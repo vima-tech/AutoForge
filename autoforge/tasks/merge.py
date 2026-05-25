@@ -3,7 +3,7 @@ import asyncio
 import uuid
 from autoforge.tasks.celery_app import celery_app
 from autoforge.database import AsyncSessionLocal
-from autoforge.models import ChangeRequest, WorktreeSession, Project
+from autoforge.models import ChangeRequest, IssueEntry, WorktreeSession, Project
 from autoforge.services.worktree_manager import merge_worktree_to_dev, remove_worktree
 from autoforge.websocket.manager import ws_manager
 
@@ -78,9 +78,12 @@ async def _do_merge(cr_id: str, env_ids: list[str]) -> dict:
             from autoforge.tasks.preview import destroy_preview
             destroy_preview.apply_async(args=[env_id], countdown=0)
 
-        # Update statuses
+        # Update statuses — also mark the source issue as completed
         cr.status = "merged"
-        session.status = "merged" if hasattr(session, "merged") else "completed"
+        session.status = "completed"
+        issue = await db.get(IssueEntry, cr.issue_id)
+        if issue:
+            issue.status = "completed"
         await db.commit()
 
         await ws_manager.broadcast(

@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     # Security
     access_token_expire_minutes: int = 60 * 24  # 24 hours
     layer1_sanitize_model: str = "claude-haiku-4-5-20251001"
+    github_webhook_secret: str = ""   # HMAC secret registered in GitHub webhook settings
+    admin_api_key: str = ""           # Shared secret for Review Portal admin actions
 
 
 settings = Settings()

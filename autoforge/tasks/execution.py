@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from celery import Task
 
+from sqlalchemy.orm import selectinload
+
 from autoforge.tasks.celery_app import celery_app
 from autoforge.database import AsyncSessionLocal
 from autoforge.models import ChangeRequest, WorktreeSession, IssueEntry, IssueAnalysis, Project
@@ -34,15 +36,20 @@ async def _do_execution(change_request_id: str) -> dict:
         if cr.status != "pending_execution":
             return {"status": "skipped", "current_status": cr.status}
 
-        # Acquire concurrency slot
+        # Acquire concurrency slot — signal caller to retry if none available
         acquired = await concurrency_manager.acquire_slot(change_request_id)
         if not acquired:
             cr.status = "queued"
             await db.commit()
-            return {"status": "queued", "reason": "no_slot_available"}
+            return {"status": "slot_unavailable"}
 
-        # Load related models
-        issue = await db.get(IssueEntry, cr.issue_id)
+        # Load related models — use selectinload to avoid lazy-load MissingGreenlet in async context
+        from sqlalchemy import select as sa_select
+        issue = (await db.scalars(
+            sa_select(IssueEntry)
+            .where(IssueEntry.id == cr.issue_id)
+            .options(selectinload(IssueEntry.analysis))
+        )).first()
         project = await db.get(Project, cr.project_id)
 
         # Load analysis for implementation hints
@@ -50,14 +57,13 @@ async def _do_execution(change_request_id: str) -> dict:
         implementation_hints = None
         if issue and issue.analysis:
             analysis_summary = issue.analysis.analysis_summary
-            # Extract implementation hints from raw_llm_output
             raw = issue.analysis.raw_llm_output or {}
             implementation_hints = raw.get("implementation_hints")
 
         # Count iterations
-        from sqlalchemy import select, func
+        from sqlalchemy import func
         iteration = await db.scalar(
-            select(func.count()).where(WorktreeSession.change_request_id == cr.id)
+            sa_select(func.count()).where(WorktreeSession.change_request_id == cr.id)
         ) or 0
         iteration += 1
 
@@ -185,9 +191,13 @@ def _extract_report(claude_output: str) -> str:
 @celery_app.task(
     name="autoforge.tasks.execution.run_claude_code",
     bind=True,
-    max_retries=0,
+    max_retries=10,
     time_limit=2000,
     soft_time_limit=1800,
 )
 def run_claude_code_task(self: Task, change_request_id: str) -> dict:
-    return _run_async(_do_execution(change_request_id))
+    result = _run_async(_do_execution(change_request_id))
+    if result.get("status") == "slot_unavailable":
+        # Slot full — back off and retry; CR stays in "queued" until a slot frees up
+        raise self.retry(countdown=60, exc=None)
+    return result

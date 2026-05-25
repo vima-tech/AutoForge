@@ -5,6 +5,7 @@ import axios from "axios";
 import toast from "react-hot-toast";
 import { SeverityBadge, CategoryBadge } from "../components/StatusBadge";
 import { ScoreBar } from "../components/ScoreBar";
+import { getAdminHeaders } from "../store/auth";
 
 interface Issue {
   id: string;
@@ -88,7 +89,7 @@ export function Review1Page() {
       return (await axios.post(
         `/api/v1/reviews/issues/${issueId}/review-1`,
         { decision, suggestions: reason || null, stage: "review_1" },
-        { headers: { "x-admin-id": "admin" } }
+        { headers: getAdminHeaders() }
       )).data;
     },
     onSuccess: (_, { decision }) => {

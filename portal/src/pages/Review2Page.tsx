@@ -5,6 +5,7 @@ import axios from "axios";
 import toast from "react-hot-toast";
 import { IterationWarning } from "../components/IterationWarning";
 import { PreviewFrame } from "../components/PreviewFrame";
+import { getAdminHeaders } from "../store/auth";
 
 interface ChangeRequest {
   id: string;
@@ -85,7 +86,7 @@ export function Review2Page() {
       return (await axios.post(
         `/api/v1/reviews/change-requests/${crId}/review-2`,
         { decision, suggestions: suggestions || null, stage: "review_2" },
-        { headers: { "x-admin-id": "admin" } }
+        { headers: getAdminHeaders() }
       )).data;
     },
     onSuccess: (_, decision) => {

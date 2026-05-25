@@ -22,9 +22,12 @@ async def github_webhook(
     """Receive GitHub issue webhook events."""
     body = await request.body()
 
-    # Verify HMAC signature
-    github_secret = getattr(settings, "github_webhook_secret", "")
-    if github_secret and x_hub_signature_256:
+    # Verify HMAC signature — required when GITHUB_WEBHOOK_SECRET is configured.
+    # If the secret is set but the header is absent, reject the request.
+    github_secret = settings.github_webhook_secret
+    if github_secret:
+        if not x_hub_signature_256:
+            raise HTTPException(status_code=401, detail="Missing signature header")
         expected = "sha256=" + hmac.new(
             github_secret.encode(), body, hashlib.sha256
         ).hexdigest()

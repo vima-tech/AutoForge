@@ -15,11 +15,18 @@ from autoforge.models import IssueEntry, ChangeRequest, AdminDecision, WorktreeS
 from autoforge.schemas import ReviewDecision
 from autoforge.core.concurrency import concurrency_manager
 from autoforge.websocket.manager import ws_manager
+from autoforge.config import settings
 
 router = APIRouter()
 
 
-async def _get_admin_id(x_admin_id: str = Header(...)) -> str:
+async def _get_admin_id(
+    x_admin_id: str = Header(..., description="Admin identity string, e.g. username"),
+    x_admin_key: str = Header(..., description="Shared secret matching ADMIN_API_KEY env var"),
+) -> str:
+    """Verify the caller holds the admin API key before allowing any review action."""
+    if settings.admin_api_key and x_admin_key != settings.admin_api_key:
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
     return x_admin_id
 
 
@@ -138,6 +145,10 @@ async def review_2(
         cr.admin_suggestions_2 = f"{existing}\n---\n{body.suggestions}".strip() if body.suggestions else existing
         cr.status = "pending_execution"
         await db.commit()
+
+        # Release the current slot (decrements both active AND pending_review counters).
+        # The new execution task will re-acquire a fresh slot, keeping counts correct.
+        await concurrency_manager.release_slot()
 
         # Destroy current preview (new one will be built after next execution)
         for env_id in env_ids:

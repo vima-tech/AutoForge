@@ -1,14 +1,11 @@
-import hashlib
-import hmac
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, Request, Header, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from autoforge.database import get_db
 from autoforge.models import IssueEntry, IssueAnalysis
 from autoforge.schemas import IssueEntryCreate, IssueEntryRead, IssueAnalysisRead
 from autoforge.services.input_gateway import submit_issue, GatewayError
-from autoforge.config import settings
 
 router = APIRouter()
 
@@ -68,54 +65,3 @@ async def get_analysis(issue_id: uuid.UUID, db: AsyncSession = Depends(get_db)) 
     if not issue.analysis:
         raise HTTPException(status_code=404, detail="Analysis not yet available")
     return issue.analysis
-
-
-@router.post("/webhook/github")
-async def github_webhook(
-    request: Request,
-    x_hub_signature_256: str = Header(None),
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    """Receive GitHub issue webhooks (M10)."""
-    body = await request.body()
-
-    # Verify signature if secret is configured
-    github_secret = getattr(settings, "github_webhook_secret", "")
-    if github_secret and x_hub_signature_256:
-        expected = "sha256=" + hmac.new(
-            github_secret.encode(), body, hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(expected, x_hub_signature_256):
-            raise HTTPException(status_code=401, detail="Invalid signature")
-
-    import json
-    payload = json.loads(body)
-    action = payload.get("action")
-
-    if action not in ("opened", "reopened"):
-        return {"status": "ignored", "action": action}
-
-    gh_issue = payload.get("issue", {})
-    repo = payload.get("repository", {})
-    project_id_str = payload.get("autoforge_project_id")  # custom header or payload field
-
-    if not project_id_str:
-        return {"status": "ignored", "reason": "no autoforge_project_id in payload"}
-
-    client_ip = request.client.host if request.client else "unknown"
-    try:
-        issue = await submit_issue(
-            db=db,
-            project_id=uuid.UUID(project_id_str),
-            source_type="github",
-            title=gh_issue.get("title", "GitHub Issue"),
-            description=gh_issue.get("body"),
-            category="Bug" if "bug" in [l.get("name", "") for l in gh_issue.get("labels", [])] else None,
-            severity=None,
-            source_id=str(gh_issue.get("number")),
-            source_url=gh_issue.get("html_url"),
-            client_ip=client_ip,
-        )
-        return {"status": "queued", "issue_id": str(issue.id)}
-    except GatewayError as e:
-        return {"status": "rejected", "reason": e.message}

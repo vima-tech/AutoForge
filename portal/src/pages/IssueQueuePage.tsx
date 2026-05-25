@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import axios from "axios";
 import toast from "react-hot-toast";
 import { SeverityBadge, StatusBadge, CategoryBadge } from "../components/StatusBadge";
+import { getAdminHeaders } from "../store/auth";
 
 interface Issue {
   id: string;
@@ -53,7 +54,7 @@ function SubmitModal({ projects, onClose }: { projects: Project[]; onClose: () =
 
   const mutation = useMutation({
     mutationFn: async () => axios.post("/api/v1/issues", { ...form, source_type: "admin" }, {
-      headers: { "x-admin-id": "admin" },
+      headers: getAdminHeaders(),
     }),
     onSuccess: () => {
       toast.success("需求已提交，分析中…");
