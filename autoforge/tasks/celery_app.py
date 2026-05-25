@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 from autoforge.config import settings
 
 celery_app = Celery(
@@ -9,6 +10,8 @@ celery_app = Celery(
         "autoforge.tasks.analysis",
         "autoforge.tasks.execution",
         "autoforge.tasks.testing",
+        "autoforge.tasks.preview",
+        "autoforge.tasks.merge",
     ],
 )
 
@@ -19,11 +22,13 @@ celery_app.conf.update(
     timezone="Asia/Shanghai",
     enable_utc=True,
     task_track_started=True,
-    worker_prefetch_multiplier=1,  # one task at a time per worker for heavy Claude tasks
+    worker_prefetch_multiplier=1,  # one heavy task at a time per worker
+    task_acks_late=True,
     beat_schedule={
+        # M8: Daily proactive scan at 2:00 AM CST
         "daily-proactive-scan": {
             "task": "autoforge.tasks.testing.run_proactive_scan",
-            "schedule": 86400,  # 24 hours
+            "schedule": crontab(hour=2, minute=0),
         },
     },
 )

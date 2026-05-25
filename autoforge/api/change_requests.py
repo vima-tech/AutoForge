@@ -30,3 +30,5 @@ async def get_change_request(cr_id: uuid.UUID, db: AsyncSession = Depends(get_db
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     return cr
+
+

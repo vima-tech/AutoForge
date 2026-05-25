@@ -1,39 +1,55 @@
 """
-Backpressure-based concurrent slot management.
-Implements the three-stage flow control from design doc §7.1.
+Redis-backed concurrency slot manager (replaces in-memory version from M1).
+Supports multi-process Celery workers and multiple uvicorn instances.
+Design doc §7.1, §11.1.
 """
-import asyncio
-from dataclasses import dataclass, field
 from enum import Enum
+from redis.asyncio import Redis
 from autoforge.config import settings
 
 
 class SystemStage(str, Enum):
-    NORMAL = "normal"         # < max_slots pending reviews
-    THROTTLED = "throttled"   # all slots occupied by pending reviews
-    PAUSED = "paused"         # pending_review count >= pause_threshold
+    NORMAL = "normal"
+    THROTTLED = "throttled"
+    PAUSED = "paused"
 
 
-@dataclass
+_ACTIVE_KEY = "autoforge:slots:active"
+_PENDING_REVIEW_KEY = "autoforge:slots:pending_review"
+
+
 class ConcurrencyManager:
-    max_slots: int = field(default_factory=lambda: settings.max_concurrent_slots)
-    pause_threshold: int = field(default_factory=lambda: settings.backpressure_pause_threshold)
+    def __init__(
+        self,
+        max_slots: int | None = None,
+        pause_threshold: int | None = None,
+    ) -> None:
+        self.max_slots = max_slots or settings.max_concurrent_slots
+        self.pause_threshold = pause_threshold or settings.backpressure_pause_threshold
 
-    _active_slots: int = field(default=0, init=False)
-    _pending_review_count: int = field(default=0, init=False)
-    _waiting_queue: list = field(default_factory=list, init=False)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    def _redis(self) -> Redis:
+        from autoforge.core.redis_client import get_redis
+        return get_redis()
 
-    def get_stage(self) -> SystemStage:
-        if self._pending_review_count >= self.pause_threshold:
+    async def _counts(self) -> tuple[int, int]:
+        r = self._redis()
+        active = int(await r.get(_ACTIVE_KEY) or 0)
+        pending = int(await r.get(_PENDING_REVIEW_KEY) or 0)
+        return active, pending
+
+    def get_stage_from(self, active: int, pending: int) -> SystemStage:
+        if pending >= self.pause_threshold:
             return SystemStage.PAUSED
-        if self._active_slots >= self.max_slots:
+        if active >= self.max_slots:
             return SystemStage.THROTTLED
         return SystemStage.NORMAL
 
-    @property
-    def effective_concurrency(self) -> int:
-        stage = self.get_stage()
+    async def get_stage(self) -> SystemStage:
+        active, pending = await self._counts()
+        return self.get_stage_from(active, pending)
+
+    async def effective_concurrency(self) -> int:
+        stage = await self.get_stage()
         if stage == SystemStage.PAUSED:
             return 0
         if stage == SystemStage.THROTTLED:
@@ -41,36 +57,56 @@ class ConcurrencyManager:
         return self.max_slots
 
     async def acquire_slot(self, cr_id: str) -> bool:
-        async with self._lock:
-            stage = self.get_stage()
-            if stage == SystemStage.PAUSED:
-                return False
-            current_running = self._active_slots - self._pending_review_count
-            limit = self.effective_concurrency
-            if current_running < limit:
-                self._active_slots += 1
-                return True
+        r = self._redis()
+        active, pending = await self._counts()
+        stage = self.get_stage_from(active, pending)
+
+        if stage == SystemStage.PAUSED:
             return False
 
+        running = active - pending
+        limit = 1 if stage == SystemStage.THROTTLED else self.max_slots
+        if running >= limit:
+            return False
+
+        await r.incr(_ACTIVE_KEY)
+        return True
+
     async def mark_pending_review(self) -> None:
-        async with self._lock:
-            self._pending_review_count += 1
+        await self._redis().incr(_PENDING_REVIEW_KEY)
 
     async def release_slot(self) -> None:
-        async with self._lock:
-            self._active_slots = max(0, self._active_slots - 1)
-            self._pending_review_count = max(0, self._pending_review_count - 1)
+        r = self._redis()
+        await r.decr(_ACTIVE_KEY)
+        current_pending = int(await r.get(_PENDING_REVIEW_KEY) or 0)
+        if current_pending > 0:
+            await r.decr(_PENDING_REVIEW_KEY)
 
-    def status_snapshot(self) -> dict:
+    async def status_snapshot(self) -> dict:
+        active, pending = await self._counts()
+        stage = self.get_stage_from(active, pending)
         return {
-            "stage": self.get_stage().value,
-            "active_slots": self._active_slots,
-            "pending_review_count": self._pending_review_count,
+            "stage": stage.value,
+            "active_slots": active,
+            "pending_review_count": pending,
             "max_slots": self.max_slots,
             "pause_threshold": self.pause_threshold,
-            "effective_concurrency": self.effective_concurrency,
+            "effective_concurrency": (
+                0 if stage == SystemStage.PAUSED
+                else 1 if stage == SystemStage.THROTTLED
+                else self.max_slots
+            ),
         }
 
+    async def update_config(self, max_slots: int, pause_threshold: int) -> None:
+        """Hot-update limits without restart. Persisted only in-memory for this process."""
+        self.max_slots = max_slots
+        self.pause_threshold = pause_threshold
 
-# Singleton instance
+    async def reset(self) -> None:
+        """Reset all counters — use only in tests."""
+        r = self._redis()
+        await r.delete(_ACTIVE_KEY, _PENDING_REVIEW_KEY)
+
+
 concurrency_manager = ConcurrencyManager()

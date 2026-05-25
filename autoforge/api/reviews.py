@@ -1,14 +1,17 @@
 """
-Review Portal API — handles the two human review checkpoints.
-Review 1: approve/reject issue analysis → creates ChangeRequest
-Review 2: approve/reject/revise implementation → merge or re-iterate
+Review Portal API — two human checkpoints.
+Review 1: approve/reject analysis → creates ChangeRequest
+Review 2: approve merge / request revision / reject → triggers merge+destroy or re-iteration
+Layer 3 security: branch operations only happen here, after explicit admin decision.
 """
 import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from autoforge.database import get_db
-from autoforge.models import IssueEntry, IssueAnalysis, ChangeRequest, AdminDecision
+from autoforge.models import IssueEntry, ChangeRequest, AdminDecision, WorktreeSession, PreviewEnvironment
 from autoforge.schemas import ReviewDecision
 from autoforge.core.concurrency import concurrency_manager
 from autoforge.websocket.manager import ws_manager
@@ -17,7 +20,6 @@ router = APIRouter()
 
 
 async def _get_admin_id(x_admin_id: str = Header(...)) -> str:
-    """Simple admin identity from header. Replace with proper auth in production."""
     return x_admin_id
 
 
@@ -28,12 +30,12 @@ async def review_1(
     admin_id: str = Depends(_get_admin_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Review checkpoint 1: approve or reject the analysis report."""
+    """Checkpoint 1: approve or reject analysis report."""
     issue = await db.get(IssueEntry, issue_id)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
     if issue.status != "pending_review":
-        raise HTTPException(status_code=409, detail=f"Issue is in status '{issue.status}', expected 'pending_review'")
+        raise HTTPException(status_code=409, detail=f"Issue is in '{issue.status}', expected 'pending_review'")
 
     decision = AdminDecision(
         project_id=issue.project_id,
@@ -47,7 +49,6 @@ async def review_1(
 
     if body.decision == "approved":
         issue.status = "approved"
-        # Create ChangeRequest
         cr = ChangeRequest(
             project_id=issue.project_id,
             issue_id=issue_id,
@@ -59,11 +60,17 @@ async def review_1(
         db.add(cr)
         await db.commit()
         await db.refresh(cr)
+
+        # Queue Claude Code execution
+        from autoforge.tasks.execution import run_claude_code_task
+        run_claude_code_task.apply_async(args=[str(cr.id)], countdown=0)
+
         await ws_manager.broadcast(
             str(issue.project_id),
-            {"type": "review_needed", "payload": {"stage": "execution", "cr_id": str(cr.id)}},
+            {"type": "worktree_update", "payload": {"stage": "queued", "cr_id": str(cr.id)}},
         )
         return {"status": "approved", "change_request_id": str(cr.id)}
+
     else:
         issue.status = "rejected"
         await db.commit()
@@ -77,14 +84,13 @@ async def review_2(
     admin_id: str = Depends(_get_admin_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Review checkpoint 2: approve merge, request revision, or reject."""
+    """Checkpoint 2: approve merge, request revision, or reject."""
     cr = await db.get(ChangeRequest, cr_id)
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     if cr.status != "pending_review_2":
-        raise HTTPException(status_code=409, detail=f"CR is in status '{cr.status}'")
+        raise HTTPException(status_code=409, detail=f"CR is in '{cr.status}', expected 'pending_review_2'")
 
-    # Layer 3: branch merge requires explicit admin decision here (not automated)
     decision = AdminDecision(
         project_id=cr.project_id,
         issue_id=cr.issue_id,
@@ -96,26 +102,70 @@ async def review_2(
     )
     db.add(decision)
 
+    # Find active preview environments for this CR's sessions
+    sessions = await db.scalars(
+        select(WorktreeSession).where(WorktreeSession.change_request_id == cr_id)
+    )
+    session_ids = [str(s.id) for s in sessions.all()]
+
+    preview_envs = await db.scalars(
+        select(PreviewEnvironment).where(
+            PreviewEnvironment.worktree_session_id.in_(
+                [uuid.UUID(sid) for sid in session_ids]
+            ),
+            PreviewEnvironment.status != "terminated",
+        )
+    ) if session_ids else []
+    env_ids = [str(e.id) for e in (preview_envs.all() if hasattr(preview_envs, "all") else preview_envs)]
+
     if body.decision == "approved":
         cr.status = "approved"
         await db.commit()
+
+        # Layer 3: trigger git merge (only here, after explicit admin approval)
+        _trigger_merge_async(str(cr.id), env_ids)
+
         await concurrency_manager.release_slot()
         await ws_manager.broadcast(
             str(cr.project_id),
-            {"type": "worktree_update", "payload": {"cr_id": str(cr_id), "status": "approved"}},
+            {"type": "worktree_update", "payload": {"cr_id": str(cr_id), "status": "merging"}},
         )
-        return {"status": "approved", "action": "merge_to_dev"}
+        return {"status": "approved", "action": "merge_triggered"}
 
     elif body.decision == "revision":
-        cr.status = "executing"
-        if body.suggestions:
-            existing = cr.admin_suggestions_2 or ""
-            cr.admin_suggestions_2 = f"{existing}\n---\n{body.suggestions}".strip()
+        # Append suggestions and re-queue execution
+        existing = cr.admin_suggestions_2 or ""
+        cr.admin_suggestions_2 = f"{existing}\n---\n{body.suggestions}".strip() if body.suggestions else existing
+        cr.status = "pending_execution"
         await db.commit()
+
+        # Destroy current preview (new one will be built after next execution)
+        for env_id in env_ids:
+            _trigger_destroy_preview(env_id)
+
+        from autoforge.tasks.execution import run_claude_code_task
+        run_claude_code_task.apply_async(args=[str(cr_id)], countdown=2)
+
         return {"status": "revision_requested"}
 
     else:  # rejected
         cr.status = "rejected"
         await db.commit()
+
+        # Destroy preview and release slot
+        for env_id in env_ids:
+            _trigger_destroy_preview(env_id)
+
         await concurrency_manager.release_slot()
         return {"status": "rejected"}
+
+
+def _trigger_merge_async(cr_id: str, env_ids: list[str]) -> None:
+    """Fire-and-forget merge task via Celery."""
+    from autoforge.tasks.merge import run_merge
+    run_merge.apply_async(args=[cr_id, env_ids], countdown=0)
+
+
+def _trigger_destroy_preview(env_id: str) -> None:
+    from autoforge.tasks.preview import destroy_preview
+    destroy_preview.apply_async(args=[env_id], countdown=0)
