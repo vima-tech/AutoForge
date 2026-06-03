@@ -154,11 +154,31 @@ button { font-family: inherit; cursor: pointer; }
   position: relative;
   z-index: 30;
 }
-.traffic { display: flex; gap: 8px; }
-.traffic i { width: 12px; height: 12px; border-radius: 50%; display: block; }
-.traffic .r { background: #ff5f57; }
-.traffic .y { background: #febc2e; }
-.traffic .g { background: #28c840; }
+.traffic { display: flex; gap: 8px; align-items: center; }
+.traffic-btn {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: none; padding: 0; cursor: pointer; flex: none;
+  display: grid; place-items: center;
+  position: relative;
+  transition: filter .12s;
+  -webkit-app-region: no-drag; /* keep button clickable inside drag region */
+}
+.traffic-btn::after {
+  content: '';
+  position: absolute; inset: 0; border-radius: 50%;
+  font-size: 9px; line-height: 12px; text-align: center;
+  color: rgba(0,0,0,.65); font-weight: 700;
+  opacity: 0; transition: opacity .12s;
+}
+.os-titlebar:hover .traffic-btn::after { opacity: 1; }
+.traffic-btn.r { background: #ff5f57; }
+.traffic-btn.r::after { content: '×'; font-size: 11px; }
+.traffic-btn.y { background: #febc2e; }
+.traffic-btn.y::after { content: '−'; font-size: 11px; letter-spacing: -.5px; }
+.traffic-btn.g { background: #28c840; }
+.traffic-btn.g::after { content: '⤢'; font-size: 8px; }
+.traffic-btn:hover { filter: brightness(.85); }
+.traffic-btn:active { filter: brightness(.65); transform: scale(.92); }
 .tb-title {
   font-family: var(--font-mono);
   font-size: 12px;

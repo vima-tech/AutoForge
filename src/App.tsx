@@ -9,6 +9,40 @@ import SettingsPage from './pages/Settings';
 type Page = 'home' | 'chat' | 'audit' | 'settings';
 type Theme = 'dark' | 'light';
 
+// Only call Tauri APIs when running inside the desktop app
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+async function getWin() {
+  const { getCurrentWindow } = await import('@tauri-apps/api/window');
+  return getCurrentWindow();
+}
+
+function TrafficLights() {
+  const [maximized, setMaximized] = useState(false);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let unlisten: (() => void) | undefined;
+    getWin().then(win => {
+      win.isMaximized().then(setMaximized);
+      win.onResized(() => win.isMaximized().then(setMaximized)).then(fn => { unlisten = fn; });
+    });
+    return () => { unlisten?.(); };
+  }, []);
+
+  const close    = () => isTauri && getWin().then(w => w.close());
+  const minimize = () => isTauri && getWin().then(w => w.minimize());
+  const toggleMax = () => isTauri && getWin().then(w => w.toggleMaximize());
+
+  return (
+    <div className="traffic">
+      <button className="traffic-btn r" onClick={close}     title="关闭" aria-label="关闭" />
+      <button className="traffic-btn y" onClick={minimize}  title="最小化" aria-label="最小化" />
+      <button className="traffic-btn g" onClick={toggleMax} title={maximized ? "还原" : "最大化"} aria-label={maximized ? "还原" : "最大化"} />
+    </div>
+  );
+}
+
 function ForgeLogo({ size = 22 }: { size?: number }) {
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="#2a1607" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round">
@@ -21,13 +55,13 @@ function ForgeLogo({ size = 22 }: { size?: number }) {
 }
 
 const NAV: { id: Page; name: string; ic: string; badge?: number }[] = [
-  { id: 'home', name: '主页', ic: 'home' },
-  { id: 'chat', name: '对话', ic: 'chat', badge: 3 },
+  { id: 'home',  name: '主页',     ic: 'home' },
+  { id: 'chat',  name: '对话',     ic: 'chat',  badge: 3 },
   { id: 'audit', name: '功能审计', ic: 'audit', badge: 4 },
 ];
 
 export default function App() {
-  const [page, setPage] = useState<Page>('home');
+  const [page,  setPage]  = useState<Page>('home');
   const [theme, setTheme] = useState<Theme>('dark');
 
   useEffect(() => {
@@ -36,11 +70,9 @@ export default function App() {
 
   return (
     <div className="os-window">
-      {/* custom title bar — data-tauri-drag-region makes it draggable */}
+      {/* custom title bar — data-tauri-drag-region enables window dragging */}
       <div className="os-titlebar" data-tauri-drag-region>
-        <div className="traffic">
-          <i className="r" /><i className="y" /><i className="g" />
-        </div>
+        <TrafficLights />
         <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
         <div className="tb-right">
           <span className="chip green" style={{ padding: '3px 9px' }}>
@@ -51,7 +83,6 @@ export default function App() {
       </div>
 
       <div className="os-body">
-        {/* nav rail */}
         <div className="rail">
           <div className="rail-logo" title="AutoForge">
             <ForgeLogo size={22} />
@@ -87,10 +118,9 @@ export default function App() {
           </div>
         </div>
 
-        {/* page content */}
-        {page === 'home' && <Dashboard />}
-        {page === 'chat' && <ConversationsPage />}
-        {page === 'audit' && <AuditPage />}
+        {page === 'home'     && <Dashboard />}
+        {page === 'chat'     && <ConversationsPage />}
+        {page === 'audit'    && <AuditPage />}
         {page === 'settings' && <SettingsPage />}
       </div>
     </div>
