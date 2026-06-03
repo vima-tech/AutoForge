@@ -112,15 +112,14 @@
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; }
+html, body { height: 100%; margin: 0; background: transparent; }
 body {
   font-family: var(--font-sans);
-  background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
-#root { height: 100%; }
+#root { height: 100%; background: transparent; }
 
 button { font-family: inherit; cursor: pointer; }
 ::selection { background: var(--ember-tint-strong); }
@@ -135,9 +134,11 @@ button { font-family: inherit; cursor: pointer; }
   width: 100vw;
   height: 100vh;
   background: var(--bg);
+  border-radius: 14px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  box-shadow: 0 32px 80px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.06);
 }
 .os-titlebar {
   height: 44px;
