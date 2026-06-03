@@ -47,6 +47,19 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str, _project_id: &str
             .await?;
     let iteration = previous_iterations + 1;
 
+    // Iteration soft limit (design §10.4): warn at >= 3 rounds, never force-stop.
+    const ITERATION_SOFT_LIMIT: i64 = 3;
+    if iteration >= ITERATION_SOFT_LIMIT {
+        event::emit(
+            app,
+            event::AppEvent::IterationWarning {
+                cr_id: cr_id.to_string(),
+                iteration,
+                soft_limit: ITERATION_SOFT_LIMIT,
+            },
+        );
+    }
+
     // Create worktree branch and path
     let branch_name = format!("autoforge/{}-i{}", cr_id, iteration);
     let worktree_path = format!("{}/{}-i{}", worktrees_base(), cr_id, iteration);

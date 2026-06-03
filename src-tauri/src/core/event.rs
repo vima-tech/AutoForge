@@ -37,6 +37,11 @@ pub enum AppEvent {
         cr_id: String,
         project_id: String,
     },
+    IterationWarning {
+        cr_id: String,
+        iteration: i64,
+        soft_limit: i64,
+    },
     PipelineStatus {
         active: usize,
         pending_review: usize,

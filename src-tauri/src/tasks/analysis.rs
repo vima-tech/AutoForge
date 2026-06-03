@@ -27,6 +27,23 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
         return Err(anyhow!("security check failed for issue {}", issue_id));
     }
 
+    // Layer 1 (design §4.3): deeper LLM sanitization beyond the regex fast-reject.
+    // Internal sources (scan/monitor) are trusted and skip this; gracefully
+    // degrades to "allow" when the claude CLI is unavailable.
+    if issue.source_type != "scan" && issue.source_type != "monitor" {
+        let combined = format!("{}\n{}", issue.title, issue.description);
+        if !crate::agents::local_claude::safety_check(&combined).await {
+            error!("issue {} rejected by Layer 1 LLM sanitizer", issue_id);
+            sqlx::query(
+                "UPDATE issues SET status='rejected', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(issue_id)
+            .execute(db)
+            .await?;
+            return Err(anyhow!("layer 1 sanitizer rejected issue {}", issue_id));
+        }
+    }
+
     info!("analyzing issue: {} — {}", issue_id, issue.title);
 
     // Run analysis

@@ -124,6 +124,61 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
 
+  // Global event bus → desktop notifications (design §8.2 / tasks G-02, G-03)
+  useEffect(() => {
+    if (!isTauri) return;
+    let unlisten: (() => void) | undefined;
+    const notify = (title: string, body: string) => {
+      try {
+        if (typeof Notification === 'undefined') return;
+        if (Notification.permission === 'granted') {
+          new Notification(title, { body });
+        } else if (Notification.permission !== 'denied') {
+          Notification.requestPermission().then(p => {
+            if (p === 'granted') new Notification(title, { body });
+          });
+        }
+      } catch { /* notifications unavailable — ignore */ }
+    };
+    listen<Record<string, unknown>>('autoforge://event', e => {
+      const ev = e.payload as {
+        type?: string; issue_title?: string; stage?: number;
+        cr_id?: string; iteration?: number; status?: string; summary?: string;
+      };
+      switch (ev?.type) {
+        case 'review_needed':
+          notify(`需要审核 · 节点 ${ev.stage ?? '?'}`, ev.issue_title ?? '有新的待审核项');
+          break;
+        case 'iteration_warning':
+          notify('迭代次数告警', `${ev.cr_id ?? ''} 已迭代 ${ev.iteration ?? ''} 轮，建议人工介入`);
+          break;
+        case 'cr_merged':
+          notify('已合并到 dev', ev.cr_id ?? '');
+          break;
+        case 'test_completed':
+          notify(ev.status === 'passed' ? '测试通过' : '测试失败', ev.summary ?? '');
+          break;
+        default:
+          break;
+      }
+    }).then(fn => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
+
+  // Startup health check (task G-01): warn if claude CLI is not logged in.
+  useEffect(() => {
+    if (!isTauri) return;
+    getSystemHealth().then(h => {
+      if (!h.claude_auth) {
+        try {
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            new Notification('Claude CLI 未登录', { body: '请在终端运行 `claude auth login` 后重启 AutoForge' });
+          }
+        } catch { /* ignore */ }
+      }
+    }).catch(() => { /* backend not ready — ignore */ });
+  }, []);
+
   useEffect(() => {
     if (!isTauri) return;
     const refresh = () => getSystemHealth().then(setHealth).catch(() => setHealth(null));

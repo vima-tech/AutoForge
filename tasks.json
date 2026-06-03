@@ -22,8 +22,13 @@
         "high": 26,
         "medium": 12,
         "low": 5
+      },
+      "by_status": {
+        "已完成": 41,
+        "未开发": 2
       }
-    }
+    },
+    "updated": "2026-06-03"
   },
   "tasks": [
     {
@@ -40,7 +45,7 @@
         "concurrency.active/max",
         "avg_delivery_hours"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -54,7 +59,7 @@
       "data_needed": [
         "issues按status分组计数"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -68,7 +73,7 @@
       "data_needed": [
         "issues+project_name，limit=5，order by priority desc"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -83,7 +88,7 @@
         "change_requests where status=executing",
         "concurrency.active/max"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -97,7 +102,7 @@
       "data_needed": [
         "concurrency.pending_review, pause_threshold, stage"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -111,7 +116,7 @@
       "data_needed": [
         "projects全量 + 各项目 issues.count(非终态)"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -125,7 +130,7 @@
       "data_needed": [
         "需新建 SubmitIssueModal 组件，list_projects 供项目选择"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -139,7 +144,7 @@
       "data_needed": [
         "前端 listen + 触发数据重载"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -153,7 +158,7 @@
       "data_needed": [
         "conversations + last_message + unread_count"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -167,7 +172,7 @@
       "data_needed": [
         "messages by conversation_id，content_json→BlockType[]"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -181,7 +186,7 @@
       "data_needed": [
         "content_json=[{t:'md',md:text}]"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -195,7 +200,7 @@
       "data_needed": [
         "conversation_id, agent_id, context → invoke claude CLI → 异步推回 MessageReceived 事件"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high",
       "notes": "核心功能，需后台 Tokio 任务 + AppEvent 推送"
     },
@@ -210,7 +215,7 @@
       "data_needed": [
         "list_agents 供选择"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -224,7 +229,7 @@
       "data_needed": [
         "agents by conv.members ids"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -238,7 +243,7 @@
       "data_needed": [
         "前端收到事件后 append 消息"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -266,7 +271,7 @@
       "data_needed": [
         "projects全量"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -280,7 +285,7 @@
       "data_needed": [
         "change_requests WHERE project_id=? AND status='pending_review_2'，JOIN issues+worktree_sessions"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -294,7 +299,7 @@
       "data_needed": [
         "report_content Markdown 解析出 summary/files/tests/risk 各段"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -308,7 +313,7 @@
       "data_needed": [
         "解析 unified diff 格式为 {file, hunk, lines[]}"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -322,7 +327,7 @@
       "data_needed": [
         "cr_id, decision='approved'"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -336,7 +341,7 @@
       "data_needed": [
         "cr_id, decision='revision', suggestions=advice_text"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -350,7 +355,7 @@
       "data_needed": [
         "cr_id, decision='rejected'"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -379,7 +384,7 @@
       "data_needed": [
         "前端收到事件后重载 CR 列表"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -393,7 +398,7 @@
       "data_needed": [
         "llm_configs 全量"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -407,7 +412,7 @@
       "data_needed": [
         "id + UpdateLlmConfig 各字段"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -421,7 +426,7 @@
       "data_needed": [
         "id, enabled: bool"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -435,7 +440,7 @@
       "data_needed": [
         "id"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -449,7 +454,7 @@
       "data_needed": [
         "llm_config.id → endpoint/key → 返回 ok/error/latency"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -463,7 +468,7 @@
       "data_needed": [
         "CreateLlmConfig 字段"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -477,7 +482,7 @@
       "data_needed": [
         "agents全量 + llm_configs.name"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -491,7 +496,7 @@
       "data_needed": [
         "id + UpdateAgent 各字段"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -505,7 +510,7 @@
       "data_needed": [
         "id, forge_role: 'analysis'|'test'|null"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -519,7 +524,7 @@
       "data_needed": [
         "id"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -533,7 +538,7 @@
       "data_needed": [
         "CreateAgent 字段"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -547,7 +552,7 @@
       "data_needed": [
         "max_slots, pause_threshold, queue_strategy"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "low"
     },
     {
@@ -561,7 +566,7 @@
       "data_needed": [
         "文件列表 + 内容"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "low"
     },
     {
@@ -575,7 +580,7 @@
       "data_needed": [
         "version, claude_auth, db_path"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "low"
     },
     {
@@ -589,7 +594,7 @@
       "data_needed": [
         "claude_auth: bool → toast 提示"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -603,7 +608,7 @@
       "data_needed": [
         "处理 PipelineStatus/ReviewNeeded/WorktreeUpdate/CrMerged/MessageReceived"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     },
     {
@@ -617,7 +622,7 @@
       "data_needed": [
         "title, body=issue_title, stage=1|2"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "medium"
     },
     {
@@ -631,7 +636,7 @@
       "data_needed": [
         "CreateProject 字段"
       ],
-      "status": "未开发",
+      "status": "已完成",
       "priority": "high"
     }
   ]
