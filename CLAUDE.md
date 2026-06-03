@@ -5,11 +5,82 @@
 AutoForge 是一个"Human-Lite-in-the-Loop"自主软件工厂，**Tauri 桌面端应用**。
 AI 全自动处理需求分析→代码实现→测试；人类只在两个审核节点做决策。
 
+## ⚠️ Tauri 版本锁定（必读）
+
+本项目使用 **Tauri 2.x**，与 Tauri 1.x 有重大 API 不兼容。**所有涉及 Tauri 的代码修改必须基于 2.x API**，不得参考 1.x 文档或示例。
+
+| 包 | 版本 |
+|----|------|
+| `tauri`（Rust crate） | **2.11.2** |
+| `tauri-build` | **2.6.2** |
+| `@tauri-apps/api`（JS） | **2.11.0** |
+| `@tauri-apps/cli` | **2.11.2** |
+| `tauri-plugin-notification` | 2.x |
+| `tauri-plugin-shell` | 2.x |
+
+### Tauri 2.x 关键差异（对比 1.x）
+
+**权限系统（Capabilities）**
+- 2.x 必须在 `src-tauri/capabilities/*.json` 中显式声明所有 JS→Rust 调用权限
+- 格式：`"core:window:allow-close"`、`"core:window:allow-start-dragging"` 等
+- 不声明则运行时报 `not allowed` 错误，**不是代码 bug**
+- 当前已声明权限见 `src-tauri/capabilities/main.json`
+
+**窗口 API（JS 侧）**
+```typescript
+// ✅ Tauri 2.x
+import { getCurrentWindow } from '@tauri-apps/api/window';
+const win = getCurrentWindow();
+win.close();
+win.minimize();
+win.toggleMaximize();
+win.startDragging();   // 在 mousedown 事件中调用，替代 data-tauri-drag-region
+
+// ❌ Tauri 1.x（禁止使用）
+import { appWindow } from '@tauri-apps/api/window';  // 1.x 旧 API
+```
+
+**IPC 调用（JS 侧）**
+```typescript
+// ✅ Tauri 2.x
+import { invoke } from '@tauri-apps/api/core';
+
+// ❌ Tauri 1.x（禁止使用）
+import { invoke } from '@tauri-apps/api/tauri';  // 1.x 旧路径
+```
+
+**事件监听（JS 侧）**
+```typescript
+// ✅ Tauri 2.x
+import { listen } from '@tauri-apps/api/event';
+```
+
+**Rust 侧 Command**
+```rust
+// ✅ Tauri 2.x
+#[tauri::command]
+async fn my_cmd(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> { ... }
+
+// 2.x 获取窗口
+let win = app.get_webview_window("main").unwrap();
+```
+
+**自定义标题栏拖拽**
+- **不要**用 `data-tauri-drag-region` 属性（Linux/WebKitGTK 不支持 `-webkit-app-region`）
+- **应该**用 `onMouseDown` → `getCurrentWindow().startDragging()`
+- 按钮内必须 `e.stopPropagation()` 阻止拖拽事件冒泡
+
+**透明窗口**
+- `tauri.conf.json` 同时设置 `"transparent": true` 和 `"backgroundColor": "#00000000"`
+- HTML/body/root 的 CSS 也需要 `background: transparent`
+
+---
+
 ## 技术栈
 
 | 层次 | 技术 |
 |------|------|
-| 桌面壳 | Tauri 2.x |
+| 桌面壳 | Tauri 2.11.2 |
 | 前端 | React 18 + TypeScript + Vite |
 | 后端 | Rust（async/tokio） |
 | 数据库 | SQLite（sqlx，零外部依赖） |
@@ -22,15 +93,15 @@ AI 全自动处理需求分析→代码实现→测试；人类只在两个审�
 # 安装前端依赖
 npm install
 
-# 开发模式（仅前端，在浏览器调试 UI）
-npm run dev
-
-# 完整 Tauri 开发模式（需要系统依赖，见下）
+# 完整 Tauri 开发模式
 npm run tauri:dev
 
 # 打包发布
 npm run tauri:build
 ```
+
+> **注意**：不要用 `npm run dev`（浏览器模式）测试 Tauri 功能，
+> 窗口控制、IPC、权限等特性只在 `tauri:dev` 下生效。
 
 ### Linux 系统依赖（Fedora）
 
@@ -57,6 +128,7 @@ src/                     # React 前端
   index.css              # 完整设计系统 CSS
 
 src-tauri/               # Rust 后端
+  capabilities/          # Tauri 2.x 权限声明（必须维护）
   src/
     agents/              # Claude CLI 调用（local_claude, analysis, code_agent）
     commands/            # Tauri IPC commands（projects, issues, reviews, settings…）
@@ -114,7 +186,8 @@ Claude Code 在 worktree 内执行时额外禁止 `git *` 工具：`--disallowed
 ### 新增 Tauri command
 1. 在 `src-tauri/src/commands/<module>.rs` 写 `#[tauri::command]` 函数
 2. 在 `src-tauri/src/lib.rs` 的 `invoke_handler![]` 中注册
-3. 在前端对应页面用 `invoke('command_name', args)` 调用
+3. 在 `src-tauri/capabilities/main.json` 的 `permissions` 数组中加入对应权限
+4. 在前端用 `invoke('command_name', args)` 调用
 
 ### 新增数据模型
 1. 在 `src-tauri/src/models/<name>.rs` 定义 `#[derive(sqlx::FromRow, Serialize)]` 结构体
