@@ -35,65 +35,63 @@ export default function App() {
   }, [theme]);
 
   return (
-    <div className="os-stage">
-      <div className="os-window">
-        {/* titlebar */}
-        <div className="os-titlebar">
-          <div className="traffic">
-            <i className="r" /><i className="y" /><i className="g" />
+    <div className="os-window">
+      {/* custom title bar — data-tauri-drag-region makes it draggable */}
+      <div className="os-titlebar" data-tauri-drag-region>
+        <div className="traffic">
+          <i className="r" /><i className="y" /><i className="g" />
+        </div>
+        <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
+        <div className="tb-right">
+          <span className="chip green" style={{ padding: '3px 9px' }}>
+            <span className="dot green" style={{ width: 6, height: 6, boxShadow: 'none' }} />
+            流水线运行中
+          </span>
+        </div>
+      </div>
+
+      <div className="os-body">
+        {/* nav rail */}
+        <div className="rail">
+          <div className="rail-logo" title="AutoForge">
+            <ForgeLogo size={22} />
           </div>
-          <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
-          <div className="tb-right">
-            <span className="chip green" style={{ padding: '3px 9px' }}>
-              <span className="dot green" style={{ width: 6, height: 6, boxShadow: 'none' }} />
-              流水线运行中
-            </span>
+          {NAV.map(n => (
+            <button
+              key={n.id}
+              className={'rail-item' + (page === n.id ? ' active' : '')}
+              onClick={() => setPage(n.id)}
+              title={n.name}
+            >
+              <Icon name={n.ic} size={23} />
+              {n.badge && page !== n.id && <span className="rail-badge">{n.badge}</span>}
+            </button>
+          ))}
+          <div className="rail-spacer" />
+          <button
+            className="rail-item"
+            title={theme === 'dark' ? '切换浅色' : '切换深色'}
+            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+          >
+            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={22} />
+          </button>
+          <button
+            className={'rail-item' + (page === 'settings' ? ' active' : '')}
+            onClick={() => setPage('settings')}
+            title="设置"
+          >
+            <Icon name="settings" size={23} />
+          </button>
+          <div style={{ marginTop: 6 }}>
+            <MeAvatar size={38} />
           </div>
         </div>
 
-        <div className="os-body">
-          {/* nav rail */}
-          <div className="rail">
-            <div className="rail-logo" title="AutoForge">
-              <ForgeLogo size={22} />
-            </div>
-            {NAV.map(n => (
-              <button
-                key={n.id}
-                className={'rail-item' + (page === n.id ? ' active' : '')}
-                onClick={() => setPage(n.id)}
-                title={n.name}
-              >
-                <Icon name={n.ic} size={23} />
-                {n.badge && page !== n.id && <span className="rail-badge">{n.badge}</span>}
-              </button>
-            ))}
-            <div className="rail-spacer" />
-            <button
-              className="rail-item"
-              title={theme === 'dark' ? '切换浅色' : '切换深色'}
-              onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
-            >
-              <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={22} />
-            </button>
-            <button
-              className={'rail-item' + (page === 'settings' ? ' active' : '')}
-              onClick={() => setPage('settings')}
-              title="设置"
-            >
-              <Icon name="settings" size={23} />
-            </button>
-            <div style={{ marginTop: 6 }}>
-              <MeAvatar size={38} />
-            </div>
-          </div>
-
-          {/* page content */}
-          {page === 'home' && <Dashboard />}
-          {page === 'chat' && <ConversationsPage />}
-          {page === 'audit' && <AuditPage />}
-          {page === 'settings' && <SettingsPage />}
-        </div>
+        {/* page content */}
+        {page === 'home' && <Dashboard />}
+        {page === 'chat' && <ConversationsPage />}
+        {page === 'audit' && <AuditPage />}
+        {page === 'settings' && <SettingsPage />}
       </div>
     </div>
   );
