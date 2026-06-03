@@ -1,0 +1,638 @@
+{
+  "meta": {
+    "version": "1.0",
+    "created": "2026-06-03",
+    "description": "AutoForge 前端页面功能对后端接口对接任务清单",
+    "status_values": [
+      "未开发",
+      "开发中",
+      "已完成",
+      "已跳过"
+    ],
+    "summary": {
+      "total": 43,
+      "by_page": {
+        "Dashboard": 8,
+        "Conversations": 8,
+        "Audit": 9,
+        "Settings": 14,
+        "Global": 4
+      },
+      "by_priority": {
+        "high": 26,
+        "medium": 12,
+        "low": 5
+      }
+    }
+  },
+  "tasks": [
+    {
+      "id": "D-01",
+      "page": "Dashboard",
+      "area": "KPI 统计卡片",
+      "description": "4 张 stat card：在产项目数、需求队列总数、并发槽位占用（x/max）、平均交付时长（h）",
+      "frontend": "Dashboard.tsx:30-40 d.stats",
+      "command": "pipeline_stats",
+      "rust_file": "commands/system.rs",
+      "data_needed": [
+        "projects.count(active)",
+        "issues.count",
+        "concurrency.active/max",
+        "avg_delivery_hours"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "D-02",
+      "page": "Dashboard",
+      "area": "流水线节点图",
+      "description": "PIPELINE 横向流程：各阶段需求数量（需求入口/分析/审核1/执行/审核2/合并），当前活跃阶段高亮",
+      "frontend": "Dashboard.tsx:51-62 d.pipeline",
+      "command": "pipeline_stats",
+      "rust_file": "commands/system.rs",
+      "data_needed": [
+        "issues按status分组计数"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "D-03",
+      "page": "Dashboard",
+      "area": "需求队列列表",
+      "description": "按优先级排序 top-N 需求，展示 id/title/category/project/当前阶段；「全部 N 条」跳转",
+      "frontend": "Dashboard.tsx:67-89 d.queue",
+      "command": "list_issues",
+      "rust_file": "commands/issues.rs",
+      "data_needed": [
+        "issues+project_name，limit=5，order by priority desc"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "D-04",
+      "page": "Dashboard",
+      "area": "并发槽位面板",
+      "description": "展示 executing 中的 CR 编号（busy slot）、空闲槽、最大并发数",
+      "frontend": "Dashboard.tsx:92-110 slots",
+      "command": "concurrency_status（并入 pipeline_stats）",
+      "rust_file": "commands/system.rs",
+      "data_needed": [
+        "change_requests where status=executing",
+        "concurrency.active/max"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "D-05",
+      "page": "Dashboard",
+      "area": "背压状态面板",
+      "description": "背压阶段（正常/降速/暂停）、积压数量进度条、pause_threshold 阈值",
+      "frontend": "Dashboard.tsx:111-130 bp-bar",
+      "command": "concurrency_status（并入 pipeline_stats）",
+      "rust_file": "commands/system.rs",
+      "data_needed": [
+        "concurrency.pending_review, pause_threshold, stage"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "D-06",
+      "page": "Dashboard",
+      "area": "在产项目列表",
+      "description": "所有项目卡片：name/desc/lang/status/backlog数，「接入项目」打开新建表单",
+      "frontend": "Dashboard.tsx:132-161 d.projects",
+      "command": "list_projects",
+      "rust_file": "commands/projects.rs",
+      "data_needed": [
+        "projects全量 + 各项目 issues.count(非终态)"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "D-07",
+      "page": "Dashboard",
+      "area": "提交需求按钮",
+      "description": "「提交需求」→ Modal（项目选择、标题、描述、分类、严重级别）→ submit_issue → 触发分析任务",
+      "frontend": "Dashboard.tsx:24 btn-primary 提交需求",
+      "command": "submit_issue",
+      "rust_file": "commands/issues.rs（已实现）",
+      "data_needed": [
+        "需新建 SubmitIssueModal 组件，list_projects 供项目选择"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "D-08",
+      "page": "Dashboard",
+      "area": "实时数据刷新",
+      "description": "监听后端事件，收到 PipelineStatus/IssueCreated/CrMerged 后重载 Dashboard 数据",
+      "frontend": "Dashboard.tsx（需新增 useEffect + event listen）",
+      "command": "listen('autoforge://event')",
+      "rust_file": "core/event.rs AppEvent::PipelineStatus",
+      "data_needed": [
+        "前端 listen + 触发数据重载"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "C-01",
+      "page": "Conversations",
+      "area": "对话列表",
+      "description": "加载所有对话（群聊+单聊），展示最后消息预览、时间戳、未读数徽标",
+      "frontend": "Conversations.tsx:7-61 ConvList",
+      "command": "list_conversations",
+      "rust_file": "commands/conversations.rs（已实现）",
+      "data_needed": [
+        "conversations + last_message + unread_count"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "C-02",
+      "page": "Conversations",
+      "area": "消息历史",
+      "description": "选中对话后加载消息列表，按时间正序；content_json 解析为多类型消息块（md/code/file/image/artifact）",
+      "frontend": "Conversations.tsx:172-186 ChatView",
+      "command": "list_messages",
+      "rust_file": "commands/conversations.rs（已实现）",
+      "data_needed": [
+        "messages by conversation_id，content_json→BlockType[]"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "C-03",
+      "page": "Conversations",
+      "area": "发送用户消息",
+      "description": "Composer 发送文字，持久化到 messages 表（from_agent=NULL），立即展示在气泡流中",
+      "frontend": "Conversations.tsx:108-170 Composer send()",
+      "command": "send_message",
+      "rust_file": "commands/conversations.rs（已实现）",
+      "data_needed": [
+        "content_json=[{t:'md',md:text}]"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "C-04",
+      "page": "Conversations",
+      "area": "Agent 自动回复",
+      "description": "用户发消息后对应 Agent 调用 Claude CLI 生成回复；群聊中 @mention 指定特定 Agent 响应",
+      "frontend": "Conversations.tsx:236-255 send() 模拟回复",
+      "command": "agent_reply（新增）",
+      "rust_file": "commands/conversations.rs 新增 + agents/local_claude.rs",
+      "data_needed": [
+        "conversation_id, agent_id, context → invoke claude CLI → 异步推回 MessageReceived 事件"
+      ],
+      "status": "未开发",
+      "priority": "high",
+      "notes": "核心功能，需后台 Tokio 任务 + AppEvent 推送"
+    },
+    {
+      "id": "C-05",
+      "page": "Conversations",
+      "area": "新建群聊",
+      "description": "NewGroupModal：输入名称、勾选 Agent 成员（≥2人）→ create_group_conversation",
+      "frontend": "Conversations.tsx:188-227 NewGroupModal",
+      "command": "create_group_conversation",
+      "rust_file": "commands/conversations.rs（已实现）",
+      "data_needed": [
+        "list_agents 供选择"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "C-06",
+      "page": "Conversations",
+      "area": "Agent 列表（@mention）",
+      "description": "群聊输入框 @ 触发弹窗，展示当前群聊成员的 name/role/color",
+      "frontend": "Conversations.tsx:153-163 mention-pop",
+      "command": "list_agents",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "agents by conv.members ids"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "C-07",
+      "page": "Conversations",
+      "area": "实时新消息推送",
+      "description": "Agent 回复完成后通过事件推到前端，自动追加到消息流，无需用户刷新",
+      "frontend": "Conversations.tsx（需新增 listen useEffect）",
+      "command": "listen('autoforge://event') → MessageReceived",
+      "rust_file": "core/event.rs 新增 AppEvent::MessageReceived{conversation_id,message}",
+      "data_needed": [
+        "前端收到事件后 append 消息"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "C-08",
+      "page": "Conversations",
+      "area": "文件/图片附件",
+      "description": "Composer 附件/图片按钮 → 选择本地文件 → 存储路径 → 消息中显示 att/att-img 气泡",
+      "frontend": "Conversations.tsx:143-147 composer-tools paperclip/image",
+      "command": "upload_attachment（新增）",
+      "rust_file": "commands/conversations.rs 新增，tauri-plugin-dialog 文件选择",
+      "data_needed": [
+        "本地文件路径或 base64 内嵌"
+      ],
+      "status": "未开发",
+      "priority": "low"
+    },
+    {
+      "id": "A-01",
+      "page": "Audit",
+      "area": "项目切换下拉",
+      "description": "左侧顶部项目选择器，列出所有项目；切换后刷新右侧待审核 CR 列表",
+      "frontend": "Audit.tsx:8-61 AuditList proj-select",
+      "command": "list_projects",
+      "rust_file": "commands/projects.rs（已实现）",
+      "data_needed": [
+        "projects全量"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-02",
+      "page": "Audit",
+      "area": "待审核 CR 列表",
+      "description": "按选中项目过滤 status=pending_review_2 的 CR，展示 id/title/category/sev/迭代次数/文件数/时间",
+      "frontend": "Audit.tsx:43-58 REQUIREMENTS list",
+      "command": "list_change_requests",
+      "rust_file": "commands/change_requests.rs（已实现）",
+      "data_needed": [
+        "change_requests WHERE project_id=? AND status='pending_review_2'，JOIN issues+worktree_sessions"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-03",
+      "page": "Audit",
+      "area": "实现报告",
+      "description": "「实现报告」tab：改动摘要/修改文件列表（+N -N）/测试情况/潜在风险；迭代≥3时显示警告",
+      "frontend": "Audit.tsx:194-218 report tab",
+      "command": "get_worktree_session（新增）",
+      "rust_file": "commands/change_requests.rs 新增，返回 WorktreeSession.report_content",
+      "data_needed": [
+        "report_content Markdown 解析出 summary/files/tests/risk 各段"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-04",
+      "page": "Audit",
+      "area": "代码 Diff",
+      "description": "「代码 Diff」tab：Unified/Split 两种视图，展示 hunk header 和逐行增删",
+      "frontend": "Audit.tsx:220-228 diff tab",
+      "command": "get_code_diff（新增）",
+      "rust_file": "commands/change_requests.rs 新增，GitProxy.run(['diff', base+'...'+branch])",
+      "data_needed": [
+        "解析 unified diff 格式为 {file, hunk, lines[]}"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-05",
+      "page": "Audit",
+      "area": "审核 — 批准合并",
+      "description": "「批准合并」→ review_2(decision=approved) → 入队 MergeJob",
+      "frontend": "Audit.tsx:170 btn-primary 批准合并",
+      "command": "review_2",
+      "rust_file": "commands/change_requests.rs（已实现）",
+      "data_needed": [
+        "cr_id, decision='approved'"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-06",
+      "page": "Audit",
+      "area": "审核 — 修改迭代",
+      "description": "「修改」+ 管理员建议文本框 → review_2(decision=revision, suggestions=advice) → 重新执行",
+      "frontend": "Audit.tsx:169+259 btn修改 + advice-box textarea",
+      "command": "review_2",
+      "rust_file": "commands/change_requests.rs（已实现）",
+      "data_needed": [
+        "cr_id, decision='revision', suggestions=advice_text"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-07",
+      "page": "Audit",
+      "area": "审核 — 拒绝",
+      "description": "「拒绝」→ review_2(decision=rejected) → 关闭 CR",
+      "frontend": "Audit.tsx:168 btn-danger 拒绝",
+      "command": "review_2",
+      "rust_file": "commands/change_requests.rs（已实现）",
+      "data_needed": [
+        "cr_id, decision='rejected'"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "A-08",
+      "page": "Audit",
+      "area": "预览地址显示",
+      "description": "左侧显示当前项目预览 URL（live 绿点）",
+      "frontend": "Audit.tsx:37-39 preview-url",
+      "command": "list_projects（扩展 preview_url 字段）",
+      "rust_file": "commands/projects.rs 扩展",
+      "data_needed": [
+        "project.preview_url（当前 schema 暂无，预览功能待定）"
+      ],
+      "status": "未开发",
+      "priority": "low",
+      "notes": "桌面版是否保留 Podman 预览容器待定"
+    },
+    {
+      "id": "A-09",
+      "page": "Audit",
+      "area": "实时状态刷新",
+      "description": "审核提交后或 merge 完成时，通过事件刷新 CR 列表和当前状态显示",
+      "frontend": "Audit.tsx（需新增 listen useEffect）",
+      "command": "listen('autoforge://event') → WorktreeUpdate/CrMerged",
+      "rust_file": "core/event.rs",
+      "data_needed": [
+        "前端收到事件后重载 CR 列表"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "S-01",
+      "page": "Settings",
+      "area": "LLM 配置 — 列表",
+      "description": "打开 LLM tab 加载所有 LLM 配置，按创建时间排序",
+      "frontend": "Settings.tsx:11 useState(LLM_CONFIGS)",
+      "command": "list_llm_configs",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "llm_configs 全量"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "S-02",
+      "page": "Settings",
+      "area": "LLM 配置 — 保存",
+      "description": "展开卡片修改 provider/model/endpoint/key/ctx/temp 后保存",
+      "frontend": "Settings.tsx:29-49 cfg-fields（需新增保存按钮）",
+      "command": "update_llm_config",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "id + UpdateLlmConfig 各字段"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "S-03",
+      "page": "Settings",
+      "area": "LLM 配置 — 启用禁用",
+      "description": "Switch 切换 enabled 状态立即保存",
+      "frontend": "Settings.tsx:45 Switch onToggle",
+      "command": "update_llm_config",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "id, enabled: bool"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "S-04",
+      "page": "Settings",
+      "area": "LLM 配置 — 删除",
+      "description": "「删除」→ 确认弹窗 → delete_llm_config",
+      "frontend": "Settings.tsx:47 btn-danger 删除",
+      "command": "delete_llm_config",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "id"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "S-05",
+      "page": "Settings",
+      "area": "LLM 配置 — 测试连接",
+      "description": "「测试连接」→ 向 endpoint 发小型测试请求验证 API Key",
+      "frontend": "Settings.tsx:48 btn 测试连接",
+      "command": "test_llm_connection（新增）",
+      "rust_file": "commands/settings.rs 新增，reqwest 发 test 请求",
+      "data_needed": [
+        "llm_config.id → endpoint/key → 返回 ok/error/latency"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "S-06",
+      "page": "Settings",
+      "area": "LLM 配置 — 新增",
+      "description": "「添加 LLM 配置」卡片 → 展开空表单 → create_llm_config",
+      "frontend": "Settings.tsx:54 cfg-card add",
+      "command": "create_llm_config",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "CreateLlmConfig 字段"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "S-07",
+      "page": "Settings",
+      "area": "Agent 配置 — 列表",
+      "description": "打开 Agent tab 加载所有 Agent，同时加载 LLM 名称供选择器",
+      "frontend": "Settings.tsx:60 useState(AGENTS)",
+      "command": "list_agents + list_llm_configs",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "agents全量 + llm_configs.name"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "S-08",
+      "page": "Settings",
+      "area": "Agent 配置 — 保存",
+      "description": "展开 Agent 卡片修改 name/llm/role/system_prompt 后保存",
+      "frontend": "Settings.tsx:119-124 cfg-fields（需新增保存按钮）",
+      "command": "update_agent",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "id + UpdateAgent 各字段"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "S-09",
+      "page": "Settings",
+      "area": "Agent 配置 — 流水线角色",
+      "description": "Switch「指派为需求分析/测试 Agent」→ update_agent forge_role",
+      "frontend": "Settings.tsx:126-131 Switch 指派",
+      "command": "update_agent",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "id, forge_role: 'analysis'|'test'|null"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "S-10",
+      "page": "Settings",
+      "area": "Agent 配置 — 删除",
+      "description": "「删除」→ 确认弹窗 → delete_agent",
+      "frontend": "Settings.tsx:132 btn-danger 删除",
+      "command": "delete_agent",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "id"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "S-11",
+      "page": "Settings",
+      "area": "Agent 配置 — 新增",
+      "description": "「添加 Agent」卡片 → 展开空表单 → create_agent",
+      "frontend": "Settings.tsx:139 cfg-card add",
+      "command": "create_agent",
+      "rust_file": "commands/settings.rs（已实现）",
+      "data_needed": [
+        "CreateAgent 字段"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "S-12",
+      "page": "Settings",
+      "area": "并发与流控面板",
+      "description": "max_slots / pause_threshold / queue_strategy 配置项，保存后实时生效",
+      "frontend": "Settings.tsx:147 concurrency 占位 tab",
+      "command": "update_concurrency_config（新增）",
+      "rust_file": "commands/system.rs 新增",
+      "data_needed": [
+        "max_slots, pause_threshold, queue_strategy"
+      ],
+      "status": "未开发",
+      "priority": "low"
+    },
+    {
+      "id": "S-13",
+      "page": "Settings",
+      "area": "规范文档面板",
+      "description": "展示并可编辑 specs/*.md 内容（分析/编码/审核/测试规范）",
+      "frontend": "Settings.tsx:148 specs 占位 tab",
+      "command": "read_spec / write_spec（新增）",
+      "rust_file": "commands/system.rs 新增，std::fs 读写 specs/",
+      "data_needed": [
+        "文件列表 + 内容"
+      ],
+      "status": "未开发",
+      "priority": "low"
+    },
+    {
+      "id": "S-14",
+      "page": "Settings",
+      "area": "关于面板",
+      "description": "展示 app 版本号、Tauri 版本、claude auth 状态、DB 路径",
+      "frontend": "Settings.tsx:149 about 占位 tab",
+      "command": "system_health",
+      "rust_file": "commands/system.rs（已实现）",
+      "data_needed": [
+        "version, claude_auth, db_path"
+      ],
+      "status": "未开发",
+      "priority": "low"
+    },
+    {
+      "id": "G-01",
+      "page": "Global",
+      "area": "启动健康检查",
+      "description": "App 启动时调用 system_health 检查 claude auth；未登录时显示引导提示",
+      "frontend": "App.tsx（需新增 useEffect on mount）",
+      "command": "system_health",
+      "rust_file": "commands/system.rs（已实现）",
+      "data_needed": [
+        "claude_auth: bool → toast 提示"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "G-02",
+      "page": "Global",
+      "area": "实时事件总线",
+      "description": "全局 listen 后端事件，分发给各页面（Pipeline/Review/消息/Merge）",
+      "frontend": "App.tsx（需全局 listen + React Context 或 zustand 分发）",
+      "command": "listen('autoforge://event')",
+      "rust_file": "core/event.rs（已实现事件定义）",
+      "data_needed": [
+        "处理 PipelineStatus/ReviewNeeded/WorktreeUpdate/CrMerged/MessageReceived"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    },
+    {
+      "id": "G-03",
+      "page": "Global",
+      "area": "审核节点桌面通知",
+      "description": "收到 ReviewNeeded 事件 → tauri-plugin-notification 发桌面系统通知",
+      "frontend": "App.tsx listen handler",
+      "command": "tauri-plugin-notification（JS 层调用）",
+      "rust_file": "无（前端直接调用 notification plugin）",
+      "data_needed": [
+        "title, body=issue_title, stage=1|2"
+      ],
+      "status": "未开发",
+      "priority": "medium"
+    },
+    {
+      "id": "G-04",
+      "page": "Global",
+      "area": "接入新项目（Modal）",
+      "description": "Dashboard「接入项目」→ Modal（name/slug/repo_path/branch_dev/main）→ create_project",
+      "frontend": "Dashboard.tsx:139 btn 接入项目（需新建 CreateProjectModal）",
+      "command": "create_project",
+      "rust_file": "commands/projects.rs（已实现）",
+      "data_needed": [
+        "CreateProject 字段"
+      ],
+      "status": "未开发",
+      "priority": "high"
+    }
+  ]
+}
