@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import Icon from './components/Icon';
 import { MeAvatar } from './components/Avatar';
 import Dashboard from './pages/Dashboard';
@@ -9,43 +10,61 @@ import SettingsPage from './pages/Settings';
 type Page = 'home' | 'chat' | 'audit' | 'settings';
 type Theme = 'dark' | 'light';
 
-// Only call Tauri APIs when running inside the desktop app
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+const win = () => getCurrentWindow();
 
-async function getWin() {
-  const { getCurrentWindow } = await import('@tauri-apps/api/window');
-  return getCurrentWindow();
-}
-
+// ---- Traffic light buttons ----
 function TrafficLights() {
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
     if (!isTauri) return;
+    win().isMaximized().then(setMaximized);
     let unlisten: (() => void) | undefined;
-    getWin().then(win => {
-      win.isMaximized().then(setMaximized);
-      win.onResized(() => win.isMaximized().then(setMaximized)).then(fn => { unlisten = fn; });
-    });
-    return () => { unlisten?.(); };
+    win().onResized(() => win().isMaximized().then(setMaximized))
+         .then(fn => { unlisten = fn; });
+    return () => unlisten?.();
   }, []);
 
-  const close    = () => isTauri && getWin().then(w => w.close());
-  const minimize = () => isTauri && getWin().then(w => w.minimize());
-  const toggleMax = () => isTauri && getWin().then(w => w.toggleMaximize());
+  // stopPropagation on mousedown prevents startDragging from firing
+  const stopDrag = (e: React.MouseEvent) => e.stopPropagation();
 
   return (
     <div className="traffic">
-      <button className="traffic-btn r" onClick={close}     title="关闭" aria-label="关闭" />
-      <button className="traffic-btn y" onClick={minimize}  title="最小化" aria-label="最小化" />
-      <button className="traffic-btn g" onClick={toggleMax} title={maximized ? "还原" : "最大化"} aria-label={maximized ? "还原" : "最大化"} />
+      <button
+        className="traffic-btn r"
+        title="关闭"
+        onMouseDown={stopDrag}
+        onClick={() => isTauri && win().close()}
+      />
+      <button
+        className="traffic-btn y"
+        title="最小化"
+        onMouseDown={stopDrag}
+        onClick={() => isTauri && win().minimize()}
+      />
+      <button
+        className="traffic-btn g"
+        title={maximized ? '还原' : '最大化'}
+        onMouseDown={stopDrag}
+        onClick={() => isTauri && win().toggleMaximize()}
+      />
     </div>
   );
 }
 
+// ---- Titlebar drag ----
+function handleTitlebarMouseDown(e: React.MouseEvent<HTMLDivElement>) {
+  // Only drag from the titlebar itself, not from child interactive elements
+  if ((e.target as HTMLElement).closest('button, a, input')) return;
+  if (isTauri) win().startDragging();
+}
+
+// ---- Logo ----
 function ForgeLogo({ size = 22 }: { size?: number }) {
   return (
-    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="#2a1607" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round">
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+         stroke="#2a1607" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round">
       <path d="M4 20h10" />
       <path d="M14 14l6-6-3-3-6 6z" />
       <path d="M8 20l4-9 3 3-3 6" />
@@ -70,8 +89,8 @@ export default function App() {
 
   return (
     <div className="os-window">
-      {/* custom title bar — data-tauri-drag-region enables window dragging */}
-      <div className="os-titlebar" data-tauri-drag-region>
+      {/* Custom titlebar — onMouseDown triggers window drag */}
+      <div className="os-titlebar" onMouseDown={handleTitlebarMouseDown}>
         <TrafficLights />
         <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
         <div className="tb-right">
