@@ -73,14 +73,37 @@ function handleTitlebarMouseDown(e: React.MouseEvent<HTMLDivElement>) {
 }
 
 // ---- Logo ----
-function ForgeLogo({ size = 22 }: { size?: number }) {
+// AutoForge mark: a stylized "A" whose crossbar is a forward-pointing pipeline arrow
+// (the autonomous analysis→code→merge flow), capped by a small ember at the apex
+// (the forge spark that the factory produces). Monoline, white on molten orange.
+function ForgeLogo({ size = 38 }: { size?: number }) {
   return (
-    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
-         stroke="#2a1607" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4 20h10" />
-      <path d="M14 14l6-6-3-3-6 6z" />
-      <path d="M8 20l4-9 3 3-3 6" />
-      <path d="M17 5l2-2" />
+    <svg viewBox="0 0 38 38" width={size} height={size} fill="none">
+      <rect width="38" height="38" rx="11" fill="url(#logo-bg)" />
+      <defs>
+        <linearGradient id="logo-bg" x1="0" y1="0" x2="38" y2="38" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#f5a623" />
+          <stop offset="55%" stopColor="#e8772e" />
+          <stop offset="100%" stopColor="#d45d1c" />
+        </linearGradient>
+      </defs>
+
+      {/* 外圆 */}
+      <circle cx="19" cy="19" r="15" stroke="#211a13" strokeWidth="1.5" fill="none" opacity="0.4"/>
+      {/* 中圆 */}
+      <circle cx="19" cy="19" r="9" stroke="#211a13" strokeWidth="1.5" fill="none" opacity="0.3"/>
+      {/* 内圆 */}
+      <circle cx="19" cy="19" r="4.5" stroke="#211a13" strokeWidth="1.5" fill="none" opacity="0.2"/>
+
+      {/* 三横 */}
+      <line x1="0" y1="9.5" x2="36" y2="9.5" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+      <line x1="0" y1="19" x2="36" y2="19" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+      <line x1="0" y1="28.5" x2="36" y2="28.5" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+
+      {/* 三竖 */}
+      <line x1="9.5" y1="0" x2="9.5" y2="36" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+      <line x1="19" y1="0" x2="19" y2="36" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+      <line x1="28.5" y1="0" x2="28.5" y2="36" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
     </svg>
   );
 }
