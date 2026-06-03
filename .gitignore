@@ -1,40 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
+node_modules/
 dist/
-.venv/
-venv/
-*.egg
-
-# Environment
+src-tauri/target/
 .env
 .env.local
-
-# Node
-portal/node_modules/
-portal/dist/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# Database
-*.db
-*.sqlite3
-
-# Docker volumes
-data/
-
-# Alembic
-alembic/versions/*.pyc
-
-# Test coverage
-.coverage
-htmlcov/
-.pytest_cache/
-
-# OS
 .DS_Store
-Thumbs.db
