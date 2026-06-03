@@ -1,6 +1,24 @@
+# Frontend
 node_modules/
 dist/
+
+# Rust / Tauri
 src-tauri/target/
+
+# App data (local SQLite DB and worktrees)
+*.db
+*.db-shm
+*.db-wal
+worktrees/
+
+# Environment
 .env
 .env.local
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
