@@ -1,8 +1,13 @@
 import React from 'react';
-import { AGENT_MAP, type Agent } from '../data/mock';
+import { AGENT_MAP, type Agent as MockAgent } from '../data/mock';
+
+type AgentLike = MockAgent | {
+  color: string;
+  initial: string;
+};
 
 interface AvatarProps {
-  agent: string | Agent;
+  agent: string | AgentLike;
   size?: number;
   status?: 'online' | 'busy' | 'offline';
 }

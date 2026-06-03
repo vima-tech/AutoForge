@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import Icon from './components/Icon';
 import { MeAvatar } from './components/Avatar';
@@ -6,6 +7,7 @@ import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
 import SettingsPage from './pages/Settings';
+import { getSystemHealth, type SystemHealth } from './services';
 
 type Page = 'home' | 'chat' | 'audit' | 'settings';
 type Theme = 'dark' | 'light';
@@ -36,19 +38,29 @@ function TrafficLights() {
         title="关闭"
         onMouseDown={stopDrag}
         onClick={() => isTauri && win().close()}
-      />
+      >
+        <Icon name="winClose" size={8} />
+      </button>
       <button
         className="traffic-btn y"
         title="最小化"
         onMouseDown={stopDrag}
         onClick={() => isTauri && win().minimize()}
-      />
+      >
+        <Icon name="winMinimize" size={8} />
+      </button>
       <button
-        className="traffic-btn g"
+        className={'traffic-btn g' + (maximized ? ' restore' : '')}
         title={maximized ? '还原' : '最大化'}
         onMouseDown={stopDrag}
-        onClick={() => isTauri && win().toggleMaximize()}
-      />
+        onClick={async () => {
+          if (!isTauri) return;
+          await win().toggleMaximize();
+          setMaximized(await win().isMaximized());
+        }}
+      >
+        <Icon name={maximized ? 'winRestore' : 'winMaximize'} size={9} />
+      </button>
     </div>
   );
 }
@@ -82,10 +94,31 @@ const NAV: { id: Page; name: string; ic: string; badge?: number }[] = [
 export default function App() {
   const [page,  setPage]  = useState<Page>('home');
   const [theme, setTheme] = useState<Theme>('dark');
+  const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [lastEvent, setLastEvent] = useState('');
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    const refresh = () => getSystemHealth().then(setHealth).catch(() => setHealth(null));
+    refresh();
+    let unlisten: (() => void) | undefined;
+    listen<Record<string, unknown>>('autoforge://event', e => {
+      const type = typeof e.payload?.type === 'string' ? e.payload.type : 'event';
+      setLastEvent(type);
+      refresh();
+    }).then(fn => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
+
+  const stageLabel = health
+    ? health.stage === 'paused' ? '系统暂停'
+      : health.stage === 'throttled' ? '单线程降速'
+      : '流水线运行中'
+    : '状态检测中';
 
   return (
     <div className="os-window">
@@ -94,9 +127,11 @@ export default function App() {
         <TrafficLights />
         <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
         <div className="tb-right">
-          <span className="chip green" style={{ padding: '3px 9px' }}>
-            <span className="dot green" style={{ width: 6, height: 6, boxShadow: 'none' }} />
-            流水线运行中
+          <span className={'chip ' + (health?.stage === 'paused' ? 'red' : health?.stage === 'throttled' ? 'amber' : 'green')} style={{ padding: '3px 9px' }}>
+            <span className={'dot ' + (health?.stage === 'paused' ? 'red' : 'green')} style={{ width: 6, height: 6, boxShadow: 'none' }} />
+            {stageLabel}
+            {health && <span style={{ marginLeft: 6, fontFamily: 'var(--font-mono)' }}>{health.active_slots}/{health.max_slots}</span>}
+            {lastEvent && <span style={{ marginLeft: 6, color: 'var(--text-faint)' }}>{lastEvent}</span>}
           </span>
         </div>
       </div>
