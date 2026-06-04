@@ -47,7 +47,9 @@ pub fn run() {
                 db,
                 job_tx,
                 concurrency,
-                dev_servers: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                dev_servers: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             });
 
             // 显式设置窗口图标，确保 Linux 任务栏在开发模式下也能显示正确图标

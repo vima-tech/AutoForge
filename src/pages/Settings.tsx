@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
 import Select from '../components/Select';
@@ -17,7 +18,7 @@ function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
 }
 
 function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
-  return (
+  return createPortal(
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }} onClick={onCancel}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 360, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 20px', fontSize: 14, lineHeight: 1.6 }}>{msg}</p>
@@ -26,7 +27,8 @@ function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; 
           <button className="btn btn-danger" onClick={onOk}>确认删除</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

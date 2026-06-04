@@ -118,7 +118,11 @@ async fn check_auth_inner() -> bool {
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
-    debug!("[claude] 'claude --version' done in {:?} ok={}", t0.elapsed(), version_ok);
+    debug!(
+        "[claude] 'claude --version' done in {:?} ok={}",
+        t0.elapsed(),
+        version_ok
+    );
     if !version_ok {
         return false;
     }
@@ -141,11 +145,19 @@ async fn check_auth_inner() -> bool {
                 || text.contains("loggedin:true")
                 || text.contains("logged in")
                 || text.contains("authenticated");
-            info!("[claude] 'claude auth status' done in {:?} authed={}", t0.elapsed(), authed);
+            info!(
+                "[claude] 'claude auth status' done in {:?} authed={}",
+                t0.elapsed(),
+                authed
+            );
             authed
         }
         Err(e) => {
-            info!("[claude] 'claude auth status' failed in {:?}: {}", t0.elapsed(), e);
+            info!(
+                "[claude] 'claude auth status' failed in {:?}: {}",
+                t0.elapsed(),
+                e
+            );
             version_ok
         }
     }

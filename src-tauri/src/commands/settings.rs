@@ -327,7 +327,9 @@ pub async fn update_agent(
     }
     if let Some(ref v) = payload.role_type {
         sets.push("role_type=?");
-        values.push(AgentUpdateValue::Text(normalize_role_type(Some(v)).to_string()));
+        values.push(AgentUpdateValue::Text(
+            normalize_role_type(Some(v)).to_string(),
+        ));
     }
     if let Some(ref v) = payload.system_kind {
         match v {
@@ -438,12 +440,10 @@ pub async fn set_agent_forge_role(
     state: State<'_, AppState>,
 ) -> Result<Vec<Agent>, String> {
     // Load current state to compute new comma-separated role lists in Rust.
-    let holders = sqlx::query_as::<_, Agent>(
-        "SELECT * FROM agents WHERE forge_role IS NOT NULL",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let holders = sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE forge_role IS NOT NULL")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
 
@@ -473,7 +473,12 @@ pub async fn set_agent_forge_role(
             .iter()
             .find(|a| a.id == agent_id)
             .and_then(|a| a.forge_role.as_deref())
-            .map(|fr| fr.split(',').filter(|&r| r != role).map(str::to_string).collect())
+            .map(|fr| {
+                fr.split(',')
+                    .filter(|&r| r != role)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default();
         let mut new_roles = existing;
         new_roles.push(role.clone());

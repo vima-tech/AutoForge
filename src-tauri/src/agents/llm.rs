@@ -14,8 +14,12 @@ pub async fn run_agent_text(
     image_paths: &[PathBuf],
 ) -> Result<String> {
     let Some(llm_id) = &agent.llm_id else {
-        return crate::agents::local_claude::run_text_with_images(prompt, system_prompt, image_paths)
-            .await;
+        return crate::agents::local_claude::run_text_with_images(
+            prompt,
+            system_prompt,
+            image_paths,
+        )
+        .await;
     };
 
     let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
@@ -124,11 +128,7 @@ async fn run_anthropic(
         .ok_or_else(|| anyhow!("Anthropic 响应缺少 content[].text"))
 }
 
-async fn run_ollama(
-    cfg: &LlmConfig,
-    prompt: &str,
-    system_prompt: Option<&str>,
-) -> Result<String> {
+async fn run_ollama(cfg: &LlmConfig, prompt: &str, system_prompt: Option<&str>) -> Result<String> {
     let client = http_client()?;
     let mut messages = Vec::new();
     if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
@@ -136,16 +136,14 @@ async fn run_ollama(
     }
     messages.push(serde_json::json!({ "role": "user", "content": prompt }));
 
-    let value = send_json(
-        client
-            .post(join_endpoint(&cfg.endpoint, "/api/chat"))
-            .json(&serde_json::json!({
-                "model": cfg.model,
-                "messages": messages,
-                "stream": false,
-                "options": { "temperature": cfg.temperature }
-            })),
-    )
+    let value = send_json(client.post(join_endpoint(&cfg.endpoint, "/api/chat")).json(
+        &serde_json::json!({
+            "model": cfg.model,
+            "messages": messages,
+            "stream": false,
+            "options": { "temperature": cfg.temperature }
+        }),
+    ))
     .await?;
 
     value
@@ -161,7 +159,11 @@ async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow!("LLM HTTP {}: {}", status_code(status), trim_body(&text)));
+        return Err(anyhow!(
+            "LLM HTTP {}: {}",
+            status_code(status),
+            trim_body(&text)
+        ));
     }
     serde_json::from_str::<Value>(&text)
         .map_err(|e| anyhow!("LLM 响应不是有效 JSON: {}; body={}", e, trim_body(&text)))

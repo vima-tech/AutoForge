@@ -218,14 +218,16 @@ pub async fn get_badge_counts(state: State<'_, AppState>) -> Result<BadgeCounts,
     .await
     .map_err(|e| e.to_string())?;
 
-    let (audit_pending,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'",
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let (audit_pending,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    debug!("[cmd] get_badge_counts done: chat={} audit={}", chat_unread, audit_pending);
+    debug!(
+        "[cmd] get_badge_counts done: chat={} audit={}",
+        chat_unread, audit_pending
+    );
     Ok(BadgeCounts {
         chat_unread,
         audit_pending,
@@ -370,10 +372,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         .into_iter()
         .map(
             |(project_id, executing, pending_review_2, merged, rejected)| {
-                (
-                    project_id,
-                    (executing, pending_review_2, merged, rejected),
-                )
+                (project_id, (executing, pending_review_2, merged, rejected))
             },
         )
         .collect::<HashMap<_, _>>();
@@ -439,7 +438,10 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         .collect::<Vec<_>>();
 
     let total_slot_capacity = project_slots.len().max(1) * concurrency.max_slots;
-    let active_slots: usize = project_slots.iter().map(|project| project.active_slots).sum();
+    let active_slots: usize = project_slots
+        .iter()
+        .map(|project| project.active_slots)
+        .sum();
     let pending_review_slots = pending_review_2.max(concurrency.pending_review as i64) as usize;
     let stage = if pending_review_slots >= concurrency.pause_threshold {
         "paused".to_string()

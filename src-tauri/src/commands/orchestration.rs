@@ -32,6 +32,15 @@ struct AgentOutcome {
     text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArtifactPayload {
+    kind: String,
+    title: String,
+    #[serde(default)]
+    rows: Vec<[String; 2]>,
+    body: String,
+}
+
 #[tauri::command]
 pub async fn start_conversation_task(
     payload: StartConversationTask,
@@ -45,14 +54,13 @@ pub async fn start_conversation_task(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("conversation {} not found", payload.conversation_id))?;
 
-    let trigger_exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM messages WHERE id=? AND conversation_id=?",
-    )
-    .bind(&payload.trigger_message_id)
-    .bind(&payload.conversation_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let trigger_exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM messages WHERE id=? AND conversation_id=?")
+            .bind(&payload.trigger_message_id)
+            .bind(&payload.conversation_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
     if trigger_exists.is_none() {
         return Err("触发消息不存在或不属于当前对话".to_string());
     }
@@ -80,7 +88,15 @@ pub async fn start_conversation_task(
     let db = state.db.clone();
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = execute_conversation_task(db.clone(), app_for_task.clone(), conversation, payload.clone(), task_id.clone()).await {
+        if let Err(e) = execute_conversation_task(
+            db.clone(),
+            app_for_task.clone(),
+            conversation,
+            payload.clone(),
+            task_id.clone(),
+        )
+        .await
+        {
             warn!("[orchestration] task {} failed: {}", task_id, e);
             let _ = sqlx::query(
                 "UPDATE conversation_tasks
@@ -121,6 +137,9 @@ async fn execute_conversation_task(
 ) -> Result<(), String> {
     let planner = load_planner_agent(&db).await?;
     let window_size = payload.window_size.unwrap_or(30).clamp(5, 100);
+    if let Err(e) = maybe_compress_context(&db, &app, &payload.conversation_id, window_size).await {
+        warn!("[orchestration] context compression skipped: {}", e);
+    }
     let snapshot = build_context_snapshot(&db, &payload.conversation_id, window_size).await?;
     let members = load_schedulable_members(&db, &payload.conversation_id).await?;
 
@@ -136,15 +155,13 @@ async fn execute_conversation_task(
     .await?;
     let plan_json = serde_json::to_string(&plan).map_err(|e| e.to_string())?;
 
-    sqlx::query(
-        "UPDATE conversation_tasks SET planner_agent_id=?, plan_json=? WHERE id=?",
-    )
-    .bind(planner.as_ref().map(|a| a.id.as_str()))
-    .bind(&plan_json)
-    .bind(&task_id)
-    .execute(&db)
-    .await
-    .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE conversation_tasks SET planner_agent_id=?, plan_json=? WHERE id=?")
+        .bind(planner.as_ref().map(|a| a.id.as_str()))
+        .bind(&plan_json)
+        .bind(&task_id)
+        .execute(&db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     emit_task_update(&app, &payload.conversation_id, &task_id, "running");
 
@@ -210,11 +227,55 @@ async fn execute_conversation_task(
              WHERE id=?",
         )
         .bind(if step_failed { "failed" } else { "completed" })
-        .bind(if step_failed { Some("部分 Agent 执行失败") } else { None::<&str> })
+        .bind(if step_failed {
+            Some("部分 Agent 执行失败")
+        } else {
+            None::<&str>
+        })
         .bind(&step_id)
         .execute(&db)
         .await
         .map_err(|e| e.to_string())?;
+    }
+
+    if asks_for_synthesis(&payload.instruction) {
+        if let Some(summarizer) = load_system_role_agent(&db, "summarizer").await? {
+            let outcome = run_summarizer(
+                &db,
+                &app,
+                &payload.conversation_id,
+                &summarizer,
+                &payload.instruction,
+                &snapshot,
+                &accumulated,
+            )
+            .await?;
+            if !outcome.ok {
+                any_failed = true;
+            }
+            accumulated.push_str(&format!(
+                "\n\n[{} / {}]\n{}",
+                outcome.agent_name, outcome.agent_id, outcome.text
+            ));
+        }
+    }
+
+    if asks_for_artifact(&payload.instruction) {
+        if let Some(doc_writer) = load_system_role_agent(&db, "doc_writer").await? {
+            let outcome = run_doc_writer(
+                &db,
+                &app,
+                &payload.conversation_id,
+                &doc_writer,
+                &payload.instruction,
+                &snapshot,
+                &accumulated,
+            )
+            .await?;
+            if !outcome.ok {
+                any_failed = true;
+            }
+        }
     }
 
     let final_status = if any_failed { "failed" } else { "completed" };
@@ -224,7 +285,11 @@ async fn execute_conversation_task(
          WHERE id=?",
     )
     .bind(final_status)
-    .bind(if any_failed { Some("部分步骤执行失败") } else { None::<&str> })
+    .bind(if any_failed {
+        Some("部分步骤执行失败")
+    } else {
+        None::<&str>
+    })
     .bind(&task_id)
     .execute(&db)
     .await
@@ -263,7 +328,12 @@ async fn build_plan(
     if !needs_planner {
         return Ok(ConversationPlan {
             steps: vec![ConversationPlanStep {
-                step_type: if mentioned.len() > 1 { "parallel" } else { "single" }.to_string(),
+                step_type: if mentioned.len() > 1 {
+                    "parallel"
+                } else {
+                    "single"
+                }
+                .to_string(),
                 agents: mentioned,
                 instruction: instruction.to_string(),
             }],
@@ -336,15 +406,9 @@ async fn ask_planner(
     } else {
         Some(planner.system_prompt.as_str())
     };
-    let raw = crate::agents::llm::run_agent_text(
-        db,
-        planner,
-        &prompt,
-        system_prompt,
-        &[],
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let raw = crate::agents::llm::run_agent_text(db, planner, &prompt, system_prompt, &[])
+        .await
+        .map_err(|e| e.to_string())?;
     parse_plan_json(&raw)
 }
 
@@ -393,7 +457,11 @@ fn fallback_plan(
     members: &[Agent],
 ) -> Result<ConversationPlan, String> {
     let agents = if mentioned_agent_ids.is_empty() {
-        members.iter().take(1).map(|a| a.id.clone()).collect::<Vec<_>>()
+        members
+            .iter()
+            .take(1)
+            .map(|a| a.id.clone())
+            .collect::<Vec<_>>()
     } else {
         mentioned_agent_ids
     };
@@ -402,7 +470,12 @@ fn fallback_plan(
     }
     Ok(ConversationPlan {
         steps: vec![ConversationPlanStep {
-            step_type: if agents.len() > 1 { "parallel" } else { "single" }.to_string(),
+            step_type: if agents.len() > 1 {
+                "parallel"
+            } else {
+                "single"
+            }
+            .to_string(),
             agents,
             instruction: instruction.to_string(),
         }],
@@ -447,14 +520,7 @@ async fn run_agent_for_step(
     } else {
         Some(agent.system_prompt.as_str())
     };
-    let result = crate::agents::llm::run_agent_text(
-        &db,
-        &agent,
-        &prompt,
-        system_prompt,
-        &[],
-    )
-    .await;
+    let result = crate::agents::llm::run_agent_text(&db, &agent, &prompt, system_prompt, &[]).await;
 
     let (ok, text, error) = match result {
         Ok(text) => (true, text, None),
@@ -508,6 +574,216 @@ async fn run_agent_for_step(
     })
 }
 
+async fn run_summarizer(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    agent: &Agent,
+    instruction: &str,
+    snapshot: &str,
+    accumulated: &str,
+) -> Result<AgentOutcome, String> {
+    let prompt = format!(
+        "以下是群聊对话快照：\n{}\n\n本轮 Agent 发言：\n{}\n\n用户原始请求：\n{}\n\n请作为群聊总结器输出最终结论。要求：\n- 综合各方观点，不重复完整原文。\n- 如果用户要求裁决，明确给出裁决和理由。\n- 输出后续行动建议。\n- 使用结构化 Markdown。",
+        snapshot,
+        if accumulated.trim().is_empty() { "无" } else { accumulated },
+        instruction
+    );
+    let fallback_system =
+        "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。";
+    run_system_agent_markdown(db, app, conversation_id, agent, &prompt, fallback_system).await
+}
+
+async fn run_doc_writer(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    agent: &Agent,
+    instruction: &str,
+    snapshot: &str,
+    accumulated: &str,
+) -> Result<AgentOutcome, String> {
+    let default_kind = infer_artifact_kind(instruction);
+    let prompt = format!(
+        r#"以下是群聊对话快照：
+{}
+
+本轮讨论和总结：
+{}
+
+用户原始请求：
+{}
+
+请生成一个可沉淀的文档产物。只输出 JSON，不要 Markdown，不要解释。
+JSON 结构：
+{{
+  "kind": "{}",
+  "title": "文档标题",
+  "rows": [["状态", "草案"], ["来源", "群聊讨论"]],
+  "body": "完整正文，使用 Markdown 风格的小标题和列表，但必须作为 JSON 字符串"
+}}
+
+要求：
+- body 要可直接作为 PRD、ADR、测试计划或实施方案的初稿使用。
+- 不要遗漏背景、目标、范围、约束、风险和下一步。
+- rows 控制在 3 到 6 行。"#,
+        snapshot,
+        if accumulated.trim().is_empty() {
+            "无"
+        } else {
+            accumulated
+        },
+        instruction,
+        default_kind
+    );
+    let fallback_system =
+        "你是 AutoForge 的系统文档生成器，负责把群聊讨论沉淀为可引用、可迭代的文档产物。";
+    let (ok, raw) = run_system_agent_text(db, agent, &prompt, fallback_system).await;
+    if !ok {
+        let message_id =
+            insert_agent_markdown_message(db, conversation_id, &agent.id, &raw).await?;
+        event::emit(
+            app,
+            event::AppEvent::MessageReceived {
+                conversation_id: conversation_id.to_string(),
+                message_id,
+            },
+        );
+        return Ok(AgentOutcome {
+            agent_id: agent.id.clone(),
+            agent_name: agent.name.clone(),
+            ok,
+            text: raw,
+        });
+    }
+
+    let artifact = parse_artifact_payload(&raw, instruction);
+    let text_for_trace = format!(
+        "[{}] {}\n\n{}",
+        artifact.kind, artifact.title, artifact.body
+    );
+    insert_agent_artifact_message(db, app, conversation_id, &agent.id, artifact).await?;
+
+    Ok(AgentOutcome {
+        agent_id: agent.id.clone(),
+        agent_name: agent.name.clone(),
+        ok,
+        text: if ok { text_for_trace } else { raw },
+    })
+}
+
+async fn run_system_agent_markdown(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    agent: &Agent,
+    prompt: &str,
+    fallback_system_prompt: &str,
+) -> Result<AgentOutcome, String> {
+    let (ok, text) = run_system_agent_text(db, agent, prompt, fallback_system_prompt).await;
+    let message_id = insert_agent_markdown_message(db, conversation_id, &agent.id, &text).await?;
+    event::emit(
+        app,
+        event::AppEvent::MessageReceived {
+            conversation_id: conversation_id.to_string(),
+            message_id,
+        },
+    );
+    Ok(AgentOutcome {
+        agent_id: agent.id.clone(),
+        agent_name: agent.name.clone(),
+        ok,
+        text,
+    })
+}
+
+async fn run_system_agent_text(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    fallback_system_prompt: &str,
+) -> (bool, String) {
+    let system_prompt = if agent.system_prompt.trim().is_empty() {
+        fallback_system_prompt
+    } else {
+        agent.system_prompt.as_str()
+    };
+    match crate::agents::llm::run_agent_text(db, agent, prompt, Some(system_prompt), &[]).await {
+        Ok(text) => (true, text),
+        Err(e) => (false, format!("[系统错误: {}]", e)),
+    }
+}
+
+async fn maybe_compress_context(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    window_size: i64,
+) -> Result<(), String> {
+    let Some(compressor) = load_system_role_agent(db, "context_compressor").await? else {
+        return Ok(());
+    };
+    let messages = sqlx::query_as::<_, Message>(
+        "SELECT *
+         FROM messages
+         WHERE conversation_id=? AND excluded_from_context=0
+         ORDER BY created_at ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let threshold = window_size as usize;
+    if messages.len() <= threshold {
+        return Ok(());
+    }
+    let keep_recent = (threshold / 2).max(5).min(threshold.saturating_sub(1));
+    let compress_count = messages.len().saturating_sub(keep_recent);
+    if compress_count < 2 {
+        return Ok(());
+    }
+
+    let to_compress = &messages[..compress_count];
+    let source = messages_to_context_text(db, to_compress).await?;
+    if source.trim().is_empty() {
+        return Ok(());
+    }
+
+    let prompt = format!(
+        "下面是将从后续上下文窗口中排除的较早群聊消息，请压缩成一份可长期引用的上下文摘要。\n\n消息：\n{}\n\n要求：\n- 保留需求、决策、约束、待办、分歧和重要事实。\n- 删除寒暄和重复表达。\n- 用结构化 Markdown 输出。\n- 不要编造未出现的信息。",
+        source
+    );
+    let fallback_system = "你是 AutoForge 的上下文压缩器，负责在长对话超过窗口条数后生成可靠摘要，降低后续 Agent 的上下文负担。";
+    let (ok, summary) = run_system_agent_text(db, &compressor, &prompt, fallback_system).await;
+    if !ok {
+        return Err(summary);
+    }
+
+    let markdown = format!(
+        "## 上下文压缩摘要\n\n{}\n\n> 已压缩 {} 条较早消息；原消息仍保留在对话中，但不再进入后续 Agent 上下文。",
+        summary.trim(),
+        to_compress.len()
+    );
+    let message_id =
+        insert_agent_markdown_message(db, conversation_id, &compressor.id, &markdown).await?;
+    for msg in to_compress {
+        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
+            .bind(&msg.id)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    event::emit(
+        app,
+        event::AppEvent::MessageReceived {
+            conversation_id: conversation_id.to_string(),
+            message_id,
+        },
+    );
+    Ok(())
+}
+
 async fn build_context_snapshot(
     db: &crate::db::Db,
     conversation_id: &str,
@@ -526,17 +802,23 @@ async fn build_context_snapshot(
     .await
     .map_err(|e| e.to_string())?;
 
+    let ordered = candidates.iter().rev().cloned().collect::<Vec<_>>();
+    messages_to_context_text(db, &ordered).await
+}
+
+async fn messages_to_context_text(
+    db: &crate::db::Db,
+    messages: &[Message],
+) -> Result<String, String> {
     let agent_rows = sqlx::query_as::<_, Agent>("SELECT * FROM agents")
         .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
-    let agent_names: HashMap<String, String> = agent_rows
-        .into_iter()
-        .map(|a| (a.id, a.name))
-        .collect();
+    let agent_names: HashMap<String, String> =
+        agent_rows.into_iter().map(|a| (a.id, a.name)).collect();
 
     let mut parts = Vec::new();
-    for msg in candidates.iter().rev().filter(|m| !m.excluded_from_context) {
+    for msg in messages.iter().filter(|m| !m.excluded_from_context) {
         let sender = msg
             .from_agent
             .as_ref()
@@ -549,6 +831,65 @@ async fn build_context_snapshot(
         }
     }
     Ok(parts.join("\n\n"))
+}
+
+async fn insert_agent_markdown_message(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    agent_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let content_json = serde_json::json!([{ "t": "md", "md": text }]).to_string();
+    let message_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, from_agent, content_json)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&message_id)
+    .bind(conversation_id)
+    .bind(agent_id)
+    .bind(&content_json)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(message_id)
+}
+
+async fn insert_agent_artifact_message(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    agent_id: &str,
+    artifact: ArtifactPayload,
+) -> Result<String, String> {
+    let content_json = serde_json::json!([{
+        "t": "artifact",
+        "kind": artifact.kind,
+        "title": artifact.title,
+        "rows": artifact.rows,
+        "body": artifact.body,
+    }])
+    .to_string();
+    let message_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, from_agent, content_json)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&message_id)
+    .bind(conversation_id)
+    .bind(agent_id)
+    .bind(&content_json)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    event::emit(
+        app,
+        event::AppEvent::MessageReceived {
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.clone(),
+        },
+    );
+    Ok(message_id)
 }
 
 async fn message_to_prompt_text(db: &crate::db::Db, msg: &Message) -> Result<String, String> {
@@ -568,7 +909,10 @@ async fn message_to_prompt_text(db: &crate::db::Db, msg: &Message) -> Result<Str
                 parts.push(format!("```{}\n{}\n```", lang, code));
             }
             Some("artifact") => {
-                let kind = block.get("kind").and_then(|v| v.as_str()).unwrap_or("artifact");
+                let kind = block
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("artifact");
                 let title = block.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 let body = block.get("body").and_then(|v| v.as_str()).unwrap_or("");
                 parts.push(format!("[{}: {}]\n{}", kind, title, body));
@@ -582,14 +926,19 @@ async fn message_to_prompt_text(db: &crate::db::Db, msg: &Message) -> Result<Str
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("文件");
                 if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
                     match load_text_attachment_content(db, id).await {
-                        Ok(Some(content)) => parts.push(format!("[文件内容 - {}]\n```\n{}\n```", name, content)),
+                        Ok(Some(content)) => {
+                            parts.push(format!("[文件内容 - {}]\n```\n{}\n```", name, content))
+                        }
                         Ok(None) => parts.push(format!("[附件: {}]", name)),
                         Err(e) => parts.push(format!("[附件: {} 读取失败: {}]", name, e)),
                     }
                 }
             }
             Some("image") => {
-                let label = block.get("label").and_then(|v| v.as_str()).unwrap_or("图片");
+                let label = block
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("图片");
                 parts.push(format!("[图片: {}]", label));
             }
             _ => {}
@@ -624,8 +973,7 @@ async fn load_text_attachment_content(
     }
     let path = attachment_path(&attachment)?;
     let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
     const MAX_CHARS: usize = 50_000;
     if text.chars().count() > MAX_CHARS {
         Ok(Some(text.chars().take(MAX_CHARS).collect::<String>()))
@@ -662,32 +1010,144 @@ async fn load_schedulable_members(
 }
 
 async fn load_planner_agent(db: &crate::db::Db) -> Result<Option<Agent>, String> {
+    load_system_role_agent(db, "planner").await
+}
+
+async fn load_system_role_agent(db: &crate::db::Db, kind: &str) -> Result<Option<Agent>, String> {
+    let pattern = format!("%,{},%", kind);
     sqlx::query_as::<_, Agent>(
         "SELECT * FROM agents
-         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE '%,planner,%'
+         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
+           AND enabled=1
          ORDER BY created_at
          LIMIT 1",
     )
+    .bind(pattern)
     .fetch_optional(db)
     .await
     .map_err(|e| e.to_string())
 }
 
 async fn load_agent(db: &crate::db::Db, agent_id: &str) -> Result<Agent, String> {
-    sqlx::query_as::<_, Agent>(
-        "SELECT * FROM agents WHERE id=? AND enabled=1",
-    )
-    .bind(agent_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("agent {} not found or disabled", agent_id))
+    sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE id=? AND enabled=1")
+        .bind(agent_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("agent {} not found or disabled", agent_id))
 }
 
 fn asks_for_sequence(text: &str) -> bool {
-    ["然后", "最后", "总结", "裁决", "汇总", "综合", "PRD", "文档", "产出"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    [
+        "然后",
+        "最后",
+        "总结",
+        "裁决",
+        "汇总",
+        "综合",
+        "PRD",
+        "prd",
+        "ADR",
+        "adr",
+        "文档",
+        "产出",
+        "产物",
+        "测试计划",
+        "验收标准",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn asks_for_synthesis(text: &str) -> bool {
+    [
+        "总结", "裁决", "汇总", "综合", "结论", "建议", "最后", "评审",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn asks_for_artifact(text: &str) -> bool {
+    [
+        "PRD",
+        "prd",
+        "ADR",
+        "adr",
+        "文档",
+        "产出",
+        "产物",
+        "测试计划",
+        "验收标准",
+        "需求说明",
+        "实施方案",
+        "方案文档",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn infer_artifact_kind(text: &str) -> &'static str {
+    if text.contains("ADR") || text.contains("adr") {
+        "ADR"
+    } else if text.contains("测试") || text.contains("验收") {
+        "测试计划"
+    } else if text.contains("实施") || text.contains("方案") {
+        "实施方案"
+    } else if text.contains("PRD") || text.contains("prd") || text.contains("需求") {
+        "PRD"
+    } else {
+        "文档产物"
+    }
+}
+
+fn parse_artifact_payload(raw: &str, instruction: &str) -> ArtifactPayload {
+    let trimmed = raw.trim();
+    let parsed = serde_json::from_str::<ArtifactPayload>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            let end = trimmed.rfind('}')?;
+            serde_json::from_str::<ArtifactPayload>(&trimmed[start..=end]).ok()
+        });
+
+    let mut artifact = parsed.unwrap_or_else(|| ArtifactPayload {
+        kind: infer_artifact_kind(instruction).to_string(),
+        title: default_artifact_title(instruction),
+        rows: Vec::new(),
+        body: raw.trim().to_string(),
+    });
+
+    if artifact.kind.trim().is_empty() {
+        artifact.kind = infer_artifact_kind(instruction).to_string();
+    }
+    if artifact.title.trim().is_empty() {
+        artifact.title = default_artifact_title(instruction);
+    }
+    if artifact.body.trim().is_empty() {
+        artifact.body = raw.trim().to_string();
+    }
+    if artifact.rows.is_empty() {
+        artifact.rows = vec![
+            ["状态".to_string(), "草案".to_string()],
+            ["来源".to_string(), "群聊讨论".to_string()],
+            ["类型".to_string(), artifact.kind.clone()],
+        ];
+    }
+    artifact
+}
+
+fn default_artifact_title(instruction: &str) -> String {
+    let mut title = instruction
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        title = "群聊文档产物".to_string();
+    }
+    title
 }
 
 fn parse_plan_json(raw: &str) -> Result<ConversationPlan, String> {
@@ -695,8 +1155,12 @@ fn parse_plan_json(raw: &str) -> Result<ConversationPlan, String> {
     if let Ok(plan) = serde_json::from_str::<ConversationPlan>(trimmed) {
         return Ok(plan);
     }
-    let start = trimmed.find('{').ok_or_else(|| "planner 未输出 JSON".to_string())?;
-    let end = trimmed.rfind('}').ok_or_else(|| "planner JSON 不完整".to_string())?;
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| "planner 未输出 JSON".to_string())?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| "planner JSON 不完整".to_string())?;
     serde_json::from_str::<ConversationPlan>(&trimmed[start..=end])
         .map_err(|e| format!("planner JSON 解析失败: {}", e))
 }

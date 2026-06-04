@@ -153,10 +153,7 @@ pub async fn start_dev_server(
 }
 
 #[tauri::command]
-pub async fn stop_dev_server(
-    project_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn stop_dev_server(project_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut servers = state.dev_servers.lock().await;
     if let Some(handle) = servers.remove(&project_id) {
         let mut guard = handle.child.lock().await;

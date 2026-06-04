@@ -927,8 +927,7 @@ async fn load_text_attachment_content(
     }
     let path = attachment_path(&attachment)?;
     let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
     // Truncate huge files so we don't blow up the context window.
     const MAX_CHARS: usize = 50_000;
     if text.chars().count() > MAX_CHARS {
@@ -981,13 +980,11 @@ pub async fn toggle_message_context(
     message_id: String,
     state: State<'_, AppState>,
 ) -> Result<Message, String> {
-    sqlx::query(
-        "UPDATE messages SET excluded_from_context = NOT excluded_from_context WHERE id=?",
-    )
-    .bind(&message_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE messages SET excluded_from_context = NOT excluded_from_context WHERE id=?")
+        .bind(&message_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     sqlx::query_as::<_, Message>("SELECT * FROM messages WHERE id=?")
         .bind(&message_id)
@@ -1040,10 +1037,8 @@ pub async fn agent_reply(
 
     for msg in messages.iter().rev() {
         let sender = msg.from_agent.as_deref().unwrap_or("User");
-        let blocks: Vec<serde_json::Value> =
-            serde_json::from_str(&msg.content_json).unwrap_or_else(|_| {
-                vec![serde_json::json!({"t": "md", "md": msg.content_json})]
-            });
+        let blocks: Vec<serde_json::Value> = serde_json::from_str(&msg.content_json)
+            .unwrap_or_else(|_| vec![serde_json::json!({"t": "md", "md": msg.content_json})]);
 
         let mut parts: Vec<String> = Vec::new();
         for block in &blocks {
@@ -1058,13 +1053,11 @@ pub async fn agent_reply(
                     if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
                         match load_text_attachment_content(id, &state.db).await {
                             Ok(Some(content)) => {
-                                parts.push(format!(
-                                    "[文件内容 — {}]\n```\n{}\n```",
-                                    name, content
-                                ));
+                                parts.push(format!("[文件内容 — {}]\n```\n{}\n```", name, content));
                             }
                             Ok(None) => {
-                                parts.push(format!("[附件: {} (PDF 或二进制，无法提取文本)]", name));
+                                parts
+                                    .push(format!("[附件: {} (PDF 或二进制，无法提取文本)]", name));
                             }
                             Err(e) => {
                                 parts.push(format!("[附件: {} (读取失败: {})]", name, e));
@@ -1075,7 +1068,10 @@ pub async fn agent_reply(
                     }
                 }
                 Some("image") => {
-                    let label = block.get("label").and_then(|v| v.as_str()).unwrap_or("图片");
+                    let label = block
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("图片");
                     if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
                         match get_attachment_file_path(id, &state.db).await {
                             Ok(path) => {
@@ -1101,7 +1097,10 @@ pub async fn agent_reply(
                     parts.push(format!("```{}\n{}\n```", lang, code));
                 }
                 Some("artifact") => {
-                    let title = block.get("title").and_then(|v| v.as_str()).unwrap_or("报告");
+                    let title = block
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("报告");
                     let body = block.get("body").and_then(|v| v.as_str()).unwrap_or("");
                     parts.push(format!("[分析报告 — {}]\n{}", title, body));
                 }

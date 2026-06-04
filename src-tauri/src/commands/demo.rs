@@ -275,7 +275,11 @@ export default function Export() {
     )?;
 
     git(repo, &["add", "."]).await?;
-    git(repo, &["commit", "-m", "feat: 导出接口改为 Celery 异步任务"]).await?;
+    git(
+        repo,
+        &["commit", "-m", "feat: 导出接口改为 Celery 异步任务"],
+    )
+    .await?;
     git(repo, &["checkout", "main"]).await?;
 
     // --- 4. 分支 autoforge/cr-003: 分页修复 ---
@@ -297,7 +301,11 @@ export default function Export() {
     )?;
 
     git(repo, &["add", "."]).await?;
-    git(repo, &["commit", "-m", "fix: 分页改用 cursor-based 防止数据重复"]).await?;
+    git(
+        repo,
+        &["commit", "-m", "fix: 分页改用 cursor-based 防止数据重复"],
+    )
+    .await?;
     git(repo, &["checkout", "main"]).await?;
 
     // --- 5. 创建 worktree 目录（让路径存在检查通过）---
@@ -308,7 +316,7 @@ export default function Export() {
     // --- 6. 确保前置数据存在（外键依赖链：project → issue → cr → worktree_session）---
     // projects
     for (id, name, slug, desc) in &[
-        ("proj-vocant",  "Vocant",     "vocant",      "AI 原生业务管理工具"),
+        ("proj-vocant", "Vocant", "vocant", "AI 原生业务管理工具"),
         ("proj-another", "AnotherApp", "another-app", "内部协作平台"),
     ] {
         sqlx::query(
@@ -321,9 +329,9 @@ export default function Export() {
 
     // issues
     for (id, proj, title, cat) in &[
-        ("issue-001", "proj-vocant",  "助手页缺少标签筛选",     "Feature"),
-        ("issue-002", "proj-vocant",  "导出报表接口超时 (>30s)", "Bug"),
-        ("issue-003", "proj-another", "客户列表分页错乱",        "Bug"),
+        ("issue-001", "proj-vocant", "助手页缺少标签筛选", "Feature"),
+        ("issue-002", "proj-vocant", "导出报表接口超时 (>30s)", "Bug"),
+        ("issue-003", "proj-another", "客户列表分页错乱", "Bug"),
     ] {
         sqlx::query(
             "INSERT OR IGNORE INTO issues (id, project_id, source_type, title, description, category, severity, priority, status, fingerprint)
@@ -335,8 +343,8 @@ export default function Export() {
 
     // change_requests
     for (id, proj, issue, status) in &[
-        ("cr-001", "proj-vocant",  "issue-001", "pending_review_2"),
-        ("cr-002", "proj-vocant",  "issue-002", "pending_review_2"),
+        ("cr-001", "proj-vocant", "issue-001", "pending_review_2"),
+        ("cr-002", "proj-vocant", "issue-002", "pending_review_2"),
         ("cr-003", "proj-another", "issue-003", "merged"),
     ] {
         sqlx::query(
@@ -353,9 +361,30 @@ export default function Export() {
     let report3 = "## 改动摘要\n修复分页 offset 计算错误，改用 cursor-based 分页防止重复。\n\n## 修改文件列表\n- api/customers.py: 修改分页逻辑 (+8 -3)\n\n## 测试情况\n新增测试：2 个\n通过状态：全部通过 ✓\n覆盖率：83.7%\n\n## 潜在风险\n无。";
 
     for (id, cr, wt_path, branch, status, report) in &[
-        ("ws-001", "cr-001", "/tmp/wt/cr-001", "autoforge/cr-001", "completed", report1),
-        ("ws-002", "cr-002", "/tmp/wt/cr-002", "autoforge/cr-002", "completed", report2),
-        ("ws-003", "cr-003", "/tmp/wt/cr-003", "autoforge/cr-003", "completed", report3),
+        (
+            "ws-001",
+            "cr-001",
+            "/tmp/wt/cr-001",
+            "autoforge/cr-001",
+            "completed",
+            report1,
+        ),
+        (
+            "ws-002",
+            "cr-002",
+            "/tmp/wt/cr-002",
+            "autoforge/cr-002",
+            "completed",
+            report2,
+        ),
+        (
+            "ws-003",
+            "cr-003",
+            "/tmp/wt/cr-003",
+            "autoforge/cr-003",
+            "completed",
+            report3,
+        ),
     ] {
         sqlx::query(
             "INSERT OR IGNORE INTO worktree_sessions
@@ -367,19 +396,35 @@ export default function Export() {
     }
 
     // 更新项目 repo_path 为真实 git 仓库
-    sqlx::query(
-        "UPDATE projects SET repo_path=? WHERE id IN ('proj-vocant','proj-another')",
-    )
-    .bind(repo)
-    .execute(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE projects SET repo_path=? WHERE id IN ('proj-vocant','proj-another')")
+        .bind(repo)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // --- 7. 插入 preview_environments ---
     for (id, proj, session, url, status) in &[
-        ("prev-001", "proj-vocant",  "ws-001", "http://localhost:3001", "ready"),
-        ("prev-002", "proj-vocant",  "ws-002", "http://localhost:3002", "ready"),
-        ("prev-003", "proj-another", "ws-003", "http://localhost:3003", "starting"),
+        (
+            "prev-001",
+            "proj-vocant",
+            "ws-001",
+            "http://localhost:3001",
+            "ready",
+        ),
+        (
+            "prev-002",
+            "proj-vocant",
+            "ws-002",
+            "http://localhost:3002",
+            "ready",
+        ),
+        (
+            "prev-003",
+            "proj-another",
+            "ws-003",
+            "http://localhost:3003",
+            "starting",
+        ),
     ] {
         sqlx::query(
             "INSERT OR REPLACE INTO preview_environments
@@ -397,5 +442,7 @@ export default function Export() {
         .map_err(|e| e.to_string())?;
     }
 
-    Ok(format!("演示 git 仓库已创建于 {repo}，preview 环境数据已填充"))
+    Ok(format!(
+        "演示 git 仓库已创建于 {repo}，preview 环境数据已填充"
+    ))
 }

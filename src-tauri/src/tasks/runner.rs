@@ -117,20 +117,18 @@ async fn wait_for_execution_slot(
                 .bind(cr_id)
                 .fetch_one(db)
                 .await?;
-        let (executing,): (i64,) =
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM change_requests WHERE project_id=? AND status='executing'",
-            )
-            .bind(&project_id)
-            .fetch_one(db)
-            .await?;
-        let (project_pending_review,): (i64,) =
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM change_requests WHERE project_id=? AND status='pending_review_2'",
-            )
-            .bind(&project_id)
-            .fetch_one(db)
-            .await?;
+        let (executing,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM change_requests WHERE project_id=? AND status='executing'",
+        )
+        .bind(&project_id)
+        .fetch_one(db)
+        .await?;
+        let (project_pending_review,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM change_requests WHERE project_id=? AND status='pending_review_2'",
+        )
+        .bind(&project_id)
+        .fetch_one(db)
+        .await?;
         let (global_pending_review,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'")
                 .fetch_one(db)
