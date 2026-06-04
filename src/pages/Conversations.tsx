@@ -572,15 +572,15 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
 
   const send = async () => {
     const outgoing = editorText().trim();
+    const pendingItems = [...pending];
     const refs = contextRefs();
-    if (!outgoing && pending.length === 0 && refs.length === 0) return;
-    const sent = await onSend(outgoing, pending, refs);
-    if (!sent) return;
+    if (!outgoing && pendingItems.length === 0 && refs.length === 0) return;
     setText('');
     setPending([]);
     if (editorRef.current) editorRef.current.innerHTML = '';
     setShowMention(false);
     setShowAttachmentPicker(false);
+    await onSend(outgoing, pendingItems, refs);
   };
 
   const onKey = (e: React.KeyboardEvent) => {
