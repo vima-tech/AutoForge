@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import Icon from './components/Icon';
@@ -7,7 +7,7 @@ import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
 import SettingsPage from './pages/Settings';
-import { getSystemHealth, getPipelineStats, listConversations, type SystemHealth } from './services';
+import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
 
 type Page = 'home' | 'chat' | 'audit' | 'settings';
 type Theme = 'dark' | 'light';
@@ -124,21 +124,41 @@ export default function App() {
   const [lastEvent, setLastEvent] = useState('');
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
 
+  const badgeRefreshInFlight = useRef(false);
   const refreshBadges = useCallback(async () => {
+    if (badgeRefreshInFlight.current) return;
+    badgeRefreshInFlight.current = true;
     try {
-      const [convs, stats] = await Promise.all([listConversations(), getPipelineStats()]);
-      setBadges({
-        chat: convs.reduce((sum, c) => sum + (c.unread ?? 0), 0),
-        audit: stats.pending_review_2,
-      });
+      const counts = await getBadgeCounts();
+      setBadges({ chat: counts.chat_unread, audit: counts.audit_pending });
     } catch {
-      setBadges({ chat: 0, audit: 0 });
+      // ignore — badges stay stale rather than crashing
+    } finally {
+      badgeRefreshInFlight.current = false;
     }
+  }, []);
+
+  // Moved out of the Tauri event effect so the useRef guard survives
+  // React StrictMode's double-invocation (local variables inside the effect
+  // get two separate copies and can't block concurrent calls).
+  const healthInFlight = useRef(false);
+  const refreshHealth = useCallback(() => {
+    if (healthInFlight.current) return;
+    healthInFlight.current = true;
+    getSystemHealth()
+      .then(h => { setHealth(h); })
+      .catch(() => setHealth(null))
+      .finally(() => { healthInFlight.current = false; });
   }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
+
+  // Auth check intentionally removed: spawning the claude Electron subprocess
+  // at any point while WebKitGTK is active delivers SIGTRAP to our process,
+  // triggering a NeedDebuggerBreak trap that permanently freezes IPC.
+  // Auth errors surface naturally when pipeline tasks fail to run.
 
   useEffect(() => {
     refreshBadges();
@@ -166,8 +186,6 @@ export default function App() {
         }
       } catch { /* notifications unavailable — ignore */ }
     };
-
-    const refreshHealth = () => getSystemHealth().then(setHealth).catch(() => setHealth(null));
 
     // Debounce heavy refresh calls: collapse bursts within 500 ms into one call.
     let badgeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -215,26 +233,20 @@ export default function App() {
       }
     }).then(fn => { unlisten = fn; });
 
-    // Initial loads.
-    refreshHealth();
-
-    // Startup auth warning (task G-01).
-    getSystemHealth().then(h => {
-      if (!h.claude_auth) {
-        try {
-          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-            new Notification('Claude CLI 未登录', { body: '请在终端运行 `claude auth login` 后重启 AutoForge' });
-          }
-        } catch { /* ignore */ }
-      }
-    }).catch(() => { /* backend not ready — ignore */ });
+    // Delay the initial health check by 2 s so that the critical startup IPC
+    // calls (list_conversations, mark_conversation_read, etc.) complete before
+    // we spawn the `claude auth status` subprocess.  The subprocess exit triggers
+    // a NeedDebuggerBreak trap in WebKitGTK that disrupts the GTK event loop;
+    // delaying it past the sensitive startup window avoids the freeze.
+    const startupHealthTimer = setTimeout(() => refreshHealth(), 2000);
 
     return () => {
+      clearTimeout(startupHealthTimer);
       if (badgeTimer) clearTimeout(badgeTimer);
       if (healthTimer) clearTimeout(healthTimer);
       unlisten?.();
     };
-  }, [refreshBadges]);
+  }, [refreshBadges, refreshHealth]);
 
   const stageLabel = health
     ? health.stage === 'paused' ? '系统暂停'

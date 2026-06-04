@@ -30,7 +30,18 @@ export default function Markdown({ md }: { md: string }) {
       const lvl = ln.match(/^#+/)![0].length;
       blocks.push({ tag: 'h' + lvl, html: renderInline(ln.replace(/^#+\s/, '')) });
       i++;
-    } else if (/^>\s/.test(ln)) {
+    } else if (/^---+$|^\*\*\*+$|^___+$/.test(ln.trim())) {
+      // Horizontal rule: ---  ***  ___
+      blocks.push({ tag: 'hr', html: '' });
+      i++;
+    } else if (/^\|/.test(ln)) {
+      // Table row: render as-is inside a <p>, skip separator rows like |---|
+      if (/^\|[-|:\s]+\|$/.test(ln.trim())) { i++; }  // skip separator
+      else {
+        blocks.push({ tag: 'p', html: renderInline(ln) });
+        i++;
+      }
+    } else if (/^>\s?/.test(ln)) {
       const buf: string[] = [];
       while (i < lines.length && /^>\s?/.test(lines[i])) {
         buf.push(lines[i].replace(/^>\s?/, ''));
@@ -55,21 +66,27 @@ export default function Markdown({ md }: { md: string }) {
       i++;
     } else {
       const buf: string[] = [];
-      while (i < lines.length && lines[i].trim() !== '' && !/^[#>\-*]|^\d+\./.test(lines[i])) {
+      const stop = (l: string) => l.trim() === '' || /^[#>\-*]|^\d+\.|\|/.test(l);
+      while (i < lines.length && !stop(lines[i])) {
         buf.push(renderInline(lines[i]));
         i++;
       }
-      blocks.push({ tag: 'p', html: buf.join('<br/>') });
+      // Safety: if nothing was consumed (stop matched immediately), skip the
+      // line to avoid an infinite loop on unrecognised patterns.
+      if (buf.length === 0) { i++; }
+      else blocks.push({ tag: 'p', html: buf.join('<br/>') });
     }
   }
 
   return (
     <>
       {blocks.map((b, k) =>
-        React.createElement(b.tag, {
-          key: k,
-          dangerouslySetInnerHTML: { __html: b.html },
-        })
+        b.tag === 'hr'
+          ? React.createElement('hr', { key: k })
+          : React.createElement(b.tag, {
+              key: k,
+              dangerouslySetInnerHTML: { __html: b.html },
+            })
       )}
     </>
   );

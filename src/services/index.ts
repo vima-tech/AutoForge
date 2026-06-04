@@ -5,6 +5,28 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 
+// Tracks how many IPC calls are currently in-flight per command.
+const _inFlight: Record<string, number> = {};
+
+function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const t0 = performance.now();
+  _inFlight[cmd] = (_inFlight[cmd] ?? 0) + 1;
+  console.debug(`[IPC] → ${cmd} (in-flight: ${_inFlight[cmd]})`, args ?? '');
+  return invoke<T>(cmd, args)
+    .then(result => {
+      const ms = (performance.now() - t0).toFixed(1);
+      _inFlight[cmd]--;
+      console.debug(`[IPC] ✓ ${cmd} ${ms}ms (in-flight: ${_inFlight[cmd]})`);
+      return result;
+    })
+    .catch(err => {
+      const ms = (performance.now() - t0).toFixed(1);
+      _inFlight[cmd]--;
+      console.error(`[IPC] ✗ ${cmd} ${ms}ms err:`, err);
+      throw err;
+    });
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface LlmConfig {
@@ -117,112 +139,116 @@ export interface AdminDecision {
   admin_id: string; suggestions: string | null; created_at: string;
 }
 
+export interface BadgeCounts { chat_unread: number; audit_pending: number; }
+
 // ── System ───────────────────────────────────────────────────────────────────
-export const getSystemHealth = () => invoke<SystemHealth>('system_health');
-export const getPipelineStats = () => invoke<PipelineStats>('pipeline_stats');
-export const getConcurrencyConfig = () => invoke<ConcurrencyConfig>('get_concurrency_config');
+export const getSystemHealth = () => ipc<SystemHealth>('system_health');
+export const checkClaudeAuth = () => ipc<boolean>('check_claude_auth');
+export const getPipelineStats = () => ipc<PipelineStats>('pipeline_stats');
+export const getBadgeCounts = () => ipc<BadgeCounts>('get_badge_counts');
+export const getConcurrencyConfig = () => ipc<ConcurrencyConfig>('get_concurrency_config');
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
-}>) => invoke<ConcurrencyConfig>('update_concurrency_config', { payload });
-export const readSpec = (name: string) => invoke<SpecDocument>('read_spec', { name });
+}>) => ipc<ConcurrencyConfig>('update_concurrency_config', { payload });
+export const readSpec = (name: string) => ipc<SpecDocument>('read_spec', { name });
 export const writeSpec = (name: string, content: string) =>
-  invoke<SpecDocument>('write_spec', { name, content });
+  ipc<SpecDocument>('write_spec', { name, content });
 export const listPreviewEnvironments = (projectId?: string, status?: string) =>
-  invoke<PreviewEnvironment[]>('list_preview_environments', {
+  ipc<PreviewEnvironment[]>('list_preview_environments', {
     projectId: projectId ?? null, status: status ?? null,
   });
 export const listTestSessions = (projectId?: string) =>
-  invoke<TestSession[]>('list_test_sessions', { projectId: projectId ?? null });
+  ipc<TestSession[]>('list_test_sessions', { projectId: projectId ?? null });
 export const listScanFindings = (testSessionId?: string) =>
-  invoke<ScanFinding[]>('list_scan_findings', { testSessionId: testSessionId ?? null });
+  ipc<ScanFinding[]>('list_scan_findings', { testSessionId: testSessionId ?? null });
 export const listAdminDecisions = (projectId?: string) =>
-  invoke<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
+  ipc<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
 
 // ── Projects ─────────────────────────────────────────────────────────────────
-export const listProjects = () => invoke<Project[]>('list_projects');
-export const getProject = (id: string) => invoke<Project>('get_project', { id });
+export const listProjects = () => ipc<Project[]>('list_projects');
+export const getProject = (id: string) => ipc<Project>('get_project', { id });
 export const createProject = (payload: {
   name: string; slug: string; description?: string;
   repo_path: string; branch_dev?: string; branch_main?: string;
-}) => invoke<Project>('create_project', { payload });
+}) => ipc<Project>('create_project', { payload });
 export const updateProject = (id: string, payload: Partial<{
   name: string; description: string; repo_path: string;
   branch_dev: string; branch_main: string; status: string; config_yaml: string;
-}>) => invoke<Project>('update_project', { id, payload });
-export const deleteProject = (id: string) => invoke<void>('delete_project', { id });
+}>) => ipc<Project>('update_project', { id, payload });
+export const deleteProject = (id: string) => ipc<void>('delete_project', { id });
 
 // ── Issues ───────────────────────────────────────────────────────────────────
 export const listIssues = (projectId?: string) =>
-  invoke<Issue[]>('list_issues', { projectId: projectId ?? null });
-export const getIssue = (id: string) => invoke<Issue>('get_issue', { id });
+  ipc<Issue[]>('list_issues', { projectId: projectId ?? null });
+export const getIssue = (id: string) => ipc<Issue>('get_issue', { id });
 export const getIssueAnalysis = (issueId: string) =>
-  invoke<IssueAnalysis | null>('get_issue_analysis', { issueId });
+  ipc<IssueAnalysis | null>('get_issue_analysis', { issueId });
 export const submitIssue = (payload: {
   project_id: string; title: string; description?: string;
   category?: string; severity?: string; source_type?: string;
-}) => invoke<Issue>('submit_issue', { payload });
+}) => ipc<Issue>('submit_issue', { payload });
 
 // ── Change Requests ──────────────────────────────────────────────────────────
 export const listChangeRequests = (projectId?: string, status?: string) =>
-  invoke<ChangeRequest[]>('list_change_requests', {
+  ipc<ChangeRequest[]>('list_change_requests', {
     projectId: projectId ?? null, status: status ?? null,
   });
 export const getChangeRequest = (id: string) =>
-  invoke<ChangeRequest>('get_change_request', { id });
+  ipc<ChangeRequest>('get_change_request', { id });
 export const getWorktreeSession = (crId: string) =>
-  invoke<WorktreeSession | null>('get_worktree_session', { crId });
+  ipc<WorktreeSession | null>('get_worktree_session', { crId });
 export const getCodeDiff = (crId: string) =>
-  invoke<string>('get_code_diff', { crId });
+  ipc<string>('get_code_diff', { crId });
 export const review1 = (issueId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
-}) => invoke<ChangeRequest>('review_1', { issueId, decision });
+}) => ipc<ChangeRequest>('review_1', { issueId, decision });
 export const review2 = (crId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
-}) => invoke<ChangeRequest>('review_2', { crId, decision });
+}) => ipc<ChangeRequest>('review_2', { crId, decision });
 
 // ── Conversations ────────────────────────────────────────────────────────────
-export const listConversations = () => invoke<Conversation[]>('list_conversations');
+export const listConversations = () => ipc<Conversation[]>('list_conversations');
 export const listMessages = (conversationId: string) =>
-  invoke<Message[]>('list_messages', { conversationId });
+  ipc<Message[]>('list_messages', { conversationId });
 export const sendMessage = (payload: { conversation_id: string; content_json: string }) =>
-  invoke<Message>('send_message', { payload });
+  ipc<Message>('send_message', { payload });
 export const createGroupConversation = (
   name: string, memberIds: string[], color?: string, initial?: string,
-) => invoke<Conversation>('create_group_conversation', { name, memberIds, color, initial });
+) => ipc<Conversation>('create_group_conversation', { name, memberIds, color, initial });
 export const addConversationMember = (conversationId: string, agentId: string) =>
-  invoke<Conversation>('add_conversation_member', { conversationId, agentId });
+  ipc<Conversation>('add_conversation_member', { conversationId, agentId });
 export const removeConversationMember = (conversationId: string, agentId: string) =>
-  invoke<Conversation>('remove_conversation_member', { conversationId, agentId });
+  ipc<Conversation>('remove_conversation_member', { conversationId, agentId });
 export const deleteGroupConversation = (conversationId: string) =>
-  invoke<void>('delete_group_conversation', { conversationId });
+  ipc<void>('delete_group_conversation', { conversationId });
 export const markConversationRead = (conversationId: string) =>
-  invoke<void>('mark_conversation_read', { conversationId });
+  ipc<void>('mark_conversation_read', { conversationId });
 export const agentReply = (conversationId: string, agentId: string) =>
-  invoke<void>('agent_reply', { conversationId, agentId });
+  ipc<void>('agent_reply', { conversationId, agentId });
 
 // ── Settings — LLM ──────────────────────────────────────────────────────────
-export const listLlmConfigs = () => invoke<LlmConfig[]>('list_llm_configs');
+export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');
 export const createLlmConfig = (payload: {
   name: string; provider: string; model: string;
   endpoint: string; api_key: string; ctx_window?: string; temperature?: number;
-}) => invoke<LlmConfig>('create_llm_config', { payload });
+}) => ipc<LlmConfig>('create_llm_config', { payload });
 export const updateLlmConfig = (id: string, payload: Partial<{
   name: string; provider: string; model: string; endpoint: string;
   api_key: string; ctx_window: string; temperature: number; enabled: boolean;
-}>) => invoke<LlmConfig>('update_llm_config', { id, payload });
-export const deleteLlmConfig = (id: string) => invoke<void>('delete_llm_config', { id });
-export const testLlmConnection = (id: string) => invoke<string>('test_llm_connection', { id });
+}>) => ipc<LlmConfig>('update_llm_config', { id, payload });
+export const deleteLlmConfig = (id: string) => ipc<void>('delete_llm_config', { id });
+export const testLlmConnection = (id: string) => ipc<string>('test_llm_connection', { id });
 
 // ── Settings — Agents ────────────────────────────────────────────────────────
-export const listAgents = () => invoke<Agent[]>('list_agents');
+export const listAgents = () => ipc<Agent[]>('list_agents');
 export const createAgent = (payload: {
   name: string; name_en?: string; role?: string; color?: string;
   initial?: string; llm_id?: string; system_prompt?: string;
-}) => invoke<Agent>('create_agent', { payload });
+}) => ipc<Agent>('create_agent', { payload });
 export const updateAgent = (id: string, payload: Partial<{
   name: string; name_en: string; role: string; color: string;
   llm_id: string | null; system_prompt: string; forge_role: string | null;
-}>) => invoke<Agent>('update_agent', { id, payload });
-export const deleteAgent = (id: string) => invoke<void>('delete_agent', { id });
+}>) => ipc<Agent>('update_agent', { id, payload });
+export const deleteAgent = (id: string) => ipc<void>('delete_agent', { id });
 export const setAgentForgeRole = (agentId: string, role: string) =>
-  invoke<Agent[]>('set_agent_forge_role', { agentId, role });
+  ipc<Agent[]>('set_agent_forge_role', { agentId, role });

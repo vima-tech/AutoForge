@@ -140,6 +140,7 @@ function LLMSettings() {
             </div>
             {exp === c.id && (
               <div className="cfg-fields rise">
+                <div className="field full"><label>名称</label><input value={v('name')} onChange={e => setDraft(c.id, 'name', e.target.value)} /></div>
                 <div className="field"><label>Provider</label>
                   <Select value={v('provider')} onChange={val => setDraft(c.id, 'provider', val)}
                     options={['Anthropic', 'OpenAI', 'Ollama', 'Azure', '自定义'].map(v => ({ value: v, label: v }))} />

@@ -1,18 +1,32 @@
 use anyhow::Result;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info};
 
-// Cache check_auth() result for 60 s to avoid spawning 2 processes per event.
-static AUTH_CACHE: OnceLock<Mutex<Option<(bool, Instant)>>> = OnceLock::new();
+// Async mutex: held across the subprocess await so concurrent callers
+// queue behind the first check instead of each spawning their own processes.
+static AUTH_CACHE: OnceLock<AsyncMutex<Option<(bool, Instant)>>> = OnceLock::new();
 
-fn auth_cache() -> &'static Mutex<Option<(bool, Instant)>> {
-    AUTH_CACHE.get_or_init(|| Mutex::new(None))
+fn auth_cache() -> &'static AsyncMutex<Option<(bool, Instant)>> {
+    AUTH_CACHE.get_or_init(|| AsyncMutex::new(None))
+}
+
+/// Build a `claude` Command with process-group isolation so the child process
+/// cannot deliver signals (e.g. the SIGTRAP / NeedDebuggerBreak that the
+/// Electron-based claude CLI triggers in WebKitGTK) to our process.
+fn isolated_claude_cmd() -> Command {
+    let mut cmd = Command::new("claude");
+    // Run the child in its own process group (setpgid(0,0)).
+    // Any signals sent to the process group will not reach our GTK event loop.
+    cmd.process_group(0);
+    cmd
 }
 
 /// Run claude CLI in text-only mode, returns stdout
 pub async fn run_text(prompt: &str, system_prompt: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("claude");
+    let mut cmd = isolated_claude_cmd();
     cmd.arg("--print")
         .arg("--permission-mode")
         .arg("dontAsk")
@@ -37,42 +51,43 @@ pub async fn run_text(prompt: &str, system_prompt: Option<&str>) -> Result<Strin
 }
 
 /// Check if claude CLI is installed AND logged in.
-/// Result is cached for 60 s — avoid spawning 2 processes on every event.
+/// Result is cached for 60 s. The async mutex is held across the subprocess
+/// call so that concurrent callers wait for the first result rather than each
+/// spawning their own `claude` processes.
 pub async fn check_auth() -> bool {
     const TTL: Duration = Duration::from_secs(60);
 
-    // Fast path: return cached result if still fresh.
-    {
-        let cache = auth_cache().lock().unwrap();
-        if let Some((result, ts)) = *cache {
-            if ts.elapsed() < TTL {
-                return result;
-            }
+    let mut cache = auth_cache().lock().await;
+
+    if let Some((result, ts)) = *cache {
+        if ts.elapsed() < TTL {
+            debug!("[claude] check_auth: cache hit ({})", result);
+            return result;
         }
     }
 
+    // Cache miss or expired — run subprocess while holding the lock.
     let result = check_auth_inner().await;
-
-    {
-        let mut cache = auth_cache().lock().unwrap();
-        *cache = Some((result, Instant::now()));
-    }
-
+    *cache = Some((result, Instant::now()));
     result
 }
 
 async fn check_auth_inner() -> bool {
-    let version_ok = Command::new("claude")
+    info!("[claude] check_auth_inner: spawning 'claude --version'");
+    let t0 = Instant::now();
+    let version_ok = isolated_claude_cmd()
         .arg("--version")
         .output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
+    debug!("[claude] 'claude --version' done in {:?} ok={}", t0.elapsed(), version_ok);
     if !version_ok {
         return false;
     }
 
-    match Command::new("claude")
+    info!("[claude] check_auth_inner: spawning 'claude auth status'");
+    match isolated_claude_cmd()
         .arg("auth")
         .arg("status")
         .output()
@@ -85,12 +100,17 @@ async fn check_auth_inner() -> bool {
                 String::from_utf8_lossy(&o.stderr)
             )
             .to_lowercase();
-            text.contains("loggedin\": true")
+            let authed = text.contains("loggedin\": true")
                 || text.contains("loggedin:true")
                 || text.contains("logged in")
-                || text.contains("authenticated")
+                || text.contains("authenticated");
+            info!("[claude] 'claude auth status' done in {:?} authed={}", t0.elapsed(), authed);
+            authed
         }
-        Err(_) => version_ok,
+        Err(e) => {
+            info!("[claude] 'claude auth status' failed in {:?}: {}", t0.elapsed(), e);
+            version_ok
+        }
     }
 }
 

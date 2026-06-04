@@ -3,12 +3,15 @@ use crate::models::conversation::{Conversation, ConversationDetail, Message, Sen
 use crate::state::AppState;
 use std::collections::HashMap;
 use tauri::{AppHandle, State};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[tauri::command]
 pub async fn list_conversations(
     state: State<'_, AppState>,
 ) -> Result<Vec<ConversationDetail>, String> {
+    let t0 = std::time::Instant::now();
+    debug!("[cmd] list_conversations start");
     ensure_direct_conversations(&state.db).await?;
 
     let convs =
@@ -33,16 +36,18 @@ pub async fn list_conversations(
             .push(agent_id);
     }
 
+    // Last message per conversation. The previous version used a correlated
+    // subquery (`WHERE m.id = (SELECT id FROM messages WHERE conversation_id = m.conversation_id ...)`)
+    // which is O(N×M) — for every message row SQLite re-ran the inner query.
+    // Window function version is O(N), leveraging ix_messages_conv(conversation_id, created_at).
     let last_rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT m.conversation_id, m.content_json, m.created_at
-         FROM messages m
-         WHERE m.id = (
-             SELECT id
+        "SELECT conversation_id, content_json, created_at
+         FROM (
+             SELECT conversation_id, content_json, created_at,
+                    ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at DESC) AS rn
              FROM messages
-             WHERE conversation_id = m.conversation_id
-             ORDER BY created_at DESC
-             LIMIT 1
-         )",
+         )
+         WHERE rn = 1",
     )
     .fetch_all(&state.db)
     .await
@@ -95,6 +100,7 @@ pub async fn list_conversations(
         });
     }
 
+    info!("[cmd] list_conversations done in {:?} ({} convs)", t0.elapsed(), details.len());
     Ok(details)
 }
 
@@ -113,6 +119,9 @@ async fn ensure_direct_conversations(db: &crate::db::Db) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
 
+    if !missing_agents.is_empty() {
+        info!("[cmd] ensure_direct_conversations: creating {} missing direct convs", missing_agents.len());
+    }
     for (agent_id, color, initial) in missing_agents {
         let conversation_id = format!("conv-direct-{}", agent_id);
         sqlx::query(
@@ -143,6 +152,7 @@ pub async fn list_messages(
     conversation_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Message>, String> {
+    debug!("[cmd] list_messages conv={}", conversation_id);
     sqlx::query_as::<_, Message>(
         "SELECT *
          FROM (
@@ -352,6 +362,7 @@ pub async fn mark_conversation_read(
     conversation_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    debug!("[cmd] mark_conversation_read conv={}", conversation_id);
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM conversations WHERE id=?")
         .bind(&conversation_id)
         .fetch_optional(&state.db)
@@ -442,6 +453,8 @@ pub async fn agent_reply(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Message, String> {
+    let t0 = std::time::Instant::now();
+    info!("[cmd] agent_reply conv={} agent={}", conversation_id, agent_id);
     // Load agent info
     let agent = sqlx::query_as::<_, crate::models::agent::Agent>("SELECT * FROM agents WHERE id=?")
         .bind(&agent_id)
@@ -478,9 +491,14 @@ pub async fn agent_reply(
         Some(agent.system_prompt.as_str())
     };
 
+    info!("[cmd] agent_reply: calling claude CLI (elapsed {:?})", t0.elapsed());
     let reply_text = crate::agents::local_claude::run_text(&prompt, system_prompt)
         .await
-        .unwrap_or_else(|e| format!("[系统错误: {}]", e));
+        .unwrap_or_else(|e| {
+            warn!("[cmd] agent_reply: claude CLI error: {}", e);
+            format!("[系统错误: {}]", e)
+        });
+    info!("[cmd] agent_reply: claude CLI returned in {:?}", t0.elapsed());
 
     // Wrap reply in content_json format
     let content_json = serde_json::json!([{"t": "md", "md": reply_text}]).to_string();
@@ -507,9 +525,11 @@ pub async fn agent_reply(
         },
     );
 
-    sqlx::query_as::<_, Message>("SELECT * FROM messages WHERE id=?")
+    let result = sqlx::query_as::<_, Message>("SELECT * FROM messages WHERE id=?")
         .bind(&msg_id)
         .fetch_one(&state.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    info!("[cmd] agent_reply done in {:?}", t0.elapsed());
+    result
 }

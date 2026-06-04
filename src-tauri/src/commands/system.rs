@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tauri::State;
+use tracing::{debug, info};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SystemHealth {
@@ -138,11 +139,18 @@ pub async fn load_concurrency_settings(
 
 #[tauri::command]
 pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, String> {
+    let t0 = std::time::Instant::now();
+    debug!("[cmd] system_health start");
     // Check DB
     let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
 
-    // Check claude auth
-    let claude_auth = local_claude::check_auth().await;
+    // Auth check is intentionally NOT done here.
+    // Spawning the claude Electron subprocess from within a WebKitGTK process
+    // delivers SIGTRAP to the parent via kill(getppid(), SIGTRAP), which
+    // triggers a NeedDebuggerBreak trap that permanently freezes the GTK event
+    // loop and drops all subsequent Tauri IPC calls.
+    // Use the dedicated `check_claude_auth` command for a one-shot lazy check.
+    let claude_auth = true;
 
     let pipeline_status = state.concurrency.status();
     let (executing,): (i64,) =
@@ -168,6 +176,7 @@ pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, S
         "normal".to_string()
     };
 
+    info!("[cmd] system_health done in {:?}", t0.elapsed());
     Ok(SystemHealth {
         status: if db_ok { "ok" } else { "degraded" }.to_string(),
         db_ok,
@@ -182,59 +191,83 @@ pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, S
     })
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BadgeCounts {
+    pub chat_unread: i64,
+    pub audit_pending: i64,
+}
+
+/// Lazily check claude CLI auth. Called once from the frontend with a long
+/// delay so the subprocess never runs during the critical startup window.
+#[tauri::command]
+pub async fn check_claude_auth() -> Result<bool, String> {
+    Ok(local_claude::check_auth().await)
+}
+
+#[tauri::command]
+pub async fn get_badge_counts(state: State<'_, AppState>) -> Result<BadgeCounts, String> {
+    debug!("[cmd] get_badge_counts start");
+    let (chat_unread,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)
+         FROM messages m
+         LEFT JOIN conversation_reads r ON r.conversation_id = m.conversation_id
+         WHERE m.from_agent IS NOT NULL
+           AND m.created_at > COALESCE(r.read_at, '1970-01-01')",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (audit_pending,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    debug!("[cmd] get_badge_counts done: chat={} audit={}", chat_unread, audit_pending);
+    Ok(BadgeCounts {
+        chat_unread,
+        audit_pending,
+    })
+}
+
 #[tauri::command]
 pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats, String> {
+    let t0 = std::time::Instant::now();
+    debug!("[cmd] pipeline_stats start");
     let concurrency = state.concurrency.status();
 
-    let (pending_analysis,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM issues WHERE status='pending_analysis'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
+    // Batch all issue status counts into a single query.
+    let (pending_analysis, pending_review_1, executing_issues, rejected_issues, total_issues): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT
+           SUM(CASE WHEN status='pending_analysis'  THEN 1 ELSE 0 END),
+           SUM(CASE WHEN status='pending_review_1'  THEN 1 ELSE 0 END),
+           SUM(CASE WHEN status='executing'          THEN 1 ELSE 0 END),
+           SUM(CASE WHEN status='rejected'           THEN 1 ELSE 0 END),
+           COUNT(*)
+         FROM issues",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    let (pending_review_1,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM issues WHERE status='pending_review_1'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (executing_issues,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM issues WHERE status='executing'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (executing_crs,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='executing'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (pending_review_2,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (merged,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='merged'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (rejected_issues,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM issues WHERE status='rejected'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (rejected_crs,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='rejected'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let (total_issues,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM issues")
+    // Batch all change_request status counts into a single query.
+    let (executing_crs, pending_review_2, merged, rejected_crs): (i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT
+               SUM(CASE WHEN status='executing'          THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status='pending_review_2'   THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status='merged'             THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status='rejected'           THEN 1 ELSE 0 END)
+             FROM change_requests",
+        )
         .fetch_one(&state.db)
         .await
         .map_err(|e| e.to_string())?;
@@ -416,7 +449,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         "normal".to_string()
     };
 
-    Ok(PipelineStats {
+    let result = Ok(PipelineStats {
         pending_analysis,
         pending_review_1,
         executing: executing_crs.max(executing_issues),
@@ -434,7 +467,9 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         executing_cr_ids,
         project_slots,
         project_pipelines,
-    })
+    });
+    info!("[cmd] pipeline_stats done in {:?}", t0.elapsed());
+    result
 }
 
 #[tauri::command]
