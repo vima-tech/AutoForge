@@ -907,7 +907,8 @@ export default function ConversationsPage() {
     setConvs(cs);
     setAgents(as);
     // Only set active when it is still empty (first load).
-    setActive(cur => cur || cs[0]?.id || '');
+    // Prefer first group conversation to match the UI order (groups listed before directs).
+    setActive(cur => cur || cs.find(c => c.conv_type === 'group')?.id || cs[0]?.id || '');
   }, []);
 
   const loadMsgs = useCallback(async (cid: string) => {

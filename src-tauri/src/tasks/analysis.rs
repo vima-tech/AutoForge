@@ -46,10 +46,33 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
 
     info!("analyzing issue: {} — {}", issue_id, issue.title);
 
+    // Load project context from local repo path
+    let repo_path: Option<String> = sqlx::query_as::<_, crate::models::project::Project>(
+        "SELECT * FROM projects WHERE id=?",
+    )
+    .bind(&issue.project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|p| !p.repo_path.is_empty())
+    .map(|p| p.repo_path);
+
+    let project_context: Option<String> = if let Some(path) = repo_path {
+        let ctx = crate::agents::analysis::build_project_context(&path).await;
+        if ctx.trim().is_empty() { None } else { Some(ctx) }
+    } else {
+        None
+    };
+
     // Run analysis
-    let result = crate::agents::analysis::analyze(&issue.title, &issue.description)
-        .await
-        .unwrap_or_default();
+    let result = crate::agents::analysis::analyze(
+        &issue.title,
+        &issue.description,
+        project_context.as_deref(),
+    )
+    .await
+    .unwrap_or_default();
 
     // Persist analysis
     let analysis_id = Uuid::new_v4().to_string();
