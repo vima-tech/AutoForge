@@ -250,8 +250,8 @@ function AgentSettings() {
     </div>
   );
 
-  const analystId = agents.find(a => a.forge_role === 'analysis')?.id ?? '';
-  const testerId  = agents.find(a => a.forge_role === 'test')?.id ?? '';
+  const analystId = agents.find(a => a.forge_role?.split(',').includes('analysis'))?.id ?? '';
+  const testerId  = agents.find(a => a.forge_role?.split(',').includes('test'))?.id ?? '';
   const agentOpts = [{ value: '', label: '— 未指派 —' }, ...agents.map(a => ({ value: a.id, label: a.name }))];
 
   return (
@@ -268,26 +268,20 @@ function AgentSettings() {
           <div className="assign-row">
             <div className="cfg-logo" style={{ background: 'var(--violet)', width: 34, height: 34 }}><Icon name="search" size={17} /></div>
             <div className="assign-info">
-              <div className="assign-title">需求分析 Agent</div>
+              <div className="assign-title">需求分析</div>
               <div className="assign-desc">在审核节点 1 前评估真实性、可行性、优先级</div>
             </div>
-            <select className="sel" style={{ width: 180 }}
-              value={analystId}
-              onChange={e => assignRole(e.target.value, 'analysis')}>
-              {agentOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
+            <Select style={{ width: 180 }} value={analystId} options={agentOpts}
+              onChange={val => assignRole(val, 'analysis')} />
           </div>
           <div className="assign-row">
             <div className="cfg-logo" style={{ background: 'var(--green)', width: 34, height: 34 }}><Icon name="flask" size={17} /></div>
             <div className="assign-info">
-              <div className="assign-title">测试 Agent</div>
+              <div className="assign-title">测试</div>
               <div className="assign-desc">合并后被动响应 + 每日主动巡检</div>
             </div>
-            <select className="sel" style={{ width: 180 }}
-              value={testerId}
-              onChange={e => assignRole(e.target.value, 'test')}>
-              {agentOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
+            <Select style={{ width: 180 }} value={testerId} options={agentOpts}
+              onChange={val => assignRole(val, 'test')} />
           </div>
         </div>
       </div>
@@ -298,7 +292,9 @@ function AgentSettings() {
         const v = (f: keyof Agent) => d[f as keyof typeof d] !== undefined
           ? String(d[f as keyof typeof d] ?? '')
           : String(a[f] ?? '');
-        const roleTag = a.forge_role === 'analysis' ? '需求分析' : a.forge_role === 'test' ? '测试' : null;
+        const roleTags = (a.forge_role ?? '').split(',').map(r =>
+          r === 'analysis' ? '需求分析' : r === 'test' ? '测试' : null
+        ).filter(Boolean) as string[];
         return (
           <div className="cfg-card" key={a.id} style={exp === a.id ? { borderColor: 'var(--ember-tint-strong)' } : {}}>
             <div className="cfg-top" onClick={() => setExp(exp === a.id ? null : a.id)} style={{ cursor: 'pointer' }}>
@@ -306,7 +302,7 @@ function AgentSettings() {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="cfg-name" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   {v('name')}
-                  {roleTag && <span className="chip ember" style={{ padding: '1px 7px', fontSize: 10 }}>{roleTag} Agent</span>}
+                  {roleTags.map(tag => <span key={tag} className="chip ember" style={{ padding: '1px 7px', fontSize: 10 }}>{tag}</span>)}
                 </div>
                 <div className="cfg-sub">{v('name_en')} · {llmNames.find(l => l.id === a.llm_id)?.name ?? '未指定 LLM'}</div>
               </div>
