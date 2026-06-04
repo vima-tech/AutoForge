@@ -35,12 +35,31 @@ export default function Markdown({ md }: { md: string }) {
       blocks.push({ tag: 'hr', html: '' });
       i++;
     } else if (/^\|/.test(ln)) {
-      // Table row: render as-is inside a <p>, skip separator rows like |---|
-      if (/^\|[-|:\s]+\|$/.test(ln.trim())) { i++; }  // skip separator
-      else {
-        blocks.push({ tag: 'p', html: renderInline(ln) });
-        i++;
+      // Collect all consecutive pipe-delimited lines, render as a proper <table>
+      const rows: string[] = [];
+      while (i < lines.length && /^\|/.test(lines[i])) { rows.push(lines[i]); i++; }
+
+      const parseRow = (line: string) =>
+        line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+      const isSep = (line: string) => /^\|[\s|:-]+\|$/.test(line.trim());
+      // Handle literal <br> / <br/> in cell text before HTML-escaping the rest
+      const renderCell = (text: string) =>
+        text.split(/(<br\s*\/?>)/i).map((p, j) => j % 2 === 0 ? renderInline(p) : '<br/>').join('');
+
+      let html = '<table class="md-table"><thead>';
+      let bodyStarted = false;
+      for (const row of rows) {
+        if (isSep(row)) {
+          html += '</thead><tbody>';
+          bodyStarted = true;
+          continue;
+        }
+        const cells = parseRow(row);
+        const tag = bodyStarted ? 'td' : 'th';
+        html += '<tr>' + cells.map(c => `<${tag}>${renderCell(c)}</${tag}>`).join('') + '</tr>';
       }
+      html += bodyStarted ? '</tbody></table>' : '</thead></table>';
+      blocks.push({ tag: 'div', html });
     } else if (/^>\s?/.test(ln)) {
       const buf: string[] = [];
       while (i < lines.length && /^>\s?/.test(lines[i])) {

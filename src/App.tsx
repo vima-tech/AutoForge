@@ -133,7 +133,6 @@ export default function App() {
   });
   const [theme, setTheme] = useState<Theme>('dark');
   const [health, setHealth] = useState<SystemHealth | null>(null);
-  const [lastEvent, setLastEvent] = useState('');
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
 
   const badgeRefreshInFlight = useRef(false);
@@ -218,21 +217,6 @@ export default function App() {
         cr_id?: string; iteration?: number; status?: string; summary?: string;
       };
 
-      // Update last event label immediately (cheap state update, no IPC).
-      const EVENT_LABELS: Record<string, string> = {
-        message_received: '新消息',
-        review_needed: '待审核',
-        iteration_warning: '迭代告警',
-        cr_merged: '已合并',
-        test_completed: '测试完成',
-        analysis_started: '分析中',
-        analysis_done: '分析完成',
-        execution_started: '执行中',
-        execution_done: '执行完成',
-      };
-      const evType = typeof ev?.type === 'string' ? ev.type : '';
-      setLastEvent(EVENT_LABELS[evType] ?? evType);
-
       // Debounced IPC refreshes.
       debouncedBadges();
       debouncedHealth();
@@ -289,7 +273,6 @@ export default function App() {
             <span className={'dot ' + (health?.stage === 'paused' ? 'red' : 'green')} style={{ width: 6, height: 6, boxShadow: 'none' }} />
             {stageLabel}
             {health && <span style={{ marginLeft: 6, fontFamily: 'var(--font-mono)' }}>{health.active_slots}/{health.total_slot_capacity}</span>}
-            {lastEvent && <span style={{ marginLeft: 6, color: 'var(--text-faint)' }}>{lastEvent}</span>}
           </span>
         </div>
       </div>

@@ -232,13 +232,6 @@ function AgentSettings() {
     }
   };
 
-  // Single atomic backend call: clears all old holders of `role`, assigns `val` ('' = unassign).
-  // Returns the authoritative agent list — no local diff needed.
-  const assignRole = async (val: string, role: 'analysis' | 'test') => {
-    const fresh = await setAgentForgeRole(val, role);
-    setAgents(fresh);
-  };
-
   const doDelete = async (id: string) => {
     await deleteAgent(id);
     setAgents(as => as.filter(a => a.id !== id));
@@ -258,15 +251,6 @@ function AgentSettings() {
     </div>
   );
 
-  const analystId = agents.find(a => a.forge_role?.split(',').includes('analysis'))?.id ?? '';
-  const testerId  = agents.find(a => a.forge_role?.split(',').includes('test'))?.id ?? '';
-  const agentOpts = [{ value: '', label: '— 未指派 —' }, ...agents.map(a => ({ value: a.id, label: a.name }))];
-  const systemRoleRows = [
-    { kind: 'planner', title: 'Planner 调度器', icon: 'layers', color: 'var(--blue)', desc: '解析群聊自然语言请求，生成多 Agent 并发/串行编排计划' },
-    { kind: 'summarizer', title: 'Summarizer 总结器', icon: 'quote', color: 'var(--violet)', desc: '综合多个 Agent 的发言，形成结论、裁决和下一步建议' },
-    { kind: 'doc_writer', title: 'Doc Writer 文档生成器', icon: 'file', color: 'var(--amber)', desc: '把讨论结果整理成 PRD、ADR、测试计划等文档产物' },
-    { kind: 'context_compressor', title: 'Context Compressor 上下文压缩器', icon: 'layers', color: 'var(--green)', desc: '压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度' },
-  ];
   const systemKindLabels: Record<string, string> = {
     planner: 'Planner 调度器',
     summarizer: 'Summarizer 总结器',
@@ -274,105 +258,12 @@ function AgentSettings() {
     context_compressor: 'Context Compressor',
   };
   const systemKinds = (a: Agent) => (a.system_kind ?? '').split(',').map(v => v.trim()).filter(Boolean);
-  const hasSystemKind = (a: Agent, kind: string) => systemKinds(a).includes(kind);
-  const systemKindValue = (a: Agent, add?: string, remove?: string) => {
-    const kinds = new Set(systemKinds(a));
-    if (remove) kinds.delete(remove);
-    if (add) kinds.add(add);
-    const next = Array.from(kinds).join(',');
-    return next || null;
-  };
-
-  const updateAgentLocal = async (id: string, payload: Partial<Agent>, status = '已保存') => {
-    try {
-      const updated = await updateAgent(id, payload);
-      setAgents(as => as.map(a => a.id === id ? updated : a));
-      setDrafts(d2 => {
-        const n = { ...d2 };
-        delete n[id];
-        return n;
-      });
-      setSaveStatus(s => ({ ...s, [id]: status }));
-      setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
-    } catch (e) {
-      setSaveStatus(s => ({ ...s, [id]: '保存失败: ' + String(e) }));
-    }
-  };
-
-  const setSystemRoleAgent = async (kind: string, id: string) => {
-    const current = agents.filter(a => hasSystemKind(a, kind));
-    if (!id) {
-      for (const holder of current) {
-        await updateAgentLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消指派');
-      }
-      return;
-    }
-    for (const holder of current) {
-      if (holder.id !== id) {
-        await updateAgentLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消指派');
-      }
-    }
-    const selected = agents.find(a => a.id === id);
-    if (selected) {
-      await updateAgentLocal(id, {
-        system_kind: systemKindValue(selected, kind),
-      }, '已指派');
-    }
-  };
 
   return (
     <div className="set-inner rise">
       {confirmDel && <ConfirmModal msg="确认删除此 Agent？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
       <div className="set-h">Agent 配置</div>
-      <div className="set-desc">配置 Agent 职能、LLM、系统提示词，并指派流水线角色。</div>
-
-      <div className="panel" style={{ marginBottom: 22 }}>
-        <div className="panel-head">
-          <div className="panel-title"><Icon name="bot" size={16} style={{ color: 'var(--blue)' }} />系统角色指派</div>
-        </div>
-        <div style={{ padding: '4px 18px 14px' }}>
-          {systemRoleRows.map(row => {
-            const holder = agents.find(a => hasSystemKind(a, row.kind));
-            return (
-              <div className="assign-row" key={row.kind}>
-                <div className="cfg-logo" style={{ background: row.color, width: 34, height: 34 }}><Icon name={row.icon} size={17} /></div>
-                <div className="assign-info">
-                  <div className="assign-title">{row.title}</div>
-                  <div className="assign-desc">{row.desc}；模型使用该 Agent 自己配置的 LLM</div>
-                </div>
-                <Select style={{ width: 180 }} value={holder?.id ?? ''} options={agentOpts}
-                  onChange={val => setSystemRoleAgent(row.kind, val)} />
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      <div className="panel" style={{ marginBottom: 22 }}>
-        <div className="panel-head">
-          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />流水线角色指派</div>
-        </div>
-        <div style={{ padding: '4px 18px 14px' }}>
-          <div className="assign-row">
-            <div className="cfg-logo" style={{ background: 'var(--violet)', width: 34, height: 34 }}><Icon name="search" size={17} /></div>
-            <div className="assign-info">
-              <div className="assign-title">需求分析</div>
-              <div className="assign-desc">在审核节点 1 前评估真实性、可行性、优先级</div>
-            </div>
-            <Select style={{ width: 180 }} value={analystId} options={agentOpts}
-              onChange={val => assignRole(val, 'analysis')} />
-          </div>
-          <div className="assign-row">
-            <div className="cfg-logo" style={{ background: 'var(--green)', width: 34, height: 34 }}><Icon name="flask" size={17} /></div>
-            <div className="assign-info">
-              <div className="assign-title">测试</div>
-              <div className="assign-desc">合并后被动响应 + 每日主动巡检</div>
-            </div>
-            <Select style={{ width: 180 }} value={testerId} options={agentOpts}
-              onChange={val => assignRole(val, 'test')} />
-          </div>
-        </div>
-      </div>
+      <div className="set-desc">配置 Agent 的名称、LLM、系统提示词及可用范围。角色绑定请前往「角色指派」页。</div>
 
       <div className="sec-kicker" style={{ marginBottom: 12 }}>全部 Agent · {agents.length}</div>
       {agents.map(a => {
@@ -454,6 +345,142 @@ function AgentSettings() {
         );
       })}
       <div className="cfg-card add" onClick={addNew}><Icon name="plus" size={18} />添加 Agent</div>
+    </div>
+  );
+}
+
+// ── Role Assignment ───────────────────────────────────────────────────────────
+function RoleAssignment() {
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    listAgents().then(ags => { setAgents(ags); setLoading(false); }).catch(() => setLoading(false));
+  }, []);
+
+  const agentOpts = [{ value: '', label: '— 未指派 —' }, ...agents.map(a => ({ value: a.id, label: a.name }))];
+  const analystId = agents.find(a => a.forge_role?.split(',').includes('analysis'))?.id ?? '';
+  const testerId  = agents.find(a => a.forge_role?.split(',').includes('test'))?.id ?? '';
+
+  const assignRole = async (val: string, role: 'analysis' | 'test') => {
+    const fresh = await setAgentForgeRole(val, role);
+    setAgents(fresh);
+  };
+
+  const systemKinds = (a: Agent) => (a.system_kind ?? '').split(',').map(v => v.trim()).filter(Boolean);
+  const hasSystemKind = (a: Agent, kind: string) => systemKinds(a).includes(kind);
+  const systemKindValue = (a: Agent, add?: string, remove?: string) => {
+    const kinds = new Set(systemKinds(a));
+    if (remove) kinds.delete(remove);
+    if (add) kinds.add(add);
+    return Array.from(kinds).join(',') || null;
+  };
+
+  const updateLocal = async (id: string, payload: Partial<Agent>, status = '已指派') => {
+    try {
+      const updated = await updateAgent(id, payload);
+      setAgents(as => as.map(a => a.id === id ? updated : a));
+      setSaveStatus(s => ({ ...s, [id]: status }));
+      setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
+    } catch (e) {
+      setSaveStatus(s => ({ ...s, [id]: '保存失败: ' + String(e) }));
+    }
+  };
+
+  const setSystemRoleAgent = async (kind: string, id: string) => {
+    const current = agents.filter(a => hasSystemKind(a, kind));
+    if (!id) {
+      for (const holder of current) {
+        await updateLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消');
+      }
+      return;
+    }
+    for (const holder of current) {
+      if (holder.id !== id) {
+        await updateLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消');
+      }
+    }
+    const selected = agents.find(a => a.id === id);
+    if (selected) {
+      await updateLocal(id, { system_kind: systemKindValue(selected, kind) });
+    }
+  };
+
+  const systemRoleRows = [
+    { kind: 'planner',           title: 'Planner 调度器',              icon: 'layers', color: 'var(--blue)',   desc: '解析群聊自然语言请求，生成多 Agent 并发/串行编排计划' },
+    { kind: 'summarizer',        title: 'Summarizer 总结器',            icon: 'quote',  color: 'var(--violet)', desc: '综合多个 Agent 的发言，形成结论、裁决和下一步建议' },
+    { kind: 'doc_writer',        title: 'Doc Writer 文档生成器',        icon: 'file',   color: 'var(--amber)',  desc: '把讨论结果整理成 PRD、ADR、测试计划等文档产物' },
+    { kind: 'context_compressor',title: 'Context Compressor 压缩器',   icon: 'layers', color: 'var(--green)',  desc: '压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度' },
+  ];
+
+  if (loading) return (
+    <div className="set-inner">
+      <div className="set-h">角色指派</div>
+      <div style={{ color: 'var(--text-3)', marginTop: 20 }}>加载中…</div>
+    </div>
+  );
+
+  const feedback = Object.values(saveStatus)[0];
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">角色指派</div>
+      <div className="set-desc">将 Agent 绑定到编排系统和流水线的各个职责槽位。每次只有一个 Agent 持有某项角色；模型使用该 Agent 自身的 LLM 配置。</div>
+
+      {feedback && (
+        <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--green-soft)', marginBottom: 12 }}>{feedback}</div>
+      )}
+
+      <div className="panel" style={{ marginBottom: 22 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="bot" size={16} style={{ color: 'var(--blue)' }} />系统角色指派</div>
+          <div className="panel-sub">群聊编排引擎的内置职责</div>
+        </div>
+        <div style={{ padding: '4px 18px 14px' }}>
+          {systemRoleRows.map(row => {
+            const holder = agents.find(a => hasSystemKind(a, row.kind));
+            return (
+              <div className="assign-row" key={row.kind}>
+                <div className="cfg-logo" style={{ background: row.color, width: 34, height: 34 }}><Icon name={row.icon} size={17} /></div>
+                <div className="assign-info">
+                  <div className="assign-title">{row.title}</div>
+                  <div className="assign-desc">{row.desc}</div>
+                </div>
+                <Select style={{ width: 180 }} value={holder?.id ?? ''} options={agentOpts}
+                  onChange={val => setSystemRoleAgent(row.kind, val)} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginBottom: 22 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />流水线角色指派</div>
+          <div className="panel-sub">需求流水线各阶段的 Agent 绑定</div>
+        </div>
+        <div style={{ padding: '4px 18px 14px' }}>
+          <div className="assign-row">
+            <div className="cfg-logo" style={{ background: 'var(--violet)', width: 34, height: 34 }}><Icon name="search" size={17} /></div>
+            <div className="assign-info">
+              <div className="assign-title">需求分析</div>
+              <div className="assign-desc">在审核节点 1 前评估真实性、可行性、优先级</div>
+            </div>
+            <Select style={{ width: 180 }} value={analystId} options={agentOpts}
+              onChange={val => assignRole(val, 'analysis')} />
+          </div>
+          <div className="assign-row">
+            <div className="cfg-logo" style={{ background: 'var(--green)', width: 34, height: 34 }}><Icon name="flask" size={17} /></div>
+            <div className="assign-info">
+              <div className="assign-title">测试</div>
+              <div className="assign-desc">合并后被动响应 + 每日主动巡检</div>
+            </div>
+            <Select style={{ width: 180 }} value={testerId} options={agentOpts}
+              onChange={val => assignRole(val, 'test')} />
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -649,6 +676,7 @@ function AboutSettings() {
 const SET_ITEMS = [
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
   { id: 'agents',      name: 'Agent 配置',   ic: 'bot' },
+  { id: 'roles',       name: '角色指派',     ic: 'layers' },
   { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
   { id: 'specs',       name: '规范文档',     ic: 'file' },
@@ -672,13 +700,14 @@ export default function SettingsPage() {
           ))}
         </div>
         <div className="set-body scroll">
-          {sec === 'llm'    && <LLMSettings />}
-          {sec === 'agents' && <AgentSettings />}
+          {sec === 'llm'         && <LLMSettings />}
+          {sec === 'agents'      && <AgentSettings />}
+          {sec === 'roles'       && <RoleAssignment />}
           {sec === 'concurrency' && <ConcurrencySettings />}
-          {sec === 'security' && <SecuritySettings />}
-          {sec === 'specs' && <SpecsSettings />}
-          {sec === 'about' && <AboutSettings />}
-          {!['llm','agents','concurrency','security','specs','about'].includes(sec) && (
+          {sec === 'security'    && <SecuritySettings />}
+          {sec === 'specs'       && <SpecsSettings />}
+          {sec === 'about'       && <AboutSettings />}
+          {!['llm','agents','roles','concurrency','security','specs','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

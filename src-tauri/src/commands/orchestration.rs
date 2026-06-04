@@ -333,6 +333,14 @@ async fn build_plan(
         .filter(|id| members.iter().any(|a| &a.id == *id))
         .cloned()
         .collect();
+
+    // Pure synthesis request with no @mentions: skip Planner and all business-agent steps.
+    // Returning an empty plan makes plan_has_final_single=false, so the post-plan
+    // summarizer hook fires directly with the conversation snapshot as context.
+    if mentioned.is_empty() && asks_for_synthesis(instruction) && !asks_for_artifact(instruction) {
+        return Ok(ConversationPlan { steps: vec![] });
+    }
+
     let needs_planner = mentioned.is_empty() || asks_for_sequence(instruction);
     if !needs_planner {
         return Ok(ConversationPlan {
