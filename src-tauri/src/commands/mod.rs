@@ -1,5 +1,6 @@
 pub mod change_requests;
 pub mod conversations;
+pub mod demo;
 pub mod issues;
 pub mod projects;
 pub mod settings;

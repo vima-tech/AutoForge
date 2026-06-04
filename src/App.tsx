@@ -65,11 +65,23 @@ function TrafficLights() {
   );
 }
 
-// ---- Titlebar drag ----
+// ---- Titlebar drag / double-click maximize ----
+// Double-click is detected at mousedown level because startDragging() captures
+// the mouse pointer on Linux/WebKitGTK, preventing the dblclick event from
+// ever reaching the webview.
+let lastTitlebarDown = 0;
+
 function handleTitlebarMouseDown(e: React.MouseEvent<HTMLDivElement>) {
-  // Only drag from the titlebar itself, not from child interactive elements
   if ((e.target as HTMLElement).closest('button, a, input')) return;
-  if (isTauri) win().startDragging();
+  if (!isTauri) return;
+  const now = Date.now();
+  if (now - lastTitlebarDown < 400) {
+    lastTitlebarDown = 0;
+    win().toggleMaximize();
+    return;
+  }
+  lastTitlebarDown = now;
+  win().startDragging();
 }
 
 // ---- Logo ----
@@ -116,7 +128,7 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 
 export default function App() {
   const [page,  setPage]  = useState<Page>(() => {
-    const saved = sessionStorage.getItem('autoforge:page') as Page | null;
+    const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
     return saved && (['home', 'chat', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
   const [theme, setTheme] = useState<Theme>('dark');
@@ -163,11 +175,11 @@ export default function App() {
   useEffect(() => {
     refreshBadges();
     const onCustom = () => refreshBadges();
-    window.addEventListener('autoforge:badges-refresh', onCustom);
-    return () => window.removeEventListener('autoforge:badges-refresh', onCustom);
+    window.addEventListener('AutoForge:badges-refresh', onCustom);
+    return () => window.removeEventListener('AutoForge:badges-refresh', onCustom);
   }, [refreshBadges]);
 
-  // Single consolidated listener for all autoforge://event traffic.
+  // Single consolidated listener for all AutoForge://event traffic.
   // Three separate listen() calls were previously registered here — each event
   // fired all three handlers simultaneously, causing 5+ concurrent IPC calls
   // (including a Rust check_auth() that spawns 2 subprocesses every time).
@@ -200,7 +212,7 @@ export default function App() {
     };
 
     let unlisten: (() => void) | undefined;
-    listen<Record<string, unknown>>('autoforge://event', e => {
+    listen<Record<string, unknown>>('AutoForge://event', e => {
       const ev = e.payload as {
         type?: string; issue_title?: string; stage?: number;
         cr_id?: string; iteration?: number; status?: string; summary?: string;
@@ -282,7 +294,7 @@ export default function App() {
             <button
               key={n.id}
               className={'rail-item' + (page === n.id ? ' active' : '')}
-              onClick={() => { setPage(n.id); sessionStorage.setItem('autoforge:page', n.id); }}
+              onClick={() => { setPage(n.id); sessionStorage.setItem('AutoForge:page', n.id); }}
               title={n.name}
             >
               <Icon name={n.ic} size={23} />
@@ -300,7 +312,7 @@ export default function App() {
           </button>
           <button
             className={'rail-item' + (page === 'settings' ? ' active' : '')}
-            onClick={() => { setPage('settings'); sessionStorage.setItem('autoforge:page', 'settings'); }}
+            onClick={() => { setPage('settings'); sessionStorage.setItem('AutoForge:page', 'settings'); }}
             title="设置"
           >
             <Icon name="settings" size={23} />

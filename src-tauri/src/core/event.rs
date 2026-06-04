@@ -54,5 +54,5 @@ pub enum AppEvent {
 }
 
 pub fn emit(app: &AppHandle, event: AppEvent) {
-    let _ = app.emit("autoforge://event", event);
+    let _ = app.emit("AutoForge://event", event);
 }

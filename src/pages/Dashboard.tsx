@@ -98,7 +98,7 @@ export default function Dashboard() {
       timer = setTimeout(() => { timer = null; loadAll(); }, 500);
     };
     let unlisten: (() => void) | undefined;
-    listen<unknown>('autoforge://event', debounced).then(fn => { unlisten = fn; });
+    listen<unknown>('AutoForge://event', debounced).then(fn => { unlisten = fn; });
     return () => {
       if (timer) clearTimeout(timer);
       unlisten?.();
@@ -148,7 +148,7 @@ export default function Dashboard() {
       await deleteProject(projectToDelete.id);
       setProjectToDelete(null);
       await loadAll();
-      window.dispatchEvent(new Event('autoforge:badges-refresh'));
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
       setProjectError(String(e));
       setProjectToDelete(null);

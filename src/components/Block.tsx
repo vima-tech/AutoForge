@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import Icon from './Icon';
 import Markdown from './Markdown';
 import type { BlockType } from '../data/mock';
+import { attachmentDataUrl, openAttachment } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -42,6 +43,27 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
 }
 
 export default function Block({ b }: { b: BlockType }) {
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [attachmentError, setAttachmentError] = useState('');
+
+  React.useEffect(() => {
+    let alive = true;
+    setAttachmentError('');
+    if (b.t !== 'image' || !b.id) {
+      setPreviewUrl('');
+      return () => { alive = false; };
+    }
+    attachmentDataUrl(b.id)
+      .then(url => { if (alive) setPreviewUrl(url); })
+      .catch(e => { if (alive) setAttachmentError(String(e)); });
+    return () => { alive = false; };
+  }, [b]);
+
+  const openStoredAttachment = (id?: string) => {
+    if (!id) return;
+    openAttachment(id).catch(e => setAttachmentError(String(e)));
+  };
+
   if (b.t === 'md') return <Markdown md={b.md} />;
   if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} />;
   if (b.t === 'typing') return <div className="typing"><i /><i /><i /></div>;
@@ -51,14 +73,25 @@ export default function Block({ b }: { b: BlockType }) {
       <div style={{ minWidth: 0 }}>
         <div className="att-name">{b.name}</div>
         <div className="att-meta">{b.meta}</div>
+        {attachmentError && <div className="att-error">{attachmentError}</div>}
       </div>
-      <button className="icon-btn" style={{ marginLeft: 'auto' }}><Icon name="arrowDown" size={16} /></button>
+      <button className="icon-btn" style={{ marginLeft: 'auto' }} disabled={!b.id} title="打开附件" onClick={() => openStoredAttachment(b.id)}>
+        <Icon name="external" size={16} />
+      </button>
     </div>
   );
   if (b.t === 'image') return (
     <div className="att-img">
-      <div className="ph" style={{ background: `linear-gradient(135deg, ${b.color}, ${b.color}99)` }}><Icon name="image" size={30} /></div>
+      {previewUrl
+        ? <img src={previewUrl} alt={b.label} />
+        : <div className="ph" style={{ background: `linear-gradient(135deg, ${b.color}, ${b.color}99)` }}><Icon name="image" size={30} /></div>}
       <div className="cap">{b.label}　{b.meta}</div>
+      {attachmentError && <button className="att-img-error" title={attachmentError}><Icon name="alert" size={14} /></button>}
+      {b.id && (
+        <button className="att-img-open icon-btn" title="打开附件" onClick={() => openStoredAttachment(b.id)}>
+          <Icon name="external" size={15} />
+        </button>
+      )}
     </div>
   );
   if (b.t === 'artifact') return (

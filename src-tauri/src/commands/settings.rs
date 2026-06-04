@@ -155,20 +155,8 @@ pub async fn test_llm_connection(id: String, state: State<'_, AppState>) -> Resu
             .send()
             .await
             .map_err(|e| format!("连接失败: {}", e))?
-    } else if provider.contains("openai") {
-        client
-            .post(join_endpoint(endpoint, "/v1/chat/completions"))
-            .bearer_auth(&cfg.api_key)
-            .json(&serde_json::json!({
-                "model": cfg.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "temperature": 0
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("连接失败: {}", e))?
-    } else {
+    } else if provider.contains("anthropic") {
+        // Anthropic native API — distinct /v1/messages format
         client
             .post(join_endpoint(endpoint, "/v1/messages"))
             .header("x-api-key", &cfg.api_key)
@@ -178,6 +166,20 @@ pub async fn test_llm_connection(id: String, state: State<'_, AppState>) -> Resu
                 "messages": [{"role": "user", "content": "ping"}],
                 "max_tokens": 1,
                 "temperature": cfg.temperature
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("连接失败: {}", e))?
+    } else {
+        // OpenAI-compatible: covers OpenAI, Azure, 自定义, and any other provider
+        client
+            .post(join_endpoint(endpoint, "/v1/chat/completions"))
+            .bearer_auth(&cfg.api_key)
+            .json(&serde_json::json!({
+                "model": cfg.model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "temperature": 0
             }))
             .send()
             .await
@@ -196,11 +198,17 @@ pub async fn test_llm_connection(id: String, state: State<'_, AppState>) -> Resu
 }
 
 fn join_endpoint(endpoint: &str, path: &str) -> String {
-    if endpoint.ends_with(path) {
-        endpoint.to_string()
-    } else {
-        format!("{}{}", endpoint, path)
+    let base = endpoint.trim_end_matches('/');
+    if base.ends_with(path) {
+        return base.to_string();
     }
+    // Avoid doubling the /v1 prefix when the user pastes a baseURL that already ends with /v1
+    // e.g. "https://dashscope.aliyuncs.com/compatible-mode/v1" + "/v1/chat/completions"
+    //   → "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    if base.ends_with("/v1") && path.starts_with("/v1/") {
+        return format!("{}{}", base, &path[3..]);
+    }
+    format!("{}{}", base, path)
 }
 
 // ---- Agents ----

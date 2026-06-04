@@ -39,3 +39,25 @@ pub struct SendMessage {
     pub conversation_id: String,
     pub content_json: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ConversationAttachment {
+    pub id: String,
+    pub conversation_id: String,
+    pub original_name: String,
+    pub stored_name: String,
+    pub rel_path: String,
+    pub mime: String,
+    pub kind: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentUpload {
+    pub conversation_id: String,
+    pub file_name: String,
+    pub mime_hint: String,
+    pub data_base64: String,
+}

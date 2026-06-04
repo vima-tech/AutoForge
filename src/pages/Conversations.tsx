@@ -6,12 +6,38 @@ import Block from '../components/Block';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation, agentReply,
   listAgents, addConversationMember, removeConversationMember, deleteGroupConversation,
-  markConversationRead,
-  type Conversation, type Message, type Agent,
+  markConversationRead, importAttachment, listConversationAttachments, openAttachment,
+  clearConversationMessages,
+  type Conversation, type Message, type Agent, type ConversationAttachment,
 } from '../services';
 import type { BlockType } from '../data/mock';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif'];
+const FILE_EXTS = [...IMAGE_EXTS, 'pdf', 'txt', 'log', 'md', 'json', 'csv', 'yaml', 'yml', 'toml'];
+const IMAGE_ACCEPT = '.png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif';
+const FILE_ACCEPT = '.png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.log,.md,.json,.csv,.yaml,.yml,.toml,image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json';
+
+interface PendingAttachment {
+  id: string;
+  file: File;
+  mode: 'file' | 'image';
+}
+
+interface QuoteDraft {
+  message_id: string;
+  author: string;
+  text: string;
+  created_at: string;
+}
+
+interface BubbleMenuState {
+  x: number;
+  y: number;
+  message: Message;
+  author: string;
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -23,6 +49,7 @@ function msgText(m: Message): string {
       if (b.t === 'code') return b.code;
       if (b.t === 'file') return `${b.name} ${b.meta}`;
       if (b.t === 'image') return `${b.label} ${b.meta}`;
+      if (b.t === 'quote_ref') return '';
       if (b.t === 'artifact') return `${b.kind} ${b.title} ${b.body}`;
       return '';
     }).join('\n');
@@ -31,11 +58,92 @@ function msgText(m: Message): string {
   }
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function fileExt(name: string): string {
+  const idx = name.lastIndexOf('.');
+  return idx >= 0 ? name.slice(idx + 1).toLowerCase() : '';
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('无法读取附件'));
+    reader.onload = () => {
+      const result = String(reader.result ?? '');
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function parseMessageBlocks(m: Message): BlockType[] {
+  try {
+    return JSON.parse(m.content_json);
+  } catch {
+    return [{ t: 'md', md: m.content_json }];
+  }
+}
+
+function messageQuote(m: Message): QuoteDraft | null {
+  const quote = parseMessageBlocks(m).find(b => b.t === 'quote_ref');
+  if (!quote || quote.t !== 'quote_ref') return null;
+  return {
+    message_id: quote.message_id,
+    author: quote.author,
+    text: quote.text,
+    created_at: quote.created_at,
+  };
+}
+
+function visibleMessageBlocks(m: Message): BlockType[] {
+  return parseMessageBlocks(m).filter(b => b.t !== 'quote_ref');
+}
+
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+}
+
+function attachmentBlock(a: ConversationAttachment): BlockType {
+  const meta = `${a.mime.split('/').pop()?.toUpperCase() ?? 'FILE'} · ${formatBytes(a.size_bytes)}`;
+  if (a.kind === 'image') {
+    return { t: 'image', id: a.id, label: a.original_name, meta, color: '#4f8ed1', mime: a.mime, size: a.size_bytes };
+  }
+  return { t: 'file', id: a.id, name: a.original_name, meta, color: '#e0a32e', mime: a.mime, size: a.size_bytes };
+}
+
+function contextAttachmentBlock(a: ConversationAttachment): BlockType {
+  const meta = `上下文 · ${a.mime.split('/').pop()?.toUpperCase() ?? 'FILE'} · ${formatBytes(a.size_bytes)}`;
+  if (a.kind === 'image') {
+    return { t: 'image', id: a.id, label: a.original_name, meta, color: '#4f8ed1', mime: a.mime, size: a.size_bytes };
+  }
+  return { t: 'file', id: a.id, name: a.original_name, meta, color: '#e0a32e', mime: a.mime, size: a.size_bytes };
+}
+
 function convPreview(c: Conversation): string {
   if (!c.last_message) return '暂无消息';
   try {
     const bs: BlockType[] = JSON.parse(c.last_message);
-    return bs[0]?.t === 'md' ? bs[0].md.slice(0, 40) : '消息';
+    if (bs[0]?.t === 'md') return bs[0].md.slice(0, 40);
+    if (bs[0]?.t === 'file') return `附件：${bs[0].name}`;
+    if (bs[0]?.t === 'image') return `图片：${bs[0].label}`;
+    return '消息';
   } catch {
     return c.last_message.slice(0, 40);
   }
@@ -109,15 +217,17 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
   );
 }
 
-function MessageRow({ m, agents, isGroup, highlighted, rowRef }: {
+function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMenu }: {
   m: Message; agents: Agent[]; isGroup: boolean;
   highlighted?: boolean; rowRef?: (el: HTMLDivElement | null) => void;
+  onBubbleContextMenu?: (e: React.MouseEvent, message: Message, author: string) => void;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const me = !m.from_agent;
   const a  = me ? null : agentMap[m.from_agent!];
-  let blocks: BlockType[] = [];
-  try { blocks = JSON.parse(m.content_json); } catch { blocks = [{ t: 'md', md: m.content_json }]; }
+  const author = me ? '我' : (a?.name ?? 'Agent');
+  const blocks = visibleMessageBlocks(m);
+  const quote = messageQuote(m);
   return (
     <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
       {me
@@ -134,49 +244,343 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef }: {
             </span>
           </div>
         )}
-        <div className="bubble">
+        <div className="bubble" onContextMenu={e => onBubbleContextMenu?.(e, m, author)}>
           {blocks.map((b, i) => <Block key={i} b={b} />)}
         </div>
+        {quote && (
+          <div className="bubble-quote" title={`${quote.author}: ${quote.text}`}>
+            <span className="quote-author">{quote.author}</span>
+            <span className="quote-text">{quote.text}</span>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-function Composer({ conv, agents, onSend }: {
-  conv: Conversation; agents: Agent[]; onSend: (text: string) => void;
+function Composer({ conv, agents, contextAttachments, onSend, onError, quote, onClearQuote, busy }: {
+  conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
+  onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[]) => Promise<boolean>;
+  onError: (message: string) => void;
+  quote: QuoteDraft | null;
+  onClearQuote: () => void;
+  busy?: boolean;
 }) {
   const [text, setText] = useState('');
+  const [pending, setPending] = useState<PendingAttachment[]>([]);
   const [showMention, setShowMention] = useState(false);
+  const [showAttachmentPicker, setShowAttachmentPicker] = useState(false);
+  const [attachmentQuery, setAttachmentQuery] = useState('');
   const [mentionSel, setMentionSel] = useState(0);
-  const taRef = useRef<HTMLTextAreaElement>(null);
+  const [attachmentSel, setAttachmentSel] = useState(0);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const isG = conv.conv_type === 'group';
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const members  = useMemo(() => isG ? conv.members.map(id => agentMap[id]).filter(Boolean) : [], [isG, conv.members, agentMap]);
+  const filteredContextAttachments = useMemo(() => {
+    const q = attachmentQuery.trim().toLowerCase();
+    if (!q) return contextAttachments;
+    return contextAttachments.filter(a => a.original_name.toLowerCase().includes(q) || a.mime.toLowerCase().includes(q));
+  }, [contextAttachments, attachmentQuery]);
+  const visibleContextAttachments = useMemo(
+    () => filteredContextAttachments.slice(0, 8),
+    [filteredContextAttachments],
+  );
 
-  const resize = () => {
-    const ta = taRef.current;
-    if (ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 140) + 'px'; }
+  useEffect(() => {
+    setAttachmentSel(0);
+  }, [attachmentQuery, contextAttachments]);
+
+  useEffect(() => {
+    if (!showAttachmentPicker) return;
+    const closeOnOutside = (e: PointerEvent) => {
+      if (!(e.target instanceof Node)) return;
+      if (composerRef.current?.contains(e.target)) return;
+      setShowAttachmentPicker(false);
+      setAttachmentQuery('');
+    };
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowAttachmentPicker(false);
+        setAttachmentQuery('');
+      }
+    };
+    document.addEventListener('pointerdown', closeOnOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [showAttachmentPicker]);
+
+  const editorText = () => (editorRef.current?.innerText ?? '').replace(/\u00a0/g, ' ');
+
+  const textBeforeCaret = () => {
+    const editor = editorRef.current;
+    const sel = window.getSelection();
+    if (!editor || !sel || sel.rangeCount === 0) return '';
+    const range = sel.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return '';
+    const before = range.cloneRange();
+    before.selectNodeContents(editor);
+    before.setEnd(range.startContainer, range.startOffset);
+    return before.toString().replace(/\u00a0/g, ' ');
   };
 
-  const onChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const v = e.target.value;
-    setText(v);
-    if (isG && /@[^\s]*$/.test(v)) { setShowMention(true); setMentionSel(0); } else setShowMention(false);
-    resize();
+  const setCaretAfter = (node: Node) => {
+    const range = document.createRange();
+    range.setStartAfter(node);
+    range.collapse(true);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+  };
+
+  const setCaretToEnd = () => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      editorRef.current?.focus();
+      setCaretToEnd();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [conv.id]);
+
+  const findTextPosition = (editor: HTMLElement, target: number) => {
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let seen = 0;
+    let node = walker.nextNode() as Text | null;
+    while (node) {
+      const len = node.data.length;
+      if (seen + len >= target) return { node, offset: Math.max(0, target - seen) };
+      seen += len;
+      node = walker.nextNode() as Text | null;
+    }
+    return null;
+  };
+
+  const isMentionTag = (node: Node | null): node is HTMLElement =>
+    node instanceof HTMLElement && node.classList.contains('mention-tag');
+
+  const isContextAttachmentTag = (node: Node | null): node is HTMLElement =>
+    node instanceof HTMLElement && node.classList.contains('context-attachment-tag');
+
+  const isInlineTag = (node: Node | null): node is HTMLElement =>
+    isMentionTag(node) || isContextAttachmentTag(node);
+
+  const isBlankText = (node: Node | null): node is Text =>
+    node instanceof Text && /^[\s\u00a0]*$/.test(node.data);
+
+  const removeInlineTag = (tag: HTMLElement, spacers: Text[] = []) => {
+    const parent = tag.parentNode;
+    const index = parent ? Array.prototype.indexOf.call(parent.childNodes, tag) : -1;
+    spacers.forEach(spacer => spacer.remove());
+    tag.remove();
+    if (parent && index >= 0) {
+      const range = document.createRange();
+      range.setStart(parent, Math.min(index, parent.childNodes.length));
+      range.collapse(true);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+    setText(editorText());
+    return true;
+  };
+
+  const removeInlineTagBeforeChildIndex = (editor: HTMLElement, startIndex: number, seedSpacers: Text[] = []) => {
+    const spacers = [...seedSpacers];
+    for (let i = startIndex; i >= 0; i--) {
+      const child = editor.childNodes[i];
+      if (isInlineTag(child)) return removeInlineTag(child, spacers);
+      if (isBlankText(child)) {
+        spacers.push(child);
+        continue;
+      }
+      return false;
+    }
+    return false;
+  };
+
+  const syncEditor = () => {
+    const next = editorText();
+    setText(next);
+    const before = textBeforeCaret();
+    const mentionMatch = before.match(/@([^\s@#]*)$/);
+    const attachmentMatch = before.match(/#([^\s@#]*)$/);
+    if (members.length > 0 && mentionMatch) {
+      setShowMention(true);
+      setShowAttachmentPicker(false);
+      setMentionSel(0);
+      return;
+    }
+    if (attachmentMatch) {
+      setAttachmentQuery(attachmentMatch[1] ?? '');
+      setShowAttachmentPicker(true);
+      setShowMention(false);
+      setAttachmentSel(0);
+      return;
+    }
+    setShowMention(false);
+    setShowAttachmentPicker(false);
+  };
+
+  const insertPlainText = (value: string) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.focus();
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !editor.contains(sel.getRangeAt(0).startContainer)) {
+      setCaretToEnd();
+    }
+    document.execCommand('insertText', false, value);
+    syncEditor();
   };
 
   const pickMention = (a: Agent) => {
-    setText(t => t.replace(/@[^\s]*$/, '@' + a.name + ' '));
+    const editor = editorRef.current;
+    const sel = window.getSelection();
+    if (!editor || !sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return;
+
+    const before = textBeforeCaret();
+    const match = before.match(/@[^\s@]*$/);
+    if (match) {
+      const start = findTextPosition(editor, before.length - match[0].length);
+      if (start) {
+        range.setStart(start.node, start.offset);
+        range.deleteContents();
+      }
+    }
+
+    const tag = document.createElement('span');
+    tag.className = 'mention-tag';
+    tag.contentEditable = 'false';
+    tag.dataset.agentId = a.id;
+    tag.textContent = '@' + a.name;
+    const spacer = document.createTextNode('\u00a0');
+    range.insertNode(spacer);
+    range.insertNode(tag);
+    setCaretAfter(spacer);
     setShowMention(false);
-    taRef.current?.focus();
+    setText(editorText());
+    editor.focus();
   };
 
-  const send = () => {
-    if (!text.trim()) return;
-    onSend(text.trim());
+  const pickContextAttachment = (a: ConversationAttachment) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.focus();
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !editor.contains(sel.getRangeAt(0).startContainer)) {
+      setCaretToEnd();
+    }
+    const nextSel = window.getSelection();
+    if (!nextSel || nextSel.rangeCount === 0) return;
+    const range = nextSel.getRangeAt(0);
+
+    const before = textBeforeCaret();
+    const match = before.match(/#[^\s@#]*$/);
+    if (match) {
+      const start = findTextPosition(editor, before.length - match[0].length);
+      if (start) {
+        range.setStart(start.node, start.offset);
+        range.deleteContents();
+      }
+    }
+
+    const tag = document.createElement('span');
+    tag.className = 'context-attachment-tag';
+    tag.contentEditable = 'false';
+    tag.dataset.attachmentId = a.id;
+    tag.dataset.kind = a.kind;
+    tag.textContent = '#' + a.original_name;
+    const spacer = document.createTextNode('\u00a0');
+    range.insertNode(spacer);
+    range.insertNode(tag);
+    setCaretAfter(spacer);
+    setShowAttachmentPicker(false);
+    setAttachmentQuery('');
+    setText(editorText());
+    editor.focus();
+  };
+
+  const contextRefs = () => {
+    const editor = editorRef.current;
+    if (!editor) return [];
+    const ids = Array.from(editor.querySelectorAll<HTMLElement>('.context-attachment-tag'))
+      .map(node => node.dataset.attachmentId)
+      .filter((id): id is string => !!id);
+    const uniqueIds = Array.from(new Set(ids));
+    return uniqueIds
+      .map(id => contextAttachments.find(a => a.id === id))
+      .filter((a): a is ConversationAttachment => !!a);
+  };
+
+  const deleteAdjacentInlineTag = () => {
+    const editor = editorRef.current;
+    const sel = window.getSelection();
+    if (!editor || !sel || sel.rangeCount === 0 || !sel.isCollapsed) return false;
+    const range = sel.getRangeAt(0);
+
+    if (range.startContainer === editor) {
+      return removeInlineTagBeforeChildIndex(editor, range.startOffset - 1);
+    }
+
+    let child: Node | null = range.startContainer;
+    while (child && child.parentNode !== editor) child = child.parentNode;
+    if (!child) return false;
+
+    const childIndex = Array.prototype.indexOf.call(editor.childNodes, child);
+    if (childIndex < 0) return false;
+
+    if (child.nodeType === Node.TEXT_NODE) {
+      const textNode = child as Text;
+      const before = textNode.data.slice(0, range.startOffset);
+      const after = textNode.data.slice(range.startOffset);
+      if (before && !/^[\s\u00a0]*$/.test(before)) return false;
+
+      const spacers: Text[] = [];
+      if (before) {
+        if (after) textNode.data = after;
+        else spacers.push(textNode);
+      }
+      return removeInlineTagBeforeChildIndex(editor, childIndex - 1, spacers);
+    }
+
+    if (child instanceof HTMLElement && editor.contains(child)) {
+      const offset = range.startOffset;
+      if (offset > 0) return removeInlineTagBeforeChildIndex(child, offset - 1);
+      return removeInlineTagBeforeChildIndex(editor, childIndex - 1);
+    }
+
+    return false;
+  };
+
+  const send = async () => {
+    const outgoing = editorText().trim();
+    const refs = contextRefs();
+    if (!outgoing && pending.length === 0 && refs.length === 0) return;
+    const sent = await onSend(outgoing, pending, refs);
+    if (!sent) return;
     setText('');
-    if (taRef.current) taRef.current.style.height = 'auto';
+    setPending([]);
+    if (editorRef.current) editorRef.current.innerHTML = '';
     setShowMention(false);
+    setShowAttachmentPicker(false);
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -185,31 +589,138 @@ function Composer({ conv, agents, onSend }: {
       if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel(s => (s + 1) % members.length); return; }
       if (e.key === 'ArrowUp')   { e.preventDefault(); setMentionSel(s => (s - 1 + members.length) % members.length); return; }
     }
+    if (showAttachmentPicker) {
+      if ((e.key === 'Enter' || e.key === 'Tab') && visibleContextAttachments.length > 0) {
+        e.preventDefault();
+        pickContextAttachment(visibleContextAttachments[attachmentSel] ?? visibleContextAttachments[0]);
+        return;
+      }
+      if (e.key === 'ArrowDown' && visibleContextAttachments.length > 0) {
+        e.preventDefault();
+        setAttachmentSel(s => (s + 1) % visibleContextAttachments.length);
+        return;
+      }
+      if (e.key === 'ArrowUp' && visibleContextAttachments.length > 0) {
+        e.preventDefault();
+        setAttachmentSel(s => (s - 1 + visibleContextAttachments.length) % visibleContextAttachments.length);
+        return;
+      }
+    }
+    if (e.key === 'Backspace' && deleteAdjacentInlineTag()) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const nextBefore = textBeforeCaret() + e.key;
+      const mentionMatch = nextBefore.match(/@([^\s@#]*)$/);
+      const attachmentMatch = nextBefore.match(/#([^\s@#]*)$/);
+      if (members.length > 0 && mentionMatch) {
+        setShowMention(true);
+        setShowAttachmentPicker(false);
+        setMentionSel(0);
+      } else if (attachmentMatch) {
+        setAttachmentQuery(attachmentMatch[1] ?? '');
+        setShowAttachmentPicker(true);
+        setShowMention(false);
+        setAttachmentSel(0);
+      }
+    }
   };
 
   const agentName = isG ? '群聊' : (agents.find(a => conv.members.includes(a.id))?.name ?? 'Agent');
+  const pickFiles = (mode: 'file' | 'image') => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = '';
+    if (files.length === 0) return;
+    if (pending.length + files.length > 5) {
+      onError('一次最多待发送 5 个附件');
+      return;
+    }
+
+    const next: PendingAttachment[] = [];
+    for (const file of files) {
+      const ext = fileExt(file.name);
+      const allowed = mode === 'image' ? IMAGE_EXTS.includes(ext) : FILE_EXTS.includes(ext);
+      if (!allowed) {
+        onError(`不支持的附件类型：${file.name}`);
+        return;
+      }
+      if (file.size <= 0) {
+        onError(`附件为空：${file.name}`);
+        return;
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        onError(`附件超过 10 MB：${file.name}`);
+        return;
+      }
+      next.push({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, file, mode });
+    }
+    setPending(items => [...items, ...next]);
+    onError('');
+  };
+  const removePending = (id: string) => setPending(items => items.filter(item => item.id !== id));
 
   return (
-    <div className="composer">
+    <div ref={composerRef} className="composer">
       <div className="composer-tools">
-        <button className="icon-btn" title="添加附件"><Icon name="paperclip" size={18} /></button>
-        <button className="icon-btn" title="发送图片"><Icon name="image" size={18} /></button>
+        <input ref={fileInputRef} type="file" multiple accept={FILE_ACCEPT} hidden onChange={pickFiles('file')} />
+        <input ref={imageInputRef} type="file" multiple accept={IMAGE_ACCEPT} hidden onChange={pickFiles('image')} />
+        <button className="icon-btn" title="添加附件" disabled={busy} onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={18} /></button>
+        <button className="icon-btn" title="添加图片" disabled={busy} onClick={() => imageInputRef.current?.click()}><Icon name="image" size={18} /></button>
         {isG && (
-          <button className="icon-btn" title="@ 指定 Agent" onClick={() => { setText(t => t + '@'); setShowMention(true); taRef.current?.focus(); }}>
+          <button className="icon-btn" title="@ 指定 Agent" onClick={() => insertPlainText('@')}>
             <Icon name="at" size={18} />
           </button>
         )}
+        <button
+          className="context-attach-trigger"
+          title="引用历史附件到对话上下文"
+          disabled={busy}
+          onMouseDown={e => e.preventDefault()}
+          onClick={() => {
+            editorRef.current?.focus();
+            setAttachmentQuery('');
+            setAttachmentSel(0);
+            setShowMention(false);
+            setShowAttachmentPicker(v => !v);
+          }}
+        >
+          <Icon name="paperclip" size={14} />
+          <span>对话上下文附件</span>
+          <b>{contextAttachments.length}</b>
+        </button>
+        {pending.map(item => (
+          <div key={item.id} className="composer-pending-item">
+            <Icon name={item.mode === 'image' ? 'image' : 'file'} size={15} />
+            <span className="pending-name">{item.file.name}</span>
+            <span className="pending-size">{formatBytes(item.file.size)}</span>
+            <button className="icon-btn" title="移除附件" disabled={busy} onClick={() => removePending(item.id)}>
+              <Icon name="x" size={13} />
+            </button>
+          </div>
+        ))}
         <div style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', paddingRight: 4 }}>
           {isG ? '群聊共享上下文' : 'Enter 发送'}
         </div>
       </div>
+      {quote && (
+        <div className="composer-quote" title={`${quote.author}: ${quote.text}`}>
+          <Icon name="quote" size={15} />
+          <span className="quote-author">{quote.author}</span>
+          <span className="quote-text">{quote.text}</span>
+          <button className="icon-btn" title="取消引用" disabled={busy} onClick={onClearQuote}>
+            <Icon name="x" size={13} />
+          </button>
+        </div>
+      )}
       <div className="composer-box" style={{ position: 'relative' }}>
         {showMention && members.length > 0 && (
           <div className="mention-pop">
             <div className="mention-pop-label">@ 指定 Agent 回答</div>
             {members.map((a, i) => (
               <div key={a.id} className={'mention-row' + (i === mentionSel ? ' sel' : '')}
+                onMouseDown={e => e.preventDefault()}
                 onMouseEnter={() => setMentionSel(i)} onClick={() => pickMention(a)}>
                 <Avatar agent={a} size={30} />
                 <div><div className="nm">{a.name}</div><div className="rl">{a.role}</div></div>
@@ -217,9 +728,46 @@ function Composer({ conv, agents, onSend }: {
             ))}
           </div>
         )}
-        <textarea ref={taRef} rows={1} value={text} onChange={onChange} onKeyDown={onKey}
-          placeholder={isG ? '输入消息，@ 可指定 Agent 回答…' : `给 ${agentName} 发消息…`} />
-        <button className="send-btn" disabled={!text.trim()} onClick={send}>
+        {showAttachmentPicker && (
+          <div className="mention-pop attachment-pop">
+            <div className="mention-pop-label"># 引用对话上下文附件</div>
+            {visibleContextAttachments.length > 0 ? (
+              visibleContextAttachments.map((a, i) => (
+                <div
+                  key={a.id}
+                  className={'mention-row attachment-row' + (i === attachmentSel ? ' sel' : '')}
+                  onMouseDown={e => e.preventDefault()}
+                  onMouseEnter={() => setAttachmentSel(i)}
+                  onClick={() => pickContextAttachment(a)}
+                >
+                  <div className="attachment-row-ic">
+                    <Icon name={a.kind === 'image' ? 'image' : 'file'} size={15} />
+                  </div>
+                  <div style={{ minWidth: 0 }}>
+                    <div className="nm">{a.original_name}</div>
+                    <div className="rl">{a.mime} · {formatBytes(a.size_bytes)}</div>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="attachment-empty">暂无可引用附件</div>
+            )}
+          </div>
+        )}
+        <div
+          ref={editorRef}
+          className="composer-editor"
+          contentEditable={!busy}
+          suppressContentEditableWarning
+          data-placeholder={isG ? '输入消息，@ 可指定 Agent 回答…' : `给 ${agentName} 发消息…`}
+          onInput={syncEditor}
+          onKeyDown={onKey}
+          onPaste={e => {
+            e.preventDefault();
+            insertPlainText(e.clipboardData.getData('text/plain'));
+          }}
+        />
+        <button className="send-btn" disabled={(!text.trim() && pending.length === 0) || busy} onClick={send}>
           <Icon name="send" size={18} />
         </button>
       </div>
@@ -302,9 +850,13 @@ export default function ConversationsPage() {
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
+  const [confirmClear,   setConfirmClear]   = useState<string | null>(null);
   const [memberError,    setMemberError]    = useState('');
   const [sending,        setSending]        = useState(false);
   const [loadError,      setLoadError]      = useState('');
+  const [quoteDraft,     setQuoteDraft]     = useState<QuoteDraft | null>(null);
+  const [bubbleMenu,     setBubbleMenu]     = useState<BubbleMenuState | null>(null);
+  const [contextAttachments, setContextAttachments] = useState<ConversationAttachment[]>([]);
 
   const scrollRef       = useRef<HTMLDivElement>(null);
   const headerActionsRef= useRef<HTMLDivElement>(null);
@@ -332,6 +884,15 @@ export default function ConversationsPage() {
     setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
   }, []);
 
+  const loadContextAttachments = useCallback(async (cid: string) => {
+    if (!cid) {
+      setContextAttachments([]);
+      return;
+    }
+    const attachments = await listConversationAttachments(cid);
+    setContextAttachments(attachments);
+  }, []);
+
   // ── Effects ─────────────────────────────────────────────────────────────────
 
   // 1. Initial data load (fires once on mount).
@@ -343,27 +904,31 @@ export default function ConversationsPage() {
   //    markConversationRead is called with a 500 ms delay so it does not race
   //    with the list_messages response that unblocks the chat panel.
   useEffect(() => {
-    if (!active) { setMsgs([]); return; }
+    if (!active) { setMsgs([]); setContextAttachments([]); return; }
 
     let alive = true;
-    loadMsgs(active).then(() => {
+    Promise.all([loadMsgs(active), loadContextAttachments(active)]).then(() => {
       if (!alive) return;
       setConvs(cs => cs.map(c => c.id === active ? { ...c, unread: 0 } : c));
       setLoadError('');
     }).catch(e => { if (alive) setLoadError(String(e)); });
 
     const readTimer = setTimeout(() => {
-      markConversationRead(active).catch(() => {});
+      markConversationRead(active)
+        .then(() => window.dispatchEvent(new Event('AutoForge:badges-refresh')))
+        .catch(() => {});
     }, 500);
 
     return () => { alive = false; clearTimeout(readTimer); };
-  }, [active, loadMsgs]);
+  }, [active, loadMsgs, loadContextAttachments]);
 
   // 3. Reset search state when switching conversations.
   useEffect(() => {
     setShowSearch(false);
     setSearchQuery('');
     setActiveSearchId(null);
+    setQuoteDraft(null);
+    setBubbleMenu(null);
   }, [active]);
 
   // 4. Auto-focus search input when panel opens.
@@ -382,7 +947,7 @@ export default function ConversationsPage() {
     let unlisten: (() => void) | undefined;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    listen<unknown>('autoforge://event', e => {
+    listen<unknown>('AutoForge://event', e => {
       const ev = e.payload as { type?: string; conversation_id?: string };
       if (ev?.type !== 'message_received') return;
       if (timer) clearTimeout(timer);
@@ -393,8 +958,15 @@ export default function ConversationsPage() {
         if (isActive) {
           setConvs(cs => cs.map(c => c.id === cur ? { ...c, unread: 0 } : c));
           loadMsgs(cur).catch(() => {});
+          markConversationRead(cur)
+            .then(() => {
+              window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+              loadConvs().catch(() => {});
+            })
+            .catch(() => { loadConvs().catch(() => {}); });
+        } else {
+          loadConvs().catch(() => {});
         }
-        loadConvs().catch(() => {});
       }, 300);
     }).then(fn => {
       if (cancelled) fn(); // immediately unregister if StrictMode already cleaned up
@@ -420,6 +992,18 @@ export default function ConversationsPage() {
     return () => document.removeEventListener('pointerdown', close);
   }, [showMembers, showContext, showSearch]);
 
+  useEffect(() => {
+    if (!bubbleMenu) return;
+    const close = () => setBubbleMenu(null);
+    const closeOnEscape = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('pointerdown', close);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', close);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [bubbleMenu]);
+
   // ── Derived state ──────────────────────────────────────────────────────────
 
   const conv = useMemo(() => convs.find(c => c.id === active), [active, convs]);
@@ -444,7 +1028,9 @@ export default function ConversationsPage() {
     return msgs.flatMap(m => {
       try {
         const bs: BlockType[] = JSON.parse(m.content_json);
-        return bs.filter(b => b.t === 'file' || b.t === 'image' || b.t === 'artifact' || b.t === 'code');
+        return bs
+          .filter(b => b.t === 'file' || b.t === 'image' || b.t === 'artifact' || b.t === 'code')
+          .map(block => ({ block, messageId: m.id }));
       } catch { return []; }
     });
   }, [msgs, showContext]);
@@ -465,16 +1051,92 @@ export default function ConversationsPage() {
     messageRefs.current[id]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   };
 
-  const onSend = async (text: string) => {
-    if (!conv || sending) return;
-    setSending(true);
+  const openBubbleMenu = (e: React.MouseEvent, message: Message, author: string) => {
+    e.preventDefault();
+    setBubbleMenu({
+      x: Math.min(e.clientX, window.innerWidth - 132),
+      y: Math.min(e.clientY, window.innerHeight - 96),
+      message,
+      author,
+    });
+  };
+
+  const copyBubbleMessage = async () => {
+    if (!bubbleMenu) return;
     try {
-      const m = await sendMessage({ conversation_id: conv.id, content_json: JSON.stringify([{ t: 'md', md: text }]) });
+      await copyText(msgText(bubbleMenu.message).trim());
+      setLoadError('');
+    } catch (e) {
+      setLoadError(String(e));
+    } finally {
+      setBubbleMenu(null);
+    }
+  };
+
+  const quoteBubbleMessage = () => {
+    if (!bubbleMenu) return;
+    const text = msgText(bubbleMenu.message).replace(/\s+/g, ' ').trim();
+    setQuoteDraft({
+      message_id: bubbleMenu.message.id,
+      author: bubbleMenu.author,
+      text: text || '消息内容为空',
+      created_at: bubbleMenu.message.created_at,
+    });
+    setBubbleMenu(null);
+  };
+
+  const onSend = async (
+    text: string,
+    attachments: PendingAttachment[],
+    contextRefs: ConversationAttachment[],
+  ) => {
+    if (!conv || sending) return false;
+    setSending(true);
+    setLoadError('');
+    try {
+      const blocks: BlockType[] = [];
+      if (text) blocks.push({ t: 'md', md: text });
+
+      for (const item of attachments) {
+        const data_base64 = await fileToBase64(item.file);
+        const attachment = await importAttachment({
+          conversation_id: conv.id,
+          file_name: item.file.name,
+          mime_hint: item.file.type || '',
+          data_base64,
+        });
+        if (item.mode === 'image' && attachment.kind !== 'image') {
+          throw new Error(`${item.file.name} 不是受支持的图片`);
+        }
+        blocks.push(attachmentBlock(attachment));
+      }
+
+      for (const attachment of contextRefs) {
+        blocks.push(contextAttachmentBlock(attachment));
+      }
+
+      if (quoteDraft) {
+        blocks.push({
+          t: 'quote_ref',
+          message_id: quoteDraft.message_id,
+          author: quoteDraft.author,
+          text: quoteDraft.text,
+          created_at: quoteDraft.created_at,
+        });
+      }
+
+      if (blocks.length === 0) return false;
+      const m = await sendMessage({ conversation_id: conv.id, content_json: JSON.stringify(blocks) });
       setMsgs(ms => [...ms, m]);
+      setQuoteDraft(null);
+      loadConvs().catch(() => {});
+      if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
       setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
 
       let respondAgentId: string | null = null;
-      if (conv.conv_type === 'direct') {
+      if (!text) {
+        respondAgentId = null;
+      } else if (conv.conv_type === 'direct') {
         respondAgentId = conv.members[0] ?? null;
       } else {
         const mention = text.match(/@([^\s，。@]+)/);
@@ -496,6 +1158,10 @@ export default function ConversationsPage() {
           setMsgs(ms => ms.filter(m => m.id !== typingId));
         }
       }
+      return true;
+    } catch (e) {
+      setLoadError(String(e));
+      return false;
     } finally {
       setSending(false);
     }
@@ -544,17 +1210,34 @@ export default function ConversationsPage() {
     }
   };
 
+  const clearConversation = async () => {
+    if (!confirmClear) return;
+    const id = confirmClear;
+    setLoadError('');
+    try {
+      await clearConversationMessages(id);
+      const remaining = await listConversations();
+      setConvs(remaining);
+      setMsgs([]);
+      setContextAttachments([]);
+      setQuoteDraft(null);
+      setBubbleMenu(null);
+      setConfirmClear(null);
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+      if (!remaining.some(c => c.id === id)) {
+        setActive(remaining[0]?.id ?? '');
+      }
+    } catch (e) {
+      setLoadError(String(e));
+      setConfirmClear(null);
+    }
+  };
+
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <>
       <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} />
-
-      {loadError && (
-        <div style={{ position: 'fixed', right: 18, bottom: 18, zIndex: 260, maxWidth: 420, padding: '10px 12px', borderRadius: 10, border: '1px solid var(--red)', background: 'var(--bg-2)', color: 'var(--red)', fontSize: 12.5, boxShadow: 'var(--shadow-lg)' }}>
-          对话加载失败：{loadError}
-        </div>
-      )}
 
       {conv ? (
         <div className="content">
@@ -587,6 +1270,20 @@ export default function ConversationsPage() {
               </button>
               <button className="icon-btn" title="搜索对话" onClick={() => { setShowSearch(v => !v); setShowMembers(false); setShowContext(false); }}>
                 <Icon name="search" size={18} />
+              </button>
+              <button
+                className="icon-btn"
+                title="清空对话内容"
+                disabled={visibleMsgCount === 0}
+                style={{ color: 'var(--red)' }}
+                onClick={() => {
+                  setConfirmClear(conv.id);
+                  setShowMembers(false);
+                  setShowContext(false);
+                  setShowSearch(false);
+                }}
+              >
+                <Icon name="trash" size={17} />
               </button>
 
               {/* Members panel */}
@@ -636,15 +1333,36 @@ export default function ConversationsPage() {
                   <div style={{ padding: '7px 8px 9px', color: 'var(--text-3)', fontSize: 12, lineHeight: 1.5 }}>
                     消息 {msgs.length} 条 · 上下文块 {contextBlocks.length} 个
                   </div>
-                  {contextBlocks.slice(-8).reverse().map((b, i) => (
-                    <div key={i} className="mention-row" style={{ alignItems: 'flex-start' }}>
+                  {contextBlocks.slice(-8).reverse().map(({ block: b, messageId }, i) => (
+                    <div
+                      key={`${messageId}-${i}`}
+                      className="mention-row"
+                      title="定位到这条对话内容"
+                      onClick={() => {
+                        jumpToMessage(messageId);
+                        setShowContext(false);
+                      }}
+                    >
                       <div className="cfg-logo" style={{ width: 30, height: 30, background: b.t === 'image' ? 'var(--blue)' : b.t === 'file' ? 'var(--amber)' : 'var(--ember)' }}>
                         <Icon name={b.t === 'image' ? 'image' : b.t === 'file' ? 'file' : b.t === 'code' ? 'code' : 'zap'} size={15} />
                       </div>
-                      <div style={{ minWidth: 0 }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
                         <div className="nm">{b.t === 'file' ? b.name : b.t === 'image' ? b.label : b.t === 'code' ? `${b.lang} 代码片段` : b.title}</div>
                         <div className="rl">{b.t === 'file' || b.t === 'image' ? b.meta : b.t === 'artifact' ? b.kind : '可引用上下文'}</div>
                       </div>
+                      {(b.t === 'file' || b.t === 'image') && b.id && (
+                        <button
+                          className="icon-btn"
+                          title="用本机默认程序打开"
+                          style={{ width: 26, height: 26, flex: 'none' }}
+                          onClick={e => {
+                            e.stopPropagation();
+                            openAttachment(b.id!).catch(err => setLoadError(String(err)));
+                          }}
+                        >
+                          <Icon name="external" size={13} />
+                        </button>
+                      )}
                     </div>
                   ))}
                   {contextBlocks.length === 0 && <div style={{ padding: '10px 8px', color: 'var(--text-3)', fontSize: 13 }}>暂无附件或上下文块</div>}
@@ -669,7 +1387,7 @@ export default function ConversationsPage() {
                           <div className="nm">{sender}</div>
                           <div className="rl">{text || '消息内容为空'}</div>
                         </div>
-                        <span className="req-id" style={{ fontSize: 10 }}>
+                        <span className="chat-search-time">
                           {new Date(message.created_at).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}
                         </span>
                       </div>
@@ -693,12 +1411,32 @@ export default function ConversationsPage() {
                 isGroup={conv.conv_type === 'group'}
                 highlighted={activeSearchId === m.id}
                 rowRef={el => { messageRefs.current[m.id] = el; }}
+                onBubbleContextMenu={openBubbleMenu}
               />
             ))}
           </div>
 
+          {loadError && (
+            <div className="chat-error-bar">
+              <Icon name="alert" size={14} />
+              <span>操作失败：{loadError}</span>
+              <button className="icon-btn" title="关闭提示" onClick={() => setLoadError('')}>
+                <Icon name="x" size={13} />
+              </button>
+            </div>
+          )}
+
           {/* ── Composer ── */}
-          <Composer conv={conv} agents={agents} onSend={onSend} />
+          <Composer
+            conv={conv}
+            agents={agents}
+            contextAttachments={contextAttachments}
+            onSend={onSend}
+            onError={setLoadError}
+            quote={quoteDraft}
+            onClearQuote={() => setQuoteDraft(null)}
+            busy={sending}
+          />
         </div>
       ) : (
         <div className="content">
@@ -707,12 +1445,31 @@ export default function ConversationsPage() {
       )}
 
       {showNew && <NewGroupModal agents={agents} onClose={() => setShowNew(false)} onCreate={handleNewGroup} />}
+      {bubbleMenu && (
+        <div
+          className="bubble-menu"
+          style={{ left: bubbleMenu.x, top: bubbleMenu.y }}
+          onPointerDown={e => e.stopPropagation()}
+          onContextMenu={e => e.preventDefault()}
+        >
+          <button onClick={copyBubbleMessage}><Icon name="copy" size={14} />复制</button>
+          <button onClick={quoteBubbleMessage}><Icon name="quote" size={14} />引用</button>
+        </div>
+      )}
       {confirmDissolve && (
         <ConfirmModal
           msg="确认解散这个群聊？解散后将删除群聊记录、成员关系和历史消息。"
           okLabel="确认解散"
           onOk={dissolveGroup}
           onCancel={() => setConfirmDissolve(null)}
+        />
+      )}
+      {confirmClear && (
+        <ConfirmModal
+          msg="确认清空当前对话内容？消息、已读状态和附件记录会被删除；单聊清空后将从左侧列表消失。"
+          okLabel="确认清空"
+          onOk={clearConversation}
+          onCancel={() => setConfirmClear(null)}
         />
       )}
     </>

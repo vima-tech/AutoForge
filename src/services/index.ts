@@ -80,6 +80,11 @@ export interface Message {
   id: string; conversation_id: string; from_agent: string | null;
   content_json: string; created_at: string;
 }
+export interface ConversationAttachment {
+  id: string; conversation_id: string; original_name: string;
+  stored_name: string; rel_path: string; mime: string; kind: string;
+  size_bytes: number; sha256: string; created_at: string;
+}
 export interface PipelineStats {
   pending_analysis: number; pending_review_1: number;
   executing: number; pending_review_2: number;
@@ -212,6 +217,15 @@ export const listMessages = (conversationId: string) =>
   ipc<Message[]>('list_messages', { conversationId });
 export const sendMessage = (payload: { conversation_id: string; content_json: string }) =>
   ipc<Message>('send_message', { payload });
+export const importAttachment = (payload: {
+  conversation_id: string; file_name: string; mime_hint: string; data_base64: string;
+}) => ipc<ConversationAttachment>('import_attachment', { payload });
+export const listConversationAttachments = (conversationId: string) =>
+  ipc<ConversationAttachment[]>('list_conversation_attachments', { conversationId });
+export const openAttachment = (attachmentId: string) =>
+  ipc<void>('open_attachment', { attachmentId });
+export const attachmentDataUrl = (attachmentId: string) =>
+  ipc<string>('attachment_data_url', { attachmentId });
 export const createGroupConversation = (
   name: string, memberIds: string[], color?: string, initial?: string,
 ) => ipc<Conversation>('create_group_conversation', { name, memberIds, color, initial });
@@ -221,6 +235,8 @@ export const removeConversationMember = (conversationId: string, agentId: string
   ipc<Conversation>('remove_conversation_member', { conversationId, agentId });
 export const deleteGroupConversation = (conversationId: string) =>
   ipc<void>('delete_group_conversation', { conversationId });
+export const clearConversationMessages = (conversationId: string) =>
+  ipc<void>('clear_conversation_messages', { conversationId });
 export const markConversationRead = (conversationId: string) =>
   ipc<void>('mark_conversation_read', { conversationId });
 export const agentReply = (conversationId: string, agentId: string) =>
@@ -252,3 +268,6 @@ export const updateAgent = (id: string, payload: Partial<{
 export const deleteAgent = (id: string) => ipc<void>('delete_agent', { id });
 export const setAgentForgeRole = (agentId: string, role: string) =>
   ipc<Agent[]>('set_agent_forge_role', { agentId, role });
+
+export const openUrl = (url: string) => ipc<void>('open_url', { url });
+export const seedDemoData = () => ipc<string>('seed_demo_data');

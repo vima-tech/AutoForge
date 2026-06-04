@@ -27,8 +27,9 @@ export type BlockType =
   | { t: 'md'; md: string }
   | { t: 'code'; lang: string; code: string }
   | { t: 'typing' }
-  | { t: 'file'; name: string; meta: string; color: string }
-  | { t: 'image'; label: string; meta: string; color: string }
+  | { t: 'file'; id?: string; name: string; meta: string; color: string; mime?: string; size?: number }
+  | { t: 'image'; id?: string; label: string; meta: string; color: string; mime?: string; size?: number }
+  | { t: 'quote_ref'; message_id: string; author: string; text: string; created_at: string }
   | { t: 'artifact'; kind: string; title: string; rows: [string, string][]; body: string };
 
 export interface Message {

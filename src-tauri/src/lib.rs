@@ -27,7 +27,9 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir).expect("create data dir");
             let db_path = data_dir.join("autoforge.db").to_string_lossy().to_string();
             let worktrees = data_dir.join("worktrees").to_string_lossy().to_string();
+            let attachments = data_dir.join("attachments").to_string_lossy().to_string();
             state::init_worktrees_base(worktrees);
+            state::init_attachments_base(attachments);
 
             let db = tauri::async_runtime::block_on(async {
                 db::init(&db_path).await.expect("db init failed")
@@ -46,6 +48,15 @@ pub fn run() {
                 job_tx,
                 concurrency,
             });
+
+            // 显式设置窗口图标，确保 Linux 任务栏在开发模式下也能显示正确图标
+            if let Some(win) = app.get_webview_window("main") {
+                let icon_bytes = include_bytes!("../icons/icon.png");
+                if let Ok(icon) = tauri::image::Image::from_bytes(icon_bytes) {
+                    let _ = win.set_icon(icon);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -67,10 +78,15 @@ pub fn run() {
             commands::conversations::list_conversations,
             commands::conversations::list_messages,
             commands::conversations::send_message,
+            commands::conversations::import_attachment,
+            commands::conversations::list_conversation_attachments,
+            commands::conversations::open_attachment,
+            commands::conversations::attachment_data_url,
             commands::conversations::create_group_conversation,
             commands::conversations::add_conversation_member,
             commands::conversations::remove_conversation_member,
             commands::conversations::delete_group_conversation,
+            commands::conversations::clear_conversation_messages,
             commands::conversations::mark_conversation_read,
             commands::conversations::agent_reply,
             commands::settings::list_llm_configs,
@@ -95,7 +111,9 @@ pub fn run() {
             commands::system::list_test_sessions,
             commands::system::list_scan_findings,
             commands::system::list_admin_decisions,
+            commands::demo::seed_demo_data,
+            commands::demo::open_url,
         ])
         .run(tauri::generate_context!())
-        .expect("error running autoforge");
+        .expect("error running AutoForge");
 }

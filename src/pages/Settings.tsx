@@ -471,25 +471,47 @@ function SecuritySettings() {
 
 function AboutSettings() {
   const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [healthError, setHealthError] = useState(false);
+  const [healthLoading, setHealthLoading] = useState(true);
   const [previews, setPreviews] = useState<PreviewEnvironment[]>([]);
   const [tests, setTests] = useState<TestSession[]>([]);
 
+  const loadHealth = () => {
+    setHealthLoading(true);
+    setHealthError(false);
+    getSystemHealth()
+      .then(h => { setHealth(h); setHealthError(false); })
+      .catch(() => { setHealth(null); setHealthError(true); })
+      .finally(() => setHealthLoading(false));
+  };
+
   useEffect(() => {
-    getSystemHealth().then(setHealth).catch(() => setHealth(null));
+    loadHealth();
     listPreviewEnvironments().then(setPreviews).catch(() => setPreviews([]));
     listTestSessions().then(setTests).catch(() => setTests([]));
   }, []);
 
+  const dbVal   = healthLoading ? '…' : health?.db_ok ? 'OK' : healthError ? '错误' : '—';
+  const dbColor = healthLoading ? 'var(--text-3)' : health?.db_ok ? 'var(--green)' : healthError ? 'var(--red)' : 'var(--text-3)';
+  const authVal   = healthLoading ? '…' : health ? (health.claude_auth ? 'OK' : '未登录') : '—';
+  const authColor = healthLoading ? 'var(--text-3)' : (health?.claude_auth) ? 'var(--green)' : health ? 'var(--red)' : 'var(--text-3)';
+
   return (
     <div className="set-inner rise">
       <div className="set-h">关于 AutoForge</div>
-      <div className="set-desc">运行健康、Claude 认证和后台运行态概览。</div>
+      <div className="set-desc" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span>运行健康、Claude 认证和后台运行态概览。</span>
+        {healthError && <span style={{ fontSize: 12, color: 'var(--red)' }}>状态获取失败</span>}
+        <button className="btn" style={{ marginLeft: 'auto', fontSize: 12, padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading}>
+          {healthLoading ? '加载中…' : '刷新'}
+        </button>
+      </div>
       <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', marginBottom: 16 }}>
         {[
-          { label: '数据库', val: health?.db_ok ? 'OK' : '—', color: 'var(--green)' },
-          { label: 'Claude Auth', val: health?.claude_auth ? 'OK' : '未登录', color: health?.claude_auth ? 'var(--green)' : 'var(--red)' },
-          { label: '版本', val: health?.version ?? '—', color: 'var(--blue)' },
-          { label: '阶段', val: health?.stage ?? '—', color: 'var(--ember)' },
+          { label: '数据库',     val: dbVal,                         color: dbColor },
+          { label: 'Claude Auth', val: authVal,                      color: authColor },
+          { label: '版本',       val: health?.version ?? (healthLoading ? '…' : '—'), color: 'var(--blue)' },
+          { label: '阶段',       val: health?.stage    ?? (healthLoading ? '…' : '—'), color: 'var(--ember)' },
         ].map(x => (
           <div className="stat" key={x.label}>
             <div className="stat-val" style={{ color: x.color }}>{x.val}</div>
