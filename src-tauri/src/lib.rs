@@ -32,8 +32,13 @@ pub fn run() {
             let db = tauri::async_runtime::block_on(async {
                 db::init(&db_path).await.expect("db init failed")
             });
+            let (max_slots, pause_threshold, queue_strategy) =
+                tauri::async_runtime::block_on(commands::system::load_concurrency_settings(&db))
+                    .expect("load concurrency settings failed");
 
-            let concurrency = core::concurrency::ConcurrencyManager::new(5, 20);
+            let concurrency =
+                core::concurrency::ConcurrencyManager::new(max_slots, pause_threshold);
+            concurrency.update_config(None, None, Some(queue_strategy));
             let job_tx = tasks::runner::start(db.clone(), app_handle, concurrency.clone());
 
             app.manage(AppState {
@@ -65,6 +70,8 @@ pub fn run() {
             commands::conversations::create_group_conversation,
             commands::conversations::add_conversation_member,
             commands::conversations::remove_conversation_member,
+            commands::conversations::delete_group_conversation,
+            commands::conversations::mark_conversation_read,
             commands::conversations::agent_reply,
             commands::settings::list_llm_configs,
             commands::settings::create_llm_config,
@@ -81,6 +88,7 @@ pub fn run() {
             commands::system::read_spec,
             commands::system::write_spec,
             commands::system::update_concurrency_config,
+            commands::system::get_concurrency_config,
             commands::system::list_preview_environments,
             commands::system::list_test_sessions,
             commands::system::list_scan_findings,

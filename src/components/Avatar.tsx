@@ -54,8 +54,8 @@ export function MeAvatar({ size = 40 }: { size?: number }) {
         height: size,
         fontSize: size * 0.4,
         borderRadius: size * 0.32,
-        background: 'linear-gradient(135deg,#3a2c1c,#211a13)',
-        color: 'var(--ember-soft)',
+        background: 'var(--me-avatar-bg)',
+        color: 'var(--me-avatar-color)',
         border: '1px solid var(--border-strong)',
       }}
     >

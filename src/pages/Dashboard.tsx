@@ -238,35 +238,6 @@ export default function Dashboard() {
             </div>}
         </div>
 
-        {/* pipeline */}
-        <div className="panel" style={{ marginBottom: 16 }}>
-          <div className="panel-head">
-            <div className="eyebrow" style={{ fontSize: 14 }}><span className="en">PIPELINE</span><span className="cn">· 完整流水线</span></div>
-            <div className="sec-kicker">{carouselPaused ? '已暂停' : '自动轮播'} · {projectPipelines.length ? `${(carouselIndex % projectPipelines.length) + 1}/${projectPipelines.length}` : '0/0'}</div>
-          </div>
-          <div className="project-pipelines" onMouseEnter={() => setCarouselPaused(true)} onMouseLeave={() => setCarouselPaused(false)}>
-            {!visiblePipeline
-              ? <div className="empty-state">暂无在产项目流水线</div>
-              : (
-                <div className="project-pipeline-row carousel-card" key={visiblePipeline.project_id}>
-                <div className="project-pipeline-head">
-                  <div className="project-slot-name">{visiblePipeline.project_name}</div>
-                  <span className="sec-kicker">需求 {visiblePipeline.total_issues}</span>
-                </div>
-                <div className="pipe scroll">
-                  {buildPipeline(visiblePipeline).map((p, i) => (
-                    <div className="pipe-stage" key={i}>
-                      <div className={'pipe-node ' + p.state}><Icon name={p.ic} size={20} /></div>
-                      <div className="pipe-cnt" style={{ color: p.state==='active'?'var(--ember)':p.state==='warn'?'var(--amber)':p.state==='done'?'var(--green-soft)':'var(--text-2)' }}>{p.cnt}</div>
-                      <div className="pipe-name">{p.name}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              )}
-          </div>
-        </div>
-
         <div className="dash-cols">
           {/* queue */}
           <div className="panel">
@@ -348,6 +319,35 @@ export default function Dashboard() {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* pipeline */}
+        <div className="panel" style={{ marginBottom: 16 }}>
+          <div className="panel-head">
+            <div className="eyebrow" style={{ fontSize: 14 }}><span className="en">PIPELINE</span><span className="cn">· 完整流水线</span></div>
+            <div className="sec-kicker">{carouselPaused ? '已暂停' : '自动轮播'} · {projectPipelines.length ? `${(carouselIndex % projectPipelines.length) + 1}/${projectPipelines.length}` : '0/0'}</div>
+          </div>
+          <div className="project-pipelines" onMouseEnter={() => setCarouselPaused(true)} onMouseLeave={() => setCarouselPaused(false)}>
+            {!visiblePipeline
+              ? <div className="empty-state">暂无在产项目流水线</div>
+              : (
+                <div className="project-pipeline-row carousel-card" key={visiblePipeline.project_id}>
+                <div className="project-pipeline-head">
+                  <div className="project-slot-name">{visiblePipeline.project_name}</div>
+                  <span className="sec-kicker">需求 {visiblePipeline.total_issues}</span>
+                </div>
+                <div className="pipe scroll">
+                  {buildPipeline(visiblePipeline).map((p, i) => (
+                    <div className="pipe-stage" key={i}>
+                      <div className={'pipe-node ' + p.state}><Icon name={p.ic} size={20} /></div>
+                      <div className="pipe-cnt" style={{ color: p.state==='active'?'var(--ember)':p.state==='warn'?'var(--amber)':p.state==='done'?'var(--green-soft)':'var(--text-2)' }}>{p.cnt}</div>
+                      <div className="pipe-name">{p.name}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              )}
           </div>
         </div>
       </div>

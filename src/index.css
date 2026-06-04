@@ -43,6 +43,13 @@
 
   --titlebar: rgba(28,21,14,.72);
   --rail-bg: #110d09;
+  --rail-border: rgba(0,0,0,.4);
+  --rail-item-color: #8a7c69;
+  --rail-item-hover-bg: rgba(255,255,255,.06);
+  --rail-item-hover-color: #d8c9b4;
+  --me-avatar-bg: linear-gradient(135deg,#3a2c1c,#211a13);
+  --me-avatar-color: var(--ember-soft);
+  --av-status-border: var(--bg-1);
 
   --border: rgba(255,206,150,.10);
   --border-strong: rgba(255,206,150,.18);
@@ -79,7 +86,14 @@
   --surface-active: #efe4d0;
 
   --titlebar: rgba(250,246,239,.78);
-  --rail-bg: #2a2017;
+  --rail-bg: #f4eee3;
+  --rail-border: rgba(74,52,28,.12);
+  --rail-item-color: #8a7c69;
+  --rail-item-hover-bg: rgba(74,52,28,.06);
+  --rail-item-hover-color: #2c241a;
+  --me-avatar-bg: linear-gradient(135deg,#fbf7f0,#f4eee3);
+  --me-avatar-color: var(--ember-deep);
+  --av-status-border: var(--bg-3);
 
   --border: rgba(74,52,28,.12);
   --border-strong: rgba(74,52,28,.20);
@@ -198,7 +212,7 @@ button { font-family: inherit; cursor: pointer; }
   align-items: center;
   padding: 14px 0 12px;
   gap: 6px;
-  border-right: 1px solid rgba(0,0,0,.4);
+  border-right: 1px solid var(--rail-border);
 }
 .rail-logo {
   width: 38px; height: 38px; border-radius: 11px;
@@ -213,16 +227,16 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: 13px;
   border: none;
   background: transparent;
-  color: #8a7c69;
+  color: var(--rail-item-color);
   display: grid; place-items: center;
   position: relative;
   transition: background .15s, color .15s, transform .1s;
 }
 .rail-item svg { width: 23px; height: 23px; }
-.rail-item:hover { background: rgba(255,255,255,.06); color: #d8c9b4; }
+.rail-item:hover { background: var(--rail-item-hover-bg); color: var(--rail-item-hover-color); }
 .rail-item:active { transform: scale(.94); }
 .rail-item.active { background: var(--ember-tint-strong); color: var(--ember-soft); }
-[data-theme="light"] .rail-item.active { color: #ffd9b0; background: rgba(232,119,46,.28); }
+[data-theme="light"] .rail-item.active { color: var(--ember-deep); background: rgba(217,106,34,.20); }
 .rail-item.active::before {
   content: ""; position: absolute; left: -14px; top: 50%; transform: translateY(-50%);
   width: 4px; height: 22px; border-radius: 0 4px 4px 0; background: var(--ember);
@@ -337,7 +351,7 @@ button { font-family: inherit; cursor: pointer; }
 .av-status {
   position: absolute; bottom: -2px; right: -2px;
   width: 13px; height: 13px; border-radius: 50%;
-  border: 2.5px solid var(--bg-1);
+  border: 2.5px solid var(--av-status-border);
 }
 
 .seg { display: inline-flex; background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 2px; }

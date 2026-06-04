@@ -1,6 +1,7 @@
 use crate::core::event;
 use crate::models::conversation::{Conversation, ConversationDetail, Message, SendMessage};
 use crate::state::AppState;
+use std::collections::HashMap;
 use tauri::{AppHandle, State};
 use uuid::Uuid;
 
@@ -16,34 +17,69 @@ pub async fn list_conversations(
             .await
             .map_err(|e| e.to_string())?;
 
+    let member_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conversation_id, agent_id
+         FROM conversation_members
+         ORDER BY conversation_id, agent_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut members_by_conversation: HashMap<String, Vec<String>> = HashMap::new();
+    for (conversation_id, agent_id) in member_rows {
+        members_by_conversation
+            .entry(conversation_id)
+            .or_default()
+            .push(agent_id);
+    }
+
+    let last_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT m.conversation_id, m.content_json, m.created_at
+         FROM messages m
+         WHERE m.id = (
+             SELECT id
+             FROM messages
+             WHERE conversation_id = m.conversation_id
+             ORDER BY created_at DESC
+             LIMIT 1
+         )",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let last_by_conversation: HashMap<String, (String, String)> = last_rows
+        .into_iter()
+        .map(|(conversation_id, content_json, created_at)| {
+            (conversation_id, (content_json, created_at))
+        })
+        .collect();
+
+    let unread_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT m.conversation_id, COUNT(*)
+         FROM messages m
+         LEFT JOIN conversation_reads r ON r.conversation_id = m.conversation_id
+         WHERE m.from_agent IS NOT NULL
+           AND m.created_at > COALESCE(r.read_at, '1970-01-01')
+         GROUP BY m.conversation_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let unread_by_conversation: HashMap<String, i64> = unread_rows.into_iter().collect();
+
     let mut details = Vec::new();
     for conv in convs {
-        // Get members
-        let members: Vec<(String,)> =
-            sqlx::query_as("SELECT agent_id FROM conversation_members WHERE conversation_id=?")
-                .bind(&conv.id)
-                .fetch_all(&state.db)
-                .await
-                .unwrap_or_default();
+        let member_ids = members_by_conversation
+            .get(&conv.id)
+            .cloned()
+            .unwrap_or_default();
 
-        let member_ids: Vec<String> = members.into_iter().map(|(id,)| id).collect();
-
-        // Last message
-        let last: Option<(String, String)> = sqlx::query_as(
-            "SELECT content_json, created_at FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT 1"
-        )
-        .bind(&conv.id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
-
-        let (last_message, last_time) = match last {
+        let (last_message, last_time) = match last_by_conversation.get(&conv.id).cloned() {
             Some((msg, time)) => (Some(msg), Some(time)),
             None => (None, None),
         };
 
-        let unread = unread_count(&state.db, &conv.id).await?;
+        let unread = *unread_by_conversation.get(&conv.id).unwrap_or(&0);
 
         details.push(ConversationDetail {
             id: conv.id,
@@ -108,7 +144,15 @@ pub async fn list_messages(
     state: State<'_, AppState>,
 ) -> Result<Vec<Message>, String> {
     sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC",
+        "SELECT *
+         FROM (
+             SELECT *
+             FROM messages
+             WHERE conversation_id=?
+             ORDER BY created_at DESC
+             LIMIT 300
+         )
+         ORDER BY created_at ASC",
     )
     .bind(&conversation_id)
     .fetch_all(&state.db)

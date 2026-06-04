@@ -325,15 +325,22 @@ pub async fn update_agent(
 
 #[tauri::command]
 pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    sqlx::query("DELETE FROM agents WHERE id=?")
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM conversation_members WHERE agent_id=?")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    sqlx::query("DELETE FROM agents WHERE id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
-/// Atomically clears all agents with `role` then assigns `agent_id` (empty = unassign only).
+/// Assigns `role` to `agent_id` (empty = unassign only). forge_role is comma-separated so the
+/// same agent can hold both 'analysis' and 'test' simultaneously.
 /// Returns full refreshed agent list — frontend needs no local diff logic.
 #[tauri::command]
 pub async fn set_agent_forge_role(
@@ -341,20 +348,55 @@ pub async fn set_agent_forge_role(
     role: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Agent>, String> {
+    // Load current state to compute new comma-separated role lists in Rust.
+    let holders = sqlx::query_as::<_, Agent>(
+        "SELECT * FROM agents WHERE forge_role IS NOT NULL",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
-    sqlx::query("UPDATE agents SET forge_role=NULL WHERE forge_role=?")
-        .bind(&role)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    // Remove `role` from every agent that currently holds it.
+    for a in &holders {
+        if let Some(fr) = &a.forge_role {
+            if fr.split(',').any(|r| r == role) {
+                let remaining: Vec<&str> = fr.split(',').filter(|&r| r != role).collect();
+                let new_fr: Option<String> = if remaining.is_empty() {
+                    None
+                } else {
+                    Some(remaining.join(","))
+                };
+                sqlx::query("UPDATE agents SET forge_role=? WHERE id=?")
+                    .bind(&new_fr)
+                    .bind(&a.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // Add `role` to the target agent (merging with its existing roles).
     if !agent_id.is_empty() {
+        let existing: Vec<String> = holders
+            .iter()
+            .find(|a| a.id == agent_id)
+            .and_then(|a| a.forge_role.as_deref())
+            .map(|fr| fr.split(',').filter(|&r| r != role).map(str::to_string).collect())
+            .unwrap_or_default();
+        let mut new_roles = existing;
+        new_roles.push(role.clone());
+        let new_fr = new_roles.join(",");
         sqlx::query("UPDATE agents SET forge_role=? WHERE id=?")
-            .bind(&role)
+            .bind(&new_fr)
             .bind(&agent_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
     }
+
     tx.commit().await.map_err(|e| e.to_string())?;
     sqlx::query_as::<_, Agent>("SELECT * FROM agents ORDER BY created_at")
         .fetch_all(&state.db)

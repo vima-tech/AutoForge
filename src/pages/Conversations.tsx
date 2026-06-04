@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import { Avatar, MeAvatar } from '../components/Avatar';
@@ -10,6 +10,8 @@ import {
   type Conversation, type Message, type Agent,
 } from '../services';
 import type { BlockType } from '../data/mock';
+
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 function ConvList({ convs, agents, active, onSelect, onNew }: {
   convs: Conversation[]; agents: Agent[];
@@ -235,6 +237,7 @@ export default function ConversationsPage() {
   const [confirmDissolve, setConfirmDissolve] = useState<string | null>(null);
   const [memberError, setMemberError] = useState('');
   const [sending, setSending] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const headerActionsRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -242,9 +245,10 @@ export default function ConversationsPage() {
 
   const loadConvs = useCallback(async () => {
     const [cs, as] = await Promise.all([listConversations(), listAgents()]);
-    setConvs(cs); setAgents(as);
-    if (!active && cs.length > 0) setActive(cs[0].id);
-  }, [active]);
+    setConvs(cs);
+    setAgents(as);
+    setActive(current => current || cs[0]?.id || '');
+  }, []);
 
   const loadMsgs = useCallback(async (cid: string) => {
     if (!cid) return;
@@ -253,7 +257,18 @@ export default function ConversationsPage() {
     setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
   }, []);
 
-  useEffect(() => { loadConvs(); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    loadConvs()
+      .then(() => {
+        if (!cancelled) setLoadError('');
+      })
+      .catch(e => {
+        if (!cancelled) setLoadError(String(e));
+      });
+    return () => { cancelled = true; };
+  }, [loadConvs]);
+
   useEffect(() => {
     if (!active) {
       setMsgs([]);
@@ -262,10 +277,17 @@ export default function ConversationsPage() {
 
     let cancelled = false;
     (async () => {
-      await loadMsgs(active);
-      await markConversationRead(active);
+      try {
+        await loadMsgs(active);
+        await markConversationRead(active);
+        if (!cancelled) {
+          await loadConvs();
+          setLoadError('');
+        }
+      } catch (e) {
+        if (!cancelled) setLoadError(String(e));
+      }
       if (!cancelled) {
-        await loadConvs();
         window.dispatchEvent(new Event('autoforge:badges-refresh'));
       }
     })();
@@ -285,20 +307,35 @@ export default function ConversationsPage() {
   }, [showSearch]);
 
   useEffect(() => {
+    if (!isTauri) return;
+
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
     let unlisten: (() => void) | undefined;
     listen<{ conversation_id: string }>('autoforge://event', e => {
       const ev = e.payload as { type?: string; conversation_id?: string };
-      if (ev?.type === 'message_received' && ev.conversation_id === active) {
-        loadMsgs(active).then(() => markConversationRead(active)).then(loadConvs).then(() => {
-          window.dispatchEvent(new Event('autoforge:badges-refresh'));
-        });
-      } else {
-        loadConvs().then(() => window.dispatchEvent(new Event('autoforge:badges-refresh')));
-      }
-    }).then(fn => { unlisten = fn; });
-    return () => unlisten?.();
-  }, [active, loadConvs, loadMsgs]);
+      if (ev?.type !== 'message_received') return;
 
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        const refresh = ev.conversation_id === active && active
+          ? loadMsgs(active).then(() => markConversationRead(active)).then(loadConvs)
+          : loadConvs();
+        refresh
+          .then(() => {
+            setLoadError('');
+            window.dispatchEvent(new Event('autoforge:badges-refresh'));
+          })
+          .catch(err => setLoadError(String(err)));
+      }, 250);
+    }).then(fn => { unlisten = fn; }).catch(err => {
+      setLoadError(String(err));
+    });
+    return () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      unlisten?.();
+    };
+  }, [active, loadConvs, loadMsgs]);
   useEffect(() => {
     if (!showMembers && !showContext && !showSearch) return;
 
@@ -316,30 +353,44 @@ export default function ConversationsPage() {
     return () => document.removeEventListener('pointerdown', closeIfOutside);
   }, [showMembers, showContext, showSearch]);
 
-  const conv = convs.find(c => c.id === active);
-  const agentMap = Object.fromEntries(agents.map(a => [a.id, a]));
-  const convMembers = conv ? conv.members.map(id => agentMap[id]).filter(Boolean) : [];
-  const availableAgents = conv ? agents.filter(a => !conv.members.includes(a.id)) : [];
+  const conv = useMemo(() => convs.find(c => c.id === active), [active, convs]);
+  const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
+  const convMembers = useMemo(
+    () => conv ? conv.members.map(id => agentMap[id]).filter(Boolean) : [],
+    [agentMap, conv],
+  );
+  const availableAgents = useMemo(
+    () => conv ? agents.filter(a => !conv.members.includes(a.id)) : [],
+    [agents, conv],
+  );
   const memberNames = convMembers.map(a => a.name).join(' · ');
   const chatHeadSub = memberNames.length > 40 ? memberNames.slice(0, 40) + '...' : memberNames;
-  const contextBlocks = msgs.flatMap(m => {
-    try {
-      const blocks: BlockType[] = JSON.parse(m.content_json);
-      return blocks.filter(b => b.t === 'file' || b.t === 'image' || b.t === 'artifact' || b.t === 'code');
-    } catch {
-      return [];
-    }
-  });
+  const contextBlocks = useMemo(() => {
+    if (!showContext) return [];
+    return msgs.flatMap(m => {
+      try {
+        const blocks: BlockType[] = JSON.parse(m.content_json);
+        return blocks.filter(b => b.t === 'file' || b.t === 'image' || b.t === 'artifact' || b.t === 'code');
+      } catch {
+        return [];
+      }
+    });
+  }, [msgs, showContext]);
   const normalizedSearch = searchQuery.trim().toLowerCase();
-  const searchResults = normalizedSearch
-    ? msgs
-        .filter(m => !m.id.startsWith('typing-') && messageText(m).toLowerCase().includes(normalizedSearch))
-        .map(m => ({
-          message: m,
-          text: messageText(m).replace(/\s+/g, ' ').trim(),
-          sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : '我',
-        }))
-    : [];
+  const visibleMessageCount = useMemo(
+    () => msgs.filter(m => !m.id.startsWith('typing-')).length,
+    [msgs],
+  );
+  const searchResults = useMemo(() => {
+    if (!showSearch || !normalizedSearch) return [];
+    return msgs
+      .filter(m => !m.id.startsWith('typing-') && messageText(m).toLowerCase().includes(normalizedSearch))
+      .map(m => ({
+        message: m,
+        text: messageText(m).replace(/\s+/g, ' ').trim(),
+        sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : '我',
+      }));
+  }, [agentMap, msgs, normalizedSearch, showSearch]);
 
   const jumpToMessage = (id: string) => {
     setActiveSearchId(id);
@@ -442,6 +493,11 @@ export default function ConversationsPage() {
   return (
     <>
       <ConvList convs={convs} agents={agents} active={active} onSelect={id => setActive(id)} onNew={() => setShowNew(true)} />
+      {loadError && (
+        <div style={{ position: 'fixed', right: 18, bottom: 18, zIndex: 260, maxWidth: 420, padding: '10px 12px', borderRadius: 10, border: '1px solid var(--red)', background: 'var(--bg-2)', color: 'var(--red)', fontSize: 12.5, boxShadow: 'var(--shadow-lg)' }}>
+          对话加载失败：{loadError}
+        </div>
+      )}
       {conv
         ? <div className="content">
             <div className="chat-head">
@@ -544,7 +600,7 @@ export default function ConversationsPage() {
                       />
                     </div>
                     <div className="chat-search-meta">
-                      {normalizedSearch ? `找到 ${searchResults.length} 条匹配消息` : `当前对话 ${msgs.filter(m => !m.id.startsWith('typing-')).length} 条消息`}
+                      {normalizedSearch ? `找到 ${searchResults.length} 条匹配消息` : `当前对话 ${visibleMessageCount} 条消息`}
                     </div>
                     <div className="chat-search-results scroll">
                       {normalizedSearch && searchResults.map(({ message, text, sender }) => (
