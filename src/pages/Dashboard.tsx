@@ -92,9 +92,17 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadAll();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const debounced = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { timer = null; loadAll(); }, 500);
+    };
     let unlisten: (() => void) | undefined;
-    listen<unknown>('autoforge://event', () => loadAll()).then(fn => { unlisten = fn; });
-    return () => unlisten?.();
+    listen<unknown>('autoforge://event', debounced).then(fn => { unlisten = fn; });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
   }, [loadAll]);
 
   // Build backlog map

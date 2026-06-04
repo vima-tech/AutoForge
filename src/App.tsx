@@ -142,24 +142,18 @@ export default function App() {
 
   useEffect(() => {
     refreshBadges();
-    const refresh = () => refreshBadges();
-    window.addEventListener('autoforge:badges-refresh', refresh);
-
-    let unlisten: (() => void) | undefined;
-    if (isTauri) {
-      listen('autoforge://event', refresh).then(fn => { unlisten = fn; });
-    }
-
-    return () => {
-      window.removeEventListener('autoforge:badges-refresh', refresh);
-      unlisten?.();
-    };
+    const onCustom = () => refreshBadges();
+    window.addEventListener('autoforge:badges-refresh', onCustom);
+    return () => window.removeEventListener('autoforge:badges-refresh', onCustom);
   }, [refreshBadges]);
 
-  // Global event bus → desktop notifications (design §8.2 / tasks G-02, G-03)
+  // Single consolidated listener for all autoforge://event traffic.
+  // Three separate listen() calls were previously registered here — each event
+  // fired all three handlers simultaneously, causing 5+ concurrent IPC calls
+  // (including a Rust check_auth() that spawns 2 subprocesses every time).
   useEffect(() => {
     if (!isTauri) return;
-    let unlisten: (() => void) | undefined;
+
     const notify = (title: string, body: string) => {
       try {
         if (typeof Notification === 'undefined') return;
@@ -172,11 +166,37 @@ export default function App() {
         }
       } catch { /* notifications unavailable — ignore */ }
     };
+
+    const refreshHealth = () => getSystemHealth().then(setHealth).catch(() => setHealth(null));
+
+    // Debounce heavy refresh calls: collapse bursts within 500 ms into one call.
+    let badgeTimer: ReturnType<typeof setTimeout> | null = null;
+    let healthTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedBadges = () => {
+      if (badgeTimer) clearTimeout(badgeTimer);
+      badgeTimer = setTimeout(() => { badgeTimer = null; refreshBadges(); }, 500);
+    };
+    const debouncedHealth = () => {
+      if (healthTimer) clearTimeout(healthTimer);
+      healthTimer = setTimeout(() => { healthTimer = null; refreshHealth(); }, 500);
+    };
+
+    let unlisten: (() => void) | undefined;
     listen<Record<string, unknown>>('autoforge://event', e => {
       const ev = e.payload as {
         type?: string; issue_title?: string; stage?: number;
         cr_id?: string; iteration?: number; status?: string; summary?: string;
       };
+
+      // Update last event label immediately (cheap state update, no IPC).
+      const evType = typeof ev?.type === 'string' ? ev.type : 'event';
+      setLastEvent(evType);
+
+      // Debounced IPC refreshes.
+      debouncedBadges();
+      debouncedHealth();
+
+      // Desktop notifications (only for actionable events).
       switch (ev?.type) {
         case 'review_needed':
           notify(`需要审核 · 节点 ${ev.stage ?? '?'}`, ev.issue_title ?? '有新的待审核项');
@@ -194,12 +214,11 @@ export default function App() {
           break;
       }
     }).then(fn => { unlisten = fn; });
-    return () => unlisten?.();
-  }, []);
 
-  // Startup health check (task G-01): warn if claude CLI is not logged in.
-  useEffect(() => {
-    if (!isTauri) return;
+    // Initial loads.
+    refreshHealth();
+
+    // Startup auth warning (task G-01).
     getSystemHealth().then(h => {
       if (!h.claude_auth) {
         try {
@@ -209,20 +228,13 @@ export default function App() {
         } catch { /* ignore */ }
       }
     }).catch(() => { /* backend not ready — ignore */ });
-  }, []);
 
-  useEffect(() => {
-    if (!isTauri) return;
-    const refresh = () => getSystemHealth().then(setHealth).catch(() => setHealth(null));
-    refresh();
-    let unlisten: (() => void) | undefined;
-    listen<Record<string, unknown>>('autoforge://event', e => {
-      const type = typeof e.payload?.type === 'string' ? e.payload.type : 'event';
-      setLastEvent(type);
-      refresh();
-    }).then(fn => { unlisten = fn; });
-    return () => unlisten?.();
-  }, []);
+    return () => {
+      if (badgeTimer) clearTimeout(badgeTimer);
+      if (healthTimer) clearTimeout(healthTimer);
+      unlisten?.();
+    };
+  }, [refreshBadges]);
 
   const stageLabel = health
     ? health.stage === 'paused' ? '系统暂停'

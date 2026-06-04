@@ -1,5 +1,14 @@
 use anyhow::Result;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+
+// Cache check_auth() result for 60 s to avoid spawning 2 processes per event.
+static AUTH_CACHE: OnceLock<Mutex<Option<(bool, Instant)>>> = OnceLock::new();
+
+fn auth_cache() -> &'static Mutex<Option<(bool, Instant)>> {
+    AUTH_CACHE.get_or_init(|| Mutex::new(None))
+}
 
 /// Run claude CLI in text-only mode, returns stdout
 pub async fn run_text(prompt: &str, system_prompt: Option<&str>) -> Result<String> {
@@ -28,9 +37,31 @@ pub async fn run_text(prompt: &str, system_prompt: Option<&str>) -> Result<Strin
 }
 
 /// Check if claude CLI is installed AND logged in.
-/// Design / CLAUDE.md requirement: judge real auth state via `claude auth status`,
-/// not just `--version` (which only proves the binary exists).
+/// Result is cached for 60 s — avoid spawning 2 processes on every event.
 pub async fn check_auth() -> bool {
+    const TTL: Duration = Duration::from_secs(60);
+
+    // Fast path: return cached result if still fresh.
+    {
+        let cache = auth_cache().lock().unwrap();
+        if let Some((result, ts)) = *cache {
+            if ts.elapsed() < TTL {
+                return result;
+            }
+        }
+    }
+
+    let result = check_auth_inner().await;
+
+    {
+        let mut cache = auth_cache().lock().unwrap();
+        *cache = Some((result, Instant::now()));
+    }
+
+    result
+}
+
+async fn check_auth_inner() -> bool {
     let version_ok = Command::new("claude")
         .arg("--version")
         .output()
@@ -59,7 +90,6 @@ pub async fn check_auth() -> bool {
                 || text.contains("logged in")
                 || text.contains("authenticated")
         }
-        // `auth status` subcommand unavailable on this CLI build → fall back to "binary present"
         Err(_) => version_ok,
     }
 }

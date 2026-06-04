@@ -192,12 +192,21 @@ export default function AuditPage() {
   }, [activeCr, activeProject]);
 
   useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const debounced = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        if (activeProject) loadCrs(activeProject.id);
+        loadProjectReviewCounts();
+      }, 500);
+    };
     let unlisten: (() => void) | undefined;
-    listen('autoforge://event', () => {
-      if (activeProject) loadCrs(activeProject.id);
-      loadProjectReviewCounts();
-    }).then(fn => { unlisten = fn; });
-    return () => unlisten?.();
+    listen('autoforge://event', debounced).then(fn => { unlisten = fn; });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
   }, [activeProject, loadCrs, loadProjectReviewCounts]);
 
   const doReview = async (decision: 'approved'|'revision'|'rejected') => {
