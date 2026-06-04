@@ -8,6 +8,8 @@ use uuid::Uuid;
 pub async fn list_conversations(
     state: State<'_, AppState>,
 ) -> Result<Vec<ConversationDetail>, String> {
+    ensure_direct_conversations(&state.db).await?;
+
     let convs =
         sqlx::query_as::<_, Conversation>("SELECT * FROM conversations ORDER BY created_at DESC")
             .fetch_all(&state.db)
@@ -41,6 +43,8 @@ pub async fn list_conversations(
             None => (None, None),
         };
 
+        let unread = unread_count(&state.db, &conv.id).await?;
+
         details.push(ConversationDetail {
             id: conv.id,
             conv_type: conv.conv_type,
@@ -49,13 +53,53 @@ pub async fn list_conversations(
             initial: conv.initial,
             created_at: conv.created_at,
             members: member_ids,
-            unread: 0,
+            unread,
             last_message,
             last_time,
         });
     }
 
     Ok(details)
+}
+
+async fn ensure_direct_conversations(db: &crate::db::Db) -> Result<(), String> {
+    let missing_agents: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT a.id, a.color, a.initial
+         FROM agents a
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM conversation_members cm
+             JOIN conversations c ON c.id=cm.conversation_id
+             WHERE cm.agent_id=a.id AND c.type='direct'
+         )",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for (agent_id, color, initial) in missing_agents {
+        let conversation_id = format!("conv-direct-{}", agent_id);
+        sqlx::query(
+            "INSERT OR IGNORE INTO conversations (id, type, name, color, initial) VALUES (?, 'direct', NULL, ?, ?)",
+        )
+        .bind(&conversation_id)
+        .bind(&color)
+        .bind(&initial)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO conversation_members (conversation_id, agent_id) VALUES (?, ?)",
+        )
+        .bind(&conversation_id)
+        .bind(&agent_id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -214,6 +258,78 @@ pub async fn remove_conversation_member(
     conversation_detail(&state.db, conv).await
 }
 
+#[tauri::command]
+pub async fn delete_group_conversation(
+    conversation_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let conv = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+
+    if conv.conv_type != "group" {
+        return Err("只能解散群聊".to_string());
+    }
+
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM messages WHERE conversation_id=?")
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM conversation_reads WHERE conversation_id=?")
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM conversation_members WHERE conversation_id=?")
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn mark_conversation_read(
+    conversation_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if exists.is_none() {
+        return Err(format!("conversation {} not found", conversation_id));
+    }
+
+    sqlx::query(
+        "INSERT INTO conversation_reads (conversation_id, read_at)
+         VALUES (?, datetime('now'))
+         ON CONFLICT(conversation_id) DO UPDATE SET read_at=excluded.read_at",
+    )
+    .bind(&conversation_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 async fn conversation_detail(
     db: &crate::db::Db,
     conv: Conversation,
@@ -239,6 +355,8 @@ async fn conversation_detail(
         None => (None, None),
     };
 
+    let unread = unread_count(db, &conv.id).await?;
+
     Ok(ConversationDetail {
         id: conv.id,
         conv_type: conv.conv_type,
@@ -247,10 +365,30 @@ async fn conversation_detail(
         initial: conv.initial,
         created_at: conv.created_at,
         members: member_ids,
-        unread: 0,
+        unread,
         last_message,
         last_time,
     })
+}
+
+async fn unread_count(db: &crate::db::Db, conversation_id: &str) -> Result<i64, String> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)
+         FROM messages
+         WHERE conversation_id=?
+           AND from_agent IS NOT NULL
+           AND created_at > COALESCE(
+             (SELECT read_at FROM conversation_reads WHERE conversation_id=?),
+             '1970-01-01'
+           )",
+    )
+    .bind(conversation_id)
+    .bind(conversation_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(count)
 }
 
 #[tauri::command]

@@ -112,17 +112,32 @@ async fn wait_for_execution_slot(
 ) -> Result<()> {
     loop {
         let status = concurrency.status();
-        let (executing,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='executing'")
+        let (project_id,): (String,) =
+            sqlx::query_as("SELECT project_id FROM change_requests WHERE id=?")
+                .bind(cr_id)
                 .fetch_one(db)
                 .await?;
-        let (pending_review,): (i64,) =
+        let (executing,): (i64,) =
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM change_requests WHERE project_id=? AND status='executing'",
+            )
+            .bind(&project_id)
+            .fetch_one(db)
+            .await?;
+        let (project_pending_review,): (i64,) =
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM change_requests WHERE project_id=? AND status='pending_review_2'",
+            )
+            .bind(&project_id)
+            .fetch_one(db)
+            .await?;
+        let (global_pending_review,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'")
                 .fetch_one(db)
                 .await?;
 
-        let paused = pending_review as usize >= status.pause_threshold;
-        let full = (executing + pending_review) as usize >= status.max_slots;
+        let paused = global_pending_review as usize >= status.pause_threshold;
+        let full = (executing + project_pending_review) as usize >= status.max_slots;
         if !paused && !full {
             let result = sqlx::query(
                 "UPDATE change_requests SET status='executing', updated_at=datetime('now') WHERE id=? AND status='pending_execution'",

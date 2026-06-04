@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import Icon from './components/Icon';
@@ -7,7 +7,7 @@ import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
 import SettingsPage from './pages/Settings';
-import { getSystemHealth, type SystemHealth } from './services';
+import { getSystemHealth, getPipelineStats, listConversations, type SystemHealth } from './services';
 
 type Page = 'home' | 'chat' | 'audit' | 'settings';
 type Theme = 'dark' | 'light';
@@ -108,21 +108,53 @@ function ForgeLogo({ size = 38 }: { size?: number }) {
   );
 }
 
-const NAV: { id: Page; name: string; ic: string; badge?: number }[] = [
+const NAV: { id: Page; name: string; ic: string }[] = [
   { id: 'home',  name: '主页',     ic: 'home' },
-  { id: 'chat',  name: '对话',     ic: 'chat',  badge: 3 },
-  { id: 'audit', name: '功能审计', ic: 'audit', badge: 4 },
+  { id: 'chat',  name: '对话',     ic: 'chat' },
+  { id: 'audit', name: '功能审计', ic: 'audit' },
 ];
 
 export default function App() {
-  const [page,  setPage]  = useState<Page>('home');
+  const [page,  setPage]  = useState<Page>(() => {
+    const saved = sessionStorage.getItem('autoforge:page') as Page | null;
+    return saved && (['home', 'chat', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
+  });
   const [theme, setTheme] = useState<Theme>('dark');
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [lastEvent, setLastEvent] = useState('');
+  const [badges, setBadges] = useState({ chat: 0, audit: 0 });
+
+  const refreshBadges = useCallback(async () => {
+    try {
+      const [convs, stats] = await Promise.all([listConversations(), getPipelineStats()]);
+      setBadges({
+        chat: convs.reduce((sum, c) => sum + (c.unread ?? 0), 0),
+        audit: stats.pending_review_2,
+      });
+    } catch {
+      setBadges({ chat: 0, audit: 0 });
+    }
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    refreshBadges();
+    const refresh = () => refreshBadges();
+    window.addEventListener('autoforge:badges-refresh', refresh);
+
+    let unlisten: (() => void) | undefined;
+    if (isTauri) {
+      listen('autoforge://event', refresh).then(fn => { unlisten = fn; });
+    }
+
+    return () => {
+      window.removeEventListener('autoforge:badges-refresh', refresh);
+      unlisten?.();
+    };
+  }, [refreshBadges]);
 
   // Global event bus → desktop notifications (design §8.2 / tasks G-02, G-03)
   useEffect(() => {
@@ -197,6 +229,7 @@ export default function App() {
       : health.stage === 'throttled' ? '单线程降速'
       : '流水线运行中'
     : '状态检测中';
+  const navBadge = (id: Page) => id === 'chat' ? badges.chat : id === 'audit' ? badges.audit : 0;
 
   return (
     <div className="os-window">
@@ -208,7 +241,7 @@ export default function App() {
           <span className={'chip ' + (health?.stage === 'paused' ? 'red' : health?.stage === 'throttled' ? 'amber' : 'green')} style={{ padding: '3px 9px' }}>
             <span className={'dot ' + (health?.stage === 'paused' ? 'red' : 'green')} style={{ width: 6, height: 6, boxShadow: 'none' }} />
             {stageLabel}
-            {health && <span style={{ marginLeft: 6, fontFamily: 'var(--font-mono)' }}>{health.active_slots}/{health.max_slots}</span>}
+            {health && <span style={{ marginLeft: 6, fontFamily: 'var(--font-mono)' }}>{health.active_slots}/{health.total_slot_capacity}</span>}
             {lastEvent && <span style={{ marginLeft: 6, color: 'var(--text-faint)' }}>{lastEvent}</span>}
           </span>
         </div>
@@ -219,17 +252,20 @@ export default function App() {
           <div className="rail-logo" title="AutoForge">
             <ForgeLogo size={22} />
           </div>
-          {NAV.map(n => (
+          {NAV.map(n => {
+            const badge = navBadge(n.id);
+            return (
             <button
               key={n.id}
               className={'rail-item' + (page === n.id ? ' active' : '')}
-              onClick={() => setPage(n.id)}
+              onClick={() => { setPage(n.id); sessionStorage.setItem('autoforge:page', n.id); }}
               title={n.name}
             >
               <Icon name={n.ic} size={23} />
-              {n.badge && page !== n.id && <span className="rail-badge">{n.badge}</span>}
+              {badge > 0 && page !== n.id && <span className="rail-badge">{badge}</span>}
             </button>
-          ))}
+            );
+          })}
           <div className="rail-spacer" />
           <button
             className="rail-item"
@@ -240,7 +276,7 @@ export default function App() {
           </button>
           <button
             className={'rail-item' + (page === 'settings' ? ' active' : '')}
-            onClick={() => setPage('settings')}
+            onClick={() => { setPage('settings'); sessionStorage.setItem('autoforge:page', 'settings'); }}
             title="设置"
           >
             <Icon name="settings" size={23} />

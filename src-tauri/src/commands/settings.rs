@@ -116,11 +116,18 @@ pub async fn update_llm_config(
 
 #[tauri::command]
 pub async fn delete_llm_config(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    sqlx::query("DELETE FROM llm_configs WHERE id=?")
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE agents SET llm_id=NULL WHERE llm_id=?")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM llm_configs WHERE id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -324,4 +331,33 @@ pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), 
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Atomically clears all agents with `role` then assigns `agent_id` (empty = unassign only).
+/// Returns full refreshed agent list — frontend needs no local diff logic.
+#[tauri::command]
+pub async fn set_agent_forge_role(
+    agent_id: String,
+    role: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Agent>, String> {
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE agents SET forge_role=NULL WHERE forge_role=?")
+        .bind(&role)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !agent_id.is_empty() {
+        sqlx::query("UPDATE agents SET forge_role=? WHERE id=?")
+            .bind(&role)
+            .bind(&agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    sqlx::query_as::<_, Agent>("SELECT * FROM agents ORDER BY created_at")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }

@@ -75,6 +75,7 @@ pub fn run() {
             commands::settings::create_agent,
             commands::settings::update_agent,
             commands::settings::delete_agent,
+            commands::settings::set_agent_forge_role,
             commands::system::system_health,
             commands::system::pipeline_stats,
             commands::system::read_spec,

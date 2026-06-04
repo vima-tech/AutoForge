@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
+import { ProjectCreateModal, ConfirmProjectDeleteModal } from '../components/ProjectDialogs';
 import {
-  listProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2,
+  listProjects, deleteProject, listChangeRequests, getWorktreeSession, getCodeDiff, review2,
   listPreviewEnvironments,
   type Project, type ChangeRequest, type WorktreeSession,
   type PreviewEnvironment,
@@ -46,14 +47,31 @@ function parseDiff(raw: string): Hunk[] {
   return hunks;
 }
 
-function AuditList({ projects, activeProject, setActiveProject, crs, activeCr, onSelect }: {
+function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, activeCr, onSelect, onAddProject, onDeleteProject }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
-  crs: ChangeRequest[]; activeCr: string; onSelect: (id: string) => void;
+  projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; activeCr: string; onSelect: (id: string) => void;
+  onAddProject: () => void; onDeleteProject: (project: Project) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const projectMenuRef = React.useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const closeIfOutside = (e: PointerEvent) => {
+      const target = e.target;
+      if (!(target instanceof Node)) return;
+      if (projectMenuRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+
+    document.addEventListener('pointerdown', closeIfOutside);
+    return () => document.removeEventListener('pointerdown', closeIfOutside);
+  }, [open]);
+
   return (
     <div className="list-col">
-      <div className="audit-proj">
+      <div className="audit-proj" ref={projectMenuRef}>
         {activeProject && (
           <div className="proj-select" onClick={() => setOpen(o => !o)}>
             <div className="proj-logo" style={{ background: '#e8772e' }}>{activeProject.name[0]}</div>
@@ -64,18 +82,36 @@ function AuditList({ projects, activeProject, setActiveProject, crs, activeCr, o
             <Icon name="chevDown" size={16} style={{ color: 'var(--text-3)' }} />
           </div>
         )}
+        {!activeProject && (
+          <button className="btn btn-primary" style={{ justifyContent:'center', width:'100%' }} onClick={onAddProject}>
+            <Icon name="plus" size={15} />添加项目
+          </button>
+        )}
         {open && (
-          <div style={{ background:'var(--bg-3)',border:'1px solid var(--border-strong)',borderRadius:12,padding:6,marginTop:-4 }}>
+          <div className="mention-pop audit-project-pop" style={{ left: 16, top: 64, bottom: 'auto', width: 'calc(var(--list-w) - 32px)', marginBottom: 0 }}>
             {projects.map(p => (
               <div key={p.id} className="mention-row" onClick={() => { setActiveProject(p); setOpen(false); }}>
                 <div className="proj-logo" style={{ background:'#e8772e',width:30,height:30,fontSize:13 }}>{p.name[0]}</div>
-                <div className="nm">{p.name}</div>
-                {p.id === activeProject?.id && <Icon name="check" size={15} style={{ marginLeft:'auto',color:'var(--ember)' }} />}
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="nm">{p.name}</div>
+                  <div className="rl">{p.description || p.slug}</div>
+                </div>
+                <span className={'chip ' + ((projectReviewCounts[p.id] ?? 0) > 0 ? 'amber' : '')} style={{ padding:'1px 7px',fontSize:10 }}>
+                  {projectReviewCounts[p.id] ?? 0} 待审
+                </span>
+                {p.id === activeProject?.id && <Icon name="check" size={15} style={{ color:'var(--ember)' }} />}
+                <button className="icon-btn" title="删除项目" style={{ width: 26, height: 26, color: 'var(--red)' }} onClick={(e) => { e.stopPropagation(); onDeleteProject(p); setOpen(false); }}>
+                  <Icon name="trash" size={13} />
+                </button>
               </div>
             ))}
+            <div style={{ height: 1, background: 'var(--border)', margin: '6px 4px' }} />
+            <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => { onAddProject(); setOpen(false); }}>
+              <Icon name="plus" size={14} />添加项目
+            </button>
           </div>
         )}
-        {!open && <button className="btn" style={{ justifyContent:'center', width:'100%' }}><Icon name="play" size={15} />预览记录已接入</button>}
+        <button className="btn" style={{ justifyContent:'center', width:'100%' }}><Icon name="play" size={15} />预览记录已接入</button>
       </div>
       <div className="list-group-label">待审核需求 · 审核节点 2</div>
       <div className="list-body scroll" style={{ paddingTop: 0 }}>
@@ -108,21 +144,38 @@ export default function AuditPage() {
   const [advice, setAdvice] = useState('');
   const [decided, setDecided] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
+  const [showProjectCreate, setShowProjectCreate] = useState(false);
+  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
+  const [projectError, setProjectError] = useState('');
+
+  const loadProjectReviewCounts = useCallback(async () => {
+    const pending = await listChangeRequests(undefined, 'pending_review_2');
+    setProjectReviewCounts(pending.reduce<Record<string, number>>((acc, cr) => {
+      acc[cr.project_id] = (acc[cr.project_id] ?? 0) + 1;
+      return acc;
+    }, {}));
+  }, []);
+
+  const loadProjects = useCallback(async () => {
+    const ps = await listProjects();
+    setProjects(ps);
+    setActiveProject(current => current && ps.some(p => p.id === current.id) ? current : (ps[0] ?? null));
+  }, []);
 
   useEffect(() => {
-    listProjects().then(ps => {
-      setProjects(ps);
-      if (ps.length > 0) setActiveProject(ps[0]);
-    });
-  }, []);
+    loadProjects();
+    loadProjectReviewCounts();
+  }, [loadProjects, loadProjectReviewCounts]);
 
   const loadCrs = useCallback(async (projectId: string) => {
     const all = await listChangeRequests(projectId, 'pending_review_2');
     setCrs(all);
-    if (all.length > 0 && !activeCr) setActiveCr(all[0].id);
+    if (all.length > 0 && !all.some(cr => cr.id === activeCr)) setActiveCr(all[0].id);
+    if (all.length === 0) setActiveCr('');
   }, [activeCr]);
 
-  useEffect(() => { if (activeProject) loadCrs(activeProject.id); }, [activeProject]);
+  useEffect(() => { if (activeProject) loadCrs(activeProject.id); }, [activeProject, loadCrs]);
 
   useEffect(() => {
     if (!activeCr) return;
@@ -140,9 +193,12 @@ export default function AuditPage() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    listen('autoforge://event', () => { if (activeProject) loadCrs(activeProject.id); }).then(fn => { unlisten = fn; });
+    listen('autoforge://event', () => {
+      if (activeProject) loadCrs(activeProject.id);
+      loadProjectReviewCounts();
+    }).then(fn => { unlisten = fn; });
     return () => unlisten?.();
-  }, [activeProject, loadCrs]);
+  }, [activeProject, loadCrs, loadProjectReviewCounts]);
 
   const doReview = async (decision: 'approved'|'revision'|'rejected') => {
     if (!activeCr || submitting) return;
@@ -151,7 +207,25 @@ export default function AuditPage() {
       await review2(activeCr, { decision, suggestions: advice || undefined });
       setDecided(decision);
       if (activeProject) await loadCrs(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('autoforge:badges-refresh'));
     } finally { setSubmitting(false); }
+  };
+
+  const doDeleteProject = async () => {
+    if (!projectToDelete) return;
+    setProjectError('');
+    try {
+      await deleteProject(projectToDelete.id);
+      setProjectToDelete(null);
+      setActiveCr('');
+      await loadProjects();
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('autoforge:badges-refresh'));
+    } catch (e) {
+      setProjectError(String(e));
+      setProjectToDelete(null);
+    }
   };
 
   const cr = crs.find(c => c.id === activeCr);
@@ -160,8 +234,22 @@ export default function AuditPage() {
 
   return (
     <>
-      <AuditList projects={projects} activeProject={activeProject} setActiveProject={p => { setActiveProject(p); setActiveCr(''); }} crs={crs} activeCr={activeCr} onSelect={id => { setActiveCr(id); setDecided(null); }} />
+      {showProjectCreate && (
+        <ProjectCreateModal
+          onClose={() => setShowProjectCreate(false)}
+          onCreated={async (project) => {
+            setShowProjectCreate(false);
+            await loadProjects();
+            await loadProjectReviewCounts();
+            setActiveProject(project);
+            setActiveCr('');
+          }}
+        />
+      )}
+      {projectToDelete && <ConfirmProjectDeleteModal project={projectToDelete} onCancel={() => setProjectToDelete(null)} onConfirm={doDeleteProject} />}
+      <AuditList projects={projects} activeProject={activeProject} setActiveProject={p => { setActiveProject(p); setActiveCr(''); }} projectReviewCounts={projectReviewCounts} crs={crs} activeCr={activeCr} onSelect={id => { setActiveCr(id); setDecided(null); }} onAddProject={() => setShowProjectCreate(true)} onDeleteProject={setProjectToDelete} />
       <div className="content">
+        {projectError && <div style={{ padding: '10px 22px', color: 'var(--red)', fontSize: 13, borderBottom: '1px solid var(--border)' }}>{projectError}</div>}
         {cr ? (
           <>
             <div className="audit-top">

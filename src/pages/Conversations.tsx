@@ -5,7 +5,8 @@ import { Avatar, MeAvatar } from '../components/Avatar';
 import Block from '../components/Block';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation, agentReply,
-  listAgents, addConversationMember, removeConversationMember,
+  listAgents, addConversationMember, removeConversationMember, deleteGroupConversation,
+  markConversationRead,
   type Conversation, type Message, type Agent,
 } from '../services';
 import type { BlockType } from '../data/mock';
@@ -33,7 +34,7 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
       <div key={c.id} className={'conv-item' + (active === c.id ? ' active' : '')} onClick={() => onSelect(c.id)}>
         {isG
           ? <div className="av sq" style={{ width: 46, height: 46, background: c.color, fontSize: 18 }}>{c.initial ?? c.name?.[0] ?? '群'}</div>
-          : a ? <Avatar agent={a} size={46} status="online" /> : <div className="av" style={{ width: 46, height: 46, background: '#888' }}>?</div>}
+          : a ? <Avatar agent={a} size={46} status={c.unread > 0 ? 'online' : undefined} /> : <div className="av" style={{ width: 46, height: 46, background: '#888' }}>?</div>}
         <div className="conv-main">
           <div className="conv-top">
             <span className="conv-name">{title(c)}</span>
@@ -41,7 +42,7 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span className="conv-preview">{isG && <Icon name="bot" size={11} style={{ verticalAlign: -1, marginRight: 3, color: 'var(--text-faint)' }} />}{preview(c)}</span>
-            {c.unread > 0 && <span className="conv-unread" style={{ marginLeft: 'auto' }}>{c.unread}</span>}
+            {isG && c.unread > 0 && <span className="conv-unread" style={{ marginLeft: 'auto' }}>{c.unread}</span>}
           </div>
         </div>
       </div>
@@ -67,14 +68,32 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
   );
 }
 
-function MessageRow({ m, agents, isGroup }: { m: Message; agents: Agent[]; isGroup: boolean }) {
+function messageText(m: Message) {
+  try {
+    const blocks: BlockType[] = JSON.parse(m.content_json);
+    return blocks.map(b => {
+      if (b.t === 'md') return b.md;
+      if (b.t === 'code') return b.code;
+      if (b.t === 'file') return `${b.name} ${b.meta}`;
+      if (b.t === 'image') return `${b.label} ${b.meta}`;
+      if (b.t === 'artifact') return `${b.kind} ${b.title} ${b.body} ${b.rows.map(r => r.join(' ')).join(' ')}`;
+      return '';
+    }).join('\n');
+  } catch {
+    return m.content_json;
+  }
+}
+
+function MessageRow({ m, agents, isGroup, highlighted, rowRef }: {
+  m: Message; agents: Agent[]; isGroup: boolean; highlighted?: boolean; rowRef?: (node: HTMLDivElement | null) => void;
+}) {
   const agentMap = Object.fromEntries(agents.map(a => [a.id, a]));
   const me = !m.from_agent;
   const a = me ? null : agentMap[m.from_agent!];
   let blocks: BlockType[] = [];
   try { blocks = JSON.parse(m.content_json); } catch { blocks = [{ t: 'md', md: m.content_json }]; }
   return (
-    <div className={'msg' + (me ? ' me' : '') + ' rise'}>
+    <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
       {me ? <MeAvatar size={36} /> : (a ? <Avatar agent={a} size={36} /> : <div className="av" style={{ width:36,height:36,background:'#888',fontSize:14 }}>?</div>)}
       <div className="msg-body">
         {!me && a && (
@@ -156,7 +175,7 @@ function NewGroupModal({ agents, onClose, onCreate }: { agents: Agent[]; onClose
   const [name, setName] = useState('');
   const toggle = (id: string) => setSel(s => s.includes(id) ? s.filter(x => x!==id) : [...s,id]);
   return (
-    <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 60 }} onClick={onClose}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }} onClick={onClose}>
       <div style={{ width: 420, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center' }}>
           <div><div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">新建群聊</span></div>
@@ -188,6 +207,20 @@ function NewGroupModal({ agents, onClose, onCreate }: { agents: Agent[]; onClose
   );
 }
 
+function ConfirmActionModal({ msg, okLabel, onOk, onCancel }: { msg: string; okLabel: string; onOk: () => void; onCancel: () => void }) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onCancel}>
+      <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 380, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <p style={{ margin: '0 0 20px', fontSize: 14, lineHeight: 1.6 }}>{msg}</p>
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onCancel}>取消</button>
+          <button className="btn btn-danger" onClick={onOk}>{okLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function ConversationsPage() {
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -196,10 +229,16 @@ export default function ConversationsPage() {
   const [showNew, setShowNew] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
   const [showContext, setShowContext] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
+  const [confirmDissolve, setConfirmDissolve] = useState<string | null>(null);
   const [memberError, setMemberError] = useState('');
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const headerActionsRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const messageRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const loadConvs = useCallback(async () => {
     const [cs, as] = await Promise.all([listConversations(), listAgents()]);
@@ -215,20 +254,53 @@ export default function ConversationsPage() {
   }, []);
 
   useEffect(() => { loadConvs(); }, []);
-  useEffect(() => { if (active) loadMsgs(active); }, [active, loadMsgs]);
+  useEffect(() => {
+    if (!active) {
+      setMsgs([]);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      await loadMsgs(active);
+      await markConversationRead(active);
+      if (!cancelled) {
+        await loadConvs();
+        window.dispatchEvent(new Event('autoforge:badges-refresh'));
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [active, loadConvs, loadMsgs]);
+
+  useEffect(() => {
+    setShowSearch(false);
+    setSearchQuery('');
+    setActiveSearchId(null);
+  }, [active]);
+
+  useEffect(() => {
+    if (!showSearch) return;
+    setTimeout(() => searchInputRef.current?.focus(), 0);
+  }, [showSearch]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<{ conversation_id: string }>('autoforge://event', e => {
       const ev = e.payload as { type?: string; conversation_id?: string };
-      if (ev?.type === 'message_received' && ev.conversation_id === active) loadMsgs(active);
-      loadConvs();
+      if (ev?.type === 'message_received' && ev.conversation_id === active) {
+        loadMsgs(active).then(() => markConversationRead(active)).then(loadConvs).then(() => {
+          window.dispatchEvent(new Event('autoforge:badges-refresh'));
+        });
+      } else {
+        loadConvs().then(() => window.dispatchEvent(new Event('autoforge:badges-refresh')));
+      }
     }).then(fn => { unlisten = fn; });
     return () => unlisten?.();
   }, [active, loadConvs, loadMsgs]);
 
   useEffect(() => {
-    if (!showMembers && !showContext) return;
+    if (!showMembers && !showContext && !showSearch) return;
 
     const closeIfOutside = (e: PointerEvent) => {
       const target = e.target;
@@ -236,12 +308,13 @@ export default function ConversationsPage() {
       if (headerActionsRef.current?.contains(target)) return;
       setShowMembers(false);
       setShowContext(false);
+      setShowSearch(false);
       setMemberError('');
     };
 
     document.addEventListener('pointerdown', closeIfOutside);
     return () => document.removeEventListener('pointerdown', closeIfOutside);
-  }, [showMembers, showContext]);
+  }, [showMembers, showContext, showSearch]);
 
   const conv = convs.find(c => c.id === active);
   const agentMap = Object.fromEntries(agents.map(a => [a.id, a]));
@@ -257,6 +330,21 @@ export default function ConversationsPage() {
       return [];
     }
   });
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const searchResults = normalizedSearch
+    ? msgs
+        .filter(m => !m.id.startsWith('typing-') && messageText(m).toLowerCase().includes(normalizedSearch))
+        .map(m => ({
+          message: m,
+          text: messageText(m).replace(/\s+/g, ' ').trim(),
+          sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : '我',
+        }))
+    : [];
+
+  const jumpToMessage = (id: string) => {
+    setActiveSearchId(id);
+    messageRefs.current[id]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  };
 
   const onSend = async (text: string) => {
     if (!conv || sending) return;
@@ -299,6 +387,7 @@ export default function ConversationsPage() {
     await loadConvs();
     setActive(c.id);
     setShowNew(false);
+    window.dispatchEvent(new Event('autoforge:badges-refresh'));
   };
 
   const replaceConversation = (updated: Conversation) => {
@@ -327,6 +416,29 @@ export default function ConversationsPage() {
     }
   };
 
+  const dissolveGroup = async () => {
+    if (!confirmDissolve) return;
+    const id = confirmDissolve;
+    setMemberError('');
+    try {
+      await deleteGroupConversation(id);
+      const remaining = convs.filter(c => c.id !== id);
+      setConvs(remaining);
+      if (active === id) {
+        const next = remaining[0]?.id ?? '';
+        setActive(next);
+        if (!next) setMsgs([]);
+      }
+      setShowMembers(false);
+      setConfirmDissolve(null);
+      window.dispatchEvent(new Event('autoforge:badges-refresh'));
+    } catch (e) {
+      setMemberError(String(e));
+      setConfirmDissolve(null);
+      setShowMembers(true);
+    }
+  };
+
   return (
     <>
       <ConvList convs={convs} agents={agents} active={active} onSelect={id => setActive(id)} onNew={() => setShowNew(true)} />
@@ -335,7 +447,7 @@ export default function ConversationsPage() {
             <div className="chat-head">
               {conv.conv_type === 'group'
                 ? <div className="av sq" style={{ width: 38, height: 38, background: conv.color, fontSize: 15 }}>{conv.initial ?? conv.name?.[0] ?? '群'}</div>
-                : (() => { const a = agents.find(ag => conv.members.includes(ag.id)); return a ? <Avatar agent={a} size={38} status="online" /> : null; })()}
+                : (() => { const a = agents.find(ag => conv.members.includes(ag.id)); return a ? <Avatar agent={a} size={38} status={conv.unread > 0 ? 'online' : undefined} /> : null; })()}
               <div className="chat-head-info">
                 <div className="chat-head-title">
                   {conv.conv_type === 'group' ? conv.name : agents.find(a => conv.members.includes(a.id))?.name ?? 'Agent'}
@@ -345,16 +457,18 @@ export default function ConversationsPage() {
               </div>
               <div className="chat-head-actions" ref={headerActionsRef} style={{ position: 'relative' }}>
                 {conv.conv_type === 'group' && (
-                  <button className="member-stack" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); }} style={{ background: 'transparent', border: 0, padding: '0 4px', cursor: 'pointer' }}>
+                  <button className="member-stack" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); setShowSearch(false); }} style={{ background: 'transparent', border: 0, padding: '0 4px', cursor: 'pointer' }}>
                     {convMembers.slice(0, 4).map(a => <Avatar key={a.id} agent={a} size={28} />)}
                   </button>
                 )}
-                <button className="icon-btn" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); }}><Icon name="users" size={18} /></button>
-                <button className="icon-btn" title="对话上下文与附件" onClick={() => { setShowContext(v => !v); setShowMembers(false); }}><Icon name="layers" size={18} /></button>
-                <button className="icon-btn" title="搜索对话"><Icon name="search" size={18} /></button>
-                {showMembers && (
+                {conv.conv_type === 'group' && (
+                  <button className="icon-btn" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); setShowSearch(false); }}><Icon name="users" size={18} /></button>
+                )}
+                <button className="icon-btn" title="对话上下文与附件" onClick={() => { setShowContext(v => !v); setShowMembers(false); setShowSearch(false); }}><Icon name="layers" size={18} /></button>
+                <button className="icon-btn" title="搜索对话" onClick={() => { setShowSearch(v => !v); setShowMembers(false); setShowContext(false); }}><Icon name="search" size={18} /></button>
+                {conv.conv_type === 'group' && showMembers && (
                   <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 280 }}>
-                    <div className="mention-pop-label">{conv.conv_type === 'group' ? '群成员' : '对话成员'}</div>
+                    <div className="mention-pop-label">群成员</div>
                     {memberError && <div style={{ padding: '6px 8px', color: 'var(--red)', fontSize: 12 }}>{memberError}</div>}
                     {convMembers.map(a => (
                       <div key={a.id} className="mention-row">
@@ -385,6 +499,10 @@ export default function ConversationsPage() {
                           </div>
                         ))}
                         {availableAgents.length === 0 && <div style={{ padding: '8px', color: 'var(--text-3)', fontSize: 12 }}>所有 Agent 均已在群内</div>}
+                        <div style={{ height: 1, background: 'var(--border)', margin: '6px 4px' }} />
+                        <button className="btn btn-danger" style={{ width: '100%', justifyContent: 'center' }} onClick={() => setConfirmDissolve(conv.id)}>
+                          <Icon name="trash" size={14} />解散群聊
+                        </button>
                       </>
                     )}
                   </div>
@@ -413,15 +531,65 @@ export default function ConversationsPage() {
                     {contextBlocks.length === 0 && <div style={{ padding: '10px 8px', color: 'var(--text-3)', fontSize: 13 }}>暂无附件或上下文块</div>}
                   </div>
                 )}
+                {showSearch && (
+                  <div className="mention-pop chat-search-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 360 }}>
+                    <div className="mention-pop-label">搜索对话记录</div>
+                    <div className="chat-search-box">
+                      <Icon name="search" size={15} />
+                      <input
+                        ref={searchInputRef}
+                        value={searchQuery}
+                        onChange={e => setSearchQuery(e.target.value)}
+                        placeholder="输入关键词搜索当前对话"
+                      />
+                    </div>
+                    <div className="chat-search-meta">
+                      {normalizedSearch ? `找到 ${searchResults.length} 条匹配消息` : `当前对话 ${msgs.filter(m => !m.id.startsWith('typing-')).length} 条消息`}
+                    </div>
+                    <div className="chat-search-results scroll">
+                      {normalizedSearch && searchResults.map(({ message, text, sender }) => (
+                        <div key={message.id} className={'mention-row chat-search-row' + (activeSearchId === message.id ? ' sel' : '')} onClick={() => jumpToMessage(message.id)}>
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div className="nm">{sender}</div>
+                            <div className="rl">{text || '消息内容为空'}</div>
+                          </div>
+                          <span className="req-id" style={{ fontSize: 10 }}>
+                            {new Date(message.created_at).toLocaleTimeString('zh',{hour:'2-digit',minute:'2-digit'})}
+                          </span>
+                        </div>
+                      ))}
+                      {normalizedSearch && searchResults.length === 0 && (
+                        <div style={{ padding: '12px 8px', color: 'var(--text-3)', fontSize: 13 }}>没有匹配的消息</div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
             <div className="msgs scroll" ref={scrollRef}>
-              {msgs.map((m, i) => <MessageRow key={m.id ?? i} m={m} agents={agents} isGroup={conv.conv_type === 'group'} />)}
+              {msgs.map((m, i) => (
+                <MessageRow
+                  key={m.id ?? i}
+                  m={m}
+                  agents={agents}
+                  isGroup={conv.conv_type === 'group'}
+                  highlighted={activeSearchId === m.id}
+                  rowRef={node => { messageRefs.current[m.id] = node; }}
+                />
+              ))}
             </div>
             <Composer conv={conv} agents={agents} onSend={onSend} />
           </div>
         : <div className="content"><div className="empty"><Icon name="chat" /><div>选择一个对话开始</div></div></div>}
       {showNew && <NewGroupModal agents={agents} onClose={() => setShowNew(false)} onCreate={handleNewGroup} />}
+      {confirmDissolve && (
+        <ConfirmActionModal
+          msg="确认解散这个群聊？解散后将删除群聊记录、成员关系和历史消息。"
+          okLabel="确认解散"
+          onOk={dissolveGroup}
+          onCancel={() => setConfirmDissolve(null)}
+        />
+      )}
     </>
   );
 }

@@ -6,6 +6,7 @@ use crate::models::{
 };
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
@@ -17,9 +18,42 @@ pub struct SystemHealth {
     pub version: String,
     pub active_slots: usize,
     pub max_slots: usize,
+    pub total_slot_capacity: usize,
     pub pending_review: usize,
     pub pause_threshold: usize,
     pub stage: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SlotOccupant {
+    pub id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectSlotStats {
+    pub project_id: String,
+    pub project_name: String,
+    pub project_status: String,
+    pub active_slots: usize,
+    pub max_slots: usize,
+    pub executing_slots: usize,
+    pub pending_review_slots: usize,
+    pub occupants: Vec<SlotOccupant>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectPipelineStats {
+    pub project_id: String,
+    pub project_name: String,
+    pub project_status: String,
+    pub pending_analysis: i64,
+    pub pending_review_1: i64,
+    pub executing: i64,
+    pub pending_review_2: i64,
+    pub merged: i64,
+    pub rejected: i64,
+    pub total_issues: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,10 +68,13 @@ pub struct PipelineStats {
     pub active_projects: i64,
     pub active_slots: usize,
     pub max_slots: usize,
+    pub total_slot_capacity: usize,
     pub pending_review_slots: usize,
     pub pause_threshold: usize,
     pub stage: String,
     pub executing_cr_ids: Vec<String>,
+    pub project_slots: Vec<ProjectSlotStats>,
+    pub project_pipelines: Vec<ProjectPipelineStats>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +100,42 @@ pub struct ConcurrencyConfig {
     pub queue_strategy: String,
 }
 
+pub async fn load_concurrency_settings(
+    db: &crate::db::Db,
+) -> Result<(usize, usize, String), String> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM app_settings
+         WHERE key IN ('concurrency.max_slots', 'concurrency.pause_threshold', 'concurrency.queue_strategy')",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut max_slots = 5;
+    let mut pause_threshold = 20;
+    let mut queue_strategy = "priority".to_string();
+
+    for (key, value) in rows {
+        match key.as_str() {
+            "concurrency.max_slots" => {
+                max_slots = value.parse::<usize>().unwrap_or(5).max(1);
+            }
+            "concurrency.pause_threshold" => {
+                pause_threshold = value.parse::<usize>().unwrap_or(20).max(1);
+            }
+            "concurrency.queue_strategy" => {
+                queue_strategy = match value.as_str() {
+                    "fifo" | "priority" | "oldest" => value,
+                    _ => "priority".to_string(),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Ok((max_slots, pause_threshold, queue_strategy))
+}
+
 #[tauri::command]
 pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, String> {
     // Check DB
@@ -82,6 +155,11 @@ pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, S
             .fetch_one(&state.db)
             .await
             .unwrap_or((pipeline_status.pending_review as i64,));
+    let (active_projects,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM projects WHERE status='active'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or((1,));
     let stage = if pending_review as usize >= pipeline_status.pause_threshold {
         "paused".to_string()
     } else if pending_review as usize >= pipeline_status.pause_threshold / 2 {
@@ -97,6 +175,7 @@ pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, S
         version: env!("CARGO_PKG_VERSION").to_string(),
         active_slots: (executing + pending_review) as usize,
         max_slots: pipeline_status.max_slots,
+        total_slot_capacity: (active_projects as usize).max(1) * pipeline_status.max_slots,
         pending_review: pending_review as usize,
         pause_threshold: pipeline_status.pause_threshold,
         stage,
@@ -167,7 +246,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
             .map_err(|e| e.to_string())?;
 
     let executing_cr_ids = sqlx::query_as::<_, (String,)>(
-        "SELECT id FROM change_requests WHERE status IN ('executing', 'pending_review_2') ORDER BY updated_at DESC",
+        "SELECT id FROM change_requests WHERE status='executing' ORDER BY updated_at DESC",
     )
     .fetch_all(&state.db)
     .await
@@ -176,7 +255,158 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
     .map(|(id,)| id)
     .collect::<Vec<_>>();
 
-    let active_slots = executing_cr_ids.len().max(concurrency.active_slots);
+    let project_rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, name, status FROM projects WHERE status='active' ORDER BY name",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let occupied_rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT cr.project_id, cr.id, cr.status
+         FROM change_requests cr
+         JOIN projects p ON p.id = cr.project_id
+         WHERE p.status='active' AND cr.status IN ('executing', 'pending_review_2')
+         ORDER BY cr.updated_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut occupants_by_project: HashMap<String, Vec<SlotOccupant>> = HashMap::new();
+    for (project_id, id, status) in occupied_rows {
+        occupants_by_project
+            .entry(project_id)
+            .or_default()
+            .push(SlotOccupant { id, status });
+    }
+
+    let issue_pipeline_rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+        "SELECT project_id,
+                SUM(CASE WHEN status='pending_analysis' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='pending_review_1' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='executing' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
+                COUNT(*)
+         FROM issues
+         GROUP BY project_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let cr_pipeline_rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT project_id,
+                SUM(CASE WHEN status='executing' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='pending_review_2' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='merged' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END)
+         FROM change_requests
+         GROUP BY project_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let issue_pipeline_by_project = issue_pipeline_rows
+        .into_iter()
+        .map(
+            |(
+                project_id,
+                pending_analysis,
+                pending_review_1,
+                executing,
+                rejected,
+                total_issues,
+            )| {
+                (
+                    project_id,
+                    (
+                        pending_analysis,
+                        pending_review_1,
+                        executing,
+                        rejected,
+                        total_issues,
+                    ),
+                )
+            },
+        )
+        .collect::<HashMap<_, _>>();
+
+    let cr_pipeline_by_project = cr_pipeline_rows
+        .into_iter()
+        .map(
+            |(project_id, executing, pending_review_2, merged, rejected)| {
+                (
+                    project_id,
+                    (executing, pending_review_2, merged, rejected),
+                )
+            },
+        )
+        .collect::<HashMap<_, _>>();
+
+    let project_slots = project_rows
+        .iter()
+        .map(|(project_id, project_name, project_status)| {
+            let occupants = occupants_by_project.remove(project_id).unwrap_or_default();
+            let executing_slots = occupants
+                .iter()
+                .filter(|slot| slot.status == "executing")
+                .count();
+            let pending_review_slots = occupants
+                .iter()
+                .filter(|slot| slot.status == "pending_review_2")
+                .count();
+
+            ProjectSlotStats {
+                project_id: project_id.clone(),
+                project_name: project_name.clone(),
+                project_status: project_status.clone(),
+                active_slots: occupants.len(),
+                max_slots: concurrency.max_slots,
+                executing_slots,
+                pending_review_slots,
+                occupants,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let project_pipelines = project_rows
+        .iter()
+        .map(|(project_id, project_name, project_status)| {
+            let (
+                issue_pending_analysis,
+                issue_pending_review_1,
+                issue_executing,
+                issue_rejected,
+                project_total_issues,
+            ) = issue_pipeline_by_project
+                .get(project_id)
+                .copied()
+                .unwrap_or((0, 0, 0, 0, 0));
+            let (cr_executing, cr_pending_review_2, cr_merged, cr_rejected) =
+                cr_pipeline_by_project
+                    .get(project_id)
+                    .copied()
+                    .unwrap_or((0, 0, 0, 0));
+
+            ProjectPipelineStats {
+                project_id: project_id.clone(),
+                project_name: project_name.clone(),
+                project_status: project_status.clone(),
+                pending_analysis: issue_pending_analysis,
+                pending_review_1: issue_pending_review_1,
+                executing: issue_executing.max(cr_executing),
+                pending_review_2: cr_pending_review_2,
+                merged: cr_merged,
+                rejected: issue_rejected.max(cr_rejected),
+                total_issues: project_total_issues,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let total_slot_capacity = project_slots.len().max(1) * concurrency.max_slots;
+    let active_slots: usize = project_slots.iter().map(|project| project.active_slots).sum();
     let pending_review_slots = pending_review_2.max(concurrency.pending_review as i64) as usize;
     let stage = if pending_review_slots >= concurrency.pause_threshold {
         "paused".to_string()
@@ -197,10 +427,13 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         active_projects,
         active_slots,
         max_slots: concurrency.max_slots,
+        total_slot_capacity,
         pending_review_slots,
         pause_threshold: concurrency.pause_threshold,
         stage,
         executing_cr_ids,
+        project_slots,
+        project_pipelines,
     })
 }
 
@@ -269,6 +502,53 @@ pub async fn update_concurrency_config(
         payload.pause_threshold,
         payload.queue_strategy,
     );
+    let queue_strategy = state.concurrency.queue_strategy();
+
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('concurrency.max_slots', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(status.max_slots.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('concurrency.pause_threshold', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(status.pause_threshold.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('concurrency.queue_strategy', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(&queue_strategy)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(ConcurrencyConfig {
+        active_slots: status.active_slots,
+        max_slots: status.max_slots,
+        pending_review: status.pending_review,
+        pause_threshold: status.pause_threshold,
+        stage: status.stage,
+        queue_strategy,
+    })
+}
+
+#[tauri::command]
+pub async fn get_concurrency_config(
+    state: State<'_, AppState>,
+) -> Result<ConcurrencyConfig, String> {
+    let status = state.concurrency.status();
 
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,

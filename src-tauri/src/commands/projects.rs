@@ -112,10 +112,81 @@ pub async fn update_project(
 
 #[tauri::command]
 pub async fn delete_project(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    sqlx::query("DELETE FROM projects WHERE id=?")
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id=?")
         .bind(&id)
-        .execute(&state.db)
+        .fetch_optional(&state.db)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    if exists.is_none() {
+        return Err(format!("project {} not found", id));
+    }
+
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM scan_findings
+         WHERE test_session_id IN (SELECT id FROM test_sessions WHERE project_id=?)
+            OR issue_entry_id IN (SELECT id FROM issues WHERE project_id=?)",
+    )
+    .bind(&id)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM admin_decisions WHERE project_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM preview_environments WHERE project_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM test_sessions WHERE project_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM worktree_sessions
+         WHERE change_request_id IN (SELECT id FROM change_requests WHERE project_id=?)",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM change_requests WHERE project_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM issue_analyses
+         WHERE issue_id IN (SELECT id FROM issues WHERE project_id=?)",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM issues WHERE project_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM projects WHERE id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())
 }

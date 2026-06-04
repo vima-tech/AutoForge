@@ -63,13 +63,25 @@ export interface PipelineStats {
   executing: number; pending_review_2: number;
   merged: number; rejected: number; total_issues: number;
   active_projects: number;
-  active_slots: number; max_slots: number;
+  active_slots: number; max_slots: number; total_slot_capacity: number;
   pending_review_slots: number; pause_threshold: number;
   stage: string; executing_cr_ids: string[];
+  project_slots: Array<{
+    project_id: string; project_name: string; project_status: string;
+    active_slots: number; max_slots: number;
+    executing_slots: number; pending_review_slots: number;
+    occupants: Array<{ id: string; status: string }>;
+  }>;
+  project_pipelines: Array<{
+    project_id: string; project_name: string; project_status: string;
+    pending_analysis: number; pending_review_1: number;
+    executing: number; pending_review_2: number;
+    merged: number; rejected: number; total_issues: number;
+  }>;
 }
 export interface SystemHealth {
   status: string; claude_auth: boolean; db_ok: boolean;
-  version: string; active_slots: number; max_slots: number;
+  version: string; active_slots: number; max_slots: number; total_slot_capacity: number;
   pending_review: number; pause_threshold: number; stage: string;
 }
 export interface ConcurrencyConfig {
@@ -108,6 +120,7 @@ export interface AdminDecision {
 // ── System ───────────────────────────────────────────────────────────────────
 export const getSystemHealth = () => invoke<SystemHealth>('system_health');
 export const getPipelineStats = () => invoke<PipelineStats>('pipeline_stats');
+export const getConcurrencyConfig = () => invoke<ConcurrencyConfig>('get_concurrency_config');
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
 }>) => invoke<ConcurrencyConfig>('update_concurrency_config', { payload });
@@ -180,6 +193,10 @@ export const addConversationMember = (conversationId: string, agentId: string) =
   invoke<Conversation>('add_conversation_member', { conversationId, agentId });
 export const removeConversationMember = (conversationId: string, agentId: string) =>
   invoke<Conversation>('remove_conversation_member', { conversationId, agentId });
+export const deleteGroupConversation = (conversationId: string) =>
+  invoke<void>('delete_group_conversation', { conversationId });
+export const markConversationRead = (conversationId: string) =>
+  invoke<void>('mark_conversation_read', { conversationId });
 export const agentReply = (conversationId: string, agentId: string) =>
   invoke<void>('agent_reply', { conversationId, agentId });
 
@@ -207,3 +224,5 @@ export const updateAgent = (id: string, payload: Partial<{
   llm_id: string | null; system_prompt: string; forge_role: string | null;
 }>) => invoke<Agent>('update_agent', { id, payload });
 export const deleteAgent = (id: string) => invoke<void>('delete_agent', { id });
+export const setAgentForgeRole = (agentId: string, role: string) =>
+  invoke<Agent[]>('set_agent_forge_role', { agentId, role });

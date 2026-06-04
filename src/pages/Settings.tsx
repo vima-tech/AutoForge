@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
+import Select from '../components/Select';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
-  listAgents, createAgent, updateAgent, deleteAgent,
+  listAgents, createAgent, updateAgent, deleteAgent, setAgentForgeRole,
   getSystemHealth, updateConcurrencyConfig, readSpec, writeSpec,
   listPreviewEnvironments, listTestSessions, listAdminDecisions,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
@@ -37,6 +38,21 @@ const llmColor = (provider: string) => {
   return '#e8772e';
 };
 
+// 从后端返回的完整错误字符串中提取简短摘要，保留 HTTP 状态码 + 核心 message
+function fmtTestResult(raw: string): string {
+  if (raw.startsWith('连接成功')) return raw;
+  const jsonIdx = raw.indexOf('{');
+  if (jsonIdx === -1) return raw;
+  const prefix = raw.slice(0, jsonIdx).replace(/·\s*$/, '').trim();
+  try {
+    const body = JSON.parse(raw.slice(jsonIdx));
+    const msg: string = body?.error?.message ?? body?.message ?? '';
+    return msg ? `${prefix} · ${msg}` : prefix;
+  } catch {
+    return raw.slice(0, 80);
+  }
+}
+
 // ── LLM Settings ─────────────────────────────────────────────────────────────
 function LLMSettings() {
   const [configs, setConfigs] = useState<LlmConfig[]>([]);
@@ -44,6 +60,8 @@ function LLMSettings() {
   const [drafts, setDrafts] = useState<Record<string, Partial<LlmConfig>>>({});
   const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, string>>({});
+  const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -57,9 +75,18 @@ function LLMSettings() {
   const save = async (id: string) => {
     const d = drafts[id] ?? {};
     if (Object.keys(d).length === 0) return;
-    const updated = await updateLlmConfig(id, d);
-    setConfigs(cs => cs.map(c => c.id === id ? updated : c));
-    setDrafts(d2 => { const n = { ...d2 }; delete n[id]; return n; });
+    setSaving(id);
+    try {
+      const updated = await updateLlmConfig(id, d);
+      setConfigs(cs => cs.map(c => c.id === id ? updated : c));
+      setDrafts(d2 => { const n = { ...d2 }; delete n[id]; return n; });
+      setSaveStatus(s => ({ ...s, [id]: '已保存' }));
+      setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
+    } catch (e) {
+      setSaveStatus(s => ({ ...s, [id]: '保存失败: ' + String(e) }));
+    } finally {
+      setSaving(null);
+    }
   };
 
   const toggleEnabled = async (id: string, cur: boolean) => {
@@ -69,6 +96,7 @@ function LLMSettings() {
 
   const testConn = async (id: string) => {
     setTesting(id);
+    setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
     const result = await testLlmConnection(id).catch(e => String(e));
     setTestResult(r => ({ ...r, [id]: result }));
     setTesting(null);
@@ -113,9 +141,8 @@ function LLMSettings() {
             {exp === c.id && (
               <div className="cfg-fields rise">
                 <div className="field"><label>Provider</label>
-                  <select value={v('provider')} onChange={e => setDraft(c.id, 'provider', e.target.value)}>
-                    <option>Anthropic</option><option>OpenAI</option><option>Ollama</option><option>Azure</option><option>自定义</option>
-                  </select>
+                  <Select value={v('provider')} onChange={val => setDraft(c.id, 'provider', val)}
+                    options={['Anthropic', 'OpenAI', 'Ollama', 'Azure', '自定义'].map(v => ({ value: v, label: v }))} />
                 </div>
                 <div className="field"><label>Model</label><input className="mono" value={v('model')} onChange={e => setDraft(c.id, 'model', e.target.value)} /></div>
                 <div className="field full"><label>API Endpoint</label><input className="mono" value={v('endpoint')} onChange={e => setDraft(c.id, 'endpoint', e.target.value)} /></div>
@@ -128,19 +155,28 @@ function LLMSettings() {
                     value={d.temperature !== undefined ? String(d.temperature) : String(c.temperature)}
                     onChange={e => setDraft(c.id, 'temperature', parseFloat(e.target.value))} />
                 </div>
-                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 4 }}>
-                  <Switch on={c.enabled} onToggle={() => toggleEnabled(c.id, c.enabled)} />
-                  <span style={{ fontSize: 13, color: 'var(--text-2)' }}>启用此连接</span>
-                  {testResult[c.id] && <span style={{ fontSize: 12, color: testResult[c.id].startsWith('连接成功') ? 'var(--green-soft)' : 'var(--red)', fontFamily: 'var(--font-mono)' }}>{testResult[c.id]}</span>}
-                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-                    <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(c.id)}><Icon name="trash" size={13} />删除</button>
-                    <button className="btn btn-sm" onClick={() => testConn(c.id)} disabled={testing === c.id}>
-                      <Icon name="zap" size={13} />{testing === c.id ? '测试中…' : '测试连接'}
-                    </button>
-                    <button className="btn btn-sm btn-primary" onClick={() => save(c.id)} disabled={Object.keys(d).length === 0}>
-                      <Icon name="check" size={13} />保存
-                    </button>
+                <div className="field full" style={{ gap: 10, marginTop: 4 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <Switch on={c.enabled} onToggle={() => toggleEnabled(c.id, c.enabled)} />
+                    <span style={{ fontSize: 13, color: 'var(--text-2)', flex: 1 }}>启用此连接</span>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(c.id)}><Icon name="trash" size={13} />删除</button>
+                      <button className="btn btn-sm" onClick={() => testConn(c.id)} disabled={testing === c.id}>
+                        <Icon name="zap" size={13} />{testing === c.id ? '测试中…' : '测试连接'}
+                      </button>
+                      <button className="btn btn-sm btn-primary" onClick={() => save(c.id)} disabled={Object.keys(d).length === 0 || saving === c.id}>
+                        <Icon name="check" size={13} />{saving === c.id ? '保存中…' : '保存'}
+                      </button>
+                    </div>
                   </div>
+                  {(saveStatus[c.id] || testResult[c.id]) && (
+                    <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', lineHeight: 1.5,
+                      color: (saveStatus[c.id] === '已保存' || (testResult[c.id] ?? '').startsWith('连接成功'))
+                        ? 'var(--green-soft)' : 'var(--red)',
+                    }}>
+                      {saveStatus[c.id] ?? fmtTestResult(testResult[c.id])}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -158,16 +194,18 @@ function AgentSettings() {
   const [llmNames, setLlmNames] = useState<{ id: string; name: string }[]>([]);
   const [exp, setExp] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Partial<Agent>>>({});
+  const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const reload = () =>
     Promise.all([listAgents(), listLlmConfigs()]).then(([ags, llms]) => {
       setAgents(ags);
       setLlmNames(llms.map(l => ({ id: l.id, name: l.name })));
       setLoading(false);
     }).catch(() => setLoading(false));
-  }, []);
+
+  useEffect(() => { reload(); }, []);
 
   const setDraft = (id: string, field: string, val: unknown) =>
     setDrafts(d => ({ ...d, [id]: { ...d[id], [field]: val } }));
@@ -175,14 +213,22 @@ function AgentSettings() {
   const save = async (id: string) => {
     const d = drafts[id] ?? {};
     if (Object.keys(d).length === 0) return;
-    const updated = await updateAgent(id, d);
-    setAgents(as => as.map(a => a.id === id ? updated : a));
-    setDrafts(d2 => { const n = { ...d2 }; delete n[id]; return n; });
+    try {
+      const updated = await updateAgent(id, d);
+      setAgents(as => as.map(a => a.id === id ? updated : a));
+      setDrafts(d2 => { const n = { ...d2 }; delete n[id]; return n; });
+      setSaveStatus(s => ({ ...s, [id]: '已保存' }));
+      setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
+    } catch (e) {
+      setSaveStatus(s => ({ ...s, [id]: '保存失败: ' + String(e) }));
+    }
   };
 
-  const setForgeRole = async (id: string, role: 'analysis' | 'test' | null) => {
-    const updated = await updateAgent(id, { forge_role: role });
-    setAgents(as => as.map(a => a.id === id ? updated : a));
+  // Single atomic backend call: clears all old holders of `role`, assigns `val` ('' = unassign).
+  // Returns the authoritative agent list — no local diff needed.
+  const assignRole = async (val: string, role: 'analysis' | 'test') => {
+    const fresh = await setAgentForgeRole(val, role);
+    setAgents(fresh);
   };
 
   const doDelete = async (id: string) => {
@@ -197,10 +243,16 @@ function AgentSettings() {
     setExp(a.id);
   };
 
-  if (loading) return <div className="set-inner"><div className="set-h">Agent 配置</div><div style={{ color: 'var(--text-3)', marginTop: 20 }}>加载中…</div></div>;
+  if (loading) return (
+    <div className="set-inner">
+      <div className="set-h">Agent 配置</div>
+      <div style={{ color: 'var(--text-3)', marginTop: 20 }}>加载中…</div>
+    </div>
+  );
 
-  const analystId = agents.find(a => a.forge_role === 'analysis')?.id;
-  const testerId  = agents.find(a => a.forge_role === 'test')?.id;
+  const analystId = agents.find(a => a.forge_role === 'analysis')?.id ?? '';
+  const testerId  = agents.find(a => a.forge_role === 'test')?.id ?? '';
+  const agentOpts = [{ value: '', label: '— 未指派 —' }, ...agents.map(a => ({ value: a.id, label: a.name }))];
 
   return (
     <div className="set-inner rise">
@@ -209,30 +261,44 @@ function AgentSettings() {
       <div className="set-desc">配置 Agent 职能、LLM、系统提示词，并指派流水线角色。</div>
 
       <div className="panel" style={{ marginBottom: 22 }}>
-        <div className="panel-head"><div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />流水线角色指派</div></div>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />流水线角色指派</div>
+        </div>
         <div style={{ padding: '4px 18px 14px' }}>
-          {[{ role: 'analysis' as const, label: '需求分析 Agent', desc: '在审核节点 1 前评估真实性、可行性、优先级', color: 'var(--violet)', icon: 'search' },
-            { role: 'test' as const,     label: '测试 Agent',    desc: '合并后被动响应 + 每日主动巡检',           color: 'var(--green)', icon: 'flask' }
-          ].map(({ role, label, desc, color, icon }) => (
-            <div key={role} className="assign-row">
-              <div className="cfg-logo" style={{ background: color, width: 34, height: 34 }}><Icon name={icon} size={17} /></div>
-              <div className="assign-info"><div className="assign-title">{label}</div><div className="assign-desc">{desc}</div></div>
-              <select style={{ width: 180, background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 9, padding: '8px 10px', color: 'var(--text)', fontSize: 13 }}
-                value={role === 'analysis' ? (analystId ?? '') : (testerId ?? '')}
-                onChange={e => { if (e.target.value) setForgeRole(e.target.value, role); }}>
-                <option value="">— 未指派 —</option>
-                {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-              </select>
+          <div className="assign-row">
+            <div className="cfg-logo" style={{ background: 'var(--violet)', width: 34, height: 34 }}><Icon name="search" size={17} /></div>
+            <div className="assign-info">
+              <div className="assign-title">需求分析 Agent</div>
+              <div className="assign-desc">在审核节点 1 前评估真实性、可行性、优先级</div>
             </div>
-          ))}
+            <select className="sel" style={{ width: 180 }}
+              value={analystId}
+              onChange={e => assignRole(e.target.value, 'analysis')}>
+              {agentOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div className="assign-row">
+            <div className="cfg-logo" style={{ background: 'var(--green)', width: 34, height: 34 }}><Icon name="flask" size={17} /></div>
+            <div className="assign-info">
+              <div className="assign-title">测试 Agent</div>
+              <div className="assign-desc">合并后被动响应 + 每日主动巡检</div>
+            </div>
+            <select className="sel" style={{ width: 180 }}
+              value={testerId}
+              onChange={e => assignRole(e.target.value, 'test')}>
+              {agentOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
         </div>
       </div>
 
       <div className="sec-kicker" style={{ marginBottom: 12 }}>全部 Agent · {agents.length}</div>
       {agents.map(a => {
         const d = drafts[a.id] ?? {};
-        const v = (f: keyof Agent) => (d as Record<string, unknown>)[f] !== undefined ? String((d as Record<string, unknown>)[f]) : String(a[f] ?? '');
-        const roles = [a.forge_role === 'analysis' && '需求分析', a.forge_role === 'test' && '测试'].filter(Boolean);
+        const v = (f: keyof Agent) => d[f as keyof typeof d] !== undefined
+          ? String(d[f as keyof typeof d] ?? '')
+          : String(a[f] ?? '');
+        const roleTag = a.forge_role === 'analysis' ? '需求分析' : a.forge_role === 'test' ? '测试' : null;
         return (
           <div className="cfg-card" key={a.id} style={exp === a.id ? { borderColor: 'var(--ember-tint-strong)' } : {}}>
             <div className="cfg-top" onClick={() => setExp(exp === a.id ? null : a.id)} style={{ cursor: 'pointer' }}>
@@ -240,7 +306,7 @@ function AgentSettings() {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="cfg-name" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   {v('name')}
-                  {roles.map(r => <span key={r as string} className="chip ember" style={{ padding: '1px 7px', fontSize: 10 }}>{r} Agent</span>)}
+                  {roleTag && <span className="chip ember" style={{ padding: '1px 7px', fontSize: 10 }}>{roleTag} Agent</span>}
                 </div>
                 <div className="cfg-sub">{v('name_en')} · {llmNames.find(l => l.id === a.llm_id)?.name ?? '未指定 LLM'}</div>
               </div>
@@ -249,20 +315,28 @@ function AgentSettings() {
             {exp === a.id && (
               <div className="rise" style={{ marginTop: 15 }}>
                 <div className="cfg-fields">
-                  <div className="field"><label>Agent 名称</label><input value={v('name')} onChange={e => setDraft(a.id, 'name', e.target.value)} /></div>
-                  <div className="field"><label>使用的 LLM</label>
-                    <select value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
-                      onChange={e => setDraft(a.id, 'llm_id', e.target.value || null)}>
-                      <option value="">— 未指定 —</option>
-                      {llmNames.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
-                    </select>
+                  <div className="field"><label>Agent 名称</label>
+                    <input value={v('name')} onChange={e => setDraft(a.id, 'name', e.target.value)} />
                   </div>
-                  <div className="field full"><label>职责标签</label><input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} /></div>
+                  <div className="field"><label>使用的 LLM</label>
+                    <Select
+                      value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
+                      onChange={val => setDraft(a.id, 'llm_id', val || null)}
+                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: l.name }))]} />
+                  </div>
+                  <div className="field full"><label>职责标签</label>
+                    <input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} />
+                  </div>
                   <div className="field full"><label>系统提示词</label>
                     <textarea className="mono" rows={5} value={v('system_prompt')} onChange={e => setDraft(a.id, 'system_prompt', e.target.value)} />
                   </div>
                 </div>
-                <div style={{ display: 'flex', gap: 8, marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--border)', justifyContent: 'flex-end' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--border)', justifyContent: 'flex-end' }}>
+                  {saveStatus[a.id] && (
+                    <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: saveStatus[a.id] === '已保存' ? 'var(--green-soft)' : 'var(--red)', marginRight: 'auto' }}>
+                      {saveStatus[a.id]}
+                    </span>
+                  )}
                   <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(a.id)}><Icon name="trash" size={13} />删除</button>
                   <button className="btn btn-sm btn-primary" onClick={() => save(a.id)} disabled={Object.keys(d).length === 0}>
                     <Icon name="check" size={13} />保存
@@ -305,11 +379,8 @@ function ConcurrencySettings() {
             <input type="number" min="1" max="200" value={form.pause_threshold} onChange={e => setForm(f => ({ ...f, pause_threshold: Number(e.target.value) }))} />
           </div>
           <div className="field"><label>队列策略</label>
-            <select value={form.queue_strategy} onChange={e => setForm(f => ({ ...f, queue_strategy: e.target.value }))}>
-              <option value="priority">priority</option>
-              <option value="fifo">fifo</option>
-              <option value="oldest">oldest</option>
-            </select>
+            <Select value={form.queue_strategy} onChange={val => setForm(f => ({ ...f, queue_strategy: val }))}
+              options={[{ value: 'priority', label: 'priority' }, { value: 'fifo', label: 'fifo' }, { value: 'oldest', label: 'oldest' }]} />
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
@@ -345,9 +416,8 @@ function SpecsSettings() {
       <div className="cfg-card">
         <div className="cfg-fields">
           <div className="field full"><label>文档</label>
-            <select value={name} onChange={e => setName(e.target.value)}>
-              {SPEC_FILES.map(f => <option key={f} value={f}>{f}</option>)}
-            </select>
+            <Select value={name} onChange={setName}
+              options={SPEC_FILES.map(f => ({ value: f, label: f }))} />
           </div>
           <div className="field full"><label>内容</label>
             <textarea className="mono" rows={18} value={content} onChange={e => setContent(e.target.value)} />
