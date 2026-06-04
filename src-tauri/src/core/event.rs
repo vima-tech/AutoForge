@@ -51,6 +51,11 @@ pub enum AppEvent {
         conversation_id: String,
         message_id: String,
     },
+    ConversationTaskUpdated {
+        conversation_id: String,
+        task_id: String,
+        status: String,
+    },
 }
 
 pub fn emit(app: &AppHandle, event: AppEvent) {

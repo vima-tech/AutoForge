@@ -1,35 +1,101 @@
 import React, { useState } from 'react';
 import Icon from './Icon';
-import { createProject, type Project } from '../services';
+import { createProject, updateProject, type Project } from '../services';
 
 const slugify = (name: string) => {
-  const slug = name
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   return slug || `project-${Date.now().toString(36)}`;
 };
+
+// ── Config YAML helpers ───────────────────────────────────────────────────────
+
+type YamlSection = { key: string; lines: string[] };
+
+function splitYamlSections(yaml: string): YamlSection[] {
+  const sections: YamlSection[] = [];
+  let cur: YamlSection | null = null;
+  for (const line of yaml.split('\n')) {
+    const top = /^([a-z_][a-z0-9_]*):/i.exec(line);
+    if (top && !line.startsWith(' ') && !line.startsWith('\t')) {
+      if (cur) sections.push(cur);
+      cur = { key: top[1], lines: [line] };
+    } else if (cur) {
+      cur.lines.push(line);
+    }
+  }
+  if (cur) sections.push(cur);
+  return sections;
+}
+
+function getNestedValue(sectionLines: string[], key: string): string {
+  for (const line of sectionLines) {
+    const m = line.match(new RegExp(`^\\s+${key}:\\s*"?([^"\\n]+?)"?\\s*$`));
+    if (m) return m[1].trim();
+  }
+  return '';
+}
+
+export function parseProjectConfig(configYaml: string | null) {
+  if (!configYaml) return { devCommand: '', devUrl: '', prodUrl: '' };
+  const sections = splitYamlSections(configYaml);
+  const dev = sections.find(s => s.key === 'dev');
+  const prod = sections.find(s => s.key === 'prod');
+  return {
+    devCommand: dev ? getNestedValue(dev.lines, 'command') : '',
+    devUrl: dev ? getNestedValue(dev.lines, 'url') : '',
+    prodUrl: prod ? getNestedValue(prod.lines, 'url') : '',
+  };
+}
+
+function buildConfigYaml(
+  existing: string | null,
+  devCommand: string,
+  devUrl: string,
+  prodUrl: string,
+): string | undefined {
+  const cmd = devCommand.trim();
+  const dUrl = devUrl.trim();
+  const pUrl = prodUrl.trim();
+
+  // Preserve sections we don't manage (test, quality, etc.)
+  const preserved = existing
+    ? splitYamlSections(existing)
+        .filter(s => s.key !== 'dev' && s.key !== 'prod')
+        .map(s => s.lines.join('\n'))
+    : [];
+
+  const parts: string[] = [];
+  if (cmd || dUrl) {
+    const devLines = ['dev:'];
+    if (cmd)  devLines.push(`  command: ${JSON.stringify(cmd)}`);
+    if (dUrl) devLines.push(`  url: ${JSON.stringify(dUrl)}`);
+    parts.push(devLines.join('\n'));
+  }
+  if (pUrl) {
+    parts.push(`prod:\n  url: ${JSON.stringify(pUrl)}`);
+  }
+  parts.push(...preserved);
+
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+// ── ProjectCreateModal ────────────────────────────────────────────────────────
 
 export function ProjectCreateModal({ onClose, onCreated }: {
   onClose: () => void;
   onCreated: (project: Project) => void;
 }) {
   const [form, setForm] = useState({
-    name: '',
-    slug: '',
-    description: '',
-    repo_path: '',
-    branch_dev: 'dev',
-    branch_main: 'main',
+    name: '', slug: '', description: '', repo_path: '',
+    branch_dev: 'dev', branch_main: 'main',
+    dev_command: '', dev_url: '', prod_url: '',
   });
   const [slugTouched, setSlugTouched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const updateName = (name: string) => {
+  const updateName = (name: string) =>
     setForm(f => ({ ...f, name, slug: slugTouched ? f.slug : slugify(name) }));
-  };
 
   const submit = async () => {
     const name = form.name.trim();
@@ -38,24 +104,19 @@ export function ProjectCreateModal({ onClose, onCreated }: {
     if (!name) { setError('项目名称不能为空'); return; }
     if (!slug) { setError('项目标识不能为空'); return; }
     if (!repoPath) { setError('仓库路径不能为空'); return; }
-
-    setLoading(true);
-    setError('');
+    setLoading(true); setError('');
     try {
       const project = await createProject({
-        name,
-        slug,
+        name, slug,
         description: form.description.trim(),
         repo_path: repoPath,
         branch_dev: form.branch_dev.trim() || 'dev',
         branch_main: form.branch_main.trim() || 'main',
+        config_yaml: buildConfigYaml(null, form.dev_command, form.dev_url, form.prod_url),
       });
       onCreated(project);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
+    } catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
   };
 
   return (
@@ -66,14 +127,7 @@ export function ProjectCreateModal({ onClose, onCreated }: {
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
         <div style={{ padding: '16px 20px' }}>
-          <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
-            <div className="field"><label>项目名称</label><input value={form.name} onChange={e => updateName(e.target.value)} placeholder="例如：AutoForge" /></div>
-            <div className="field"><label>项目标识</label><input value={form.slug} onChange={e => { setSlugTouched(true); setForm(f => ({ ...f, slug: e.target.value })); }} placeholder="autoforge" /></div>
-            <div className="field full"><label>仓库路径</label><input value={form.repo_path} onChange={e => setForm(f => ({ ...f, repo_path: e.target.value }))} placeholder="/home/user/project" /></div>
-            <div className="field full"><label>项目描述</label><input value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="用于区分项目范围和业务目标" /></div>
-            <div className="field"><label>开发分支</label><input value={form.branch_dev} onChange={e => setForm(f => ({ ...f, branch_dev: e.target.value }))} /></div>
-            <div className="field"><label>主分支</label><input value={form.branch_main} onChange={e => setForm(f => ({ ...f, branch_main: e.target.value }))} /></div>
-          </div>
+          <ProjectFormFields form={form} setForm={setForm} slugTouched={slugTouched} setSlugTouched={setSlugTouched} updateName={updateName} showSlug />
           {error && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{error}</div>}
         </div>
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
@@ -86,6 +140,135 @@ export function ProjectCreateModal({ onClose, onCreated }: {
     </div>
   );
 }
+
+// ── ProjectEditModal ──────────────────────────────────────────────────────────
+
+export function ProjectEditModal({ project, onClose, onSaved }: {
+  project: Project;
+  onClose: () => void;
+  onSaved: (project: Project) => void;
+}) {
+  const parsed = parseProjectConfig(project.config_yaml);
+  const [form, setForm] = useState({
+    name: project.name,
+    description: project.description,
+    repo_path: project.repo_path,
+    branch_dev: project.branch_dev,
+    branch_main: project.branch_main,
+    dev_command: parsed.devCommand,
+    dev_url: parsed.devUrl,
+    prod_url: parsed.prodUrl,
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    const name = form.name.trim();
+    if (!name) { setError('项目名称不能为空'); return; }
+    setLoading(true); setError('');
+    try {
+      const saved = await updateProject(project.id, {
+        name,
+        description: form.description.trim(),
+        repo_path: form.repo_path.trim(),
+        branch_dev: form.branch_dev.trim() || 'dev',
+        branch_main: form.branch_main.trim() || 'main',
+        config_yaml: buildConfigYaml(
+          project.config_yaml,
+          form.dev_command,
+          form.dev_url,
+          form.prod_url,
+        ) ?? '',
+      });
+      onSaved(saved);
+    } catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
+      <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">编辑项目</span> <span style={{ fontSize: 12, color: 'var(--text-3)', fontWeight: 400 }}>{project.slug}</span></div>
+          <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
+        </div>
+        <div style={{ padding: '16px 20px' }}>
+          <ProjectFormFields form={form} setForm={setForm} slugTouched={false} setSlugTouched={() => {}} updateName={name => setForm(f => ({ ...f, name }))} showSlug={false} />
+          {error && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{error}</div>}
+        </div>
+        <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onClose}>取消</button>
+          <button className="btn btn-primary" onClick={submit} disabled={loading}>
+            <Icon name="check" size={15} />{loading ? '保存中...' : '保存'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Shared form fields ────────────────────────────────────────────────────────
+
+type FormState = {
+  name: string; description: string; repo_path: string;
+  branch_dev: string; branch_main: string;
+  dev_command: string; dev_url: string; prod_url: string;
+  slug?: string;
+};
+
+function ProjectFormFields({ form, setForm, slugTouched, setSlugTouched, updateName, showSlug }: {
+  form: FormState & { slug?: string };
+  setForm: React.Dispatch<React.SetStateAction<any>>;
+  slugTouched: boolean; setSlugTouched: (v: boolean) => void;
+  updateName: (name: string) => void;
+  showSlug: boolean;
+}) {
+  return (
+    <>
+      <div className="cfg-fields" style={{ gridTemplateColumns: showSlug ? '1fr 1fr' : '1fr' }}>
+        <div className="field">
+          <label>项目名称</label>
+          <input value={form.name} onChange={e => updateName(e.target.value)} placeholder="例如：AutoForge" />
+        </div>
+        {showSlug && (
+          <div className="field">
+            <label>项目标识</label>
+            <input value={form.slug ?? ''} onChange={e => { setSlugTouched(true); setForm((f: any) => ({ ...f, slug: e.target.value })); }} placeholder="autoforge" />
+          </div>
+        )}
+        <div className={`field${showSlug ? ' full' : ''}`}>
+          <label>仓库路径</label>
+          <input value={form.repo_path} onChange={e => setForm((f: any) => ({ ...f, repo_path: e.target.value }))} placeholder="/home/user/project" />
+        </div>
+        <div className={`field${showSlug ? ' full' : ''}`}>
+          <label>项目描述</label>
+          <input value={form.description} onChange={e => setForm((f: any) => ({ ...f, description: e.target.value }))} placeholder="用于区分项目范围和业务目标" />
+        </div>
+        <div className="field"><label>开发分支</label><input value={form.branch_dev} onChange={e => setForm((f: any) => ({ ...f, branch_dev: e.target.value }))} /></div>
+        <div className="field"><label>主分支</label><input value={form.branch_main} onChange={e => setForm((f: any) => ({ ...f, branch_main: e.target.value }))} /></div>
+      </div>
+
+      <div style={{ height: 1, background: 'var(--border)', margin: '12px 0 10px' }} />
+      <div style={{ fontSize: 11, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600, marginBottom: 8 }}>审计预览环境</div>
+      <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
+        <div className="field full">
+          <label>启动命令</label>
+          <input value={form.dev_command} onChange={e => setForm((f: any) => ({ ...f, dev_command: e.target.value }))} placeholder="npm run dev" />
+        </div>
+        <div className="field">
+          <label>开发预览地址</label>
+          <input value={form.dev_url} onChange={e => setForm((f: any) => ({ ...f, dev_url: e.target.value }))} placeholder="http://localhost:5173" />
+        </div>
+        <div className="field">
+          <label>生产环境地址</label>
+          <input value={form.prod_url} onChange={e => setForm((f: any) => ({ ...f, prod_url: e.target.value }))} placeholder="https://app.example.com" />
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── ConfirmProjectDeleteModal ─────────────────────────────────────────────────
 
 export function ConfirmProjectDeleteModal({ project, onCancel, onConfirm }: {
   project: Project;

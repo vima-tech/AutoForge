@@ -232,10 +232,23 @@ pub async fn create_agent(
     let color = payload.color.unwrap_or_else(|| "#e8772e".to_string());
     let initial = payload.initial.unwrap_or_else(|| "?".to_string());
     let system_prompt = payload.system_prompt.unwrap_or_default();
+    let role_type = normalize_role_type(payload.role_type.as_deref());
+    let system_kind = payload.system_kind.and_then(normalize_system_kind);
+    let capabilities_json = payload
+        .capabilities_json
+        .unwrap_or_else(|| "[]".to_string());
+    let max_concurrency = payload.max_concurrency.unwrap_or(1).clamp(1, 16);
+    let visible_in_chat = payload.visible_in_chat.unwrap_or(role_type == "business");
+    let mentionable = payload.mentionable.unwrap_or(role_type == "business");
+    let enabled = payload.enabled.unwrap_or(true);
 
     sqlx::query(
-        "INSERT INTO agents (id, name, name_en, role, color, initial, llm_id, system_prompt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agents (
+            id, name, name_en, role, color, initial, llm_id, system_prompt,
+            role_type, system_kind, capabilities_json, max_concurrency,
+            visible_in_chat, mentionable, enabled
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&payload.name)
@@ -245,6 +258,13 @@ pub async fn create_agent(
     .bind(&initial)
     .bind(&payload.llm_id)
     .bind(&system_prompt)
+    .bind(&role_type)
+    .bind(&system_kind)
+    .bind(&capabilities_json)
+    .bind(max_concurrency)
+    .bind(visible_in_chat)
+    .bind(mentionable)
+    .bind(enabled)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -263,36 +283,36 @@ pub async fn update_agent(
     state: State<'_, AppState>,
 ) -> Result<Agent, String> {
     let mut sets = vec![];
-    let mut values: Vec<String> = vec![];
+    let mut values: Vec<AgentUpdateValue> = vec![];
 
     if let Some(ref v) = payload.name {
         sets.push("name=?");
-        values.push(v.clone());
+        values.push(AgentUpdateValue::Text(v.clone()));
     }
     if let Some(ref v) = payload.name_en {
         sets.push("name_en=?");
-        values.push(v.clone());
+        values.push(AgentUpdateValue::Text(v.clone()));
     }
     if let Some(ref v) = payload.role {
         sets.push("role=?");
-        values.push(v.clone());
+        values.push(AgentUpdateValue::Text(v.clone()));
     }
     if let Some(ref v) = payload.color {
         sets.push("color=?");
-        values.push(v.clone());
+        values.push(AgentUpdateValue::Text(v.clone()));
     }
     if let Some(ref llm_id) = payload.llm_id {
         match llm_id {
             Some(v) => {
                 sets.push("llm_id=?");
-                values.push(v.clone());
+                values.push(AgentUpdateValue::Text(v.clone()));
             }
             None => sets.push("llm_id=NULL"),
         }
     }
     if let Some(ref v) = payload.system_prompt {
         sets.push("system_prompt=?");
-        values.push(v.clone());
+        values.push(AgentUpdateValue::Text(v.clone()));
     }
 
     // forge_role is Option<Option<String>>: Some(None) means clear the assignment.
@@ -300,10 +320,45 @@ pub async fn update_agent(
         match fr {
             Some(v) => {
                 sets.push("forge_role=?");
-                values.push(v.clone());
+                values.push(AgentUpdateValue::Text(v.clone()));
             }
             None => sets.push("forge_role=NULL"),
         }
+    }
+    if let Some(ref v) = payload.role_type {
+        sets.push("role_type=?");
+        values.push(AgentUpdateValue::Text(normalize_role_type(Some(v)).to_string()));
+    }
+    if let Some(ref v) = payload.system_kind {
+        match v {
+            Some(kind) => {
+                sets.push("system_kind=?");
+                values.push(AgentUpdateValue::Text(
+                    normalize_system_kind(kind.clone()).unwrap_or_else(|| "planner".to_string()),
+                ));
+            }
+            None => sets.push("system_kind=NULL"),
+        }
+    }
+    if let Some(ref v) = payload.capabilities_json {
+        sets.push("capabilities_json=?");
+        values.push(AgentUpdateValue::Text(v.clone()));
+    }
+    if let Some(v) = payload.max_concurrency {
+        sets.push("max_concurrency=?");
+        values.push(AgentUpdateValue::Int(v.clamp(1, 16)));
+    }
+    if let Some(v) = payload.visible_in_chat {
+        sets.push("visible_in_chat=?");
+        values.push(AgentUpdateValue::Bool(v));
+    }
+    if let Some(v) = payload.mentionable {
+        sets.push("mentionable=?");
+        values.push(AgentUpdateValue::Bool(v));
+    }
+    if let Some(v) = payload.enabled {
+        sets.push("enabled=?");
+        values.push(AgentUpdateValue::Bool(v));
     }
 
     if sets.is_empty() {
@@ -317,7 +372,11 @@ pub async fn update_agent(
     let sql = format!("UPDATE agents SET {} WHERE id=?", sets.join(", "));
     let mut q = sqlx::query(&sql);
     for v in &values {
-        q = q.bind(v);
+        q = match v {
+            AgentUpdateValue::Text(v) => q.bind(v),
+            AgentUpdateValue::Int(v) => q.bind(v),
+            AgentUpdateValue::Bool(v) => q.bind(v),
+        };
     }
     q.bind(&id)
         .execute(&state.db)
@@ -329,6 +388,28 @@ pub async fn update_agent(
         .fetch_one(&state.db)
         .await
         .map_err(|e| e.to_string())
+}
+
+enum AgentUpdateValue {
+    Text(String),
+    Int(i64),
+    Bool(bool),
+}
+
+fn normalize_role_type(value: Option<&str>) -> &'static str {
+    match value {
+        Some("system") => "system",
+        _ => "business",
+    }
+}
+
+fn normalize_system_kind(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[tauri::command]

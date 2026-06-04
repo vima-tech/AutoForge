@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
-import { ProjectCreateModal, ConfirmProjectDeleteModal } from '../components/ProjectDialogs';
+import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, parseProjectConfig } from '../components/ProjectDialogs';
 import {
   listProjects, deleteProject, listChangeRequests, getWorktreeSession, getCodeDiff, review2,
   listPreviewEnvironments, seedDemoData, openUrl,
+  getDevServerStatus, startDevServer, stopDevServer,
   type Project, type ChangeRequest, type WorktreeSession,
-  type PreviewEnvironment,
+  type PreviewEnvironment, type DevServerStatus,
 } from '../services';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -144,11 +145,13 @@ function PreviewSection({ label, tag, tagClass, url }: {
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, activeCr,
-  onSelect, onAddProject, onDeleteProject, preview, onSeedDemo, width }: {
+  onSelect, onAddProject, onEditProject, onDeleteProject, devStatus, onStartServer, onStopServer, onSeedDemo, width }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; activeCr: string;
-  onSelect: (id: string) => void; onAddProject: () => void; onDeleteProject: (p: Project) => void;
-  preview: PreviewEnvironment | null; onSeedDemo: () => void; width: number;
+  onSelect: (id: string) => void; onAddProject: () => void; onEditProject: (p: Project) => void;
+  onDeleteProject: (p: Project) => void;
+  devStatus: DevServerStatus | null; onStartServer: () => void; onStopServer: () => void;
+  onSeedDemo: () => void; width: number;
 }) {
   const [open, setOpen] = useState(false);
   const menuRef = React.useRef<HTMLDivElement>(null);
@@ -164,42 +167,53 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     return () => document.removeEventListener('pointerdown', close);
   }, [open]);
 
-  const hasPreview = preview && preview.status !== 'terminated' && preview.preview_url;
-
   return (
     <div className="list-col" style={{ width, flex: `0 0 ${width}px` }}>
       <div className="audit-proj" ref={menuRef}>
-        {activeProject ? (
-          <div className="proj-select" onClick={() => setOpen(o => !o)}>
-            <div className="proj-logo" style={{ background: '#e8772e' }}>{activeProject.name[0]}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div className="proj-name">{activeProject.name}</div>
-              <div className="proj-meta">{activeProject.description}</div>
+        <div style={{ position: 'relative' }}>
+          {activeProject ? (
+            <div className="proj-select" onClick={() => setOpen(o => !o)}>
+              <div className="proj-logo" style={{ background: '#e8772e' }}>{activeProject.name[0]}</div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="proj-name">{activeProject.name}</div>
+                <div className="proj-meta">{activeProject.description}</div>
+              </div>
+              <Icon name="chevDown" size={16} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: open ? 'rotate(180deg)' : 'none' }} />
             </div>
-            <Icon name="chevDown" size={16} style={{ color: 'var(--text-3)' }} />
-          </div>
-        ) : (
-          <button className="btn btn-primary" style={{ justifyContent: 'center', width: '100%' }} onClick={onAddProject}>
-            <Icon name="plus" size={15} />添加项目
-          </button>
-        )}
-        {open && (
-          <div className="mention-pop audit-project-pop" style={{ left: 16, top: 64, bottom: 'auto', width: 'calc(100% - 32px)', marginBottom: 0 }}>
+          ) : (
+            <button className="btn btn-primary" style={{ justifyContent: 'center', width: '100%' }} onClick={onAddProject}>
+              <Icon name="plus" size={15} />添加项目
+            </button>
+          )}
+          {open && (
+          <div className="mention-pop audit-project-pop" style={{ left: 0, right: 0, top: 'calc(100% + 6px)', bottom: 'auto', width: '100%', marginBottom: 0 }}>
             {projects.map(p => (
               <div key={p.id} className="mention-row" onClick={() => { setActiveProject(p); setOpen(false); }}>
-                <div className="proj-logo" style={{ background: '#e8772e', width: 30, height: 30, fontSize: 13 }}>{p.name[0]}</div>
+                <div className="proj-logo" style={{ background: '#e8772e', width: 28, height: 28, fontSize: 12, borderRadius: 8 }}>{p.name[0]}</div>
                 <div style={{ minWidth: 0, flex: 1 }}>
-                  <div className="nm">{p.name}</div>
+                  <div className="nm" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    {p.name}
+                    {p.id === activeProject?.id && (
+                      <span style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--ember)', display: 'inline-block', flexShrink: 0 }} />
+                    )}
+                  </div>
                   <div className="rl">{p.description || p.slug}</div>
                 </div>
-                <span className={'chip ' + ((projectReviewCounts[p.id] ?? 0) > 0 ? 'amber' : '')} style={{ padding: '1px 7px', fontSize: 10 }}>
-                  {projectReviewCounts[p.id] ?? 0} 待审
-                </span>
-                {p.id === activeProject?.id && <Icon name="check" size={15} style={{ color: 'var(--ember)' }} />}
-                <button className="icon-btn" title="删除项目" style={{ width: 26, height: 26, color: 'var(--red)' }}
-                  onClick={e => { e.stopPropagation(); onDeleteProject(p); setOpen(false); }}>
-                  <Icon name="trash" size={13} />
-                </button>
+                {(projectReviewCounts[p.id] ?? 0) > 0 && (
+                  <span className="chip amber" style={{ padding: '1px 6px', fontSize: 10, flexShrink: 0 }}>
+                    {projectReviewCounts[p.id]}
+                  </span>
+                )}
+                <div className="row-actions">
+                  <button className="icon-btn" title="编辑项目" style={{ width: 24, height: 24 }}
+                    onClick={e => { e.stopPropagation(); onEditProject(p); setOpen(false); }}>
+                    <Icon name="edit" size={12} />
+                  </button>
+                  <button className="icon-btn" title="删除项目" style={{ width: 24, height: 24, color: 'var(--red)' }}
+                    onClick={e => { e.stopPropagation(); onDeleteProject(p); setOpen(false); }}>
+                    <Icon name="trash" size={12} />
+                  </button>
+                </div>
               </div>
             ))}
             <div style={{ height: 1, background: 'var(--border)', margin: '6px 4px' }} />
@@ -207,20 +221,42 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
               <Icon name="plus" size={14} />添加项目
             </button>
           </div>
-        )}
+          )}
+        </div>
 
-        {hasPreview ? (
+        {devStatus?.status === 'running' ? (
           <button className="btn" style={{ justifyContent: 'flex-start', width: '100%', gap: 6 }}
-            onClick={() => openUrl(preview.preview_url).catch(() => {})}>
+            onClick={() => openUrl(devStatus.url!).catch(() => {})}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--green)', flexShrink: 0, display: 'inline-block' }} />
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
-              {preview.preview_url}
+              {devStatus.url}
             </span>
+            <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} title="停止服务"
+              onClick={e => { e.stopPropagation(); onStopServer(); }}>
+              <Icon name="x" size={11} />
+            </button>
             <Icon name="external" size={13} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
           </button>
-        ) : (
-          <button className="btn" style={{ justifyContent: 'center', width: '100%' }} onClick={onSeedDemo}>
-            <Icon name="play" size={15} />启动预览
+        ) : devStatus?.status === 'starting' ? (
+          <button className="btn" disabled style={{ justifyContent: 'center', width: '100%', gap: 6 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--amber)', flexShrink: 0, display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' }} />
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
+              {devStatus.url ?? '启动中…'}
+            </span>
+          </button>
+        ) : devStatus?.status === 'idle' || devStatus?.status === 'stopped' ? (
+          <button className="btn" style={{ justifyContent: 'center', width: '100%' }} onClick={onStartServer}>
+            <Icon name="play" size={15} />启动项目
+          </button>
+        ) : activeProject ? (
+          <div style={{ fontSize: 11.5, color: 'var(--text-faint)', textAlign: 'center', padding: '6px 8px', cursor: 'default' }}>
+            未配置启动命令
+          </div>
+        ) : null}
+
+        {activeProject && devStatus?.status !== 'running' && devStatus?.status !== 'starting' && (
+          <button className="btn" style={{ justifyContent: 'center', width: '100%', fontSize: 11.5, color: 'var(--text-3)' }} onClick={onSeedDemo}>
+            填充演示数据
           </button>
         )}
       </div>
@@ -269,6 +305,7 @@ export default function AuditPage() {
   const [activeCr, setActiveCr] = useState('');
   const [session, setSession] = useState<WorktreeSession | null>(null);
   const [preview, setPreview] = useState<PreviewEnvironment | null>(null);
+  const [devStatus, setDevStatus] = useState<DevServerStatus | null>(null);
   const [diff, setDiff] = useState('');
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [tab, setTab] = useState<'report' | 'diff'>('report');
@@ -278,6 +315,7 @@ export default function AuditPage() {
   const [crLoading, setCrLoading] = useState(false);
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
   const [showProjectCreate, setShowProjectCreate] = useState(false);
+  const [projectToEdit, setProjectToEdit] = useState<Project | null>(null);
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
   const [projectError, setProjectError] = useState('');
 
@@ -306,6 +344,21 @@ export default function AuditPage() {
 
   useEffect(() => { loadProjects(); loadProjectReviewCounts(); }, [loadProjects, loadProjectReviewCounts]);
 
+  // Load dev server status when active project changes
+  useEffect(() => {
+    if (!activeProject) { setDevStatus(null); return; }
+    getDevServerStatus(activeProject.id).then(setDevStatus).catch(() => setDevStatus(null));
+  }, [activeProject]);
+
+  // Poll while server is starting
+  useEffect(() => {
+    if (!activeProject || devStatus?.status !== 'starting') return;
+    const id = setInterval(() => {
+      getDevServerStatus(activeProject.id).then(setDevStatus).catch(() => {});
+    }, 2000);
+    return () => clearInterval(id);
+  }, [devStatus?.status, activeProject]);
+
   const loadCrs = useCallback(async (projectId: string) => {
     const all = await listChangeRequests(projectId);
     setCrs(all);
@@ -316,7 +369,10 @@ export default function AuditPage() {
   useEffect(() => { if (activeProject) loadCrs(activeProject.id); }, [activeProject, loadCrs]);
 
   useEffect(() => {
-    if (!activeCr) return;
+    if (!activeCr) {
+      setPreview(null);  // clear stale preview when no CR is selected
+      return;
+    }
     const crId = activeCr;
     loadingCrRef.current = crId;
     setCrLoading(true);
@@ -384,6 +440,22 @@ export default function AuditPage() {
     } catch (e) { alert('填充失败：' + String(e)); }
   }, [loadProjects, loadProjectReviewCounts, loadCrs, activeProject]);
 
+  const doStartServer = useCallback(async () => {
+    if (!activeProject) return;
+    try {
+      const status = await startDevServer(activeProject.id);
+      setDevStatus(status);
+    } catch (e) { alert('启动失败：' + String(e)); }
+  }, [activeProject]);
+
+  const doStopServer = useCallback(async () => {
+    if (!activeProject) return;
+    try {
+      await stopDevServer(activeProject.id);
+      setDevStatus(s => s ? { ...s, status: 'stopped' } : null);
+    } catch (e) { alert('停止失败：' + String(e)); }
+  }, [activeProject]);
+
   const doDeleteProject = async () => {
     if (!projectToDelete) return;
     setProjectError('');
@@ -412,6 +484,21 @@ export default function AuditPage() {
           }}
         />
       )}
+      {projectToEdit && (
+        <ProjectEditModal
+          project={projectToEdit}
+          onClose={() => setProjectToEdit(null)}
+          onSaved={async saved => {
+            setProjectToEdit(null);
+            await loadProjects();
+            // If we edited the active project, refresh it and its dev status
+            if (activeProject?.id === saved.id) {
+              setActiveProject(saved);
+              getDevServerStatus(saved.id).then(setDevStatus).catch(() => {});
+            }
+          }}
+        />
+      )}
       {projectToDelete && (
         <ConfirmProjectDeleteModal
           project={projectToDelete}
@@ -426,8 +513,10 @@ export default function AuditPage() {
         setActiveProject={p => { setActiveProject(p); setActiveCr(''); }}
         projectReviewCounts={projectReviewCounts} crs={crs} activeCr={activeCr}
         onSelect={id => { setActiveCr(id); setDecided(null); }}
-        onAddProject={() => setShowProjectCreate(true)} onDeleteProject={setProjectToDelete}
-        preview={preview} onSeedDemo={doSeedDemo} width={listWidth}
+        onAddProject={() => setShowProjectCreate(true)} onEditProject={setProjectToEdit}
+        onDeleteProject={setProjectToDelete}
+        devStatus={devStatus} onStartServer={doStartServer} onStopServer={doStopServer}
+        onSeedDemo={doSeedDemo} width={listWidth}
       />
       <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
 
@@ -563,7 +652,7 @@ export default function AuditPage() {
                   <span style={{ fontWeight: 700, fontSize: 13.5 }}>实时预览对比</span>
                 </div>
                 <div className="prev-frames">
-                  <PreviewSection label="生产 main" tag="生产 main" tagClass="prod" url={null} />
+                  <PreviewSection label="生产 main" tag="生产 main" tagClass="prod" url={parseProjectConfig(activeProject?.config_yaml ?? null).prodUrl || null} />
                   <PreviewSection label={`本次改动 ${cr.id.slice(0, 8)}`} tag={`本次改动 ${cr.id.slice(0, 8)}`} tagClass="cr" url={preview?.preview_url ?? null} />
                 </div>
 

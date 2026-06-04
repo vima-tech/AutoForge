@@ -219,8 +219,19 @@ export default function App() {
       };
 
       // Update last event label immediately (cheap state update, no IPC).
-      const evType = typeof ev?.type === 'string' ? ev.type : 'event';
-      setLastEvent(evType);
+      const EVENT_LABELS: Record<string, string> = {
+        message_received: '新消息',
+        review_needed: '待审核',
+        iteration_warning: '迭代告警',
+        cr_merged: '已合并',
+        test_completed: '测试完成',
+        analysis_started: '分析中',
+        analysis_done: '分析完成',
+        execution_started: '执行中',
+        execution_done: '执行完成',
+      };
+      const evType = typeof ev?.type === 'string' ? ev.type : '';
+      setLastEvent(EVENT_LABELS[evType] ?? evType);
 
       // Debounced IPC refreshes.
       debouncedBadges();

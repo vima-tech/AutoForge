@@ -37,7 +37,11 @@ export interface LlmConfig {
 export interface Agent {
   id: string; name: string; name_en: string; role: string;
   color: string; initial: string; llm_id: string | null;
-  system_prompt: string; forge_role: string | null; created_at: string;
+  system_prompt: string; forge_role: string | null;
+  role_type: 'business' | 'system'; system_kind: string | null;
+  capabilities_json: string; max_concurrency: number;
+  visible_in_chat: boolean; mentionable: boolean; enabled: boolean;
+  created_at: string;
 }
 export interface Project {
   id: string; name: string; slug: string; description: string;
@@ -79,6 +83,13 @@ export interface Conversation {
 export interface Message {
   id: string; conversation_id: string; from_agent: string | null;
   content_json: string; created_at: string;
+  excluded_from_context: boolean;
+}
+export interface ConversationTask {
+  id: string; conversation_id: string; trigger_message_id: string;
+  planner_agent_id: string | null; instruction: string; plan_json: string;
+  status: string; error: string | null; created_at: string;
+  started_at: string | null; completed_at: string | null;
 }
 export interface ConversationAttachment {
   id: string; conversation_id: string; original_name: string;
@@ -146,6 +157,12 @@ export interface AdminDecision {
 
 export interface BadgeCounts { chat_unread: number; audit_pending: number; }
 
+export interface DevServerStatus {
+  project_id: string;
+  status: 'no_config' | 'idle' | 'starting' | 'running' | 'stopped';
+  url: string | null;
+}
+
 // ── System ───────────────────────────────────────────────────────────────────
 export const getSystemHealth = () => ipc<SystemHealth>('system_health');
 export const checkClaudeAuth = () => ipc<boolean>('check_claude_auth');
@@ -175,6 +192,7 @@ export const getProject = (id: string) => ipc<Project>('get_project', { id });
 export const createProject = (payload: {
   name: string; slug: string; description?: string;
   repo_path: string; branch_dev?: string; branch_main?: string;
+  config_yaml?: string;
 }) => ipc<Project>('create_project', { payload });
 export const updateProject = (id: string, payload: Partial<{
   name: string; description: string; repo_path: string;
@@ -239,8 +257,16 @@ export const clearConversationMessages = (conversationId: string) =>
   ipc<void>('clear_conversation_messages', { conversationId });
 export const markConversationRead = (conversationId: string) =>
   ipc<void>('mark_conversation_read', { conversationId });
-export const agentReply = (conversationId: string, agentId: string) =>
-  ipc<void>('agent_reply', { conversationId, agentId });
+export const agentReply = (conversationId: string, agentId: string, windowSize?: number) =>
+  ipc<void>('agent_reply', { conversationId, agentId, windowSize: windowSize ?? null });
+export const toggleMessageContext = (messageId: string) =>
+  ipc<Message>('toggle_message_context', { messageId });
+export const startConversationTask = (payload: {
+  conversation_id: string; trigger_message_id: string; instruction: string;
+  mentioned_agent_ids: string[]; window_size?: number | null;
+}) => ipc<ConversationTask>('start_conversation_task', { payload });
+export const listConversationTasks = (conversationId: string) =>
+  ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
 
 // ── Settings — LLM ──────────────────────────────────────────────────────────
 export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');
@@ -260,10 +286,16 @@ export const listAgents = () => ipc<Agent[]>('list_agents');
 export const createAgent = (payload: {
   name: string; name_en?: string; role?: string; color?: string;
   initial?: string; llm_id?: string; system_prompt?: string;
+  role_type?: 'business' | 'system'; system_kind?: string | null;
+  capabilities_json?: string; max_concurrency?: number;
+  visible_in_chat?: boolean; mentionable?: boolean; enabled?: boolean;
 }) => ipc<Agent>('create_agent', { payload });
 export const updateAgent = (id: string, payload: Partial<{
   name: string; name_en: string; role: string; color: string;
   llm_id: string | null; system_prompt: string; forge_role: string | null;
+  role_type: 'business' | 'system'; system_kind: string | null;
+  capabilities_json: string; max_concurrency: number;
+  visible_in_chat: boolean; mentionable: boolean; enabled: boolean;
 }>) => ipc<Agent>('update_agent', { id, payload });
 export const deleteAgent = (id: string) => ipc<void>('delete_agent', { id });
 export const setAgentForgeRole = (agentId: string, role: string) =>
@@ -271,3 +303,11 @@ export const setAgentForgeRole = (agentId: string, role: string) =>
 
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
 export const seedDemoData = () => ipc<string>('seed_demo_data');
+
+// ── Dev Server ───────────────────────────────────────────────────────────────
+export const getDevServerStatus = (projectId: string) =>
+  ipc<DevServerStatus>('get_dev_server_status', { projectId });
+export const startDevServer = (projectId: string) =>
+  ipc<DevServerStatus>('start_dev_server', { projectId });
+export const stopDevServer = (projectId: string) =>
+  ipc<void>('stop_dev_server', { projectId });

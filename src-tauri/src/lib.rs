@@ -47,6 +47,7 @@ pub fn run() {
                 db,
                 job_tx,
                 concurrency,
+                dev_servers: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             });
 
             // 显式设置窗口图标，确保 Linux 任务栏在开发模式下也能显示正确图标
@@ -89,6 +90,9 @@ pub fn run() {
             commands::conversations::clear_conversation_messages,
             commands::conversations::mark_conversation_read,
             commands::conversations::agent_reply,
+            commands::conversations::toggle_message_context,
+            commands::orchestration::start_conversation_task,
+            commands::orchestration::list_conversation_tasks,
             commands::settings::list_llm_configs,
             commands::settings::create_llm_config,
             commands::settings::update_llm_config,
@@ -113,6 +117,9 @@ pub fn run() {
             commands::system::list_admin_decisions,
             commands::demo::seed_demo_data,
             commands::demo::open_url,
+            commands::dev_server::get_dev_server_status,
+            commands::dev_server::start_dev_server,
+            commands::dev_server::stop_dev_server,
         ])
         .run(tauri::generate_context!())
         .expect("error running AutoForge");

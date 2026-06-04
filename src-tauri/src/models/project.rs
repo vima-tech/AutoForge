@@ -23,6 +23,7 @@ pub struct CreateProject {
     pub repo_path: String,
     pub branch_dev: Option<String>,
     pub branch_main: Option<String>,
+    pub config_yaml: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

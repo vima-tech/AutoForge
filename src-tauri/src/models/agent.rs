@@ -11,6 +11,13 @@ pub struct Agent {
     pub llm_id: Option<String>,
     pub system_prompt: String,
     pub forge_role: Option<String>,
+    pub role_type: String,
+    pub system_kind: Option<String>,
+    pub capabilities_json: String,
+    pub max_concurrency: i64,
+    pub visible_in_chat: bool,
+    pub mentionable: bool,
+    pub enabled: bool,
     pub created_at: String,
 }
 
@@ -23,6 +30,13 @@ pub struct CreateAgent {
     pub initial: Option<String>,
     pub llm_id: Option<String>,
     pub system_prompt: Option<String>,
+    pub role_type: Option<String>,
+    pub system_kind: Option<String>,
+    pub capabilities_json: Option<String>,
+    pub max_concurrency: Option<i64>,
+    pub visible_in_chat: Option<bool>,
+    pub mentionable: Option<bool>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,4 +48,11 @@ pub struct UpdateAgent {
     pub llm_id: Option<Option<String>>,
     pub system_prompt: Option<String>,
     pub forge_role: Option<Option<String>>,
+    pub role_type: Option<String>,
+    pub system_kind: Option<Option<String>>,
+    pub capabilities_json: Option<String>,
+    pub max_concurrency: Option<i64>,
+    pub visible_in_chat: Option<bool>,
+    pub mentionable: Option<bool>,
+    pub enabled: Option<bool>,
 }

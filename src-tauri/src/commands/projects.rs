@@ -34,7 +34,7 @@ pub async fn create_project(
     let description = payload.description.unwrap_or_default();
 
     sqlx::query(
-        "INSERT INTO projects (id, name, slug, description, repo_path, branch_dev, branch_main) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO projects (id, name, slug, description, repo_path, branch_dev, branch_main, config_yaml) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(&payload.name)
@@ -43,6 +43,7 @@ pub async fn create_project(
     .bind(&payload.repo_path)
     .bind(&branch_dev)
     .bind(&branch_main)
+    .bind(&payload.config_yaml)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;

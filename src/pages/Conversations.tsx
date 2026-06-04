@@ -4,10 +4,10 @@ import Icon from '../components/Icon';
 import { Avatar, MeAvatar } from '../components/Avatar';
 import Block from '../components/Block';
 import {
-  listConversations, listMessages, sendMessage, createGroupConversation, agentReply,
+  listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
-  clearConversationMessages,
+  clearConversationMessages, toggleMessageContext, startConversationTask,
   type Conversation, type Message, type Agent, type ConversationAttachment,
 } from '../services';
 import type { BlockType } from '../data/mock';
@@ -188,11 +188,15 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
   active: string; onSelect: (id: string) => void; onNew: () => void;
 }) {
   const [q, setQ] = useState('');
-  const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
+  const chatAgents = useMemo(() => agents.filter(a => a.visible_in_chat && a.enabled), [agents]);
+  const agentMap = useMemo(() => Object.fromEntries(chatAgents.map(a => [a.id, a])), [chatAgents]);
   const title = (c: Conversation) => c.conv_type === 'group' ? (c.name ?? '群聊') : (agentMap[c.members[0]]?.name ?? 'Agent');
   const match = (c: Conversation) => !q || title(c).toLowerCase().includes(q.toLowerCase());
   const groups  = useMemo(() => convs.filter(c => c.conv_type === 'group'),  [convs]);
-  const directs = useMemo(() => convs.filter(c => c.conv_type === 'direct'), [convs]);
+  const directs = useMemo(
+    () => convs.filter(c => c.conv_type === 'direct' && c.members.some(id => !!agentMap[id])),
+    [convs, agentMap],
+  );
   return (
     <div className="list-col">
       <div className="list-head">
@@ -244,8 +248,17 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
             </span>
           </div>
         )}
-        <div className="bubble" onContextMenu={e => onBubbleContextMenu?.(e, m, author)}>
+        <div
+          className="bubble"
+          onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
+          style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
+        >
           {blocks.map((b, i) => <Block key={i} b={b} />)}
+          {m.excluded_from_context && (
+            <div style={{ fontSize: 10.5, color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Icon name="eye-off" size={11} />已从 AI 上下文排除
+            </div>
+          )}
         </div>
         {quote && (
           <div className="bubble-quote" title={`${quote.author}: ${quote.text}`}>
@@ -260,7 +273,7 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
 
 function Composer({ conv, agents, contextAttachments, onSend, onError, quote, onClearQuote, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
-  onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[]) => Promise<boolean>;
+  onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
   onError: (message: string) => void;
   quote: QuoteDraft | null;
   onClearQuote: () => void;
@@ -279,7 +292,12 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
   const imageInputRef = useRef<HTMLInputElement>(null);
   const isG = conv.conv_type === 'group';
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
-  const members  = useMemo(() => isG ? conv.members.map(id => agentMap[id]).filter(Boolean) : [], [isG, conv.members, agentMap]);
+  const members  = useMemo(
+    () => isG
+      ? conv.members.map(id => agentMap[id]).filter((a): a is Agent => !!a && a.mentionable && a.enabled)
+      : [],
+    [isG, conv.members, agentMap],
+  );
   const filteredContextAttachments = useMemo(() => {
     const q = attachmentQuery.trim().toLowerCase();
     if (!q) return contextAttachments;
@@ -530,6 +548,15 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
       .filter((a): a is ConversationAttachment => !!a);
   };
 
+  const mentionedAgentIds = () => {
+    const editor = editorRef.current;
+    if (!editor) return [];
+    const ids = Array.from(editor.querySelectorAll<HTMLElement>('.mention-tag'))
+      .map(node => node.dataset.agentId)
+      .filter((id): id is string => !!id);
+    return Array.from(new Set(ids));
+  };
+
   const deleteAdjacentInlineTag = () => {
     const editor = editorRef.current;
     const sel = window.getSelection();
@@ -574,13 +601,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     const outgoing = editorText().trim();
     const pendingItems = [...pending];
     const refs = contextRefs();
+    const mentions = mentionedAgentIds();
     if (!outgoing && pendingItems.length === 0 && refs.length === 0) return;
     setText('');
     setPending([]);
     if (editorRef.current) editorRef.current.innerHTML = '';
     setShowMention(false);
     setShowAttachmentPicker(false);
-    await onSend(outgoing, pendingItems, refs);
+    await onSend(outgoing, pendingItems, refs, mentions);
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -780,6 +808,10 @@ function NewGroupModal({ agents, onClose, onCreate }: {
 }) {
   const [sel, setSel] = useState<string[]>([]);
   const [name, setName] = useState('');
+  const chatAgents = useMemo(
+    () => agents.filter(a => a.visible_in_chat && a.mentionable && a.enabled),
+    [agents],
+  );
   const toggle = (id: string) => setSel(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }} onClick={onClose}>
@@ -798,7 +830,7 @@ function NewGroupModal({ agents, onClose, onCreate }: {
           </div>
           <div className="field"><label>选择 Agent（{sel.length}）</label></div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
-            {agents.map(a => (
+            {chatAgents.map(a => (
               <div key={a.id} className="mention-row"
                 style={{ border: '1px solid ' + (sel.includes(a.id) ? 'var(--ember)' : 'transparent'), background: sel.includes(a.id) ? 'var(--ember-tint)' : 'transparent' }}
                 onClick={() => toggle(a.id)}>
@@ -857,6 +889,7 @@ export default function ConversationsPage() {
   const [quoteDraft,     setQuoteDraft]     = useState<QuoteDraft | null>(null);
   const [bubbleMenu,     setBubbleMenu]     = useState<BubbleMenuState | null>(null);
   const [contextAttachments, setContextAttachments] = useState<ConversationAttachment[]>([]);
+  const [windowSize,         setWindowSize]         = useState(20);
 
   const scrollRef       = useRef<HTMLDivElement>(null);
   const headerActionsRef= useRef<HTMLDivElement>(null);
@@ -949,7 +982,7 @@ export default function ConversationsPage() {
 
     listen<unknown>('AutoForge://event', e => {
       const ev = e.payload as { type?: string; conversation_id?: string };
-      if (ev?.type !== 'message_received') return;
+      if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
@@ -1010,11 +1043,17 @@ export default function ConversationsPage() {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
 
   const convMembers = useMemo(
-    () => conv ? conv.members.map(id => agentMap[id]).filter(Boolean) : [],
+    () => conv
+      ? conv.members
+          .map(id => agentMap[id])
+          .filter((a): a is Agent => !!a && a.visible_in_chat && a.enabled)
+      : [],
     [conv, agentMap],
   );
   const availableAgents = useMemo(
-    () => conv ? agents.filter(a => !conv.members.includes(a.id)) : [],
+    () => conv
+      ? agents.filter(a => a.visible_in_chat && a.mentionable && a.enabled && !conv.members.includes(a.id))
+      : [],
     [conv, agents],
   );
 
@@ -1085,10 +1124,23 @@ export default function ConversationsPage() {
     setBubbleMenu(null);
   };
 
+  const toggleContextBubbleMessage = async () => {
+    if (!bubbleMenu) return;
+    const id = bubbleMenu.message.id;
+    setBubbleMenu(null);
+    try {
+      const updated = await toggleMessageContext(id);
+      setMsgs(ms => ms.map(m => m.id === id ? { ...m, excluded_from_context: updated.excluded_from_context } : m));
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  };
+
   const onSend = async (
     text: string,
     attachments: PendingAttachment[],
     contextRefs: ConversationAttachment[],
+    mentionedAgentIds: string[],
   ) => {
     if (!conv || sending) return false;
     setSending(true);
@@ -1133,30 +1185,21 @@ export default function ConversationsPage() {
       if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
       setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
 
-      let respondAgentId: string | null = null;
-      if (!text) {
-        respondAgentId = null;
-      } else if (conv.conv_type === 'direct') {
-        respondAgentId = conv.members[0] ?? null;
-      } else {
-        const mention = text.match(/@([^\s，。@]+)/);
-        if (mention) {
-          const found = agents.find(a => mention[1].startsWith(a.name.slice(0, 2)));
-          respondAgentId = found?.id ?? conv.members[0] ?? null;
-        } else {
-          respondAgentId = conv.members[0] ?? null;
-        }
-      }
-
-      if (respondAgentId) {
-        const typingId = 'typing-' + Date.now();
-        setMsgs(ms => [...ms, { id: typingId, conversation_id: conv.id, from_agent: respondAgentId, content_json: JSON.stringify([{ t: 'typing' }]), created_at: new Date().toISOString() }]);
-        try {
-          await agentReply(conv.id, respondAgentId);
-          await loadMsgs(conv.id);
-        } catch {
-          setMsgs(ms => ms.filter(m => m.id !== typingId));
-        }
+      const shouldStartTask = text.trim().length > 0 || contextRefs.length > 0 || attachments.length > 0;
+      if (shouldStartTask) {
+        const directAgentIds = conv.conv_type === 'direct'
+          ? conv.members.filter(id => {
+              const a = agentMap[id];
+              return !!a && a.enabled;
+            }).slice(0, 1)
+          : [];
+        await startConversationTask({
+          conversation_id: conv.id,
+          trigger_message_id: m.id,
+          instruction: text.trim() || '请基于刚刚发送的附件和上下文回复。',
+          mentioned_agent_ids: mentionedAgentIds.length > 0 ? mentionedAgentIds : directAgentIds,
+          window_size: windowSize,
+        });
       }
       return true;
     } catch (e) {
@@ -1328,11 +1371,28 @@ export default function ConversationsPage() {
 
               {/* Context panel */}
               {showContext && (
-                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 320 }}>
+                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 340 }}>
                   <div className="mention-pop-label">对话上下文与附件</div>
-                  <div style={{ padding: '7px 8px 9px', color: 'var(--text-3)', fontSize: 12, lineHeight: 1.5 }}>
-                    消息 {msgs.length} 条 · 上下文块 {contextBlocks.length} 个
+                  <div style={{ padding: '7px 8px 4px' }}>
+                    <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 8 }}>
+                      共 {visibleMsgCount} 条消息 ·
+                      已排除 {msgs.filter(m => !m.id.startsWith('typing-') && m.excluded_from_context).length} 条 ·
+                      上下文块 {contextBlocks.length} 个
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                      <span style={{ color: 'var(--text-3)', whiteSpace: 'nowrap' }}>窗口大小</span>
+                      <input
+                        type="range" min={5} max={50} step={5} value={windowSize}
+                        onChange={e => setWindowSize(Number(e.target.value))}
+                        style={{ flex: 1, accentColor: 'var(--ember)' }}
+                      />
+                      <span style={{ color: 'var(--ember)', fontFamily: 'var(--font-mono)', minWidth: 28, textAlign: 'right' }}>{windowSize}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 3 }}>
+                      发送时取最近 {windowSize} 条（排除标记的消息）
+                    </div>
                   </div>
+                  <div style={{ height: 1, background: 'var(--border)', margin: '4px 0' }} />
                   {contextBlocks.slice(-8).reverse().map(({ block: b, messageId }, i) => (
                     <div
                       key={`${messageId}-${i}`}
@@ -1454,6 +1514,10 @@ export default function ConversationsPage() {
         >
           <button onClick={copyBubbleMessage}><Icon name="copy" size={14} />复制</button>
           <button onClick={quoteBubbleMessage}><Icon name="quote" size={14} />引用</button>
+          <button onClick={toggleContextBubbleMessage} title={bubbleMenu.message.excluded_from_context ? '恢复：重新加入上下文' : '排除：不进入 AI 上下文'}>
+            <Icon name={bubbleMenu.message.excluded_from_context ? 'eye' : 'eye-off'} size={14} />
+            {bubbleMenu.message.excluded_from_context ? '恢复' : '排除'}
+          </button>
         </div>
       )}
       {confirmDissolve && (

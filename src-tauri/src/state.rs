@@ -1,12 +1,20 @@
 use crate::core::concurrency::ConcurrencyManager;
 use crate::db::Db;
 use crate::tasks::runner::JobSender;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+pub struct DevServerHandle {
+    pub child: Arc<Mutex<Option<tokio::process::Child>>>,
+    pub url: String,
+}
 
 pub struct AppState {
     pub db: Db,
     pub job_tx: JobSender,
     pub concurrency: Arc<ConcurrencyManager>,
+    pub dev_servers: Arc<Mutex<HashMap<String, DevServerHandle>>>,
 }
 
 static WORKTREES_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

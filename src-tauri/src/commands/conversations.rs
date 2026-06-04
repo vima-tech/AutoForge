@@ -127,7 +127,9 @@ async fn ensure_direct_conversations(db: &crate::db::Db) -> Result<(), String> {
     let missing_agents: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT a.id, a.color, a.initial
          FROM agents a
-         WHERE NOT EXISTS (
+         WHERE a.visible_in_chat = 1
+           AND a.enabled = 1
+           AND NOT EXISTS (
              SELECT 1
              FROM conversation_members cm
              JOIN conversations c ON c.id=cm.conversation_id
@@ -696,6 +698,8 @@ pub async fn delete_group_conversation(
             .await
             .map_err(|e| e.to_string())?;
 
+    delete_conversation_task_records(&mut tx, &conversation_id).await?;
+
     sqlx::query("DELETE FROM messages WHERE conversation_id=?")
         .bind(&conversation_id)
         .execute(&mut *tx)
@@ -762,6 +766,8 @@ pub async fn clear_conversation_messages(
             .await
             .map_err(|e| e.to_string())?;
 
+    delete_conversation_task_records(&mut tx, &conversation_id).await?;
+
     sqlx::query("DELETE FROM messages WHERE conversation_id=?")
         .bind(&conversation_id)
         .execute(&mut *tx)
@@ -789,6 +795,45 @@ pub async fn clear_conversation_messages(
             let _ = tokio::fs::remove_file(base.join(rel)).await;
         }
     }
+
+    Ok(())
+}
+
+async fn delete_conversation_task_records(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "DELETE FROM conversation_task_runs
+         WHERE task_id IN (
+             SELECT id FROM conversation_tasks WHERE conversation_id=?
+         )
+            OR message_id IN (
+             SELECT id FROM messages WHERE conversation_id=?
+         )",
+    )
+    .bind(conversation_id)
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM conversation_task_steps
+         WHERE task_id IN (
+             SELECT id FROM conversation_tasks WHERE conversation_id=?
+         )",
+    )
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM conversation_tasks WHERE conversation_id=?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -862,6 +907,55 @@ async fn conversation_detail(
     })
 }
 
+/// Read a text-based attachment from disk and return its content.
+/// Returns `Ok(None)` for PDF/binary mimes that cannot be inlined as text.
+async fn load_text_attachment_content(
+    attachment_id: &str,
+    db: &crate::db::Db,
+) -> Result<Option<String>, String> {
+    let attachment = load_attachment(db, attachment_id).await?;
+    const TEXT_MIMES: &[&str] = &[
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/json",
+        "application/x-yaml",
+        "application/toml",
+    ];
+    if !TEXT_MIMES.contains(&attachment.mime.as_str()) {
+        return Ok(None);
+    }
+    let path = attachment_path(&attachment)?;
+    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
+    // Truncate huge files so we don't blow up the context window.
+    const MAX_CHARS: usize = 50_000;
+    if text.chars().count() > MAX_CHARS {
+        let truncated: String = text.chars().take(MAX_CHARS).collect();
+        Ok(Some(format!(
+            "{}\n\n[… 内容已截断，原始大小 {} 字节]",
+            truncated,
+            bytes.len()
+        )))
+    } else {
+        Ok(Some(text.to_string()))
+    }
+}
+
+/// Return the filesystem path for an image attachment, verifying it exists.
+async fn get_attachment_file_path(
+    attachment_id: &str,
+    db: &crate::db::Db,
+) -> Result<PathBuf, String> {
+    let attachment = load_attachment(db, attachment_id).await?;
+    let path = attachment_path(&attachment)?;
+    if !path.exists() {
+        return Err("图片文件不存在".to_string());
+    }
+    Ok(path)
+}
+
 async fn unread_count(db: &crate::db::Db, conversation_id: &str) -> Result<i64, String> {
     let (count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*)
@@ -883,18 +977,40 @@ async fn unread_count(db: &crate::db::Db, conversation_id: &str) -> Result<i64, 
 }
 
 #[tauri::command]
+pub async fn toggle_message_context(
+    message_id: String,
+    state: State<'_, AppState>,
+) -> Result<Message, String> {
+    sqlx::query(
+        "UPDATE messages SET excluded_from_context = NOT excluded_from_context WHERE id=?",
+    )
+    .bind(&message_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query_as::<_, Message>("SELECT * FROM messages WHERE id=?")
+        .bind(&message_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn agent_reply(
     conversation_id: String,
     agent_id: String,
+    window_size: Option<i64>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Message, String> {
     let t0 = std::time::Instant::now();
+    let limit = window_size.unwrap_or(20).clamp(5, 100);
     info!(
-        "[cmd] agent_reply conv={} agent={}",
-        conversation_id, agent_id
+        "[cmd] agent_reply conv={} agent={} window={}",
+        conversation_id, agent_id, limit
     );
-    // Load agent info
+
     let agent = sqlx::query_as::<_, crate::models::agent::Agent>("SELECT * FROM agents WHERE id=?")
         .bind(&agent_id)
         .fetch_optional(&state.db)
@@ -902,28 +1018,108 @@ pub async fn agent_reply(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("agent {} not found", agent_id))?;
 
-    // Load last 10 messages as context
-    let messages = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT 10",
+    // Fetch the window, then exclude flagged messages (keep in DESC order for the limit,
+    // then reverse to chronological for the prompt).
+    let candidates = sqlx::query_as::<_, Message>(
+        "SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT ?",
     )
     .bind(&conversation_id)
+    .bind(limit)
     .fetch_all(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    // Build prompt from messages (reversed to chronological order)
-    let mut prompt_parts = Vec::new();
+    let messages: Vec<Message> = candidates
+        .into_iter()
+        .filter(|m| !m.excluded_from_context)
+        .collect();
+
+    // Build prompt from message blocks, extracting file content and collecting image paths.
+    let mut prompt_parts: Vec<String> = Vec::new();
+    let mut image_paths: Vec<PathBuf> = Vec::new();
+
     for msg in messages.iter().rev() {
         let sender = msg.from_agent.as_deref().unwrap_or("User");
-        prompt_parts.push(format!("[{}]: {}", sender, msg.content_json));
+        let blocks: Vec<serde_json::Value> =
+            serde_json::from_str(&msg.content_json).unwrap_or_else(|_| {
+                vec![serde_json::json!({"t": "md", "md": msg.content_json})]
+            });
+
+        let mut parts: Vec<String> = Vec::new();
+        for block in &blocks {
+            match block.get("t").and_then(|t| t.as_str()) {
+                Some("md") => {
+                    if let Some(md) = block.get("md").and_then(|v| v.as_str()) {
+                        parts.push(md.to_string());
+                    }
+                }
+                Some("file") => {
+                    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("文件");
+                    if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                        match load_text_attachment_content(id, &state.db).await {
+                            Ok(Some(content)) => {
+                                parts.push(format!(
+                                    "[文件内容 — {}]\n```\n{}\n```",
+                                    name, content
+                                ));
+                            }
+                            Ok(None) => {
+                                parts.push(format!("[附件: {} (PDF 或二进制，无法提取文本)]", name));
+                            }
+                            Err(e) => {
+                                parts.push(format!("[附件: {} (读取失败: {})]", name, e));
+                            }
+                        }
+                    } else {
+                        parts.push(format!("[附件: {}]", name));
+                    }
+                }
+                Some("image") => {
+                    let label = block.get("label").and_then(|v| v.as_str()).unwrap_or("图片");
+                    if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                        match get_attachment_file_path(id, &state.db).await {
+                            Ok(path) => {
+                                parts.push(format!("[图片: {}]", label));
+                                image_paths.push(path);
+                            }
+                            Err(_) => {
+                                parts.push(format!("[图片: {} (文件不可用)]", label));
+                            }
+                        }
+                    } else {
+                        parts.push(format!("[图片: {}]", label));
+                    }
+                }
+                Some("quote_ref") => {
+                    let author = block.get("author").and_then(|v| v.as_str()).unwrap_or("?");
+                    let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    parts.push(format!("[引用 {}]: {}", author, text));
+                }
+                Some("code") => {
+                    let lang = block.get("lang").and_then(|v| v.as_str()).unwrap_or("");
+                    let code = block.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                    parts.push(format!("```{}\n{}\n```", lang, code));
+                }
+                Some("artifact") => {
+                    let title = block.get("title").and_then(|v| v.as_str()).unwrap_or("报告");
+                    let body = block.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    parts.push(format!("[分析报告 — {}]\n{}", title, body));
+                }
+                _ => {}
+            }
+        }
+
+        if !parts.is_empty() {
+            prompt_parts.push(format!("[{}]: {}", sender, parts.join("\n")));
+        }
     }
-    let context = prompt_parts.join("\n");
+
+    let context = prompt_parts.join("\n\n");
     let prompt = format!(
         "以下是对话历史：\n{}\n\n请以 {} 的身份回复最后一条消息。",
         context, agent.name
     );
 
-    // Call claude
     let system_prompt = if agent.system_prompt.is_empty() {
         None
     } else {
@@ -931,15 +1127,17 @@ pub async fn agent_reply(
     };
 
     info!(
-        "[cmd] agent_reply: calling claude CLI (elapsed {:?})",
+        "[cmd] agent_reply: calling claude CLI with {} image(s) (elapsed {:?})",
+        image_paths.len(),
         t0.elapsed()
     );
-    let reply_text = crate::agents::local_claude::run_text(&prompt, system_prompt)
-        .await
-        .unwrap_or_else(|e| {
-            warn!("[cmd] agent_reply: claude CLI error: {}", e);
-            format!("[系统错误: {}]", e)
-        });
+    let reply_text =
+        crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, system_prompt, &image_paths)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("[cmd] agent_reply: agent LLM error: {}", e);
+                format!("[系统错误: {}]", e)
+            });
     info!(
         "[cmd] agent_reply: claude CLI returned in {:?}",
         t0.elapsed()

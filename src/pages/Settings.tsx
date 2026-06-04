@@ -254,12 +254,92 @@ function AgentSettings() {
   const analystId = agents.find(a => a.forge_role?.split(',').includes('analysis'))?.id ?? '';
   const testerId  = agents.find(a => a.forge_role?.split(',').includes('test'))?.id ?? '';
   const agentOpts = [{ value: '', label: '— 未指派 —' }, ...agents.map(a => ({ value: a.id, label: a.name }))];
+  const systemRoleRows = [
+    { kind: 'planner', title: 'Planner 调度器', icon: 'layers', color: 'var(--blue)', desc: '解析群聊自然语言请求，生成多 Agent 并发/串行编排计划' },
+    { kind: 'summarizer', title: 'Summarizer 总结器', icon: 'quote', color: 'var(--violet)', desc: '综合多个 Agent 的发言，形成结论、裁决和下一步建议' },
+    { kind: 'doc_writer', title: 'Doc Writer 文档生成器', icon: 'file', color: 'var(--amber)', desc: '把讨论结果整理成 PRD、ADR、测试计划等文档产物' },
+    { kind: 'context_compressor', title: 'Context Compressor 上下文压缩器', icon: 'layers', color: 'var(--green)', desc: '压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度' },
+  ];
+  const systemKindLabels: Record<string, string> = {
+    planner: 'Planner 调度器',
+    summarizer: 'Summarizer 总结器',
+    doc_writer: 'Doc Writer 文档生成器',
+    context_compressor: 'Context Compressor',
+  };
+  const systemKinds = (a: Agent) => (a.system_kind ?? '').split(',').map(v => v.trim()).filter(Boolean);
+  const hasSystemKind = (a: Agent, kind: string) => systemKinds(a).includes(kind);
+  const systemKindValue = (a: Agent, add?: string, remove?: string) => {
+    const kinds = new Set(systemKinds(a));
+    if (remove) kinds.delete(remove);
+    if (add) kinds.add(add);
+    const next = Array.from(kinds).join(',');
+    return next || null;
+  };
+
+  const updateAgentLocal = async (id: string, payload: Partial<Agent>, status = '已保存') => {
+    try {
+      const updated = await updateAgent(id, payload);
+      setAgents(as => as.map(a => a.id === id ? updated : a));
+      setDrafts(d2 => {
+        const n = { ...d2 };
+        delete n[id];
+        return n;
+      });
+      setSaveStatus(s => ({ ...s, [id]: status }));
+      setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
+    } catch (e) {
+      setSaveStatus(s => ({ ...s, [id]: '保存失败: ' + String(e) }));
+    }
+  };
+
+  const setSystemRoleAgent = async (kind: string, id: string) => {
+    const current = agents.filter(a => hasSystemKind(a, kind));
+    if (!id) {
+      for (const holder of current) {
+        await updateAgentLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消指派');
+      }
+      return;
+    }
+    for (const holder of current) {
+      if (holder.id !== id) {
+        await updateAgentLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消指派');
+      }
+    }
+    const selected = agents.find(a => a.id === id);
+    if (selected) {
+      await updateAgentLocal(id, {
+        system_kind: systemKindValue(selected, kind),
+      }, '已指派');
+    }
+  };
 
   return (
     <div className="set-inner rise">
       {confirmDel && <ConfirmModal msg="确认删除此 Agent？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
       <div className="set-h">Agent 配置</div>
       <div className="set-desc">配置 Agent 职能、LLM、系统提示词，并指派流水线角色。</div>
+
+      <div className="panel" style={{ marginBottom: 22 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="bot" size={16} style={{ color: 'var(--blue)' }} />系统角色指派</div>
+        </div>
+        <div style={{ padding: '4px 18px 14px' }}>
+          {systemRoleRows.map(row => {
+            const holder = agents.find(a => hasSystemKind(a, row.kind));
+            return (
+              <div className="assign-row" key={row.kind}>
+                <div className="cfg-logo" style={{ background: row.color, width: 34, height: 34 }}><Icon name={row.icon} size={17} /></div>
+                <div className="assign-info">
+                  <div className="assign-title">{row.title}</div>
+                  <div className="assign-desc">{row.desc}；模型使用该 Agent 自己配置的 LLM</div>
+                </div>
+                <Select style={{ width: 180 }} value={holder?.id ?? ''} options={agentOpts}
+                  onChange={val => setSystemRoleAgent(row.kind, val)} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
 
       <div className="panel" style={{ marginBottom: 22 }}>
         <div className="panel-head">
@@ -296,16 +376,26 @@ function AgentSettings() {
         const roleTags = (a.forge_role ?? '').split(',').map(r =>
           r === 'analysis' ? '需求分析' : r === 'test' ? '测试' : null
         ).filter(Boolean) as string[];
+        systemKinds(a).forEach(kind => {
+          roleTags.unshift(systemKindLabels[kind] ?? kind);
+        });
+        const shownRoleTags = roleTags.slice(0, 2);
+        const hiddenRoleCount = Math.max(0, roleTags.length - shownRoleTags.length);
         return (
           <div className="cfg-card" key={a.id} style={exp === a.id ? { borderColor: 'var(--ember-tint-strong)' } : {}}>
             <div className="cfg-top" onClick={() => setExp(exp === a.id ? null : a.id)} style={{ cursor: 'pointer' }}>
               <Avatar agent={a} size={40} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="cfg-name" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  {v('name')}
-                  {roleTags.map(tag => <span key={tag} className="chip ember" style={{ padding: '1px 7px', fontSize: 10 }}>{tag}</span>)}
+                <div className="cfg-name cfg-name-line">
+                  <span className="cfg-name-text">{v('name')}</span>
+                  <span className="cfg-role-tags">
+                    {shownRoleTags.map(tag => <span key={tag} className="chip ember">{tag}</span>)}
+                    {hiddenRoleCount > 0 && <span className="chip ember" title={roleTags.join(' · ')}>...</span>}
+                  </span>
                 </div>
-                <div className="cfg-sub">{v('name_en')} · {llmNames.find(l => l.id === a.llm_id)?.name ?? '未指定 LLM'}</div>
+                <div className="cfg-sub">
+                  {v('name_en')} · {llmNames.find(l => l.id === a.llm_id)?.name ?? '未指定 LLM'}
+                </div>
               </div>
               <Icon name={exp === a.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
             </div>
@@ -323,6 +413,20 @@ function AgentSettings() {
                   </div>
                   <div className="field full"><label>职责标签</label>
                     <input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} />
+                  </div>
+                  <div className="field full">
+                    <label>可用范围</label>
+                    <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 13 }}>
+                        <Switch on={Boolean(d.enabled ?? a.enabled)} onToggle={() => setDraft(a.id, 'enabled', !(d.enabled ?? a.enabled))} />启用
+                      </label>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 13 }}>
+                        <Switch on={Boolean(d.mentionable ?? a.mentionable)} onToggle={() => setDraft(a.id, 'mentionable', !(d.mentionable ?? a.mentionable))} />可拉入群聊
+                      </label>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 13 }}>
+                        <Switch on={Boolean(d.visible_in_chat ?? a.visible_in_chat)} onToggle={() => setDraft(a.id, 'visible_in_chat', !(d.visible_in_chat ?? a.visible_in_chat))} />可私聊
+                      </label>
+                    </div>
                   </div>
                   <div className="field full"><label>系统提示词</label>
                     <textarea className="mono" rows={5} value={v('system_prompt')} onChange={e => setDraft(a.id, 'system_prompt', e.target.value)} />

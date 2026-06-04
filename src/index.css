@@ -633,10 +633,12 @@ button { font-family: inherit; cursor: pointer; }
 }
 .chat-head .mention-pop { z-index: 140; }
 .mention-pop-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: .14em; color: var(--text-3); padding: 6px 8px; text-transform: uppercase; }
-.mention-row { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 9px; cursor: pointer; }
+.mention-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 9px; cursor: pointer; }
 .mention-row:hover, .mention-row.sel { background: var(--surface-hover); }
 .mention-row .nm { font-size: 13px; font-weight: 600; }
 .mention-row .rl { font-size: 11px; color: var(--text-3); }
+.mention-row .row-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; flex-shrink: 0; }
+.mention-row:hover .row-actions { opacity: 1; }
 .attachment-pop { width: min(360px, calc(100vw - 40px)); }
 .attachment-row { align-items: center; }
 .attachment-row-ic {
@@ -785,7 +787,7 @@ button { font-family: inherit; cursor: pointer; }
    Audit
    ============================================================ */
 .audit-proj { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 12px; position: relative; }
-.audit-project-pop { z-index: 120; }
+.audit-project-pop { z-index: 120; max-height: 320px; overflow-y: auto; }
 .proj-select {
   display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 12px;
   background: var(--bg-3); border: 1px solid var(--border-strong); cursor: pointer; transition: border-color .14s;
@@ -901,6 +903,10 @@ button { font-family: inherit; cursor: pointer; }
 .cfg-top { display: flex; align-items: center; gap: 12px; }
 .cfg-logo { width: 40px; height: 40px; border-radius: 11px; display: grid; place-items: center; color: #fff; font-weight: 800; font-family: var(--font-display); flex: none; }
 .cfg-name { font-weight: 700; font-size: 15px; }
+.cfg-name-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cfg-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cfg-role-tags { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; flex: none; max-width: 54%; }
+.cfg-role-tags .chip { padding: 1px 7px; font-size: 10px; white-space: nowrap; flex: none; }
 .cfg-sub { font-size: 12px; color: var(--text-3); font-family: var(--font-mono); margin-top: 2px; }
 .cfg-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 15px; }
 .field { display: flex; flex-direction: column; gap: 6px; }

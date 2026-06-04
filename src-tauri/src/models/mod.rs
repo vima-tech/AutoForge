@@ -5,6 +5,7 @@ pub mod conversation;
 pub mod issue;
 pub mod job;
 pub mod llm_config;
+pub mod orchestration;
 pub mod preview;
 pub mod project;
 pub mod test_session;

@@ -18,6 +18,8 @@ pub struct Message {
     pub from_agent: Option<String>,
     pub content_json: String,
     pub created_at: String,
+    #[sqlx(default)]
+    pub excluded_from_context: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

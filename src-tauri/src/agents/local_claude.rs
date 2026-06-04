@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -26,6 +27,25 @@ fn isolated_claude_cmd() -> Command {
 
 /// Run claude CLI in text-only mode, returns stdout
 pub async fn run_text(prompt: &str, system_prompt: Option<&str>) -> Result<String> {
+    run_text_with_images(prompt, system_prompt, &[]).await
+}
+
+/// Run claude CLI with optional image attachments (via --image <path>).
+pub async fn run_text_with_images(
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+) -> Result<String> {
+    run_text_with_model_and_images(prompt, system_prompt, image_paths, None).await
+}
+
+/// Run claude CLI with optional model and image attachments.
+pub async fn run_text_with_model_and_images(
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+    model: Option<&str>,
+) -> Result<String> {
     let mut cmd = isolated_claude_cmd();
     cmd.arg("--print")
         .arg("--permission-mode")
@@ -39,12 +59,29 @@ pub async fn run_text(prompt: &str, system_prompt: Option<&str>) -> Result<Strin
         cmd.arg("--system-prompt").arg(sp);
     }
 
+    if let Some(model) = model {
+        if !model.trim().is_empty() {
+            cmd.arg("--model").arg(model);
+        }
+    }
+
+    for path in image_paths {
+        cmd.arg("--image").arg(path);
+    }
+
     cmd.arg(prompt);
 
     let output = cmd.output().await?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("claude CLI failed: {}", stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = match (stdout.is_empty(), stderr.is_empty()) {
+            (false, false) => format!("stdout: {}; stderr: {}", stdout, stderr),
+            (false, true) => stdout,
+            (true, false) => stderr,
+            (true, true) => format!("exit status {}", output.status),
+        };
+        return Err(anyhow::anyhow!("claude CLI failed: {}", detail));
     }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(stdout)
