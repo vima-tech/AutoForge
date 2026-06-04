@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-ico", "image-png"] }
 tauri-plugin-notification = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono", "json", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }

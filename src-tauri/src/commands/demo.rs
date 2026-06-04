@@ -4,8 +4,8 @@ use tokio::process::Command;
 
 #[tauri::command]
 pub async fn open_url(url: String, app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_shell::ShellExt;
-    app.shell().open(&url, None).map_err(|e| e.to_string())
+    use tauri_plugin_opener::OpenerExt;
+    app.opener().open_url(&url, None::<&str>).map_err(|e| e.to_string())
 }
 
 async fn git(repo: &str, args: &[&str]) -> Result<(), String> {

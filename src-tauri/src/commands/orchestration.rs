@@ -238,7 +238,16 @@ async fn execute_conversation_task(
         .map_err(|e| e.to_string())?;
     }
 
-    if asks_for_synthesis(&payload.instruction) {
+    // Only fire post-plan system agents when the planner didn't already produce
+    // a terminal single step (which would be the business-agent summarizer).
+    // This prevents double-summarization when the plan already ends with agent1 summarizing.
+    let plan_has_final_single = plan
+        .steps
+        .last()
+        .map(|s| s.step_type == "single")
+        .unwrap_or(false);
+
+    if asks_for_synthesis(&payload.instruction) && !plan_has_final_single {
         if let Some(summarizer) = load_system_role_agent(&db, "summarizer").await? {
             let outcome = run_summarizer(
                 &db,
@@ -260,7 +269,7 @@ async fn execute_conversation_task(
         }
     }
 
-    if asks_for_artifact(&payload.instruction) {
+    if asks_for_artifact(&payload.instruction) && !plan_has_final_single {
         if let Some(doc_writer) = load_system_role_agent(&db, "doc_writer").await? {
             let outcome = run_doc_writer(
                 &db,
@@ -468,6 +477,35 @@ fn fallback_plan(
     if agents.is_empty() {
         return Err("当前对话没有可调度的 Agent".to_string());
     }
+
+    // When the user requests a sequence (e.g. "A/B/C discuss then D summarizes") and
+    // the planner failed, split the last mentioned agent into a single summary step so
+    // the discussion→summary flow is preserved even without LLM planning.
+    if asks_for_sequence(instruction) && agents.len() >= 2 {
+        let (discussers, summarizer_slice) = agents.split_at(agents.len() - 1);
+        let summarizer_id = summarizer_slice[0].clone();
+        let discuss_agents = discussers.to_vec();
+        return Ok(ConversationPlan {
+            steps: vec![
+                ConversationPlanStep {
+                    step_type: if discuss_agents.len() > 1 {
+                        "parallel"
+                    } else {
+                        "single"
+                    }
+                    .to_string(),
+                    agents: discuss_agents,
+                    instruction: instruction.to_string(),
+                },
+                ConversationPlanStep {
+                    step_type: "single".to_string(),
+                    agents: vec![summarizer_id],
+                    instruction: "请综合以上各方发言，给出总结和裁决建议。".to_string(),
+                },
+            ],
+        });
+    }
+
     Ok(ConversationPlan {
         steps: vec![ConversationPlanStep {
             step_type: if agents.len() > 1 {

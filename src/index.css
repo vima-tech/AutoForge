@@ -634,7 +634,7 @@ button { font-family: inherit; cursor: pointer; }
 .chat-head .mention-pop { z-index: 140; }
 .mention-pop-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: .14em; color: var(--text-3); padding: 6px 8px; text-transform: uppercase; }
 .mention-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 9px; cursor: pointer; }
-.mention-row:hover, .mention-row.sel { background: var(--surface-hover); }
+.mention-row:hover, .mention-row.mention-active { background: var(--surface-hover); }
 .mention-row .nm { font-size: 13px; font-weight: 600; }
 .mention-row .rl { font-size: 11px; color: var(--text-3); }
 .mention-row .row-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; flex-shrink: 0; }
@@ -670,7 +670,7 @@ button { font-family: inherit; cursor: pointer; }
   align-items: flex-start; gap: 10px; padding: 8px; cursor: pointer;
   border: 1px solid transparent;
 }
-.chat-search-row:hover, .chat-search-row.sel {
+.chat-search-row:hover, .chat-search-row.mention-active {
   background: var(--surface-hover); border-color: var(--border);
 }
 .chat-search-row .nm { font-size: 12.5px; line-height: 1.25; }

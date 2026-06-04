@@ -747,7 +747,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           <div className="mention-pop">
             <div className="mention-pop-label">@ 指定 Agent 回答</div>
             {members.map((a, i) => (
-              <div key={a.id} className={'mention-row' + (i === mentionSel ? ' sel' : '')}
+              <div key={a.id} className={'mention-row' + (i === mentionSel ? ' mention-active' : '')}
                 onMouseDown={e => e.preventDefault()}
                 onMouseEnter={() => setMentionSel(i)} onClick={() => pickMention(a)}>
                 <Avatar agent={a} size={30} />
@@ -1442,7 +1442,7 @@ export default function ConversationsPage() {
                   </div>
                   <div className="chat-search-results scroll">
                     {normalizedQ && searchResults.map(({ message, text, sender }) => (
-                      <div key={message.id} className={'mention-row chat-search-row' + (activeSearchId === message.id ? ' sel' : '')} onClick={() => jumpToMessage(message.id)}>
+                      <div key={message.id} className={'mention-row chat-search-row' + (activeSearchId === message.id ? ' mention-active' : '')} onClick={() => jumpToMessage(message.id)}>
                         <div style={{ minWidth: 0, flex: 1 }}>
                           <div className="nm">{sender}</div>
                           <div className="rl">{text || '消息内容为空'}</div>

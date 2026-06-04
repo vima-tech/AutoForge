@@ -40,6 +40,11 @@ const llmColor = (provider: string) => {
   return '#e8772e';
 };
 
+function formatAgentSub(agent: Agent, llmNames: { id: string; name: string }[]) {
+  const llmName = llmNames.find(l => l.id === agent.llm_id)?.name ?? '未指定 LLM';
+  return `LLM: ${llmName}`;
+}
+
 // 从后端返回的完整错误字符串中提取简短摘要，保留 HTTP 状态码 + 核心 message
 function fmtTestResult(raw: string): string {
   if (raw.startsWith('连接成功')) return raw;
@@ -395,9 +400,7 @@ function AgentSettings() {
                     {hiddenRoleCount > 0 && <span className="chip ember" title={roleTags.join(' · ')}>...</span>}
                   </span>
                 </div>
-                <div className="cfg-sub">
-                  {v('name_en')} · {llmNames.find(l => l.id === a.llm_id)?.name ?? '未指定 LLM'}
-                </div>
+                <div className="cfg-sub">{formatAgentSub(a, llmNames)}</div>
               </div>
               <Icon name={exp === a.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
             </div>
