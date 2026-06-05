@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin --bundles dmg"
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin --bundles dmg"
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: "--bundles deb"
+          - platform: fedora-latest
+            target: x86_64-unknown-linux-gnu
+            args: "--bundles rpm"
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: "--bundles nsis"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux system deps (ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - name: Install Linux system deps (fedora)
+        if: matrix.platform == 'fedora-latest'
+        run: |
+          sudo dnf install -y \
+            webkit2gtk4.1-devel \
+            gtk3-devel \
+            libappindicator-gtk3-devel \
+            librsvg2-devel \
+            openssl-devel \
+            rpm-build \
+            patchelf \
+            gcc \
+            gcc-c++ \
+            make \
+            curl \
+            wget \
+            file
+          sudo dnf groupinstall -y "Development Tools"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build & bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "AutoForge ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download the installer for your platform."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Upload artifacts (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoforge-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**
+          if-no-files-found: ignore

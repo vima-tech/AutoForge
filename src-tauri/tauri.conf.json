@@ -31,7 +31,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["deb", "rpm", "nsis", "dmg"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -39,6 +39,10 @@
       "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "publisher": "AutoForge",
+    "category": "DeveloperTool",
+    "shortDescription": "Human-Lite-in-the-Loop software factory",
+    "longDescription": "AutoForge orchestrates AI agents, code reviews, and project workflows into a self-driving software factory."
   }
 }
