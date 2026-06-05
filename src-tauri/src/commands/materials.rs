@@ -151,7 +151,7 @@ async fn ensure_default_docs_folder(
         if !repo_path.is_empty() {
             let repo_dir = PathBuf::from(repo_path);
             if repo_dir.is_dir() {
-                let dir = repo_dir.join("docs");
+                let dir = repo_dir.join(".autoforge").join("docs");
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     warn!(
                         "[materials] failed to ensure docs directory for project {}: {}",
@@ -441,7 +441,7 @@ async fn project_docs_dir(project_id: &str, state: &AppState) -> Result<Option<P
         return Ok(None);
     }
 
-    let docs_dir = repo_dir.join("docs");
+    let docs_dir = repo_dir.join(".autoforge").join("docs");
     std::fs::create_dir_all(&docs_dir).map_err(|e| e.to_string())?;
     Ok(Some(docs_dir))
 }
@@ -488,6 +488,99 @@ async fn folder_path_from_docs(
     Ok(Some(path))
 }
 
+fn build_folder_disk_path_in_memory(
+    folder_id: &str,
+    folder_map: &std::collections::HashMap<String, MaterialFolder>,
+    docs_dir: &Path,
+) -> Option<PathBuf> {
+    let mut chain: Vec<&MaterialFolder> = Vec::new();
+    let mut cursor = Some(folder_id.to_string());
+    while let Some(id) = cursor {
+        let folder = folder_map.get(&id)?;
+        cursor = folder.parent_id.clone();
+        chain.push(folder);
+    }
+    let mut path = docs_dir.to_path_buf();
+    for folder in chain.iter().rev() {
+        if folder.parent_id.is_none() && folder.name.eq_ignore_ascii_case("docs") {
+            continue;
+        }
+        let segment = safe_filename(&folder.name);
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    Some(path)
+}
+
+async fn sync_deleted_folders(project_id: &str, state: &AppState) -> Result<(), String> {
+    let Some(docs_dir) = project_docs_dir(project_id, state).await? else {
+        return Ok(());
+    };
+
+    let all_folders: Vec<MaterialFolder> = sqlx::query_as::<_, MaterialFolder>(
+        "SELECT * FROM material_folders WHERE project_id = ? ORDER BY sort_order, name",
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let folder_map: std::collections::HashMap<String, MaterialFolder> =
+        all_folders.iter().map(|f| (f.id.clone(), f.clone())).collect();
+
+    for folder in &all_folders {
+        if folder.parent_id.is_none() {
+            continue;
+        }
+
+        // May have been removed in a previous iteration (ancestor deletion cascades)
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM material_folders WHERE id = ?")
+                .bind(&folder.id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+        if count == 0 {
+            continue;
+        }
+
+        if let Some(disk_path) =
+            build_folder_disk_path_in_memory(&folder.id, &folder_map, &docs_dir)
+        {
+            if !disk_path.exists() {
+                sqlx::query(
+                    "WITH RECURSIVE tree(id) AS (
+                       SELECT id FROM material_folders WHERE id = ?
+                       UNION ALL
+                       SELECT mf.id FROM material_folders mf JOIN tree ON mf.parent_id = tree.id
+                     )
+                     DELETE FROM material_files WHERE folder_id IN (SELECT id FROM tree)",
+                )
+                .bind(&folder.id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                sqlx::query(
+                    "WITH RECURSIVE tree(id) AS (
+                       SELECT id FROM material_folders WHERE id = ?
+                       UNION ALL
+                       SELECT mf.id FROM material_folders mf JOIN tree ON mf.parent_id = tree.id
+                     )
+                     DELETE FROM material_folders WHERE id IN (SELECT id FROM tree)",
+                )
+                .bind(&folder.id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn default_folder_id_for_write(
     project_id: &str,
     folder_id: Option<String>,
@@ -507,6 +600,7 @@ pub async fn list_material_folders(
     state: State<'_, AppState>,
 ) -> Result<Vec<MaterialFolder>, String> {
     ensure_default_docs_folder(&project_id, &state).await?;
+    sync_deleted_folders(&project_id, &state).await?;
 
     sqlx::query_as::<_, MaterialFolder>(
         "SELECT * FROM material_folders WHERE project_id = ? ORDER BY sort_order, name",

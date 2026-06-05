@@ -141,6 +141,15 @@ pub fn run() {
             commands::conversations::mark_conversation_read,
             commands::conversations::agent_reply,
             commands::conversations::toggle_message_context,
+            commands::project_context::list_project_files,
+            commands::project_context::read_project_file,
+            commands::project_context::list_conversation_project_context,
+            commands::project_context::add_conversation_project_context,
+            commands::project_context::remove_conversation_project_context,
+            commands::workspace::ensure_workspace_dirs,
+            commands::workspace::list_workspace_files,
+            commands::workspace::read_workspace_file,
+            commands::workspace::write_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::list_conversation_tasks,
             commands::settings::list_llm_configs,
@@ -184,6 +193,10 @@ pub fn run() {
             commands::materials::get_material_backup_config,
             commands::materials::update_material_backup_config,
             commands::materials::backup_material_files,
+            commands::specs::list_project_specs,
+            commands::specs::upsert_project_spec,
+            commands::specs::delete_project_spec,
+            commands::specs::ai_generate_specs,
         ])
         .run(tauri::generate_context!())
         .expect("error running AutoForge");

@@ -140,7 +140,19 @@ async fn execute_conversation_task(
     if let Err(e) = maybe_compress_context(&db, &app, &payload.conversation_id, window_size).await {
         warn!("[orchestration] context compression skipped: {}", e);
     }
-    let snapshot = build_context_snapshot(&db, &payload.conversation_id, window_size).await?;
+    let project_prefix =
+        crate::commands::project_context::load_project_context_for_conversation(
+            &db,
+            &payload.conversation_id,
+        )
+        .await;
+    let snapshot = build_context_snapshot(
+        &db,
+        &payload.conversation_id,
+        window_size,
+        &project_prefix,
+    )
+    .await?;
     let members = load_schedulable_members(&db, &payload.conversation_id).await?;
 
     let plan = build_plan(
@@ -576,11 +588,20 @@ async fn run_agent_for_step(
         }
     };
 
+    // Parse file writes first (before requirement draft extraction)
+    let (text_after_writes, file_writes) =
+        crate::commands::workspace::parse_agent_file_writes(&text);
+    let write_blocks =
+        crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes).await;
+
     // 检测 LLM 输出中是否嵌入了 requirement_draft artifact JSON
-    let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text);
+    let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text_after_writes);
     let mut blocks = vec![serde_json::json!({ "t": "md", "md": clean_text })];
     if let Some(artifact) = draft_artifact {
         blocks.push(artifact);
+    }
+    for wb in write_blocks {
+        blocks.push(wb);
     }
     let content_json = serde_json::to_string(&blocks).unwrap_or_default();
 
@@ -841,6 +862,7 @@ async fn build_context_snapshot(
     db: &crate::db::Db,
     conversation_id: &str,
     limit: i64,
+    project_prefix: &str,
 ) -> Result<String, String> {
     let candidates = sqlx::query_as::<_, Message>(
         "SELECT *
@@ -856,7 +878,12 @@ async fn build_context_snapshot(
     .map_err(|e| e.to_string())?;
 
     let ordered = candidates.iter().rev().cloned().collect::<Vec<_>>();
-    messages_to_context_text(db, &ordered).await
+    let conv_text = messages_to_context_text(db, &ordered).await?;
+
+    if project_prefix.is_empty() {
+        return Ok(conv_text);
+    }
+    Ok(format!("{}{}", project_prefix, conv_text))
 }
 
 async fn messages_to_context_text(

@@ -6,13 +6,12 @@ import { MeAvatar } from './components/Avatar';
 import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
-import IntakePage from './pages/Intake';
 import ProjectsPage from './pages/Projects';
 import SettingsPage from './pages/Settings';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
 import { THEME_STORAGE_KEY, oppositeMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
-type Page = 'home' | 'chat' | 'intake' | 'projects' | 'audit' | 'settings';
+type Page = 'home' | 'chat' | 'projects' | 'audit' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
@@ -103,21 +102,28 @@ function ForgeLogo({ size = 38 }: { size?: number }) {
       </defs>
 
       {/* 外圆 */}
-      <circle cx="19" cy="19" r="15" stroke="#211a13" strokeWidth="1.5" fill="none" opacity="0.4"/>
+      <circle cx="19" cy="19" r="15" stroke="#472811" strokeWidth="1.3" fill="none" opacity="0.3"/>
       {/* 中圆 */}
-      <circle cx="19" cy="19" r="9" stroke="#211a13" strokeWidth="1.5" fill="none" opacity="0.3"/>
+      <circle cx="19" cy="19" r="9" stroke="#472811" strokeWidth="1.3" fill="none" opacity="0.2"/>
       {/* 内圆 */}
-      <circle cx="19" cy="19" r="4.5" stroke="#211a13" strokeWidth="1.5" fill="none" opacity="0.2"/>
+      <circle cx="19" cy="19" r="4.5" stroke="#472811" strokeWidth="1.3" fill="none" opacity="0.1"/>
 
       {/* 三横 */}
-      <line x1="0" y1="9.5" x2="36" y2="9.5" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
-      <line x1="0" y1="19" x2="36" y2="19" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
-      <line x1="0" y1="28.5" x2="36" y2="28.5" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+      <line x1="0" y1="9.5" x2="38" y2="9.5" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
+      <line x1="0" y1="19" x2="38" y2="19" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
+      <line x1="0" y1="28.5" x2="38" y2="28.5" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
 
       {/* 三竖 */}
-      <line x1="9.5" y1="0" x2="9.5" y2="36" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
-      <line x1="19" y1="0" x2="19" y2="36" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
-      <line x1="28.5" y1="0" x2="28.5" y2="36" stroke="#211a13" strokeWidth="1.2" opacity="0.2"/>
+      <line x1="9.5" y1="0" x2="9.5" y2="38" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
+      <line x1="19" y1="0" x2="19" y2="38" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
+      <line x1="28.5" y1="0" x2="28.5" y2="38" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
+
+      {/* 大写 A：左侧偏长，右侧偏短，复仇者风格 */}
+      <g stroke="#5d3617ff" stroke-width="4" opacity="1" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="21" y1="6" x2="11" y2="29.5" />
+        <line x1="21" y1="6" x2="25" y2="23" />
+        <line x1="15" y1="22" x2="22" y2="20" />
+      </g>  
     </svg>
   );
 }
@@ -125,7 +131,6 @@ function ForgeLogo({ size = 38 }: { size?: number }) {
 const NAV: { id: Page; name: string; ic: string }[] = [
   { id: 'home',     name: '主页',     ic: 'home' },
   { id: 'chat',     name: '会议室',   ic: 'chat' },
-  { id: 'intake',   name: '需求入口', ic: 'inbox' },
   { id: 'projects', name: '项目管理', ic: 'box' },
   { id: 'audit',    name: '功能审计', ic: 'audit' },
 ];
@@ -133,7 +138,7 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 export default function App() {
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
-    return saved && (['home', 'chat', 'intake', 'projects', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
+    return saved && (['home', 'chat', 'projects', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
@@ -324,7 +329,6 @@ export default function App() {
 
         {page === 'home'     && <Dashboard />}
         {page === 'chat'     && <ConversationsPage />}
-        {page === 'intake'   && <IntakePage />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'audit'    && <AuditPage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}

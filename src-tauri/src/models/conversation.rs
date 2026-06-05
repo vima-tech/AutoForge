@@ -9,6 +9,8 @@ pub struct Conversation {
     pub color: String,
     pub initial: Option<String>,
     pub created_at: String,
+    #[sqlx(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -34,6 +36,7 @@ pub struct ConversationDetail {
     pub unread: i64,
     pub last_message: Option<String>,
     pub last_time: Option<String>,
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

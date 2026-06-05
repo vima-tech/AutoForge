@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import Icon from './Icon';
 import Markdown from './Markdown';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, openAttachment, submitFromArtifact } from '../services';
+import { attachmentDataUrl, openAttachment, submitFromArtifact, writeWorkspaceFile } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -26,34 +26,71 @@ function tokenize(code: string): Token[] {
   return tokens;
 }
 
-function CodeBlock({ lang, code }: { lang: string; code: string }) {
+function CodeBlock({ lang, code, projectId }: { lang: string; code: string; projectId?: string }) {
   const [copied, setCopied] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState('');
+  const [saveErr, setSaveErr] = useState('');
   const tokens = tokenize(code);
+
+  const handleSave = async (subfolder: 'docs' | 'specs') => {
+    if (!projectId || saving) return;
+    const ext = lang || 'txt';
+    const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
+    const filename = `${subfolder === 'docs' ? 'doc' : 'spec'}_${ts}.${ext}`;
+    const relPath = `${subfolder}/${filename}`;
+    setSaving(true); setSaveErr('');
+    try {
+      await writeWorkspaceFile(projectId, relPath, code);
+      setSaved(relPath);
+      setTimeout(() => setSaved(''), 3000);
+    } catch (e) { setSaveErr(String(e)); }
+    finally { setSaving(false); }
+  };
+
   return (
     <div className="codeblock">
       <div className="codeblock-head">
         <span className="lang">{lang}</span>
-        <button className="icon-btn" style={{ width: 24, height: 24 }} onClick={() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
-          <Icon name={copied ? 'check' : 'copy'} size={13} />
-        </button>
+        <div style={{ display: 'flex', gap: 4, marginLeft: 'auto', alignItems: 'center' }}>
+          {saveErr && <span style={{ fontSize: 10, color: 'var(--red)' }}>{saveErr}</span>}
+          {saved && <span style={{ fontSize: 10, color: 'var(--green)' }}>已存入 {saved}</span>}
+          {projectId && (
+            <>
+              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 10 }} disabled={saving} onClick={() => handleSave('docs')} title="存入 .autoforge/docs/">
+                <Icon name="folder" size={10} />docs
+              </button>
+              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 10 }} disabled={saving} onClick={() => handleSave('specs')} title="存入 .autoforge/specs/">
+                <Icon name="folder" size={10} />specs
+              </button>
+            </>
+          )}
+          <button className="icon-btn" style={{ width: 24, height: 24 }} onClick={() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
+            <Icon name={copied ? 'check' : 'copy'} size={13} />
+          </button>
+        </div>
       </div>
       <pre><code>{tokens.map((tk, i) => tk.c ? <span key={i} className={tk.c}>{tk.t}</span> : tk.t)}</code></pre>
     </div>
   );
 }
 
-// ── ArtifactBlock (extracted to support requirement_draft) ──────────────────
+// ── ArtifactBlock ─────────────────────────────────────────────────────────────
 
-function ArtifactBlock({ b }: { b: Extract<BlockType, { t: 'artifact' }> }) {
+function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string }) {
   const [submitted, setSubmitted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitErr, setSubmitErr] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState('');
+  const [saveErr, setSaveErr] = useState('');
 
   const meta = (b as any)._meta as {
     project_id?: string; title?: string; description?: string;
     category?: string; severity?: string;
   } | undefined;
   const isDraft = b.kind === 'requirement_draft';
+  const effectiveProjectId = projectId || meta?.project_id;
 
   const handleSubmitDraft = async () => {
     if (!meta?.title || submitting) return;
@@ -69,6 +106,26 @@ function ArtifactBlock({ b }: { b: Extract<BlockType, { t: 'artifact' }> }) {
       setSubmitted(true);
     } catch (e) { setSubmitErr(String(e)); }
     finally { setSubmitting(false); }
+  };
+
+  const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs') => {
+    if (!effectiveProjectId || saving) return;
+    const slug = b.title
+      .toLowerCase()
+      .replace(/[^\w一-鿿]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 40);
+    const relPath = `${subfolder}/${slug || 'artifact'}.md`;
+    // Build markdown content from artifact
+    const rows = b.rows.map(([k, v]: [string, string]) => `| ${k} | ${v} |`).join('\n');
+    const content = `# ${b.title}\n\n${rows ? `| 属性 | 值 |\n|---|---|\n${rows}\n\n` : ''}${b.body}`;
+    setSaving(true); setSaveErr('');
+    try {
+      await writeWorkspaceFile(effectiveProjectId, relPath, content);
+      setSaved(relPath);
+      setTimeout(() => setSaved(''), 3000);
+    } catch (e) { setSaveErr(String(e)); }
+    finally { setSaving(false); }
   };
 
   return (
@@ -103,18 +160,58 @@ function ArtifactBlock({ b }: { b: Extract<BlockType, { t: 'artifact' }> }) {
               {submitErr && <span style={{ fontSize: 11, color: 'var(--red)' }}>{submitErr}</span>}
             </>
           )
-        ) : (
+        ) : null}
+        {effectiveProjectId && !isDraft && (
           <>
-            <button className="btn btn-sm btn-primary"><Icon name="eye" size={13} />查看详情</button>
-            <button className="btn btn-sm">引用</button>
+            <button className="btn btn-sm" disabled={saving} onClick={() => handleSaveToWorkspace('docs')} title="存入 .autoforge/docs/">
+              <Icon name="folder" size={12} />存入 docs
+            </button>
+            <button className="btn btn-sm" disabled={saving} onClick={() => handleSaveToWorkspace('specs')} title="存入 .autoforge/specs/">
+              <Icon name="folder" size={12} />存入 specs
+            </button>
           </>
         )}
+        {saveErr && <span style={{ fontSize: 11, color: 'var(--red)' }}>{saveErr}</span>}
+        {saved && <span style={{ fontSize: 11, color: 'var(--green)' }}>已存入 .autoforge/{saved}</span>}
       </div>
     </div>
   );
 }
 
-export default function Block({ b }: { b: BlockType }) {
+// ── FileWrittenBlock ──────────────────────────────────────────────────────────
+
+function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div style={{
+      border: `1px solid ${b.error ? 'var(--red)' : 'var(--ember)'}`,
+      borderRadius: 10, overflow: 'hidden',
+      background: b.error ? 'color-mix(in srgb, var(--red) 8%, transparent)' : 'var(--ember-tint)',
+      fontSize: 13,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer' }}
+        onClick={() => setExpanded(v => !v)}>
+        <Icon name={b.error ? 'alert' : 'file'} size={14} style={{ color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }} />
+        <span style={{ color: 'var(--text-3)', fontSize: 11, fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          .autoforge/{b.path}
+        </span>
+        <span style={{ fontSize: 10.5, color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }}>
+          {b.error ? '写入失败' : `${(b.size_bytes / 1024).toFixed(1)} KB 已写入`}
+        </span>
+        <Icon name={expanded ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+      </div>
+      {expanded && b.preview && (
+        <pre style={{ margin: 0, padding: '0 12px 10px', fontSize: 11.5, lineHeight: 1.6, color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: '1px solid var(--border)' }}>
+          {b.preview}{b.size_bytes > 200 ? ' …' : ''}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+// ── Main Block ────────────────────────────────────────────────────────────────
+
+export default function Block({ b, projectId }: { b: BlockType; projectId?: string }) {
   const [previewUrl, setPreviewUrl] = useState('');
   const [attachmentError, setAttachmentError] = useState('');
 
@@ -137,7 +234,7 @@ export default function Block({ b }: { b: BlockType }) {
   };
 
   if (b.t === 'md') return <Markdown md={b.md} />;
-  if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} />;
+  if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} projectId={projectId} />;
   if (b.t === 'typing') return <div className="typing"><i /><i /><i /></div>;
   if (b.t === 'file') return (
     <div className="att">
@@ -166,8 +263,7 @@ export default function Block({ b }: { b: BlockType }) {
       )}
     </div>
   );
-  if (b.t === 'artifact') return (
-    <ArtifactBlock b={b} />
-  );
+  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} />;
+  if (b.t === 'file_written') return <FileWrittenBlock b={b} />;
   return null;
 }

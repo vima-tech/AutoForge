@@ -1702,3 +1702,5 @@ button { font-family: inherit; cursor: pointer; }
   display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
   padding: 0 14px 14px;
 }
+
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }

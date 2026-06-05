@@ -1,4 +1,5 @@
 pub mod admin_decision;
+pub mod spec;
 pub mod intake;
 pub mod agent;
 pub mod change_request;

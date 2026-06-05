@@ -8,7 +8,10 @@ import {
   listAgents, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   clearConversationMessages, toggleMessageContext, startConversationTask,
+  listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
+  listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
   type Conversation, type Message, type Agent, type ConversationAttachment,
+  type Project, type ProjectContextFile, type WorkspaceFile,
 } from '../services';
 import type { BlockType } from '../data/mock';
 
@@ -176,6 +179,11 @@ function ConvItem({ c, active, agentMap, onSelect }: {
             {isG && <Icon name="bot" size={11} style={{ verticalAlign: -1, marginRight: 3, color: 'var(--text-faint)' }} />}
             {convPreview(c)}
           </span>
+          {isG && c.project_id && (
+            <span style={{ marginLeft: c.unread > 0 ? 0 : 'auto', fontSize: 10, color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+              <Icon name="folder" size={9} />
+            </span>
+          )}
           {isG && c.unread > 0 && <span className="conv-unread" style={{ marginLeft: 'auto' }}>{c.unread}</span>}
         </div>
       </div>
@@ -221,10 +229,11 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
   );
 }
 
-function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMenu }: {
+function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMenu, projectId }: {
   m: Message; agents: Agent[]; isGroup: boolean;
   highlighted?: boolean; rowRef?: (el: HTMLDivElement | null) => void;
   onBubbleContextMenu?: (e: React.MouseEvent, message: Message, author: string) => void;
+  projectId?: string;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const me = !m.from_agent;
@@ -253,7 +262,7 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
           onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
           style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
         >
-          {blocks.map((b, i) => <Block key={i} b={b} />)}
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
           {m.excluded_from_context && (
             <div style={{ fontSize: 10.5, color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
               <Icon name="eye-off" size={11} />已从 AI 上下文排除
@@ -803,19 +812,36 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
   );
 }
 
-function NewGroupModal({ agents, onClose, onCreate }: {
-  agents: Agent[]; onClose: () => void; onCreate: (name: string, ids: string[]) => void;
+function NewGroupModal({ agents, projects, onClose, onCreate }: {
+  agents: Agent[];
+  projects: Project[];
+  onClose: () => void;
+  onCreate: (name: string, ids: string[], projectId: string | null) => void;
 }) {
   const [sel, setSel] = useState<string[]>([]);
   const [name, setName] = useState('');
+  const [projectId, setProjectId] = useState<string>('');
+  const [projOpen, setProjOpen] = useState(false);
+  const projRef = useRef<HTMLDivElement>(null);
   const chatAgents = useMemo(
     () => agents.filter(a => a.visible_in_chat && a.mentionable && a.enabled),
     [agents],
   );
   const toggle = (id: string) => setSel(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+  const selectedProject = projects.find(p => p.id === projectId) ?? null;
+
+  useEffect(() => {
+    if (!projOpen) return;
+    const close = (e: PointerEvent) => {
+      if (projRef.current && !projRef.current.contains(e.target as Node)) setProjOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [projOpen]);
+
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }} onClick={onClose}>
-      <div style={{ width: 420, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+      <div style={{ width: 440, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center' }}>
           <div>
             <div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">新建群聊</span></div>
@@ -824,12 +850,73 @@ function NewGroupModal({ agents, onClose, onCreate }: {
           <button className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
         <div style={{ padding: '16px 20px' }}>
-          <div className="field" style={{ marginBottom: 16 }}>
+          <div className="field" style={{ marginBottom: 14 }}>
             <label>群聊名称</label>
             <input value={name} onChange={e => setName(e.target.value)} placeholder="例如：Vocant · 导出性能优化" />
           </div>
+          <div className="field" style={{ marginBottom: 14 }}>
+            <label>绑定项目（可选）</label>
+            <div style={{ position: 'relative' }} ref={projRef}>
+              <div
+                className="proj-select"
+                style={{ padding: '8px 12px', borderRadius: 10 }}
+                onClick={() => setProjOpen(o => !o)}
+              >
+                {selectedProject ? (
+                  <>
+                    <div className="proj-logo" style={{ background: 'var(--ember)', width: 28, height: 28, fontSize: 12, borderRadius: 8 }}>
+                      {selectedProject.name[0]}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="proj-name" style={{ fontSize: 13 }}>{selectedProject.name}</div>
+                      <div className="proj-meta">{selectedProject.description || selectedProject.slug}</div>
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ flex: 1, fontSize: 13, color: 'var(--text-3)' }}>不绑定项目（通用群聊）</div>
+                )}
+                <Icon name="chevDown" size={15} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none', flexShrink: 0 }} />
+              </div>
+              {projOpen && (
+                <div className="mention-pop" style={{ left: 0, right: 0, top: 'calc(100% + 5px)', bottom: 'auto', width: '100%', maxHeight: 200, overflowY: 'auto', zIndex: 300 }}>
+                  <div
+                    className="mention-row"
+                    onClick={() => { setProjectId(''); setProjOpen(false); }}
+                  >
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="nm">不绑定项目</div>
+                      <div className="rl">通用群聊，无项目上下文</div>
+                    </div>
+                    {!projectId && <Icon name="check" size={13} style={{ color: 'var(--ember)', flexShrink: 0 }} />}
+                  </div>
+                  {projects.map(p => (
+                    <div
+                      key={p.id}
+                      className="mention-row"
+                      onClick={() => { setProjectId(p.id); setProjOpen(false); }}
+                    >
+                      <div className="proj-logo" style={{ background: 'var(--ember)', width: 26, height: 26, fontSize: 11, borderRadius: 7, flexShrink: 0 }}>
+                        {p.name[0]}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="nm">{p.name}</div>
+                        <div className="rl">{p.description || p.slug}</div>
+                      </div>
+                      {projectId === p.id && <Icon name="check" size={13} style={{ color: 'var(--ember)', flexShrink: 0 }} />}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            {projectId && (
+              <div style={{ fontSize: 11.5, color: 'var(--ember)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Icon name="zap" size={11} />
+                claude.md / agents.md 将自动注入每次对话上下文
+              </div>
+            )}
+          </div>
           <div className="field"><label>选择 Agent（{sel.length}）</label></div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8, maxHeight: 240, overflowY: 'auto' }}>
             {chatAgents.map(a => (
               <div key={a.id} className="mention-row"
                 style={{ border: '1px solid ' + (sel.includes(a.id) ? 'var(--ember)' : 'transparent'), background: sel.includes(a.id) ? 'var(--ember-tint)' : 'transparent' }}
@@ -843,7 +930,7 @@ function NewGroupModal({ agents, onClose, onCreate }: {
         </div>
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onClose}>取消</button>
-          <button className="btn btn-primary" disabled={sel.length < 2 || !name.trim()} onClick={() => onCreate(name, sel)}>
+          <button className="btn btn-primary" disabled={sel.length < 2 || !name.trim()} onClick={() => onCreate(name, sel, projectId || null)}>
             <Icon name="plus" size={15} />创建群聊
           </button>
         </div>
@@ -873,12 +960,17 @@ function ConfirmModal({ msg, okLabel, onOk, onCancel }: {
 export default function ConversationsPage() {
   const [convs,          setConvs]          = useState<Conversation[]>([]);
   const [agents,         setAgents]         = useState<Agent[]>([]);
+  const [projects,       setProjects]       = useState<Project[]>([]);
   const [active,         setActive]         = useState('');
   const [msgs,           setMsgs]           = useState<Message[]>([]);
   const [showNew,        setShowNew]        = useState(false);
   const [showMembers,    setShowMembers]    = useState(false);
   const [showContext,    setShowContext]     = useState(false);
   const [showSearch,     setShowSearch]     = useState(false);
+  const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
+  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
+  const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
+  const [wsFileContent,  setWsFileContent]  = useState<{ path: string; content: string } | null>(null);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
@@ -903,9 +995,10 @@ export default function ConversationsPage() {
   // ── Stable data-fetching callbacks ─────────────────────────────────────────
 
   const loadConvs = useCallback(async () => {
-    const [cs, as] = await Promise.all([listConversations(), listAgents()]);
+    const [cs, as, ps] = await Promise.all([listConversations(), listAgents(), listProjects()]);
     setConvs(cs);
     setAgents(as);
+    setProjects(ps);
     // Only set active when it is still empty (first load).
     // Prefer first group conversation to match the UI order (groups listed before directs).
     setActive(cur => cur || cs.find(c => c.conv_type === 'group')?.id || cs[0]?.id || '');
@@ -1037,6 +1130,18 @@ export default function ConversationsPage() {
       document.removeEventListener('keydown', closeOnEscape);
     };
   }, [bubbleMenu]);
+
+  // Load project files + workspace files when context panel opens for a project-linked group chat
+  useEffect(() => {
+    if (!showContext) { setProjectFiles([]); setWorkspaceFiles([]); setWsFileContent(null); return; }
+    const c = convs.find(c => c.id === active);
+    if (!c?.project_id) { setProjectFiles([]); setWorkspaceFiles([]); return; }
+    const pid = c.project_id;
+    Promise.all([
+      listProjectFiles(pid, active).catch(() => [] as ProjectContextFile[]),
+      ensureWorkspaceDirs(pid).then(() => listWorkspaceFiles(pid)).catch(() => [] as WorkspaceFile[]),
+    ]).then(([pf, wf]) => { setProjectFiles(pf); setWorkspaceFiles(wf); });
+  }, [showContext, active, convs]);
 
   // ── Derived state ──────────────────────────────────────────────────────────
 
@@ -1211,8 +1316,8 @@ export default function ConversationsPage() {
     }
   };
 
-  const handleNewGroup = async (name: string, memberIds: string[]) => {
-    const c = await createGroupConversation(name, memberIds);
+  const handleNewGroup = async (name: string, memberIds: string[], projectId: string | null) => {
+    const c = await createGroupConversation(name, memberIds, undefined, undefined, projectId);
     await loadConvs();
     setActive(c.id);
     setShowNew(false);
@@ -1294,6 +1399,12 @@ export default function ConversationsPage() {
               <div className="chat-head-title">
                 {conv.conv_type === 'group' ? conv.name : agentMap[conv.members[0]]?.name ?? 'Agent'}
                 {conv.conv_type === 'group' && <span className="chip" style={{ padding: '1px 7px', fontSize: 10 }}>{conv.members.length} 成员</span>}
+                {conv.conv_type === 'group' && conv.project_id && (
+                  <span className="chip" style={{ padding: '1px 7px', fontSize: 10, background: 'var(--ember-tint)', color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                    <Icon name="folder" size={9} />
+                    {projects.find(p => p.id === conv.project_id)?.name ?? '项目'}
+                  </span>
+                )}
               </div>
               <div className="chat-head-sub">{chatHeadSub}</div>
             </div>
@@ -1372,7 +1483,7 @@ export default function ConversationsPage() {
 
               {/* Context panel */}
               {showContext && (
-                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 340 }}>
+                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 360, maxHeight: 560, overflowY: 'auto' }}>
                   <div className="mention-pop-label">会议室上下文与附件</div>
                   <div style={{ padding: '7px 8px 4px' }}>
                     <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 8 }}>
@@ -1426,7 +1537,124 @@ export default function ConversationsPage() {
                       )}
                     </div>
                   ))}
-                  {contextBlocks.length === 0 && <div className="empty-compact" style={{ padding: '10px 8px' }}>暂无附件或上下文块</div>}
+                  {contextBlocks.length === 0 && !conv?.project_id && (
+                    <div className="empty-compact" style={{ padding: '10px 8px' }}>暂无附件或上下文块</div>
+                  )}
+
+                  {/* Workspace (.autoforge) section */}
+                  {conv?.project_id && (
+                    <>
+                      <div style={{ height: 1, background: 'var(--border)', margin: '6px 0 2px' }} />
+                      <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <Icon name="folder" size={12} style={{ color: 'var(--ember)' }} />
+                        工作区文件
+                        <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                          {(['docs', 'specs'] as const).map(tab => (
+                            <button key={tab} onClick={() => { setWorkspaceTab(tab); setWsFileContent(null); }}
+                              className="btn btn-sm"
+                              style={{ padding: '1px 8px', fontSize: 10, background: workspaceTab === tab ? 'var(--ember)' : undefined, color: workspaceTab === tab ? '#fff' : undefined }}>
+                              {tab}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {/* File viewer */}
+                      {wsFileContent && (
+                        <div style={{ margin: '4px 8px 4px', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                          <div style={{ padding: '6px 10px', background: 'var(--bg-3)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+                            <Icon name="file" size={11} style={{ color: 'var(--ember)' }} />
+                            <span style={{ fontFamily: 'var(--font-mono)', flex: 1, color: 'var(--text-2)' }}>.autoforge/{wsFileContent.path}</span>
+                            <button className="icon-btn" style={{ width: 20, height: 20 }} onClick={() => setWsFileContent(null)}>
+                              <Icon name="x" size={11} />
+                            </button>
+                          </div>
+                          <pre style={{ margin: 0, padding: '8px 10px', fontSize: 11, lineHeight: 1.6, color: 'var(--text-2)', maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                            {wsFileContent.content}
+                          </pre>
+                        </div>
+                      )}
+                      {/* File list */}
+                      {workspaceFiles.filter(f => f.subfolder === workspaceTab).length === 0 ? (
+                        <div className="empty-compact" style={{ padding: '8px 8px' }}>
+                          .autoforge/{workspaceTab}/ 暂无文件
+                          <span style={{ display: 'block', fontSize: 10, color: 'var(--text-faint)', marginTop: 3 }}>
+                            让 Agent 创建文档，或直接点击 Artifact 的"存入 {workspaceTab}"按钮
+                          </span>
+                        </div>
+                      ) : (
+                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => (
+                          <div key={f.rel_path} className="mention-row" style={{ cursor: 'pointer' }}
+                            onClick={() => {
+                              if (wsFileContent?.path === f.rel_path) { setWsFileContent(null); return; }
+                              if (conv.project_id) {
+                                readWorkspaceFile(conv.project_id, f.rel_path)
+                                  .then(content => setWsFileContent({ path: f.rel_path, content }))
+                                  .catch(err => setLoadError(String(err)));
+                              }
+                            }}>
+                            <div className="cfg-logo" style={{ width: 28, height: 28, background: 'var(--ember)', flexShrink: 0 }}>
+                              <Icon name="file" size={13} />
+                            </div>
+                            <div style={{ minWidth: 0, flex: 1 }}>
+                              <div className="nm">{f.name}</div>
+                              <div className="rl" style={{ fontSize: 10.5 }}>{f.modified_at} · {(f.size_bytes / 1024).toFixed(1)} KB</div>
+                            </div>
+                            <Icon name={wsFileContent?.path === f.rel_path ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                          </div>
+                        ))
+                      )}
+                      <div style={{ height: 1, background: 'var(--border)', margin: '4px 0 2px' }} />
+
+                      {/* Project context files (claude.md etc.) */}
+                      <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <Icon name="zap" size={12} style={{ color: 'var(--ember)' }} />
+                        只读上下文文件
+                      </div>
+                      {projectFiles.length === 0 && (
+                        <div className="empty-compact" style={{ padding: '6px 8px' }}>项目目录无可引用文件</div>
+                      )}
+                      {projectFiles.slice(0, 12).map(f => (
+                        <div key={f.rel_path} className="mention-row" style={{ paddingTop: 5, paddingBottom: 5 }}>
+                          <div className="cfg-logo" style={{ width: 26, height: 26, flexShrink: 0,
+                            background: f.is_priority ? 'var(--ember)' : f.pinned ? 'var(--amber)' : 'var(--bg-4)' }}>
+                            <Icon name={f.is_priority ? 'zap' : 'file'} size={12} />
+                          </div>
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div className="nm" style={{ fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 4 }}>
+                              {f.name}
+                              {f.is_priority && (
+                                <span style={{ fontSize: 9.5, background: 'var(--ember-tint)', color: 'var(--ember)', borderRadius: 4, padding: '0 4px' }}>自动注入</span>
+                              )}
+                            </div>
+                            <div className="rl" style={{ fontSize: 10 }}>{f.rel_path}</div>
+                          </div>
+                          {!f.is_priority && (
+                            <button
+                              className="icon-btn"
+                              title={f.pinned ? '从只读上下文移除' : '加入只读上下文'}
+                              style={{ width: 24, height: 24, flex: 'none', color: f.pinned ? 'var(--ember)' : undefined }}
+                              onClick={e => {
+                                e.stopPropagation();
+                                const op = f.pinned
+                                  ? removeConversationProjectContext(active, f.rel_path)
+                                  : addConversationProjectContext(active, f.rel_path);
+                                op.then(() => {
+                                  if (conv?.project_id) {
+                                    listProjectFiles(conv.project_id, active).then(setProjectFiles).catch(() => {});
+                                  }
+                                }).catch(err => setLoadError(String(err)));
+                              }}
+                            >
+                              <Icon name={f.pinned ? 'check' : 'plus'} size={12} />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      <div style={{ fontSize: 10.5, color: 'var(--text-faint)', padding: '4px 8px 8px' }}>
+                        只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/ 和 .autoforge/specs/
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -1473,6 +1701,7 @@ export default function ConversationsPage() {
                 highlighted={activeSearchId === m.id}
                 rowRef={el => { messageRefs.current[m.id] = el; }}
                 onBubbleContextMenu={openBubbleMenu}
+                projectId={conv.project_id ?? undefined}
               />
             ))}
           </div>
@@ -1505,7 +1734,7 @@ export default function ConversationsPage() {
         </div>
       )}
 
-      {showNew && <NewGroupModal agents={agents} onClose={() => setShowNew(false)} onCreate={handleNewGroup} />}
+      {showNew && <NewGroupModal agents={agents} projects={projects} onClose={() => setShowNew(false)} onCreate={handleNewGroup} />}
       {bubbleMenu && (
         <div
           className="bubble-menu"

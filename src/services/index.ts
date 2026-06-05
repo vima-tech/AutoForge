@@ -79,6 +79,11 @@ export interface Conversation {
   color: string; initial: string | null; created_at: string;
   members: string[]; unread: number;
   last_message: string | null; last_time: string | null;
+  project_id: string | null;
+}
+export interface ProjectContextFile {
+  rel_path: string; name: string; size_bytes: number;
+  is_priority: boolean; pinned: boolean;
 }
 export interface Message {
   id: string; conversation_id: string; from_agent: string | null;
@@ -246,8 +251,8 @@ export const openAttachment = (attachmentId: string) =>
 export const attachmentDataUrl = (attachmentId: string) =>
   ipc<string>('attachment_data_url', { attachmentId });
 export const createGroupConversation = (
-  name: string, memberIds: string[], color?: string, initial?: string,
-) => ipc<Conversation>('create_group_conversation', { name, memberIds, color, initial });
+  name: string, memberIds: string[], color?: string, initial?: string, projectId?: string | null,
+) => ipc<Conversation>('create_group_conversation', { name, memberIds, color, initial, projectId: projectId ?? null });
 export const addConversationMember = (conversationId: string, agentId: string) =>
   ipc<Conversation>('add_conversation_member', { conversationId, agentId });
 export const removeConversationMember = (conversationId: string, agentId: string) =>
@@ -268,6 +273,30 @@ export const startConversationTask = (payload: {
 }) => ipc<ConversationTask>('start_conversation_task', { payload });
 export const listConversationTasks = (conversationId: string) =>
   ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
+export const listProjectFiles = (projectId: string, conversationId?: string) =>
+  ipc<ProjectContextFile[]>('list_project_files', { projectId, conversationId: conversationId ?? null });
+export const readProjectFile = (projectId: string, relPath: string) =>
+  ipc<string>('read_project_file', { projectId, relPath });
+export const listConversationProjectContext = (conversationId: string) =>
+  ipc<string[]>('list_conversation_project_context', { conversationId });
+export const addConversationProjectContext = (conversationId: string, relPath: string) =>
+  ipc<void>('add_conversation_project_context', { conversationId, relPath });
+export const removeConversationProjectContext = (conversationId: string, relPath: string) =>
+  ipc<void>('remove_conversation_project_context', { conversationId, relPath });
+
+// ── Workspace (.autoforge) ───────────────────────────────────────────────────
+export interface WorkspaceFile {
+  rel_path: string; name: string; subfolder: string;
+  size_bytes: number; modified_at: string;
+}
+export const ensureWorkspaceDirs = (projectId: string) =>
+  ipc<void>('ensure_workspace_dirs', { projectId });
+export const listWorkspaceFiles = (projectId: string) =>
+  ipc<WorkspaceFile[]>('list_workspace_files', { projectId });
+export const readWorkspaceFile = (projectId: string, relPath: string) =>
+  ipc<string>('read_workspace_file', { projectId, relPath });
+export const writeWorkspaceFile = (projectId: string, relPath: string, content: string) =>
+  ipc<WorkspaceFile>('write_workspace_file', { projectId, relPath, content });
 
 // ── Settings — LLM ──────────────────────────────────────────────────────────
 export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');
@@ -392,3 +421,28 @@ export const startDevServer = (projectId: string) =>
   ipc<DevServerStatus>('start_dev_server', { projectId });
 export const stopDevServer = (projectId: string) =>
   ipc<void>('stop_dev_server', { projectId });
+
+// ── Specs ─────────────────────────────────────────────────────────────────────
+
+export type SpecCategory = 'tech_stack' | 'architecture' | 'coding' | 'api' | 'testing';
+
+export interface ProjectSpec {
+  id: string;
+  project_id: string;
+  category: SpecCategory;
+  title: string;
+  content: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export const listProjectSpecs = (projectId: string) =>
+  ipc<ProjectSpec[]>('list_project_specs', { projectId });
+export const upsertProjectSpec = (
+  projectId: string, id: string | null, category: SpecCategory, title: string, content: string,
+) => ipc<ProjectSpec>('upsert_project_spec', { projectId, id, category, title, content });
+export const deleteProjectSpec = (id: string) =>
+  ipc<boolean>('delete_project_spec', { id });
+export const aiGenerateSpecs = (projectId: string) =>
+  ipc<string>('ai_generate_specs', { projectId });

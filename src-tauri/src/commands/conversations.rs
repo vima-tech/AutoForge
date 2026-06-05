@@ -112,6 +112,7 @@ pub async fn list_conversations(
             unread,
             last_message,
             last_time,
+            project_id: conv.project_id,
         });
     }
 
@@ -561,18 +562,32 @@ pub async fn create_group_conversation(
     member_ids: Vec<String>,
     color: Option<String>,
     initial: Option<String>,
+    project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ConversationDetail, String> {
     let id = Uuid::new_v4().to_string();
     let color = color.unwrap_or_else(|| "#e8772e".to_string());
 
+    // Validate project if provided
+    if let Some(ref pid) = project_id {
+        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id=?")
+            .bind(pid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Err(format!("project {} not found", pid));
+        }
+    }
+
     sqlx::query(
-        "INSERT INTO conversations (id, type, name, color, initial) VALUES (?, 'group', ?, ?, ?)",
+        "INSERT INTO conversations (id, type, name, color, initial, project_id) VALUES (?, 'group', ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
     .bind(&color)
     .bind(&initial)
+    .bind(&project_id)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -599,6 +614,7 @@ pub async fn create_group_conversation(
         unread: 0,
         last_message: None,
         last_time: None,
+        project_id,
     })
 }
 
@@ -904,6 +920,7 @@ async fn conversation_detail(
         unread,
         last_message,
         last_time,
+        project_id: conv.project_id,
     })
 }
 

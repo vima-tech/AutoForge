@@ -9,8 +9,9 @@ import {
   listAgents, createAgent, updateAgent, deleteAgent, setAgentForgeRole,
   getSystemHealth, updateConcurrencyConfig, readSpec, writeSpec,
   listPreviewEnvironments, listTestSessions, listAdminDecisions,
+  getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
-  type TestSession, type AdminDecision,
+  type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -761,6 +762,137 @@ function AboutSettings() {
   );
 }
 
+// ── WebhookSettings ───────────────────────────────────────────────────────────
+
+function WebhookSettings() {
+  const [cfg, setCfg]     = useState<IntakeConfig | null>(null);
+  const [status, setStatus] = useState<WebhookStatus | null>(null);
+  const [form, setForm]   = useState({ enabled: false, port: '27182', token: '' });
+  const [saving, setSaving]   = useState(false);
+  const [copied, setCopied]   = useState(false);
+  const [saveOk, setSaveOk]   = useState<boolean | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([getIntakeConfig(), getWebhookStatus()])
+      .then(([c, s]) => {
+        setCfg(c);
+        setStatus(s);
+        setForm({ enabled: c.webhook_enabled, port: String(c.webhook_port), token: c.webhook_token });
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async () => {
+    setSaving(true); setSaveOk(null);
+    try {
+      const updated = await updateIntakeConfig({
+        webhook_enabled: form.enabled,
+        webhook_port: parseInt(form.port) || 27182,
+        webhook_token: form.token,
+      });
+      setCfg(updated);
+      setSaveOk(true);
+      getWebhookStatus().then(setStatus).catch(() => {});
+      setTimeout(() => setSaveOk(null), 2500);
+    } catch { setSaveOk(false); }
+    finally { setSaving(false); }
+  };
+
+  const genToken = () => {
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    setForm(f => ({ ...f, token: btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '') }));
+  };
+
+  const curlExample = `curl -X POST http://127.0.0.1:${form.port}/webhook/issues \\
+  -H "Authorization: Bearer ${form.token || '<token>'}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"project_id":"<uuid>","title":"需求标题","description":"详细描述"}'`;
+
+  if (loading) return <div className="set-inner" style={{ color: 'var(--text-3)', fontSize: 13 }}>加载中…</div>;
+
+  return (
+    <div className="set-inner" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {/* 状态卡 */}
+      <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '18px 20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 9, background: 'rgba(232,119,46,.15)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>HTTP Webhook 接口</div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>外部系统通过 POST 请求推送需求到指定项目</div>
+          </div>
+          {status && (
+            <span className={'chip ' + (status.running ? 'green' : '')} style={{ padding: '3px 10px', fontSize: 11 }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: status.running ? 'var(--green)' : 'var(--text-3)', display: 'inline-block', marginRight: 5 }} />
+              {status.running ? `运行中 :${status.port}` : '已停止'}
+            </span>
+          )}
+        </div>
+
+        {/* 启用开关 */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--bg-3)', borderRadius: 9, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontWeight: 500, fontSize: 13 }}>启用 Webhook</div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>开启后外部系统可向本机端口推送需求</div>
+          </div>
+          <div role="switch" aria-checked={form.enabled} onClick={() => setForm(f => ({ ...f, enabled: !f.enabled }))}
+            style={{ width: 38, height: 22, borderRadius: 11, cursor: 'pointer', flexShrink: 0, background: form.enabled ? 'var(--ember)' : 'var(--bg-3)', border: `1.5px solid ${form.enabled ? 'var(--ember-deep)' : 'var(--border-strong)'}`, position: 'relative', transition: 'background .2s, border-color .2s' }}>
+            <div style={{ position: 'absolute', top: 2, left: form.enabled ? 18 : 2, width: 14, height: 14, borderRadius: '50%', background: '#fff', transition: 'left .2s cubic-bezier(.4,0,.2,1)', boxShadow: '0 1px 3px rgba(0,0,0,.35)' }} />
+          </div>
+        </div>
+
+        <div className="cfg-fields" style={{ gridTemplateColumns: '120px 1fr', gap: 10, marginBottom: 14 }}>
+          <div className="field" style={{ margin: 0 }}>
+            <label>监听端口</label>
+            <input value={form.port} onChange={e => setForm(f => ({ ...f, port: e.target.value }))} placeholder="27182" />
+          </div>
+          <div className="field" style={{ margin: 0 }}>
+            <label>访问 Token</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input value={form.token} onChange={e => setForm(f => ({ ...f, token: e.target.value }))}
+                placeholder="Bearer 令牌" style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11.5 }} />
+              <button className="btn btn-sm" onClick={genToken} style={{ flexShrink: 0 }}>
+                <Icon name="refresh" size={13} />生成
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ background: 'rgba(139,122,216,.08)', border: '1px solid rgba(139,122,216,.22)', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 8, marginBottom: 14 }}>
+          <Icon name="bell" size={13} style={{ flexShrink: 0, marginTop: 1, color: 'var(--violet)' }} />
+          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>127.0.0.1</code>（本机），不暴露公网。更改配置后点击「保存并应用」以重启服务。</div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button className="btn btn-primary" onClick={save} disabled={saving}>
+            <Icon name="check" size={14} />{saving ? '保存中…' : '保存并应用'}
+          </button>
+          {saveOk === true && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ 已保存</span>}
+          {saveOk === false && <span style={{ fontSize: 12, color: 'var(--red)' }}>保存失败</span>}
+        </div>
+      </div>
+
+      {/* curl 示例卡 */}
+      <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '18px 20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>curl 示例</div>
+          <button className="icon-btn" style={{ width: 26, height: 26 }} title="复制"
+            onClick={async () => { await navigator.clipboard.writeText(curlExample).catch(() => {}); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
+            <Icon name={copied ? 'check' : 'copy'} size={13} />
+          </button>
+        </div>
+        <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, lineHeight: 1.6, color: 'var(--text-2)', background: 'var(--bg-3)', borderRadius: 8, padding: '12px 14px', overflowX: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', border: '1px solid var(--border)' }}>
+          {curlExample}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
 const SET_ITEMS = [
   { id: 'theme',       name: '主题设置',     ic: 'palette' },
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
@@ -768,8 +900,9 @@ const SET_ITEMS = [
   { id: 'roles',       name: '角色指派',     ic: 'layers' },
   { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
+  { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
   { id: 'specs',       name: '规范文档',     ic: 'file' },
-  { id: 'about',       name: '关于 AutoForge', ic: 'zap' },
+  { id: 'about',       name: '关于 AutoForge', ic: 'box' },
 ];
 
 export default function SettingsPage({
@@ -801,9 +934,10 @@ export default function SettingsPage({
           {sec === 'roles'       && <RoleAssignment />}
           {sec === 'concurrency' && <ConcurrencySettings />}
           {sec === 'security'    && <SecuritySettings />}
+          {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','agents','roles','concurrency','security','specs','about'].includes(sec) && (
+          {!['theme','llm','agents','roles','concurrency','security','webhook','specs','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>
