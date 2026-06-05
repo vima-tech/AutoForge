@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
-import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal } from '../components/ProjectDialogs';
+import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, ConfirmModal } from '../components/ProjectDialogs';
 import {
   listProjects, updateProject, deleteProject, type Project,
   listMaterialFolders, createMaterialFolder, renameMaterialFolder, deleteMaterialFolder,
@@ -48,13 +48,8 @@ function buildTree(folders: MaterialFolder[], parentId: string | null): Material
     .sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name));
 }
 
-function findDocsRoot(folders: MaterialFolder[]): MaterialFolder | null {
-  return folders.find(f => f.parent_id === null && f.name.toLowerCase() === 'docs') ?? null;
-}
-
 function visibleMaterialFolders(folders: MaterialFolder[]): MaterialFolder[] {
-  const docsRoot = findDocsRoot(folders);
-  return docsRoot ? folders.filter(f => f.id !== docsRoot.id) : folders;
+  return folders;
 }
 
 function countFilesInFolderTree(folderId: string, folders: MaterialFolder[], files: MaterialFile[]): number {
@@ -270,17 +265,15 @@ function MoveFileModal({ file, folders, onMove, onClose }: {
   file: MaterialFile; folders: MaterialFolder[];
   onMove: (folderId: string | null) => void; onClose: () => void;
 }) {
-  const docsRoot = findDocsRoot(folders);
-  const visibleFolders = visibleMaterialFolders(folders);
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
       <div style={{ width: 360, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '20px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ fontWeight: 600, marginBottom: 14 }}>移动到文件夹</div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 300, overflowY: 'auto' }}>
-          <button className="btn btn-sm" style={{ justifyContent: 'flex-start', gap: 8, background: file.folder_id === null || file.folder_id === docsRoot?.id ? 'var(--ember-tint)' : '' }} onClick={() => onMove(null)}>
+          <button className="btn btn-sm" style={{ justifyContent: 'flex-start', gap: 8, background: file.folder_id === null ? 'var(--ember-tint)' : '' }} onClick={() => onMove(null)}>
             <Icon name="layers" size={13} />根目录
           </button>
-          {visibleFolders.map(f => (
+          {folders.map(f => (
             <button key={f.id} className="btn btn-sm" style={{ justifyContent: 'flex-start', gap: 8, background: file.folder_id === f.id ? 'var(--ember-tint)' : '' }} onClick={() => onMove(f.id)}>
               <Icon name="folder" size={13} />{f.name}
             </button>
@@ -318,14 +311,15 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
   const [renameName, setRenameName]         = useState('');
   const [movingFile, setMovingFile]         = useState<MaterialFile | null>(null);
   const [dragOver, setDragOver]             = useState(false);
+  const [confirmDelFolder, setConfirmDelFolder] = useState<MaterialFolder | null>(null);
+  const [confirmDelFile,   setConfirmDelFile]   = useState<MaterialFile | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const docsRoot = findDocsRoot(folders);
   const visibleFolders = visibleMaterialFolders(folders);
   const displayedFiles = selectedFolderId === null
-    ? files.filter(f => docsRoot ? f.folder_id === docsRoot.id : f.folder_id === null)
+    ? files.filter(f => f.folder_id === null)
     : files.filter(f => f.folder_id === selectedFolderId);
-  const rootFileCount = files.filter(f => docsRoot ? f.folder_id === docsRoot.id : f.folder_id === null).length;
+  const rootFileCount = files.filter(f => f.folder_id === null).length;
 
   const load = useCallback(async () => {
     try {
@@ -383,7 +377,11 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
   };
 
   const doDeleteFolder = async (f: MaterialFolder) => {
-    if (!confirm(`确认删除文件夹「${f.name}」？文件夹内的文件将移至根目录。`)) return;
+    setConfirmDelFolder(f);
+  };
+
+  const execDeleteFolder = async (f: MaterialFolder) => {
+    setConfirmDelFolder(null);
     try {
       const ok = await deleteMaterialFolder(f.id);
       if (!ok) throw new Error('文件夹不存在或已被删除');
@@ -393,7 +391,11 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
   };
 
   const doDeleteFile = async (f: MaterialFile) => {
-    if (!confirm(`确认删除「${f.original_name}」？此操作不可撤销。`)) return;
+    setConfirmDelFile(f);
+  };
+
+  const execDeleteFile = async (f: MaterialFile) => {
+    setConfirmDelFile(null);
     try { await deleteMaterialFile(f.id); await load(); }
     catch (e) { setError(String(e)); }
   };
@@ -425,7 +427,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
     finally { setBackupWorking(false); }
   };
 
-  const rootFolders = docsRoot ? buildTree(folders, docsRoot.id) : buildTree(visibleFolders, null);
+  const rootFolders = buildTree(visibleFolders, null);
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
@@ -463,7 +465,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
 
         {/* folder sidebar */}
-        <div style={{ width: 190, flexShrink: 0, borderRight: '1px solid var(--border)', overflowY: 'auto', padding: '10px 6px' }}>
+        <div style={{ width: 245, flexShrink: 0, borderRight: '1px solid var(--border)', overflowY: 'auto', padding: '10px 6px' }}>
           {/* "all" root */}
           <div
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 'var(--text-control)', marginBottom: 2, background: selectedFolderId === null ? 'var(--ember-tint)' : 'transparent', color: selectedFolderId === null ? 'var(--ember)' : 'var(--text-2)' }}
@@ -581,6 +583,26 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
         <BackupConfigModal config={backupConfig}
           onSave={cfg => { setBackupConfig(cfg); setShowBackupConfig(false); flash('备份配置已保存'); }}
           onClose={() => setShowBackupConfig(false)} />
+      )}
+
+      {confirmDelFolder && (
+        <ConfirmModal
+          msg={`确认删除文件夹「${confirmDelFolder.name}」？`}
+          sub="文件夹内的文件将移至根目录。"
+          okLabel="删除"
+          onOk={() => execDeleteFolder(confirmDelFolder)}
+          onCancel={() => setConfirmDelFolder(null)}
+        />
+      )}
+
+      {confirmDelFile && (
+        <ConfirmModal
+          msg={`确认删除「${confirmDelFile.original_name}」？`}
+          sub="此操作不可撤销。"
+          okLabel="删除"
+          onOk={() => execDeleteFile(confirmDelFile)}
+          onCancel={() => setConfirmDelFile(null)}
+        />
       )}
     </div>
   );
@@ -985,6 +1007,8 @@ function SpecPanel({ projectId }: { projectId: string }) {
   const [error, setError]           = useState('');
   const [editing, setEditing]       = useState<ProjectSpec | null | undefined>(undefined);
   // undefined = modal closed, null = new item, ProjectSpec = editing existing
+  const [confirmAiGen,  setConfirmAiGen]  = useState(false);
+  const [confirmDelSpec, setConfirmDelSpec] = useState<ProjectSpec | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -997,16 +1021,20 @@ function SpecPanel({ projectId }: { projectId: string }) {
 
   const flash = (msg: string) => { setMessage(msg); setTimeout(() => setMessage(''), 4000); };
 
-  const doAiGenerate = async () => {
-    if (!confirm('AI 将分析项目信息并重新生成所有分类规格，现有规格将被覆盖。确认继续？')) return;
+  const doAiGenerate = () => { setConfirmAiGen(true); };
+
+  const execAiGenerate = async () => {
+    setConfirmAiGen(false);
     setAiWorking(true); setError('');
     try { flash(await aiGenerateSpecs(projectId)); await load(); }
     catch (e) { setError(String(e)); }
     finally { setAiWorking(false); }
   };
 
-  const doDelete = async (s: ProjectSpec) => {
-    if (!confirm(`确认删除规格「${s.title}」？`)) return;
+  const doDelete = (s: ProjectSpec) => { setConfirmDelSpec(s); };
+
+  const execDeleteSpec = async (s: ProjectSpec) => {
+    setConfirmDelSpec(null);
     try { await deleteProjectSpec(s.id); await load(); }
     catch (e) { setError(String(e)); }
   };
@@ -1093,6 +1121,26 @@ function SpecPanel({ projectId }: { projectId: string }) {
           projectId={projectId}
           onSave={onSaved}
           onClose={() => setEditing(undefined)}
+        />
+      )}
+
+      {confirmAiGen && (
+        <ConfirmModal
+          msg="AI 一键生成规格"
+          sub="AI 将分析项目信息并重新生成所有分类规格，现有规格将被覆盖。确认继续？"
+          okLabel="生成"
+          danger={false}
+          onOk={execAiGenerate}
+          onCancel={() => setConfirmAiGen(false)}
+        />
+      )}
+
+      {confirmDelSpec && (
+        <ConfirmModal
+          msg={`确认删除规格「${confirmDelSpec.title}」？`}
+          okLabel="删除"
+          onOk={() => execDeleteSpec(confirmDelSpec)}
+          onCancel={() => setConfirmDelSpec(null)}
         />
       )}
     </div>

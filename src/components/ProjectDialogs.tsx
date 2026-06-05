@@ -268,6 +268,30 @@ function ProjectFormFields({ form, setForm, slugTouched, setSlugTouched, updateN
   );
 }
 
+// ── ConfirmModal (generic) ────────────────────────────────────────────────────
+
+export function ConfirmModal({ msg, sub, okLabel = '确认', danger = true, onOk, onCancel }: {
+  msg: string;
+  sub?: string;
+  okLabel?: string;
+  danger?: boolean;
+  onOk: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }} onClick={onCancel}>
+      <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 400, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <p style={{ margin: sub ? '0 0 8px' : '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
+        {sub && <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>{sub}</p>}
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onCancel}>取消</button>
+          <button className={`btn ${danger ? 'btn-danger' : 'btn-primary'}`} onClick={onOk}>{okLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── ConfirmProjectDeleteModal ─────────────────────────────────────────────────
 
 export function ConfirmProjectDeleteModal({ project, onCancel, onConfirm }: {

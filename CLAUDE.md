@@ -356,3 +356,15 @@ Claude Code 在 worktree 内执行时额外禁止 git 工具：`--disallowedTool
 4. **工作区写入限制**：`workspace.rs` 强制验证写路径必须在 `.autoforge/docs/` 或 `.autoforge/specs/` 内，禁止路径越界（`..` 等）
 5. **附件安全**：白名单 MIME 类型，最大 10 MB，存储时 UUID 化文件名
 6. **API Key 存储**：LLM API Key 存入 SQLite（后续迁移到 Tauri keychain plugin）
+
+<!-- autoforge:specs:start -->
+## AutoForge 项目规格
+
+以下为 AutoForge 管理的项目规格约束，AI 执行任务时必须遵守：
+
+@.autoforge/specs/tech_stack.md
+@.autoforge/specs/architecture.md
+@.autoforge/specs/coding.md
+@.autoforge/specs/api.md
+@.autoforge/specs/testing.md
+<!-- autoforge:specs:end -->

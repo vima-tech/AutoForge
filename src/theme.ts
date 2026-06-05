@@ -123,7 +123,7 @@ export function themeIdOf(selection: ThemeSelection): ThemeId {
 }
 
 export function parseTheme(value: string | null | undefined): ThemeSelection {
-  if (!value) return { palette: 'forge', mode: 'dark' };
+  if (!value) return { palette: 'forge', mode: 'light' };
 
   if (value === 'dark' || value === 'light') {
     return { palette: 'forge', mode: value };
@@ -134,7 +134,7 @@ export function parseTheme(value: string | null | undefined): ThemeSelection {
     return { palette, mode };
   }
 
-  return { palette: 'forge', mode: 'dark' };
+  return { palette: 'forge', mode: 'light' };
 }
 
 export function oppositeMode(mode: ThemeMode): ThemeMode {

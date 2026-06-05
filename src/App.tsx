@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import Icon from './components/Icon';
+import logoUrl from './assets/logo.png';
 import { MeAvatar } from './components/Avatar';
 import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
@@ -86,45 +87,16 @@ function handleTitlebarMouseDown(e: React.MouseEvent<HTMLDivElement>) {
 }
 
 // ---- Logo ----
-// AutoForge mark: a stylized "A" whose crossbar is a forward-pointing pipeline arrow
-// (the autonomous analysis→code→merge flow), capped by a small ember at the apex
-// (the forge spark that the factory produces). Monoline, white on molten orange.
 function ForgeLogo({ size = 38 }: { size?: number }) {
   return (
-    <svg viewBox="0 0 38 38" width={size} height={size} fill="none">
-      <rect width="38" height="38" rx="11" fill="url(#logo-bg)" />
-      <defs>
-        <linearGradient id="logo-bg" x1="0" y1="0" x2="38" y2="38" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stopColor="#f5a623" />
-          <stop offset="55%" stopColor="#e8772e" />
-          <stop offset="100%" stopColor="#d45d1c" />
-        </linearGradient>
-      </defs>
-
-      {/* 外圆 */}
-      <circle cx="19" cy="19" r="15" stroke="#472811" strokeWidth="1.3" fill="none" opacity="0.3"/>
-      {/* 中圆 */}
-      <circle cx="19" cy="19" r="9" stroke="#472811" strokeWidth="1.3" fill="none" opacity="0.2"/>
-      {/* 内圆 */}
-      <circle cx="19" cy="19" r="4.5" stroke="#472811" strokeWidth="1.3" fill="none" opacity="0.1"/>
-
-      {/* 三横 */}
-      <line x1="0" y1="9.5" x2="38" y2="9.5" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
-      <line x1="0" y1="19" x2="38" y2="19" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
-      <line x1="0" y1="28.5" x2="38" y2="28.5" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
-
-      {/* 三竖 */}
-      <line x1="9.5" y1="0" x2="9.5" y2="38" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
-      <line x1="19" y1="0" x2="19" y2="38" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
-      <line x1="28.5" y1="0" x2="28.5" y2="38" stroke="#472811" strokeWidth="0.8" opacity="0.2"/>
-
-      {/* 大写 A：左侧偏长，右侧偏短，复仇者风格 */}
-      <g stroke="#5d3617ff" stroke-width="4" opacity="1" fill="none" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="21" y1="6" x2="11" y2="29.5" />
-        <line x1="21" y1="6" x2="25" y2="23" />
-        <line x1="15" y1="22" x2="22" y2="20" />
-      </g>  
-    </svg>
+    <img
+      src={logoUrl}
+      width={size}
+      height={size}
+      alt="AutoForge"
+      style={{ borderRadius: size * 0.29, display: 'block' }}
+      draggable={false}
+    />
   );
 }
 
@@ -291,7 +263,7 @@ export default function App() {
       <div className="os-body">
         <div className="rail">
           <div className="rail-logo" title="AutoForge">
-            <ForgeLogo size={22} />
+            <ForgeLogo size={38} />
           </div>
           {NAV.map(n => {
             const badge = navBadge(n.id);
