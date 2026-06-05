@@ -6,11 +6,13 @@ import { MeAvatar } from './components/Avatar';
 import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
+import IntakePage from './pages/Intake';
+import ProjectsPage from './pages/Projects';
 import SettingsPage from './pages/Settings';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
+import { THEME_STORAGE_KEY, oppositeMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
-type Page = 'home' | 'chat' | 'audit' | 'settings';
-type Theme = 'dark' | 'light';
+type Page = 'home' | 'chat' | 'intake' | 'projects' | 'audit' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
@@ -121,17 +123,19 @@ function ForgeLogo({ size = 38 }: { size?: number }) {
 }
 
 const NAV: { id: Page; name: string; ic: string }[] = [
-  { id: 'home',  name: '主页',     ic: 'home' },
-  { id: 'chat',  name: '对话',     ic: 'chat' },
-  { id: 'audit', name: '功能审计', ic: 'audit' },
+  { id: 'home',     name: '主页',     ic: 'home' },
+  { id: 'chat',     name: '会议室',   ic: 'chat' },
+  { id: 'intake',   name: '需求入口', ic: 'inbox' },
+  { id: 'projects', name: '项目管理', ic: 'box' },
+  { id: 'audit',    name: '功能审计', ic: 'audit' },
 ];
 
 export default function App() {
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
-    return saved && (['home', 'chat', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
+    return saved && (['home', 'chat', 'intake', 'projects', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
-  const [theme, setTheme] = useState<Theme>('dark');
+  const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
 
@@ -163,7 +167,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.setAttribute('data-theme', theme.mode);
+    document.documentElement.setAttribute('data-palette', theme.palette);
+    localStorage.setItem(THEME_STORAGE_KEY, themeIdOf(theme));
   }, [theme]);
 
   // Auth check intentionally removed: spawning the claude Electron subprocess
@@ -299,10 +305,10 @@ export default function App() {
           <div className="rail-spacer" />
           <button
             className="rail-item"
-            title={theme === 'dark' ? '切换浅色' : '切换深色'}
-            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+            title={theme.mode === 'dark' ? '切换浅色' : '切换深色'}
+            onClick={() => setTheme(t => ({ ...t, mode: oppositeMode(t.mode) }))}
           >
-            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={22} />
+            <Icon name={theme.mode === 'dark' ? 'sun' : 'moon'} size={22} />
           </button>
           <button
             className={'rail-item' + (page === 'settings' ? ' active' : '')}
@@ -318,8 +324,10 @@ export default function App() {
 
         {page === 'home'     && <Dashboard />}
         {page === 'chat'     && <ConversationsPage />}
+        {page === 'intake'   && <IntakePage />}
+        {page === 'projects' && <ProjectsPage />}
         {page === 'audit'    && <AuditPage />}
-        {page === 'settings' && <SettingsPage />}
+        {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
     </div>
   );

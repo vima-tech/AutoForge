@@ -12,6 +12,16 @@ pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, S
 }
 
 #[tauri::command]
+pub async fn list_active_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    sqlx::query_as::<_, Project>(
+        "SELECT * FROM projects WHERE status = 'active' ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_project(
     id: String,
     state: State<'_, AppState>,

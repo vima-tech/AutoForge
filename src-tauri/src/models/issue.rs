@@ -12,6 +12,8 @@ pub struct Issue {
     pub priority: Option<i64>,
     pub status: String,
     pub fingerprint: String,
+    #[sqlx(default)]
+    pub source_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -40,4 +42,5 @@ pub struct CreateIssue {
     pub category: Option<String>,
     pub severity: Option<String>,
     pub source_type: Option<String>,
+    pub source_ref: Option<String>,
 }

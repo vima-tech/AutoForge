@@ -2,6 +2,7 @@ mod agents;
 mod commands;
 mod core;
 mod db;
+mod intake;
 mod models;
 mod state;
 mod tasks;
@@ -29,8 +30,10 @@ pub fn run() {
             let db_path = data_dir.join("autoforge.db").to_string_lossy().to_string();
             let worktrees = data_dir.join("worktrees").to_string_lossy().to_string();
             let attachments = data_dir.join("attachments").to_string_lossy().to_string();
+            let materials = data_dir.join("materials").to_string_lossy().to_string();
             state::init_worktrees_base(worktrees);
             state::init_attachments_base(attachments);
+            state::init_materials_base(materials);
 
             let db = tauri::async_runtime::block_on(async {
                 db::init(&db_path).await.expect("db init failed")
@@ -42,15 +45,51 @@ pub fn run() {
             let concurrency =
                 core::concurrency::ConcurrencyManager::new(max_slots, pause_threshold);
             concurrency.update_config(None, None, Some(queue_strategy));
-            let job_tx = tasks::runner::start(db.clone(), app_handle, concurrency.clone());
+            let job_tx = tasks::runner::start(db.clone(), app_handle.clone(), concurrency.clone());
+
+            let webhook_handle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
             app.manage(AppState {
-                db,
-                job_tx,
+                db: db.clone(),
+                job_tx: job_tx.clone(),
                 concurrency,
                 dev_servers: std::sync::Arc::new(tokio::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
+                webhook_handle: webhook_handle.clone(),
+            });
+
+            // 启动 webhook server（若配置中已启用）
+            let db_for_wh = db.clone();
+            let app_for_wh = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(cfg) = sqlx::query_as::<_, models::intake::IntakeConfig>(
+                    "SELECT * FROM intake_configs WHERE id='singleton'",
+                )
+                .fetch_one(&db_for_wh)
+                .await
+                {
+                    if cfg.webhook_enabled && !cfg.webhook_token.is_empty() {
+                        let port = cfg.webhook_port as u16;
+                        let token = cfg.webhook_token.clone();
+                        let db_clone = db_for_wh.clone();
+                        let app_clone = app_for_wh.clone();
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = intake::webhook::start(
+                                port,
+                                token,
+                                db_clone,
+                                job_tx.clone(),
+                                app_clone,
+                            )
+                            .await
+                            {
+                                tracing::error!("[webhook] server error: {}", e);
+                            }
+                        });
+                        *webhook_handle.lock().await = Some(handle);
+                    }
+                }
             });
 
             // 显式设置窗口图标，确保 Linux 任务栏在开发模式下也能显示正确图标
@@ -65,6 +104,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::projects::list_projects,
+            commands::projects::list_active_projects,
             commands::projects::get_project,
             commands::projects::create_project,
             commands::projects::update_project,
@@ -73,6 +113,13 @@ pub fn run() {
             commands::issues::get_issue,
             commands::issues::get_issue_analysis,
             commands::issues::submit_issue,
+            commands::intake::get_intake_config,
+            commands::intake::update_intake_config,
+            commands::intake::get_webhook_status,
+            commands::intake::sync_github_issues,
+            commands::intake::run_code_scan,
+            commands::intake::bulk_import_issues,
+            commands::intake::submit_from_artifact,
             commands::change_requests::list_change_requests,
             commands::change_requests::get_change_request,
             commands::change_requests::get_worktree_session,
@@ -118,11 +165,25 @@ pub fn run() {
             commands::system::list_test_sessions,
             commands::system::list_scan_findings,
             commands::system::list_admin_decisions,
-            commands::demo::seed_demo_data,
             commands::demo::open_url,
             commands::dev_server::get_dev_server_status,
             commands::dev_server::start_dev_server,
             commands::dev_server::stop_dev_server,
+            commands::materials::list_material_folders,
+            commands::materials::create_material_folder,
+            commands::materials::rename_material_folder,
+            commands::materials::delete_material_folder,
+            commands::materials::list_material_files,
+            commands::materials::import_material_file,
+            commands::materials::move_material_file,
+            commands::materials::update_material_file_meta,
+            commands::materials::delete_material_file,
+            commands::materials::open_material_file,
+            commands::materials::material_file_data_url,
+            commands::materials::ai_organize_materials,
+            commands::materials::get_material_backup_config,
+            commands::materials::update_material_backup_config,
+            commands::materials::backup_material_files,
         ])
         .run(tauri::generate_context!())
         .expect("error running AutoForge");

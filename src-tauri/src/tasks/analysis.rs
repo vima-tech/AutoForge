@@ -28,9 +28,12 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     }
 
     // Layer 1 (design §4.3): deeper LLM sanitization beyond the regex fast-reject.
-    // Internal sources (scan/monitor) are trusted and skip this; gracefully
-    // degrades to "allow" when the claude CLI is unavailable.
-    if issue.source_type != "scan" && issue.source_type != "monitor" {
+    // Trusted internal sources skip the LLM check; external sources always run it.
+    // Gracefully degrades to "allow" when the claude CLI is unavailable.
+    const TRUSTED_SOURCES: &[&str] = &[
+        "scan", "monitor", "github", "todo_scan", "security_audit", "ci_monitor",
+    ];
+    if !TRUSTED_SOURCES.contains(&issue.source_type.as_str()) {
         let combined = format!("{}\n{}", issue.title, issue.description);
         if !crate::agents::local_claude::safety_check(&combined).await {
             error!("issue {} rejected by Layer 1 LLM sanitizer", issue_id);

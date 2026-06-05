@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import Icon from './Icon';
 import Markdown from './Markdown';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, openAttachment } from '../services';
+import { attachmentDataUrl, openAttachment, submitFromArtifact } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -38,6 +38,78 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
         </button>
       </div>
       <pre><code>{tokens.map((tk, i) => tk.c ? <span key={i} className={tk.c}>{tk.t}</span> : tk.t)}</code></pre>
+    </div>
+  );
+}
+
+// ── ArtifactBlock (extracted to support requirement_draft) ──────────────────
+
+function ArtifactBlock({ b }: { b: Extract<BlockType, { t: 'artifact' }> }) {
+  const [submitted, setSubmitted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitErr, setSubmitErr] = useState('');
+
+  const meta = (b as any)._meta as {
+    project_id?: string; title?: string; description?: string;
+    category?: string; severity?: string;
+  } | undefined;
+  const isDraft = b.kind === 'requirement_draft';
+
+  const handleSubmitDraft = async () => {
+    if (!meta?.title || submitting) return;
+    setSubmitting(true); setSubmitErr('');
+    try {
+      await submitFromArtifact({
+        project_id: meta.project_id || '',
+        title: meta.title || b.title,
+        description: meta.description || b.body,
+        category: meta.category,
+        severity: meta.severity,
+      });
+      setSubmitted(true);
+    } catch (e) { setSubmitErr(String(e)); }
+    finally { setSubmitting(false); }
+  };
+
+  return (
+    <div className="artifact">
+      <div className="artifact-head">
+        <div className="artifact-ic"><Icon name={isDraft ? 'inbox' : 'zap'} size={17} /></div>
+        <div style={{ minWidth: 0 }}>
+          <div className="artifact-kind">{isDraft ? '需求草稿' : b.kind}</div>
+          <div className="artifact-title">{b.title}</div>
+        </div>
+      </div>
+      <div style={{ padding: '4px 14px' }}>
+        {b.rows.map((r, i) => (
+          <div className="artifact-row" key={i}>
+            <span className="k">{r[0]}</span>
+            <span className="v">{r[1]}</span>
+          </div>
+        ))}
+      </div>
+      <div className="artifact-body">{b.body}</div>
+      <div className="artifact-foot">
+        {isDraft ? (
+          submitted ? (
+            <span className="chip green" style={{ padding: '3px 10px' }}>
+              <Icon name="check" size={12} style={{ marginRight: 4 }} />已提交入队
+            </span>
+          ) : (
+            <>
+              <button className="btn btn-sm btn-primary" disabled={submitting} onClick={handleSubmitDraft}>
+                <Icon name="arrowUp" size={13} />{submitting ? '提交中…' : '提交到流水线'}
+              </button>
+              {submitErr && <span style={{ fontSize: 11, color: 'var(--red)' }}>{submitErr}</span>}
+            </>
+          )
+        ) : (
+          <>
+            <button className="btn btn-sm btn-primary"><Icon name="eye" size={13} />查看详情</button>
+            <button className="btn btn-sm">引用</button>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -95,28 +167,7 @@ export default function Block({ b }: { b: BlockType }) {
     </div>
   );
   if (b.t === 'artifact') return (
-    <div className="artifact">
-      <div className="artifact-head">
-        <div className="artifact-ic"><Icon name="zap" size={17} /></div>
-        <div style={{ minWidth: 0 }}>
-          <div className="artifact-kind">{b.kind}</div>
-          <div className="artifact-title">{b.title}</div>
-        </div>
-      </div>
-      <div style={{ padding: '4px 14px' }}>
-        {b.rows.map((r, i) => (
-          <div className="artifact-row" key={i}>
-            <span className="k">{r[0]}</span>
-            <span className="v">{r[1]}</span>
-          </div>
-        ))}
-      </div>
-      <div className="artifact-body">{b.body}</div>
-      <div className="artifact-foot">
-        <button className="btn btn-sm btn-primary"><Icon name="eye" size={13} />查看详情</button>
-        <button className="btn btn-sm">引用</button>
-      </div>
-    </div>
+    <ArtifactBlock b={b} />
   );
   return null;
 }

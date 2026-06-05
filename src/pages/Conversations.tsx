@@ -201,7 +201,7 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
     <div className="list-col">
       <div className="list-head">
         <div className="list-title-row">
-          <span className="list-title">对话</span>
+          <span className="list-title">会议室</span>
           <button className="icon-btn" title="新建群聊" onClick={onNew} style={{ color: 'var(--ember)' }}>
             <Icon name="plus" size={20} />
           </button>
@@ -214,7 +214,7 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
       <div className="list-body scroll">
         <div className="list-group-label">群聊 · 需求讨论</div>
         {groups.filter(match).map(c => <ConvItem key={c.id} c={c} active={active} agentMap={agentMap} onSelect={onSelect} />)}
-        <div className="list-group-label">Agent · 单独对话</div>
+        <div className="list-group-label">Agent · 单独会议室</div>
         {directs.filter(match).map(c => <ConvItem key={c.id} c={c} active={active} agentMap={agentMap} onSelect={onSelect} />)}
       </div>
     </div>
@@ -703,7 +703,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
         )}
         <button
           className="context-attach-trigger"
-          title="引用历史附件到对话上下文"
+          title="引用历史附件到会议室上下文"
           disabled={busy}
           onMouseDown={e => e.preventDefault()}
           onClick={() => {
@@ -715,7 +715,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           }}
         >
           <Icon name="paperclip" size={14} />
-          <span>对话上下文附件</span>
+          <span>会议室上下文附件</span>
           <b>{contextAttachments.length}</b>
         </button>
         {pending.map(item => (
@@ -758,7 +758,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
         )}
         {showAttachmentPicker && (
           <div className="mention-pop attachment-pop">
-            <div className="mention-pop-label"># 引用对话上下文附件</div>
+            <div className="mention-pop-label"># 引用会议室上下文附件</div>
             {visibleContextAttachments.length > 0 ? (
               visibleContextAttachments.map((a, i) => (
                 <div
@@ -1309,15 +1309,15 @@ export default function ConversationsPage() {
                   <Icon name="users" size={18} />
                 </button>
               )}
-              <button className="icon-btn" title="对话上下文与附件" onClick={() => { setShowContext(v => !v); setShowMembers(false); setShowSearch(false); }}>
+              <button className="icon-btn" title="会议室上下文与附件" onClick={() => { setShowContext(v => !v); setShowMembers(false); setShowSearch(false); }}>
                 <Icon name="layers" size={18} />
               </button>
-              <button className="icon-btn" title="搜索对话" onClick={() => { setShowSearch(v => !v); setShowMembers(false); setShowContext(false); }}>
+              <button className="icon-btn" title="搜索会议室" onClick={() => { setShowSearch(v => !v); setShowMembers(false); setShowContext(false); }}>
                 <Icon name="search" size={18} />
               </button>
               <button
                 className="icon-btn"
-                title="清空对话内容"
+                title="清空会议室内容"
                 disabled={visibleMsgCount === 0}
                 style={{ color: 'var(--red)' }}
                 onClick={() => {
@@ -1350,7 +1350,7 @@ export default function ConversationsPage() {
                       )}
                     </div>
                   ))}
-                  {convMembers.length === 0 && <div style={{ padding: '10px 8px', color: 'var(--text-3)', fontSize: 13 }}>暂无成员信息</div>}
+                  {convMembers.length === 0 && <div className="empty-compact" style={{ padding: '10px 8px' }}>暂无成员信息</div>}
                   <div className="mention-pop-label" style={{ paddingTop: 10 }}>快速添加</div>
                   {availableAgents.map(a => (
                     <div key={a.id} className="mention-row" onClick={() => addMember(a.id)}>
@@ -1362,7 +1362,7 @@ export default function ConversationsPage() {
                       <Icon name="plus" size={14} style={{ color: 'var(--ember)' }} />
                     </div>
                   ))}
-                  {availableAgents.length === 0 && <div style={{ padding: '8px', color: 'var(--text-3)', fontSize: 12 }}>所有 Agent 均已在群内</div>}
+                  {availableAgents.length === 0 && <div className="empty-compact" style={{ padding: 8 }}>所有 Agent 均已在群内</div>}
                   <div style={{ height: 1, background: 'var(--border)', margin: '6px 4px' }} />
                   <button className="btn btn-danger" style={{ width: '100%', justifyContent: 'center' }} onClick={() => setConfirmDissolve(conv.id)}>
                     <Icon name="trash" size={14} />解散群聊
@@ -1373,7 +1373,7 @@ export default function ConversationsPage() {
               {/* Context panel */}
               {showContext && (
                 <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 340 }}>
-                  <div className="mention-pop-label">对话上下文与附件</div>
+                  <div className="mention-pop-label">会议室上下文与附件</div>
                   <div style={{ padding: '7px 8px 4px' }}>
                     <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 8 }}>
                       共 {visibleMsgCount} 条消息 ·
@@ -1398,7 +1398,7 @@ export default function ConversationsPage() {
                     <div
                       key={`${messageId}-${i}`}
                       className="mention-row"
-                      title="定位到这条对话内容"
+                      title="定位到这条会议室内容"
                       onClick={() => {
                         jumpToMessage(messageId);
                         setShowContext(false);
@@ -1426,20 +1426,20 @@ export default function ConversationsPage() {
                       )}
                     </div>
                   ))}
-                  {contextBlocks.length === 0 && <div style={{ padding: '10px 8px', color: 'var(--text-3)', fontSize: 13 }}>暂无附件或上下文块</div>}
+                  {contextBlocks.length === 0 && <div className="empty-compact" style={{ padding: '10px 8px' }}>暂无附件或上下文块</div>}
                 </div>
               )}
 
               {/* Search panel */}
               {showSearch && (
                 <div className="mention-pop chat-search-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 360 }}>
-                  <div className="mention-pop-label">搜索对话记录</div>
+                  <div className="mention-pop-label">搜索会议室记录</div>
                   <div className="chat-search-box">
                     <Icon name="search" size={15} />
-                    <input ref={searchInputRef} value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="输入关键词搜索当前对话" />
+                    <input ref={searchInputRef} value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="输入关键词搜索当前会议室" />
                   </div>
                   <div className="chat-search-meta">
-                    {normalizedQ ? `找到 ${searchResults.length} 条匹配消息` : `当前对话 ${visibleMsgCount} 条消息`}
+                    {normalizedQ ? `找到 ${searchResults.length} 条匹配消息` : `当前会议室 ${visibleMsgCount} 条消息`}
                   </div>
                   <div className="chat-search-results scroll">
                     {normalizedQ && searchResults.map(({ message, text, sender }) => (
@@ -1454,7 +1454,7 @@ export default function ConversationsPage() {
                       </div>
                     ))}
                     {normalizedQ && searchResults.length === 0 && (
-                      <div style={{ padding: '12px 8px', color: 'var(--text-3)', fontSize: 13 }}>没有匹配的消息</div>
+                      <div className="empty-compact" style={{ padding: '12px 8px' }}>没有匹配的消息</div>
                     )}
                   </div>
                 </div>
@@ -1501,7 +1501,7 @@ export default function ConversationsPage() {
         </div>
       ) : (
         <div className="content">
-          <div className="empty"><Icon name="chat" /><div>选择一个对话开始</div></div>
+          <div className="empty"><Icon name="chat" /><div>选择一个会议室开始</div></div>
         </div>
       )}
 
@@ -1531,7 +1531,7 @@ export default function ConversationsPage() {
       )}
       {confirmClear && (
         <ConfirmModal
-          msg="确认清空当前对话内容？消息、已读状态和附件记录会被删除；单聊清空后将从左侧列表消失。"
+          msg="确认清空当前会议室内容？消息、已读状态和附件记录会被删除；单聊清空后将从左侧列表消失。"
           okLabel="确认清空"
           onOk={clearConversation}
           onCancel={() => setConfirmClear(null)}

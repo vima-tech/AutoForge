@@ -2,8 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
-import { ProjectCreateModal, ConfirmProjectDeleteModal } from '../components/ProjectDialogs';
-import { getPipelineStats, listProjects, listIssues, submitIssue, deleteProject, type PipelineStats, type Project, type Issue } from '../services';
+import { getPipelineStats, listActiveProjects, listIssues, submitIssue, type PipelineStats, type Project, type Issue } from '../services';
 
 const SEV_COLOR: Record<string, string> = {
   critical: 'red', high: 'amber', medium: 'blue', low: 'green',
@@ -73,14 +72,11 @@ export default function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [showSubmit, setShowSubmit] = useState(false);
-  const [showProjectCreate, setShowProjectCreate] = useState(false);
-  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
-  const [projectError, setProjectError] = useState('');
   const [carouselIndex, setCarouselIndex] = useState(0);
   const [carouselPaused, setCarouselPaused] = useState(false);
 
   const loadAll = useCallback(async () => {
-    const [s, ps, is] = await Promise.all([getPipelineStats(), listProjects(), listIssues()]);
+    const [s, ps, is] = await Promise.all([getPipelineStats(), listActiveProjects(), listIssues()]);
     setStats(s);
     setProjects(ps);
     setIssues(is.sort((a, b) => {
@@ -141,33 +137,9 @@ export default function Dashboard() {
     return () => window.clearInterval(timer);
   }, [carouselCount, carouselPaused]);
 
-  const doDeleteProject = async () => {
-    if (!projectToDelete) return;
-    setProjectError('');
-    try {
-      await deleteProject(projectToDelete.id);
-      setProjectToDelete(null);
-      await loadAll();
-      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
-    } catch (e) {
-      setProjectError(String(e));
-      setProjectToDelete(null);
-    }
-  };
-
   return (
     <div className="dash scroll">
       {showSubmit && <SubmitIssueModal projects={projects} onClose={() => { setShowSubmit(false); loadAll(); }} />}
-      {showProjectCreate && (
-        <ProjectCreateModal
-          onClose={() => setShowProjectCreate(false)}
-          onCreated={async () => {
-            setShowProjectCreate(false);
-            await loadAll();
-          }}
-        />
-      )}
-      {projectToDelete && <ConfirmProjectDeleteModal project={projectToDelete} onCancel={() => setProjectToDelete(null)} onConfirm={doDeleteProject} />}
       <div className="dash-inner rise">
         {/* hero */}
         <div className="dash-hero">
@@ -202,42 +174,6 @@ export default function Dashboard() {
           ))}
         </div>
 
-        {/* projects */}
-        <div className="panel" style={{ marginBottom: 16 }}>
-          <div className="panel-head">
-            <div className="eyebrow" style={{ fontSize: 14 }}><span className="en">PROJECTS</span><span className="cn">· 在产项目</span></div>
-            <button className="btn btn-sm btn-primary" onClick={() => setShowProjectCreate(true)}><Icon name="plus" size={13} />添加项目</button>
-          </div>
-          {projectError && <div style={{ padding: '10px 18px', color: 'var(--red)', fontSize: 13, borderBottom: '1px solid var(--border)' }}>{projectError}</div>}
-          {projects.length === 0
-            ? <div style={{ padding: '20px 18px', color: 'var(--text-3)', fontSize: 13 }}>暂无项目，点击「添加项目」添加</div>
-            : <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
-              {projects.map(p => (
-                <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 13, padding: '15px 18px', background: 'var(--bg-2)' }}>
-                  <div className="proj-logo" style={{ background: '#e8772e', width: 42, height: 42, fontSize: 18 }}>{p.name[0]}</div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontWeight: 700, fontSize: 14 }}>{p.name}</span>
-                      <span className={'dot ' + (p.status === 'active' ? 'green' : 'gray')} />
-                    </div>
-                    <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 2 }}>{p.description}</div>
-                  </div>
-                  <div style={{ textAlign: 'right', display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <div>
-                    <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 20 }}>
-                      {backlogByProject[p.id] ?? 0}
-                    </div>
-                    <div style={{ fontSize: 10.5, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>BACKLOG</div>
-                    </div>
-                    <button className="icon-btn" title="删除项目" onClick={() => setProjectToDelete(p)} style={{ color: 'var(--red)' }}>
-                      <Icon name="trash" size={15} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>}
-        </div>
-
         <div className="dash-cols">
           {/* queue */}
           <div className="panel">
@@ -246,7 +182,7 @@ export default function Dashboard() {
               <span className="sec-kicker">显示 {queueIssues.length} / {issues.length} 条</span>
             </div>
             {queueIssues.length === 0
-              ? <div style={{ padding: '20px 18px', color: 'var(--text-3)', fontSize: 13 }}>暂无需求</div>
+              ? <div className="empty-compact" style={{ padding: '20px 18px' }}>暂无需求</div>
               : queueIssues.map((q, i) => (
               <div className="q-row" key={q.id}>
                 <div className="q-pr">{i + 1}</div>

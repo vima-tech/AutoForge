@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
-import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, parseProjectConfig } from '../components/ProjectDialogs';
+import { parseProjectConfig } from '../components/ProjectDialogs';
 import {
-  listProjects, deleteProject, listChangeRequests, getWorktreeSession, getCodeDiff, review2,
-  listPreviewEnvironments, seedDemoData, openUrl,
+  listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2,
+  listPreviewEnvironments, openUrl,
   getDevServerStatus, startDevServer, stopDevServer,
   type Project, type ChangeRequest, type WorktreeSession,
   type PreviewEnvironment, type DevServerStatus,
@@ -145,13 +145,13 @@ function PreviewSection({ label, tag, tagClass, url }: {
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, activeCr,
-  onSelect, onAddProject, onEditProject, onDeleteProject, devStatus, onStartServer, onStopServer, onSeedDemo, width }: {
+  onSelect, devStatus, onStartServer, onStopServer,
+  width }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; activeCr: string;
-  onSelect: (id: string) => void; onAddProject: () => void; onEditProject: (p: Project) => void;
-  onDeleteProject: (p: Project) => void;
+  onSelect: (id: string) => void;
   devStatus: DevServerStatus | null; onStartServer: () => void; onStopServer: () => void;
-  onSeedDemo: () => void; width: number;
+  width: number;
 }) {
   const [open, setOpen] = useState(false);
   const menuRef = React.useRef<HTMLDivElement>(null);
@@ -172,7 +172,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       <div className="audit-proj" ref={menuRef}>
         <div style={{ position: 'relative' }}>
           {activeProject ? (
-            <div className="proj-select" onClick={() => setOpen(o => !o)}>
+            <div className="proj-select" onClick={() => setOpen(o => !o)} style={{ cursor: 'pointer' }}>
               <div className="proj-logo" style={{ background: '#e8772e' }}>{activeProject.name[0]}</div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="proj-name">{activeProject.name}</div>
@@ -181,9 +181,9 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
               <Icon name="chevDown" size={16} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: open ? 'rotate(180deg)' : 'none' }} />
             </div>
           ) : (
-            <button className="btn btn-primary" style={{ justifyContent: 'center', width: '100%' }} onClick={onAddProject}>
-              <Icon name="plus" size={15} />添加项目
-            </button>
+            <div className="empty-compact" style={{ padding: '8px 10px' }}>
+              暂无项目，请前往「项目管理」页添加
+            </div>
           )}
           {open && (
           <div className="mention-pop audit-project-pop" style={{ left: 0, right: 0, top: 'calc(100% + 6px)', bottom: 'auto', width: '100%', marginBottom: 0 }}>
@@ -204,22 +204,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                     {projectReviewCounts[p.id]}
                   </span>
                 )}
-                <div className="row-actions">
-                  <button className="icon-btn" title="编辑项目" style={{ width: 24, height: 24 }}
-                    onClick={e => { e.stopPropagation(); onEditProject(p); setOpen(false); }}>
-                    <Icon name="edit" size={12} />
-                  </button>
-                  <button className="icon-btn" title="删除项目" style={{ width: 24, height: 24, color: 'var(--red)' }}
-                    onClick={e => { e.stopPropagation(); onDeleteProject(p); setOpen(false); }}>
-                    <Icon name="trash" size={12} />
-                  </button>
-                </div>
               </div>
             ))}
-            <div style={{ height: 1, background: 'var(--border)', margin: '6px 4px' }} />
-            <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => { onAddProject(); setOpen(false); }}>
-              <Icon name="plus" size={14} />添加项目
-            </button>
           </div>
           )}
         </div>
@@ -254,16 +240,11 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           </div>
         ) : null}
 
-        {activeProject && devStatus?.status !== 'running' && devStatus?.status !== 'starting' && (
-          <button className="btn" style={{ justifyContent: 'center', width: '100%', fontSize: 11.5, color: 'var(--text-3)' }} onClick={onSeedDemo}>
-            填充演示数据
-          </button>
-        )}
       </div>
 
       <div className="list-group-label">全部需求 · {crs.length} 条</div>
       <div className="list-body scroll" style={{ paddingTop: 0 }}>
-        {crs.length === 0 && <div style={{ padding: '16px 12px', color: 'var(--text-3)', fontSize: 13 }}>暂无需求</div>}
+        {crs.length === 0 && <div className="empty-compact">暂无需求</div>}
         {(() => {
           const sorted = sortedCrs(crs);
           let lastStatus = '';
@@ -314,10 +295,6 @@ export default function AuditPage() {
   const [submitting, setSubmitting] = useState(false);
   const [crLoading, setCrLoading] = useState(false);
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
-  const [showProjectCreate, setShowProjectCreate] = useState(false);
-  const [projectToEdit, setProjectToEdit] = useState<Project | null>(null);
-  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
-  const [projectError, setProjectError] = useState('');
 
   // Column widths
   const [listWidth, setListWidth] = useState(300);
@@ -337,7 +314,7 @@ export default function AuditPage() {
   }, []);
 
   const loadProjects = useCallback(async () => {
-    const ps = await listProjects();
+    const ps = await listActiveProjects();
     setProjects(ps);
     setActiveProject(cur => cur && ps.some(p => p.id === cur.id) ? cur : (ps[0] ?? null));
   }, []);
@@ -431,15 +408,6 @@ export default function AuditPage() {
     }
   };
 
-  const doSeedDemo = useCallback(async () => {
-    try {
-      const msg = await seedDemoData();
-      await loadProjects(); await loadProjectReviewCounts();
-      if (activeProject) await loadCrs(activeProject.id);
-      alert(msg);
-    } catch (e) { alert('填充失败：' + String(e)); }
-  }, [loadProjects, loadProjectReviewCounts, loadCrs, activeProject]);
-
   const doStartServer = useCallback(async () => {
     if (!activeProject) return;
     try {
@@ -456,17 +424,6 @@ export default function AuditPage() {
     } catch (e) { alert('停止失败：' + String(e)); }
   }, [activeProject]);
 
-  const doDeleteProject = async () => {
-    if (!projectToDelete) return;
-    setProjectError('');
-    try {
-      await deleteProject(projectToDelete.id);
-      setProjectToDelete(null); setActiveCr('');
-      await loadProjects(); await loadProjectReviewCounts();
-      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
-    } catch (e) { setProjectError(String(e)); setProjectToDelete(null); }
-  };
-
   const cr = crs.find(c => c.id === activeCr);
   const report = session?.report_content ? parseReport(session.report_content) : null;
   const hunks = diff ? parseDiff(diff) : [];
@@ -474,58 +431,18 @@ export default function AuditPage() {
 
   return (
     <>
-      {showProjectCreate && (
-        <ProjectCreateModal
-          onClose={() => setShowProjectCreate(false)}
-          onCreated={async project => {
-            setShowProjectCreate(false);
-            await loadProjects(); await loadProjectReviewCounts();
-            setActiveProject(project); setActiveCr('');
-          }}
-        />
-      )}
-      {projectToEdit && (
-        <ProjectEditModal
-          project={projectToEdit}
-          onClose={() => setProjectToEdit(null)}
-          onSaved={async saved => {
-            setProjectToEdit(null);
-            await loadProjects();
-            // If we edited the active project, refresh it and its dev status
-            if (activeProject?.id === saved.id) {
-              setActiveProject(saved);
-              getDevServerStatus(saved.id).then(setDevStatus).catch(() => {});
-            }
-          }}
-        />
-      )}
-      {projectToDelete && (
-        <ConfirmProjectDeleteModal
-          project={projectToDelete}
-          onCancel={() => setProjectToDelete(null)}
-          onConfirm={doDeleteProject}
-        />
-      )}
-
       {/* 1. 左侧列表 + 第一个拖拽分割线 */}
       <AuditList
         projects={projects} activeProject={activeProject}
         setActiveProject={p => { setActiveProject(p); setActiveCr(''); }}
         projectReviewCounts={projectReviewCounts} crs={crs} activeCr={activeCr}
         onSelect={id => { setActiveCr(id); setDecided(null); }}
-        onAddProject={() => setShowProjectCreate(true)} onEditProject={setProjectToEdit}
-        onDeleteProject={setProjectToDelete}
         devStatus={devStatus} onStartServer={doStartServer} onStopServer={doStopServer}
-        onSeedDemo={doSeedDemo} width={listWidth}
+        width={listWidth}
       />
       <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
 
       <div className="content">
-        {projectError && (
-          <div style={{ padding: '10px 22px', color: 'var(--red)', fontSize: 13, borderBottom: '1px solid var(--border)' }}>
-            {projectError}
-          </div>
-        )}
         {cr ? (
           <>
             {/* 顶部标题栏 */}
@@ -601,13 +518,13 @@ export default function AuditPage() {
                           )}
                         </>
                       ) : (
-                        <div style={{ color: 'var(--text-3)', padding: '20px 0' }}>{session ? '报告内容为空' : '加载中…'}</div>
+                        <div className="empty-compact" style={{ padding: '20px 0' }}>{session ? '报告内容为空' : '加载中…'}</div>
                       )}
                     </div>
                   ) : (
                     <div className="diff">
                       {hunks.length === 0
-                        ? <div style={{ padding: '20px 22px', color: 'var(--text-3)' }}>{diff === '' ? '加载中…' : 'Diff 为空或 worktree 不存在'}</div>
+                        ? <div className="empty-compact" style={{ padding: '20px 22px' }}>{diff === '' ? '加载中…' : 'Diff 为空或 worktree 不存在'}</div>
                         : hunks.map((h, hi) => (
                           <div key={hi}>
                             <div className="diff-toolbar">

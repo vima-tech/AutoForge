@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
 import Select from '../components/Select';
+import { THEME_PALETTES, type ThemeMode, type ThemeSelection } from '../theme';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
   listAgents, createAgent, updateAgent, deleteAgent, setAgentForgeRole,
@@ -565,6 +566,93 @@ function SpecsSettings() {
   );
 }
 
+function ThemeSettings({
+  theme,
+  onThemeChange,
+}: {
+  theme: ThemeSelection;
+  onThemeChange: React.Dispatch<React.SetStateAction<ThemeSelection>>;
+}) {
+  const setMode = (mode: ThemeMode) => onThemeChange(t => ({ ...t, mode }));
+  const selected = THEME_PALETTES.find(p => p.id === theme.palette) ?? THEME_PALETTES[0];
+
+  return (
+    <div className="set-inner set-inner-wide rise">
+      <div className="set-h">主题设置</div>
+      <div className="set-desc">当前明暗主题已归入 Forge Ember。选择任一主题族后，可在深色和浅色两种风格间切换。</div>
+
+      <div className="theme-toolbar">
+        <div>
+          <div className="sec-kicker">当前主题</div>
+          <div className="theme-current">{selected.name} · {theme.mode === 'dark' ? '深色' : '浅色'}</div>
+        </div>
+        <div className="theme-mode-toggle" aria-label="切换明暗风格">
+          <button className={theme.mode === 'dark' ? 'active' : ''} onClick={() => setMode('dark')}>
+            <Icon name="moon" size={14} />深色
+          </button>
+          <button className={theme.mode === 'light' ? 'active' : ''} onClick={() => setMode('light')}>
+            <Icon name="sun" size={14} />浅色
+          </button>
+        </div>
+      </div>
+
+      <div className="theme-grid">
+        {THEME_PALETTES.map(p => {
+          const active = p.id === theme.palette;
+          return (
+            <div
+              key={p.id}
+              className={'theme-card' + (active ? ' active' : '')}
+              style={{ '--theme-accent': p.accent } as React.CSSProperties}
+            >
+              <button className="theme-card-main" onClick={() => onThemeChange(t => ({ ...t, palette: p.id }))}>
+                <div className="theme-preview">
+                  <div className="theme-preview-rail" style={{ background: p.swatches[0] }}>
+                    <i style={{ background: p.accent }} />
+                    <i />
+                    <i />
+                  </div>
+                  <div className="theme-preview-body">
+                    <div className="theme-preview-line" />
+                    <div className="theme-preview-panel">
+                      <span style={{ background: p.accent }} />
+                      <span />
+                      <span />
+                    </div>
+                  </div>
+                </div>
+                <div className="theme-card-text">
+                  <div>
+                    <div className="theme-card-title">{p.name}</div>
+                    <div className="theme-card-sub">{p.subtitle}</div>
+                  </div>
+                  <div className="theme-swatches">
+                    {p.swatches.map(color => <i key={color} style={{ background: color }} />)}
+                  </div>
+                </div>
+              </button>
+              <div className="theme-card-actions">
+                <button
+                  className={active && theme.mode === 'dark' ? 'active' : ''}
+                  onClick={() => onThemeChange({ palette: p.id, mode: 'dark' })}
+                >
+                  <Icon name="moon" size={13} />深色
+                </button>
+                <button
+                  className={active && theme.mode === 'light' ? 'active' : ''}
+                  onClick={() => onThemeChange({ palette: p.id, mode: 'light' })}
+                >
+                  <Icon name="sun" size={13} />浅色
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function SecuritySettings() {
   const [decisions, setDecisions] = useState<AdminDecision[]>([]);
 
@@ -600,7 +688,7 @@ function SecuritySettings() {
           {d.suggestions && <div style={{ padding: '0 2px 2px', fontSize: 13, color: 'var(--text-3)' }}>{d.suggestions}</div>}
         </div>
       ))}
-      {decisions.length === 0 && <div style={{ color: 'var(--text-3)', fontSize: 13 }}>暂无审计记录</div>}
+      {decisions.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无审计记录</div>}
     </div>
   );
 }
@@ -659,14 +747,14 @@ function AboutSettings() {
         <div className="panel-head"><div className="panel-title"><Icon name="eye" size={16} style={{ color: 'var(--ember)' }} />预览环境</div><span className="sec-kicker">{previews.length}</span></div>
         <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 8 }}>
           {previews.slice(0, 8).map(p => <div key={p.id} style={{ fontSize: 12, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{p.status} · {p.preview_url || p.id}</div>)}
-          {previews.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-3)' }}>暂无预览环境</div>}
+          {previews.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无预览环境</div>}
         </div>
       </div>
       <div className="panel">
         <div className="panel-head"><div className="panel-title"><Icon name="flask" size={16} style={{ color: 'var(--green)' }} />测试会话</div><span className="sec-kicker">{tests.length}</span></div>
         <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 8 }}>
           {tests.slice(0, 8).map(t => <div key={t.id} style={{ fontSize: 12, color: 'var(--text-3)' }}>{t.status} · {t.summary || t.id}</div>)}
-          {tests.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-3)' }}>暂无测试会话</div>}
+          {tests.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无测试会话</div>}
         </div>
       </div>
     </div>
@@ -674,6 +762,7 @@ function AboutSettings() {
 }
 
 const SET_ITEMS = [
+  { id: 'theme',       name: '主题设置',     ic: 'palette' },
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
   { id: 'agents',      name: 'Agent 配置',   ic: 'bot' },
   { id: 'roles',       name: '角色指派',     ic: 'layers' },
@@ -683,7 +772,13 @@ const SET_ITEMS = [
   { id: 'about',       name: '关于 AutoForge', ic: 'zap' },
 ];
 
-export default function SettingsPage() {
+export default function SettingsPage({
+  theme,
+  onThemeChange,
+}: {
+  theme: ThemeSelection;
+  onThemeChange: React.Dispatch<React.SetStateAction<ThemeSelection>>;
+}) {
   const [sec, setSec] = useState('llm');
   const cur = SET_ITEMS.find(i => i.id === sec)!;
   return (
@@ -700,6 +795,7 @@ export default function SettingsPage() {
           ))}
         </div>
         <div className="set-body scroll">
+          {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
           {sec === 'llm'         && <LLMSettings />}
           {sec === 'agents'      && <AgentSettings />}
           {sec === 'roles'       && <RoleAssignment />}
@@ -707,7 +803,7 @@ export default function SettingsPage() {
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['llm','agents','roles','concurrency','security','specs','about'].includes(sec) && (
+          {!['theme','llm','agents','roles','concurrency','security','specs','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

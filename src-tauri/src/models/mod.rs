@@ -1,10 +1,12 @@
 pub mod admin_decision;
+pub mod intake;
 pub mod agent;
 pub mod change_request;
 pub mod conversation;
 pub mod issue;
 pub mod job;
 pub mod llm_config;
+pub mod material;
 pub mod orchestration;
 pub mod preview;
 pub mod project;

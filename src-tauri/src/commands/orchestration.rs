@@ -576,7 +576,14 @@ async fn run_agent_for_step(
         }
     };
 
-    let content_json = serde_json::json!([{ "t": "md", "md": text.clone() }]).to_string();
+    // 检测 LLM 输出中是否嵌入了 requirement_draft artifact JSON
+    let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text);
+    let mut blocks = vec![serde_json::json!({ "t": "md", "md": clean_text })];
+    if let Some(artifact) = draft_artifact {
+        blocks.push(artifact);
+    }
+    let content_json = serde_json::to_string(&blocks).unwrap_or_default();
+
     let message_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO messages (id, conversation_id, from_agent, content_json)
@@ -1209,6 +1216,68 @@ fn parse_plan_json(raw: &str) -> Result<ConversationPlan, String> {
         .ok_or_else(|| "planner JSON 不完整".to_string())?;
     serde_json::from_str::<ConversationPlan>(&trimmed[start..=end])
         .map_err(|e| format!("planner JSON 解析失败: {}", e))
+}
+
+/// 从 LLM 输出中提取 requirement_draft artifact JSON block。
+/// 若找到，返回 (清理后的文本, Some(artifact值))，否则返回 (原文本, None)。
+fn extract_requirement_draft_artifact(text: &str) -> (String, Option<serde_json::Value>) {
+    if !text.contains("requirement_draft") {
+        return (text.to_string(), None);
+    }
+
+    // 遍历文本，寻找以 '{' 开始的平衡 JSON 对象
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] != b'{' {
+            pos += 1;
+            continue;
+        }
+        // 找到平衡的 JSON 对象
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes[pos..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(pos + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(end_pos) = end {
+            let candidate = &text[pos..end_pos];
+            if candidate.contains("requirement_draft") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+                    if val.get("kind").and_then(|k| k.as_str()) == Some("requirement_draft") {
+                        // 移除 JSON 及周围的 markdown 代码围栏
+                        let before = text[..pos]
+                            .trim_end()
+                            .trim_end_matches("```json")
+                            .trim_end_matches("```")
+                            .trim_end()
+                            .to_string();
+                        let after = text[end_pos..]
+                            .trim_start()
+                            .trim_start_matches("```")
+                            .trim_start()
+                            .to_string();
+                        let clean = format!("{} {}", before, after).trim().to_string();
+                        return (clean, Some(val));
+                    }
+                }
+            }
+            pos = end_pos;
+        } else {
+            break;
+        }
+    }
+
+    (text.to_string(), None)
 }
 
 fn emit_task_update(app: &AppHandle, conversation_id: &str, task_id: &str, status: &str) {

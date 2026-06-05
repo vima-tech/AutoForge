@@ -1,8 +1,10 @@
 pub mod change_requests;
+pub mod intake;
 pub mod conversations;
 pub mod demo;
 pub mod dev_server;
 pub mod issues;
+pub mod materials;
 pub mod orchestration;
 pub mod projects;
 pub mod settings;

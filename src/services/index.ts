@@ -188,6 +188,7 @@ export const listAdminDecisions = (projectId?: string) =>
 
 // ── Projects ─────────────────────────────────────────────────────────────────
 export const listProjects = () => ipc<Project[]>('list_projects');
+export const listActiveProjects = () => ipc<Project[]>('list_active_projects');
 export const getProject = (id: string) => ipc<Project>('get_project', { id });
 export const createProject = (payload: {
   name: string; slug: string; description?: string;
@@ -302,7 +303,87 @@ export const setAgentForgeRole = (agentId: string, role: string) =>
   ipc<Agent[]>('set_agent_forge_role', { agentId, role });
 
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
-export const seedDemoData = () => ipc<string>('seed_demo_data');
+
+// ── Materials ─────────────────────────────────────────────────────────────────
+export interface MaterialFolder {
+  id: string; project_id: string; parent_id: string | null;
+  name: string; sort_order: number;
+  created_at: string; updated_at: string;
+}
+export interface MaterialFile {
+  id: string; project_id: string; folder_id: string | null;
+  original_name: string; stored_name: string; rel_path: string;
+  mime: string; size_bytes: number; sha256: string;
+  description: string | null; tags: string;
+  backup_status: string; backup_url: string | null;
+  backed_up_at: string | null; created_at: string; updated_at: string;
+}
+export interface MaterialBackupConfig {
+  id: string; provider: string; config_json: string;
+  enabled: boolean; updated_at: string;
+}
+
+export const listMaterialFolders = (projectId: string) =>
+  ipc<MaterialFolder[]>('list_material_folders', { projectId });
+export const createMaterialFolder = (projectId: string, parentId: string | null, name: string) =>
+  ipc<MaterialFolder>('create_material_folder', { projectId, parentId, name });
+export const renameMaterialFolder = (id: string, name: string) =>
+  ipc<MaterialFolder>('rename_material_folder', { id, name });
+export const deleteMaterialFolder = (id: string) =>
+  ipc<boolean>('delete_material_folder', { id });
+export const listMaterialFiles = (projectId: string, folderId?: string | null) =>
+  ipc<MaterialFile[]>('list_material_files', { projectId, folderId: folderId ?? null });
+export const importMaterialFile = (
+  projectId: string, folderId: string | null,
+  fileName: string, mimeHint: string, dataBase64: string,
+) => ipc<MaterialFile>('import_material_file', { projectId, folderId, fileName, mimeHint, dataBase64 });
+export const moveMaterialFile = (id: string, folderId: string | null) =>
+  ipc<MaterialFile>('move_material_file', { id, folderId });
+export const updateMaterialFileMeta = (id: string, description?: string, tags?: string) =>
+  ipc<MaterialFile>('update_material_file_meta', { id, description: description ?? null, tags: tags ?? null });
+export const deleteMaterialFile = (id: string) =>
+  ipc<void>('delete_material_file', { id });
+export const openMaterialFile = (id: string) =>
+  ipc<void>('open_material_file', { id });
+export const materialFileDataUrl = (id: string) =>
+  ipc<string>('material_file_data_url', { id });
+export const aiOrganizeMaterials = (projectId: string) =>
+  ipc<string>('ai_organize_materials', { projectId });
+export const getMaterialBackupConfig = () =>
+  ipc<MaterialBackupConfig>('get_material_backup_config');
+export const updateMaterialBackupConfig = (provider: string, configJson: string, enabled: boolean) =>
+  ipc<MaterialBackupConfig>('update_material_backup_config', { provider, configJson, enabled });
+export const backupMaterialFiles = (projectId: string, fileIds: string[]) =>
+  ipc<string>('backup_material_files', { projectId, fileIds });
+
+// ── Intake ───────────────────────────────────────────────────────────────────
+export interface IntakeConfig {
+  id: string; webhook_enabled: boolean; webhook_port: number;
+  webhook_token: string; github_owner: string; github_repo: string;
+  github_token: string; github_project_id: string;
+  github_last_sync: string | null; ci_watch_dir: string; updated_at: string;
+}
+export interface SyncResult { imported: number; skipped: number; errors: number; }
+export interface ScanResult { found: number; new_issues: number; }
+export interface BulkResult { total: number; imported: number; skipped: number; errors: string[]; }
+export interface WebhookStatus { running: boolean; port: number; }
+
+export const getIntakeConfig = () => ipc<IntakeConfig>('get_intake_config');
+export const updateIntakeConfig = (payload: Partial<{
+  webhook_enabled: boolean; webhook_port: number; webhook_token: string;
+  github_owner: string; github_repo: string; github_token: string;
+  github_project_id: string; ci_watch_dir: string;
+}>) => ipc<IntakeConfig>('update_intake_config', { payload });
+export const getWebhookStatus = () => ipc<WebhookStatus>('get_webhook_status');
+export const syncGithubIssues = () => ipc<SyncResult>('sync_github_issues');
+export const runCodeScan = (projectId: string, scanTypes?: string[]) =>
+  ipc<ScanResult>('run_code_scan', { projectId, scanTypes: scanTypes ?? [] });
+export const bulkImportIssues = (projectId: string, format: string, content: string) =>
+  ipc<BulkResult>('bulk_import_issues', { projectId, format, content });
+export const submitFromArtifact = (payload: {
+  project_id: string; title: string; description?: string;
+  category?: string; severity?: string; source_ref?: string;
+}) => ipc<Issue>('submit_from_artifact', { payload });
 
 // ── Dev Server ───────────────────────────────────────────────────────────────
 export const getDevServerStatus = (projectId: string) =>
