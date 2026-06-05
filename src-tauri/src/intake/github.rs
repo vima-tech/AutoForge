@@ -1,6 +1,6 @@
 use super::IntakePayload;
 use crate::core::security;
-use tracing::{info, warn};
+use tracing::info;
 
 /// GitHub Issues 字段到 AutoForge 字段的映射
 struct GithubIssue {

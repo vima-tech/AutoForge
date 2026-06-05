@@ -5,8 +5,6 @@ use tauri::State;
 use tracing::info;
 
 pub const AUTOFORGE_DIR: &str = ".autoforge";
-pub const DOCS_DIR: &str = ".autoforge/docs";
-pub const SPECS_DIR: &str = ".autoforge/specs";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceFile {
