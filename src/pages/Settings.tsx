@@ -258,6 +258,8 @@ function AgentSettings() {
     summarizer: 'Summarizer 总结器',
     doc_writer: 'Doc Writer 文档生成器',
     context_compressor: 'Context Compressor',
+    material_ai: 'Material AI 物料助手',
+    spec_writer: 'Spec Writer 规格生成器',
   };
   const systemKinds = (a: Agent) => (a.system_kind ?? '').split(',').map(v => v.trim()).filter(Boolean);
 
@@ -414,6 +416,8 @@ function RoleAssignment() {
     { kind: 'summarizer',        title: 'Summarizer 总结器',            icon: 'quote',  color: 'var(--violet)', desc: '综合多个 Agent 的发言，形成结论、裁决和下一步建议' },
     { kind: 'doc_writer',        title: 'Doc Writer 文档生成器',        icon: 'file',   color: 'var(--amber)',  desc: '把讨论结果整理成 PRD、ADR、测试计划等文档产物' },
     { kind: 'context_compressor',title: 'Context Compressor 压缩器',   icon: 'layers', color: 'var(--green)',  desc: '压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度' },
+    { kind: 'material_ai',       title: 'Material AI 物料助手',         icon: 'folder', color: 'var(--ember)',  desc: '驱动物料库 AI 搜索和 AI 整理，使用该 Agent 自身的 LLM 配置' },
+    { kind: 'spec_writer',       title: 'Spec Writer 规格生成器',       icon: 'file',   color: 'var(--blue)',   desc: '驱动项目规格页 AI 一键生成，使用该 Agent 自身的 LLM 配置' },
   ];
 
   if (loading) return (

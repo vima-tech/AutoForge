@@ -27,6 +27,21 @@ pub struct CreateProject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneProject {
+    pub name: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub git_url: String,
+    pub target_path: String,
+    pub clone_branch: Option<String>,
+    pub git_username: Option<String>,
+    pub git_password: Option<String>,
+    pub branch_dev: Option<String>,
+    pub branch_main: Option<String>,
+    pub config_yaml: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateProject {
     pub name: Option<String>,
     pub description: Option<String>,

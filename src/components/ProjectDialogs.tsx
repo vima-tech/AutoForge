@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
 import Icon from './Icon';
-import { createProject, updateProject, type Project } from '../services';
+import { cloneProjectFromGit, createLocalProject, updateProject, type Project } from '../services';
 
 const slugify = (name: string) => {
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   return slug || `project-${Date.now().toString(36)}`;
 };
+
+type ProjectCreateMode = 'local' | 'git';
 
 // ── Config YAML helpers ───────────────────────────────────────────────────────
 
@@ -85,8 +87,10 @@ export function ProjectCreateModal({ onClose, onCreated }: {
   onClose: () => void;
   onCreated: (project: Project) => void;
 }) {
+  const [mode, setMode] = useState<ProjectCreateMode>('local');
   const [form, setForm] = useState({
     name: '', slug: '', description: '', repo_path: '',
+    git_url: '', target_path: '', clone_branch: '', git_username: '', git_password: '',
     branch_dev: 'dev', branch_main: 'main',
     dev_command: '', dev_url: '', prod_url: '',
   });
@@ -101,19 +105,35 @@ export function ProjectCreateModal({ onClose, onCreated }: {
     const name = form.name.trim();
     const slug = form.slug.trim();
     const repoPath = form.repo_path.trim();
+    const targetPath = form.target_path.trim();
+    const gitUrl = form.git_url.trim();
+    const gitUsername = form.git_username.trim();
+    const gitPassword = form.git_password;
     if (!name) { setError('项目名称不能为空'); return; }
     if (!slug) { setError('项目标识不能为空'); return; }
-    if (!repoPath) { setError('仓库路径不能为空'); return; }
+    if (mode === 'local' && !repoPath) { setError('本地目录不能为空'); return; }
+    if (mode === 'git' && !gitUrl) { setError('Git 地址不能为空'); return; }
+    if (mode === 'git' && !targetPath) { setError('克隆到本地目录不能为空'); return; }
+    if (mode === 'git' && (!!gitUsername !== !!gitPassword)) { setError('Git 认证需要同时填写用户名和密码/Token'); return; }
     setLoading(true); setError('');
     try {
-      const project = await createProject({
+      const common = {
         name, slug,
         description: form.description.trim(),
-        repo_path: repoPath,
         branch_dev: form.branch_dev.trim() || 'dev',
         branch_main: form.branch_main.trim() || 'main',
         config_yaml: buildConfigYaml(null, form.dev_command, form.dev_url, form.prod_url),
-      });
+      };
+      const project = mode === 'local'
+        ? await createLocalProject({ ...common, repo_path: repoPath })
+        : await cloneProjectFromGit({
+            ...common,
+            git_url: gitUrl,
+            target_path: targetPath,
+            clone_branch: form.clone_branch.trim() || undefined,
+            git_username: gitUsername || undefined,
+            git_password: gitPassword || undefined,
+          });
       onCreated(project);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); }
@@ -121,19 +141,61 @@ export function ProjectCreateModal({ onClose, onCreated }: {
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
-      <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+      <div style={{ width: 560, maxHeight: 'min(760px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">添加项目</span></div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
-        <div style={{ padding: '16px 20px' }}>
-          <ProjectFormFields form={form} setForm={setForm} slugTouched={slugTouched} setSlugTouched={setSlugTouched} updateName={updateName} showSlug />
+        <div className="scroll" style={{ padding: '16px 20px', overflowY: 'auto', minHeight: 0 }}>
+          <div className="seg" style={{ marginBottom: 14 }}>
+            <button className={mode === 'local' ? 'on' : ''} onClick={() => setMode('local')}>
+              <Icon name="folderPlus" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />本地新建
+            </button>
+            <button className={mode === 'git' ? 'on' : ''} onClick={() => setMode('git')}>
+              <Icon name="download" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />从 Git 拉取
+            </button>
+          </div>
+          {mode === 'git' && (
+            <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+              <div className="field full">
+                <label>Git 仓库地址</label>
+                <input value={form.git_url} onChange={e => setForm(f => ({ ...f, git_url: e.target.value }))} placeholder="https://github.com/org/repo.git" />
+              </div>
+              <div className="field full">
+                <label>克隆到本地目录</label>
+                <input value={form.target_path} onChange={e => setForm(f => ({ ...f, target_path: e.target.value }))} placeholder="/home/user/projects/repo" />
+              </div>
+              <div className="field full">
+                <label>克隆分支（可选）</label>
+                <input value={form.clone_branch} onChange={e => setForm(f => ({ ...f, clone_branch: e.target.value }))} placeholder="留空使用远端默认分支" />
+              </div>
+              <div className="field">
+                <label>Git 用户名（私有仓库可选）</label>
+                <input value={form.git_username} onChange={e => setForm(f => ({ ...f, git_username: e.target.value }))} placeholder="GitHub 用户名" />
+              </div>
+              <div className="field">
+                <label>密码 / Token（私有仓库可选）</label>
+                <input type="password" value={form.git_password} onChange={e => setForm(f => ({ ...f, git_password: e.target.value }))} placeholder="建议使用 Personal Access Token" />
+              </div>
+            </div>
+          )}
+          <ProjectFormFields
+            form={form}
+            setForm={setForm}
+            slugTouched={slugTouched}
+            setSlugTouched={setSlugTouched}
+            updateName={updateName}
+            showSlug
+            showRepoPath={mode === 'local'}
+            repoPathLabel="本地目录"
+            repoPathPlaceholder="/home/user/projects/my-app"
+          />
           {error && <div style={{ color: 'var(--red)', fontSize: 'var(--text-control)', marginTop: 10 }}>{error}</div>}
         </div>
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onClose}>取消</button>
           <button className="btn btn-primary" onClick={submit} disabled={loading}>
-            <Icon name="plus" size={15} />{loading ? '添加中...' : '添加项目'}
+            <Icon name={mode === 'git' ? 'download' : 'plus'} size={15} />{loading ? (mode === 'git' ? '拉取中...' : '创建中...') : (mode === 'git' ? '拉取并添加' : '创建项目')}
           </button>
         </div>
       </div>
@@ -216,12 +278,18 @@ type FormState = {
   slug?: string;
 };
 
-function ProjectFormFields({ form, setForm, slugTouched, setSlugTouched, updateName, showSlug }: {
+function ProjectFormFields({
+  form, setForm, slugTouched, setSlugTouched, updateName, showSlug,
+  showRepoPath = true, repoPathLabel = '仓库路径', repoPathPlaceholder = '/home/user/project',
+}: {
   form: FormState & { slug?: string };
   setForm: React.Dispatch<React.SetStateAction<any>>;
   slugTouched: boolean; setSlugTouched: (v: boolean) => void;
   updateName: (name: string) => void;
   showSlug: boolean;
+  showRepoPath?: boolean;
+  repoPathLabel?: string;
+  repoPathPlaceholder?: string;
 }) {
   return (
     <>
@@ -236,10 +304,12 @@ function ProjectFormFields({ form, setForm, slugTouched, setSlugTouched, updateN
             <input value={form.slug ?? ''} onChange={e => { setSlugTouched(true); setForm((f: any) => ({ ...f, slug: e.target.value })); }} placeholder="autoforge" />
           </div>
         )}
-        <div className={`field${showSlug ? ' full' : ''}`}>
-          <label>仓库路径</label>
-          <input value={form.repo_path} onChange={e => setForm((f: any) => ({ ...f, repo_path: e.target.value }))} placeholder="/home/user/project" />
-        </div>
+        {showRepoPath && (
+          <div className={`field${showSlug ? ' full' : ''}`}>
+            <label>{repoPathLabel}</label>
+            <input value={form.repo_path} onChange={e => setForm((f: any) => ({ ...f, repo_path: e.target.value }))} placeholder={repoPathPlaceholder} />
+          </div>
+        )}
         <div className={`field${showSlug ? ' full' : ''}`}>
           <label>项目描述</label>
           <input value={form.description} onChange={e => setForm((f: any) => ({ ...f, description: e.target.value }))} placeholder="用于区分项目范围和业务目标" />

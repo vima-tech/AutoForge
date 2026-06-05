@@ -6,12 +6,13 @@ import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, Confir
 import {
   listProjects, updateProject, deleteProject, type Project,
   listMaterialFolders, createMaterialFolder, renameMaterialFolder, deleteMaterialFolder,
-  listMaterialFiles, importMaterialFile, moveMaterialFile, deleteMaterialFile,
+  listMaterialFiles, searchMaterialFiles, importMaterialFile, moveMaterialFile, deleteMaterialFile,
   openMaterialFile, aiOrganizeMaterials, backupMaterialFiles,
   getMaterialBackupConfig, updateMaterialBackupConfig,
   getIntakeConfig, updateIntakeConfig, syncGithubIssues, runCodeScan, bulkImportIssues,
   listProjectSpecs, upsertProjectSpec, deleteProjectSpec, aiGenerateSpecs,
   type MaterialFolder, type MaterialFile, type MaterialBackupConfig,
+  type MaterialSearchResult,
   type IntakeConfig, type SyncResult, type ScanResult, type BulkResult,
   type ProjectSpec, type SpecCategory,
 } from '../services';
@@ -42,6 +43,25 @@ function fileIcon(mime: string): string {
   return 'file';
 }
 
+const RESERVED_ENTRY_NAMES = new Set([
+  'CON', 'PRN', 'AUX', 'NUL',
+  'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+  'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+]);
+
+function validateProjectEntryName(name: string, label: string): string | null {
+  if (!name.trim()) return `${label}不能为空`;
+  if (name !== name.trim()) return `${label}首尾不能包含空格`;
+  if (name === '.' || name === '..') return `${label}不能为 . 或 ..`;
+  if (/[<>:"/\\|?*\x00-\x1F]/.test(name)) return `${label}不能包含 < > : " / \\ | ? * 或控制字符`;
+  if (/[ .]$/.test(name)) return `${label}不能以空格或句点结尾`;
+  if (name.length > 255) return `${label}不能超过 255 个字符`;
+
+  const baseName = name.split('.')[0]?.toUpperCase() ?? '';
+  if (RESERVED_ENTRY_NAMES.has(baseName)) return `${label}不能使用 Windows 保留名称 ${baseName}`;
+  return null;
+}
+
 function buildTree(folders: MaterialFolder[], parentId: string | null): MaterialFolder[] {
   return folders
     .filter(f => f.parent_id === parentId)
@@ -56,6 +76,21 @@ function countFilesInFolderTree(folderId: string, folders: MaterialFolder[], fil
   const childIds = folders.filter(f => f.parent_id === folderId).map(f => f.id);
   return files.filter(f => f.folder_id === folderId).length
     + childIds.reduce((sum, id) => sum + countFilesInFolderTree(id, folders, files), 0);
+}
+
+function folderTreeIds(folderId: string, folders: MaterialFolder[]): Set<string> {
+  const ids = new Set<string>([folderId]);
+  const pending = [folderId];
+  while (pending.length > 0) {
+    const parentId = pending.pop()!;
+    for (const folder of folders) {
+      if (folder.parent_id === parentId && !ids.has(folder.id)) {
+        ids.add(folder.id);
+        pending.push(folder.id);
+      }
+    }
+  }
+  return ids;
 }
 
 // ── BackupConfigModal ─────────────────────────────────────────────────────────
@@ -197,8 +232,9 @@ function FolderTreeItem({ folder, allFolders, allFiles, depth, selectedId, onSel
 
 // ── FileCard ──────────────────────────────────────────────────────────────────
 
-function FileCard({ file, onOpen, onDelete, onMove }: {
+function FileCard({ file, searchMeta, onOpen, onDelete, onMove }: {
   file: MaterialFile;
+  searchMeta?: { folderPath: string; reason: string; preview: string | null };
   onOpen: () => void; onDelete: () => void; onMove: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
@@ -213,7 +249,7 @@ function FileCard({ file, onOpen, onDelete, onMove }: {
     <div
       style={{
         background: 'var(--bg-2)', border: `1px solid ${hovered ? 'var(--border-strong)' : 'var(--border)'}`,
-        borderRadius: 10, padding: '9px 10px 9px 12px', minHeight: 54,
+        borderRadius: 10, padding: '9px 10px 9px 12px', minHeight: searchMeta ? 82 : 54,
         display: 'grid', gridTemplateColumns: '34px minmax(180px, 1fr) minmax(110px, auto) 104px auto',
         alignItems: 'center', gap: 11,
         cursor: 'default', transition: 'border-color .15s, transform .15s',
@@ -231,6 +267,19 @@ function FileCard({ file, onOpen, onDelete, onMove }: {
         <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {file.description || file.mime}
         </div>
+        {searchMeta && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6, minWidth: 0 }}>
+            <span style={{ fontSize: 'var(--text-micro)', color: 'var(--ember)', background: 'var(--ember-tint)', borderRadius: 5, padding: '2px 6px', flexShrink: 0 }}>{searchMeta.reason}</span>
+            <span title={searchMeta.folderPath} style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {searchMeta.folderPath}
+            </span>
+          </div>
+        )}
+        {searchMeta?.preview && (
+          <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginTop: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 680 }}>
+            {searchMeta.preview.replace(/\s+/g, ' ').trim()}
+          </div>
+        )}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, minWidth: 110 }}>
         <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>{formatSize(file.size_bytes)}</span>
@@ -296,6 +345,12 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError]   = useState('');
   const [message, setMessage] = useState('');
+  const [toastMessage, setToastMessage] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<MaterialSearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [aiSearching, setAiSearching] = useState(false);
+  const [searchMode, setSearchMode] = useState<'quick' | 'ai'>('quick');
 
   const [aiWorking,     setAiWorking]     = useState(false);
   const [backupWorking, setBackupWorking] = useState(false);
@@ -315,11 +370,22 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
   const [confirmDelFile,   setConfirmDelFile]   = useState<MaterialFile | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const searchSeqRef = useRef(0);
+  const toastTimerRef = useRef<number | null>(null);
   const visibleFolders = visibleMaterialFolders(folders);
+  const trimmedSearch = searchQuery.trim();
+  const searchActive = trimmedSearch.length > 0;
+  const selectedFolderTreeIds = selectedFolderId ? folderTreeIds(selectedFolderId, visibleFolders) : null;
   const displayedFiles = selectedFolderId === null
-    ? files.filter(f => f.folder_id === null)
-    : files.filter(f => f.folder_id === selectedFolderId);
-  const rootFileCount = files.filter(f => f.folder_id === null).length;
+    ? files
+    : files.filter(f => f.folder_id !== null && selectedFolderTreeIds?.has(f.folder_id));
+  const rootFileCount = files.length;
+  const newFolderNameError = newFolderName.trim()
+    ? validateProjectEntryName(newFolderName, '文件夹名称')
+    : null;
+  const renameFolderNameError = renameName.trim()
+    ? validateProjectEntryName(renameName, '文件夹名称')
+    : null;
 
   const load = useCallback(async () => {
     try {
@@ -343,16 +409,68 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
     return () => clearInterval(id);
   }, [load]);
 
+  useEffect(() => {
+    const query = searchQuery.trim();
+    const seq = ++searchSeqRef.current;
+    if (!query) {
+      setSearchResults([]);
+      setSearching(false);
+      setAiSearching(false);
+      setSearchMode('quick');
+      return;
+    }
+
+    setSearching(true);
+    setAiSearching(false);
+    const timer = window.setTimeout(async () => {
+      try {
+        const results = await searchMaterialFiles(projectId, query, false);
+        if (searchSeqRef.current === seq) {
+          setSearchResults(results);
+          setSearchMode('quick');
+        }
+      } catch (e) {
+        if (searchSeqRef.current === seq) setError(String(e));
+      } finally {
+        if (searchSeqRef.current === seq) setSearching(false);
+      }
+    }, 260);
+
+    return () => window.clearTimeout(timer);
+  }, [projectId, searchQuery, files.length]);
+
   const flash = (msg: string) => { setMessage(msg); setTimeout(() => setMessage(''), 4000); };
+  const toast = (msg: string) => {
+    setToastMessage(msg);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToastMessage(''), 4200);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   const handleFiles = async (fileList: FileList) => {
     setUploading(true); setError('');
+    const invalidFiles: string[] = [];
     for (const f of Array.from(fileList)) {
+      const nameError = validateProjectEntryName(f.name, '文件名');
+      if (nameError) {
+        invalidFiles.push(`${f.name}：${nameError}`);
+        continue;
+      }
+
       try {
         const buf = await f.arrayBuffer();
         const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
         await importMaterialFile(projectId, selectedFolderId, f.name, f.type, b64);
       } catch (e) { setError(String(e)); }
+    }
+    if (invalidFiles.length > 0) {
+      const shown = invalidFiles.slice(0, 3).join('；');
+      setError(`已跳过 ${invalidFiles.length} 个名称不合法的文件：${shown}${invalidFiles.length > 3 ? '…' : ''}`);
     }
     setUploading(false);
     await load();
@@ -360,6 +478,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
   const doCreateFolder = async () => {
     if (!newFolderName.trim()) return;
+    const nameError = validateProjectEntryName(newFolderName, '文件夹名称');
+    if (nameError) { setError(nameError); return; }
     try {
       await createMaterialFolder(projectId, creatingFolder?.parentId ?? null, newFolderName.trim());
       setCreatingFolder(null); setNewFolderName('');
@@ -369,6 +489,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
   const doRenameFolder = async () => {
     if (!renamingFolder || !renameName.trim()) return;
+    const nameError = validateProjectEntryName(renameName, '文件夹名称');
+    if (nameError) { setError(nameError); return; }
     try {
       await renameMaterialFolder(renamingFolder.id, renameName.trim());
       setRenamingFolder(null); setRenameName('');
@@ -408,16 +530,44 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
   const doRefresh = async () => {
     setRefreshing(true); setError('');
-    try { await load(); }
+    searchSeqRef.current += 1;
+    setSearchQuery('');
+    setSearchResults([]);
+    setSearchMode('quick');
+    setSearching(false);
+    setAiSearching(false);
+    try {
+      await load();
+      setSelectedFolderId(null);
+      toast('物料库已校准');
+    }
     catch (e) { setError(String(e)); }
     finally { setRefreshing(false); }
   };
 
   const doAiOrganize = async () => {
-    setAiWorking(true); setError('');
-    try { flash(await aiOrganizeMaterials(projectId)); await load(); }
+    setAiWorking(true); setError(''); setMessage('');
+    try { toast(await aiOrganizeMaterials(projectId)); await load(); }
     catch (e) { setError(String(e)); }
     finally { setAiWorking(false); }
+  };
+
+  const doAiSearch = async () => {
+    const query = searchQuery.trim();
+    if (!query) return;
+    const seq = ++searchSeqRef.current;
+    setAiSearching(true); setSearching(false); setError('');
+    try {
+      const results = await searchMaterialFiles(projectId, query, true);
+      if (searchSeqRef.current === seq) {
+        setSearchResults(results);
+        setSearchMode('ai');
+      }
+    } catch (e) {
+      if (searchSeqRef.current === seq) setError(String(e));
+    } finally {
+      if (searchSeqRef.current === seq) setAiSearching(false);
+    }
   };
 
   const doBackup = async () => {
@@ -431,6 +581,35 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
+      {toastMessage && (
+        <div
+          role="status"
+          style={{
+            position: 'fixed',
+            right: 24,
+            bottom: 24,
+            zIndex: 260,
+            maxWidth: 360,
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: 10,
+            padding: '11px 13px',
+            borderRadius: 8,
+            border: '1px solid var(--border-strong)',
+            background: 'var(--bg-2)',
+            boxShadow: 'var(--shadow-lg)',
+            color: 'var(--text-2)',
+            fontSize: 'var(--text-label)',
+            lineHeight: 'var(--leading-normal)',
+          }}
+        >
+          <Icon name="brain" size={15} style={{ color: 'var(--ember)', flexShrink: 0, marginTop: 1 }} />
+          <span style={{ minWidth: 0, wordBreak: 'break-word' }}>{toastMessage}</span>
+          <button className="icon-btn" style={{ width: 20, height: 20, flexShrink: 0 }} onClick={() => setToastMessage('')} title="关闭提示" aria-label="关闭提示">
+            <Icon name="x" size={11} />
+          </button>
+        </div>
+      )}
 
       {/* action bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 20px', borderBottom: '1px solid var(--border)', flexShrink: 0, flexWrap: 'wrap' }}>
@@ -446,8 +625,14 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
         </button>
         <div style={{ flex: 1 }} />
         {message && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
-        <button className="btn btn-sm" onClick={doAiOrganize} disabled={aiWorking}>
-          <Icon name="brain" size={13} />{aiWorking ? 'AI 整理中…' : 'AI 整理'}
+        <button
+          className={'btn btn-sm' + (aiWorking ? ' btn-primary' : '')}
+          style={aiWorking ? { boxShadow: '0 0 0 3px var(--ember-tint), 0 6px 18px var(--ember-tint-strong)' } : undefined}
+          onClick={doAiOrganize}
+          disabled={aiWorking}
+          aria-busy={aiWorking}
+        >
+          <Icon name="brain" size={13} style={aiWorking ? { animation: 'spin 1s linear infinite' } : undefined} />{aiWorking ? 'AI 整理中…' : 'AI 整理'}
         </button>
         <button className="btn btn-sm" onClick={doBackup} disabled={backupWorking}>
           <Icon name="cloudUpload" size={13} />{backupWorking ? '备份中…' : '批量备份'}
@@ -466,6 +651,27 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
         {/* folder sidebar */}
         <div style={{ width: 245, flexShrink: 0, borderRight: '1px solid var(--border)', overflowY: 'auto', padding: '10px 6px' }}>
+          <div style={{ padding: '0 2px 10px', marginBottom: 8, borderBottom: '1px solid var(--border)' }}>
+            <div className="search" style={{ width: '100%', padding: '5px 7px 5px 9px' }}>
+              <Icon name={aiSearching ? 'brain' : 'search'} size={14} style={aiSearching || searching ? { color: 'var(--ember)' } : undefined} />
+              <input
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') doAiSearch(); if (e.key === 'Escape') setSearchQuery(''); }}
+                placeholder="搜索物料"
+                style={{ minWidth: 0 }}
+              />
+              {searchQuery && (
+                <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} onClick={() => setSearchQuery('')} title="清空搜索" aria-label="清空搜索">
+                  <Icon name="x" size={11} />
+                </button>
+              )}
+              <button className="btn btn-sm" style={{ padding: '3px 6px', minWidth: 34, height: 24, flexShrink: 0, justifyContent: 'center' }} onClick={doAiSearch} disabled={!trimmedSearch || aiSearching} title="AI 查找">
+                <Icon name="brain" size={11} />{aiSearching ? '' : 'AI'}
+              </button>
+            </div>
+          </div>
+
           {/* "all" root */}
           <div
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 'var(--text-control)', marginBottom: 2, background: selectedFolderId === null ? 'var(--ember-tint)' : 'transparent', color: selectedFolderId === null ? 'var(--ember)' : 'var(--text-2)' }}
@@ -496,9 +702,10 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
                 <input autoFocus placeholder="文件夹名称" value={newFolderName}
                   onChange={e => setNewFolderName(e.target.value)}
                   onKeyDown={e => { if (e.key === 'Enter') doCreateFolder(); if (e.key === 'Escape') setCreatingFolder(null); }} />
+                {newFolderNameError && <div style={{ marginTop: 5, color: 'var(--red)', fontSize: 'var(--text-caption)' }}>{newFolderNameError}</div>}
               </div>
               <div style={{ display: 'flex', gap: 4, marginTop: 5 }}>
-                <button className="btn btn-sm btn-primary" style={{ flex: 1, fontSize: 'var(--text-caption)' }} onClick={doCreateFolder}>确认</button>
+                <button className="btn btn-sm btn-primary" style={{ flex: 1, fontSize: 'var(--text-caption)' }} onClick={doCreateFolder} disabled={!newFolderName.trim() || Boolean(newFolderNameError)}>确认</button>
                 <button className="btn btn-sm" style={{ flex: 1, fontSize: 'var(--text-caption)' }} onClick={() => setCreatingFolder(null)}>取消</button>
               </div>
             </div>
@@ -514,6 +721,31 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
         >
           {loading ? (
             <div style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>
+          ) : searchActive ? (
+            searchResults.length === 0 ? (
+              <div className="empty" style={{ minHeight: 180 }}>
+                <Icon name={aiSearching ? 'brain' : 'search'} size={34} style={{ opacity: .25 }} />
+                <div>{aiSearching || searching ? '正在查找文件…' : '没有找到匹配文件'}</div>
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>可尝试描述文件用途，例如“登录接口说明”或“客户访谈记录”。</div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '0 2px 5px' }}>
+                  <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
+                    {searchMode === 'ai' ? 'AI 查找结果' : '快速检索结果'} · {searchResults.length} 个文件
+                  </div>
+                  {searching && <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>正在更新…</div>}
+                </div>
+                {searchResults.map(r => (
+                  <FileCard key={r.file.id} file={r.file}
+                    searchMeta={{ folderPath: r.folder_path, reason: r.match_reason, preview: r.content_preview }}
+                    onOpen={() => openMaterialFile(r.file.id).catch(e => setError(String(e)))}
+                    onDelete={() => doDeleteFile(r.file)}
+                    onMove={() => setMovingFile(r.file)}
+                  />
+                ))}
+              </div>
+            )
           ) : displayedFiles.length === 0 ? (
             <div className="empty" style={{ minHeight: 160 }}>
               <Icon name="upload" size={34} style={{ opacity: .25 }} />
@@ -550,10 +782,11 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
             <div className="field" style={{ marginBottom: 12 }}>
               <input autoFocus value={renameName} onChange={e => setRenameName(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') doRenameFolder(); if (e.key === 'Escape') setRenamingFolder(null); }} />
+              {renameFolderNameError && <div style={{ marginTop: 5, color: 'var(--red)', fontSize: 'var(--text-caption)' }}>{renameFolderNameError}</div>}
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button className="btn btn-sm" onClick={() => setRenamingFolder(null)}>取消</button>
-              <button className="btn btn-sm btn-primary" onClick={doRenameFolder}>确认</button>
+              <button className="btn btn-sm btn-primary" onClick={doRenameFolder} disabled={!renameName.trim() || Boolean(renameFolderNameError)}>确认</button>
             </div>
           </div>
         </div>
@@ -568,10 +801,11 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
               <input autoFocus placeholder="文件夹名称" value={newFolderName}
                 onChange={e => setNewFolderName(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') doCreateFolder(); if (e.key === 'Escape') setCreatingFolder(null); }} />
+              {newFolderNameError && <div style={{ marginTop: 5, color: 'var(--red)', fontSize: 'var(--text-caption)' }}>{newFolderNameError}</div>}
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button className="btn btn-sm" onClick={() => setCreatingFolder(null)}>取消</button>
-              <button className="btn btn-sm btn-primary" onClick={doCreateFolder}>创建</button>
+              <button className="btn btn-sm btn-primary" onClick={doCreateFolder} disabled={!newFolderName.trim() || Boolean(newFolderNameError)}>创建</button>
             </div>
           </div>
         </div>

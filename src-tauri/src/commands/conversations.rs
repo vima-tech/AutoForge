@@ -619,6 +619,67 @@ pub async fn create_group_conversation(
 }
 
 #[tauri::command]
+pub async fn update_group_conversation(
+    conversation_id: String,
+    name: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ConversationDetail, String> {
+    let conv = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conv.conv_type != "group" {
+        return Err("only group conversations can be edited".into());
+    }
+
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("group name cannot be empty".into());
+    }
+
+    if let Some(ref pid) = project_id {
+        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id=?")
+            .bind(pid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Err(format!("project {} not found", pid));
+        }
+    }
+
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE conversations SET name=?, initial=?, project_id=? WHERE id=?")
+        .bind(&name)
+        .bind(name.chars().next().map(|c| c.to_string()))
+        .bind(&project_id)
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if conv.project_id != project_id {
+        sqlx::query("DELETE FROM conversation_project_context WHERE conversation_id=?")
+            .bind(&conversation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    let updated = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    conversation_detail(&state.db, updated).await
+}
+
+#[tauri::command]
 pub async fn add_conversation_member(
     conversation_id: String,
     agent_id: String,

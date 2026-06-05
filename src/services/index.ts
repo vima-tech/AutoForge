@@ -200,6 +200,17 @@ export const createProject = (payload: {
   repo_path: string; branch_dev?: string; branch_main?: string;
   config_yaml?: string;
 }) => ipc<Project>('create_project', { payload });
+export const createLocalProject = (payload: {
+  name: string; slug: string; description?: string;
+  repo_path: string; branch_dev?: string; branch_main?: string;
+  config_yaml?: string;
+}) => ipc<Project>('create_local_project', { payload });
+export const cloneProjectFromGit = (payload: {
+  name: string; slug: string; description?: string;
+  git_url: string; target_path: string; clone_branch?: string;
+  git_username?: string; git_password?: string;
+  branch_dev?: string; branch_main?: string; config_yaml?: string;
+}) => ipc<Project>('clone_project_from_git', { payload });
 export const updateProject = (id: string, payload: Partial<{
   name: string; description: string; repo_path: string;
   branch_dev: string; branch_main: string; status: string; config_yaml: string;
@@ -253,6 +264,8 @@ export const attachmentDataUrl = (attachmentId: string) =>
 export const createGroupConversation = (
   name: string, memberIds: string[], color?: string, initial?: string, projectId?: string | null,
 ) => ipc<Conversation>('create_group_conversation', { name, memberIds, color, initial, projectId: projectId ?? null });
+export const updateGroupConversation = (conversationId: string, name: string, projectId?: string | null) =>
+  ipc<Conversation>('update_group_conversation', { conversationId, name, projectId: projectId ?? null });
 export const addConversationMember = (conversationId: string, agentId: string) =>
   ipc<Conversation>('add_conversation_member', { conversationId, agentId });
 export const removeConversationMember = (conversationId: string, agentId: string) =>
@@ -347,6 +360,13 @@ export interface MaterialFile {
   backup_status: string; backup_url: string | null;
   backed_up_at: string | null; created_at: string; updated_at: string;
 }
+export interface MaterialSearchResult {
+  file: MaterialFile;
+  score: number;
+  match_reason: string;
+  content_preview: string | null;
+  folder_path: string;
+}
 export interface MaterialBackupConfig {
   id: string; provider: string; config_json: string;
   enabled: boolean; updated_at: string;
@@ -362,6 +382,8 @@ export const deleteMaterialFolder = (id: string) =>
   ipc<boolean>('delete_material_folder', { id });
 export const listMaterialFiles = (projectId: string, folderId?: string | null) =>
   ipc<MaterialFile[]>('list_material_files', { projectId, folderId: folderId ?? null });
+export const searchMaterialFiles = (projectId: string, query: string, aiMode = false) =>
+  ipc<MaterialSearchResult[]>('search_material_files', { projectId, query, aiMode });
 export const importMaterialFile = (
   projectId: string, folderId: string | null,
   fileName: string, mimeHint: string, dataBase64: string,

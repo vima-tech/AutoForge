@@ -1,8 +1,9 @@
-use crate::agents::local_claude;
 use crate::models::material::{MaterialBackupConfig, MaterialFile, MaterialFolder};
 use crate::state::{self, AppState};
 use base64::{engine::general_purpose, Engine as _};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::State;
 use tracing::warn;
@@ -10,13 +11,20 @@ use uuid::Uuid;
 
 const MAX_MATERIAL_BYTES: usize = 100 * 1024 * 1024; // 100 MB
 const REPO_MATERIAL_PREFIX: &str = "repo://";
+const MATERIAL_AI_SYSTEM_KIND: &str = "material_ai";
+const OTHER_MATERIAL_FOLDER: &str = "其他";
+const FIXED_MATERIAL_FOLDERS: &[(&str, &str)] = &[
+    ("产品需求", "PRD、需求说明、用户故事、功能清单"),
+    ("用户研究", "访谈记录、调研资料、竞品分析、用户反馈"),
+    ("设计文档", "交互稿、视觉稿、原型、设计规范"),
+    ("技术规格", "架构说明、接口文档、数据模型、技术约束"),
+    ("测试验收", "测试用例、验收标准、缺陷记录、质量报告"),
+    ("品牌素材", "Logo、品牌图片、图标、宣传素材"),
+    ("项目管理", "会议记录、排期计划、里程碑、归档资料"),
+    (OTHER_MATERIAL_FOLDER, "无法明确归入以上分类的文件"),
+];
 
 // ── helper structs for AI organize ────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct OrgFolder {
-    name: String,
-}
 
 #[derive(serde::Deserialize)]
 struct OrgAssignment {
@@ -26,9 +34,29 @@ struct OrgAssignment {
 
 #[derive(serde::Deserialize)]
 struct OrgPlan {
-    folders: Vec<OrgFolder>,
+    #[serde(default)]
     assignments: Vec<OrgAssignment>,
     summary: String,
+}
+
+#[derive(Serialize)]
+pub struct MaterialSearchResult {
+    file: MaterialFile,
+    score: i64,
+    match_reason: String,
+    content_preview: Option<String>,
+    folder_path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AiSearchItem {
+    file_id: String,
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AiSearchPlan {
+    results: Vec<AiSearchItem>,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -47,6 +75,41 @@ fn safe_filename(name: &str) -> String {
         .to_string()
 }
 
+fn fixed_material_folder_list() -> String {
+    FIXED_MATERIAL_FOLDERS
+        .iter()
+        .map(|(name, desc)| format!("- {}：{}", name, desc))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_material_folder_name(
+    name: &str,
+    existing_folder_labels: &std::collections::HashSet<String>,
+) -> String {
+    let trimmed = name.trim();
+    if existing_folder_labels.contains(trimmed) {
+        return trimmed.to_string();
+    }
+
+    for (fixed, _) in FIXED_MATERIAL_FOLDERS {
+        if trimmed == *fixed {
+            return fixed.to_string();
+        }
+    }
+
+    match trimmed {
+        "需求文档" | "产品文档" | "功能需求" => "产品需求".to_string(),
+        "调研资料" | "竞品分析" | "用户反馈" => "用户研究".to_string(),
+        "设计稿" | "设计素材" | "原型设计" | "视觉设计" => "设计文档".to_string(),
+        "架构文档" | "接口文档" | "开发文档" => "技术规格".to_string(),
+        "测试用例" | "测试报告" | "验收文档" => "测试验收".to_string(),
+        "品牌资产" | "品牌资源" | "图片素材" | "图标素材" => "品牌素材".to_string(),
+        "会议记录" | "项目计划" | "排期计划" | "归档" => "项目管理".to_string(),
+        _ => OTHER_MATERIAL_FOLDER.to_string(),
+    }
+}
+
 fn materials_dir(project_id: &str) -> PathBuf {
     PathBuf::from(state::materials_base()).join(project_id)
 }
@@ -61,6 +124,49 @@ fn material_disk_path(file: &MaterialFile) -> PathBuf {
 
 fn is_repo_material(file: &MaterialFile) -> bool {
     file.rel_path.starts_with(REPO_MATERIAL_PREFIX)
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value.to_lowercase()
+}
+
+fn read_text_preview(file: &MaterialFile, max_bytes: usize) -> Option<String> {
+    if !is_text_mime(&file.mime) {
+        return None;
+    }
+
+    let path = material_disk_path(file);
+    let mut opened = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; max_bytes];
+    let read = opened.read(&mut buf).ok()?;
+    buf.truncate(read);
+    String::from_utf8(buf).ok()
+}
+
+fn folder_path_label(
+    folder_id: Option<&str>,
+    folder_map: &std::collections::HashMap<String, MaterialFolder>,
+) -> String {
+    let Some(folder_id) = folder_id else {
+        return "根目录".to_string();
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut cursor = Some(folder_id.to_string());
+    while let Some(id) = cursor {
+        let Some(folder) = folder_map.get(&id) else {
+            break;
+        };
+        names.push(folder.name.clone());
+        cursor = folder.parent_id.clone();
+    }
+    names.reverse();
+
+    if names.is_empty() {
+        "根目录".to_string()
+    } else {
+        names.join(" / ")
+    }
 }
 
 fn guess_mime(path: &Path) -> String {
@@ -129,9 +235,7 @@ fn unique_child_path(dir: &Path, file_name: &str) -> PathBuf {
 }
 
 fn now_str() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Ensure `.autoforge/docs/` exists on disk and sync its contents into the DB.
@@ -209,11 +313,7 @@ async fn get_or_create_material_folder(
 /// Walk `.autoforge/docs/` and upsert its contents into the DB.
 /// Items directly in docs_dir → `folder_id = NULL`.
 /// Sub-directories → top-level `material_folders` (`parent_id = NULL`).
-async fn sync_repo_docs(
-    project_id: &str,
-    docs_dir: &Path,
-    state: &AppState,
-) -> Result<(), String> {
+async fn sync_repo_docs(project_id: &str, docs_dir: &Path, state: &AppState) -> Result<(), String> {
     // (dir_on_disk, db_folder_id)  None means the docs root itself
     let mut pending: Vec<(PathBuf, Option<String>)> = vec![(docs_dir.to_path_buf(), None)];
 
@@ -221,7 +321,11 @@ async fn sync_repo_docs(
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
-                warn!("[materials] failed to read docs dir {}: {}", dir.display(), e);
+                warn!(
+                    "[materials] failed to read docs dir {}: {}",
+                    dir.display(),
+                    e
+                );
                 continue;
             }
         };
@@ -253,7 +357,11 @@ async fn sync_repo_docs(
                 }
             };
             if metadata.len() as usize > MAX_MATERIAL_BYTES {
-                warn!("[materials] skip large file {} ({} bytes)", path.display(), metadata.len());
+                warn!(
+                    "[materials] skip large file {} ({} bytes)",
+                    path.display(),
+                    metadata.len()
+                );
                 continue;
             }
 
@@ -272,13 +380,14 @@ async fn sync_repo_docs(
             let mime = guess_mime(&path);
             let now = now_str();
 
-            let existing: Option<(String,)> =
-                sqlx::query_as("SELECT id FROM material_files WHERE project_id = ? AND rel_path = ?")
-                    .bind(project_id)
-                    .bind(&rel_path)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM material_files WHERE project_id = ? AND rel_path = ?",
+            )
+            .bind(project_id)
+            .bind(&rel_path)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
 
             if let Some((id,)) = existing {
                 sqlx::query(
@@ -328,13 +437,12 @@ async fn sync_repo_docs(
 }
 
 async fn project_docs_dir(project_id: &str, state: &AppState) -> Result<Option<PathBuf>, String> {
-    let Some((repo_path,)) = sqlx::query_as::<_, (String,)>(
-        "SELECT repo_path FROM projects WHERE id = ?",
-    )
-    .bind(project_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| e.to_string())?
+    let Some((repo_path,)) =
+        sqlx::query_as::<_, (String,)>("SELECT repo_path FROM projects WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
     else {
         return Ok(None);
     };
@@ -430,17 +538,18 @@ async fn sync_deleted_folders(project_id: &str, state: &AppState) -> Result<(), 
     .await
     .map_err(|e| e.to_string())?;
 
-    let folder_map: std::collections::HashMap<String, MaterialFolder> =
-        all_folders.iter().map(|f| (f.id.clone(), f.clone())).collect();
+    let folder_map: std::collections::HashMap<String, MaterialFolder> = all_folders
+        .iter()
+        .map(|f| (f.id.clone(), f.clone()))
+        .collect();
 
     for folder in &all_folders {
         // May have been removed in a previous iteration (ancestor deletion cascades)
-        let (count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM material_folders WHERE id = ?")
-                .bind(&folder.id)
-                .fetch_one(&state.db)
-                .await
-                .map_err(|e| e.to_string())?;
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM material_folders WHERE id = ?")
+            .bind(&folder.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
         if count == 0 {
             continue;
         }
@@ -481,6 +590,41 @@ async fn sync_deleted_folders(project_id: &str, state: &AppState) -> Result<(), 
     Ok(())
 }
 
+async fn cleanup_material_file_records(project_id: &str, state: &AppState) -> Result<(), String> {
+    let files: Vec<MaterialFile> = sqlx::query_as::<_, MaterialFile>(
+        "SELECT * FROM material_files
+         WHERE project_id = ?
+         ORDER BY updated_at DESC, created_at DESC, id DESC",
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut seen_rel_paths = std::collections::HashSet::new();
+    for file in files {
+        let disk_path = material_disk_path(&file);
+        if !disk_path.exists() {
+            sqlx::query("DELETE FROM material_files WHERE id = ?")
+                .bind(&file.id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+            continue;
+        }
+
+        if !seen_rel_paths.insert(file.rel_path.clone()) {
+            sqlx::query("DELETE FROM material_files WHERE id = ?")
+                .bind(&file.id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 // ── Folder CRUD ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -490,6 +634,7 @@ pub async fn list_material_folders(
 ) -> Result<Vec<MaterialFolder>, String> {
     ensure_and_sync_docs(&project_id, &state).await?;
     sync_deleted_folders(&project_id, &state).await?;
+    cleanup_material_file_records(&project_id, &state).await?;
 
     sqlx::query_as::<_, MaterialFolder>(
         "SELECT * FROM material_folders WHERE project_id = ? ORDER BY sort_order, name",
@@ -514,13 +659,8 @@ pub async fn create_material_folder(
 
     let parent_id = parent_id.filter(|s| !s.is_empty());
 
-    let folder = get_or_create_material_folder(
-        &project_id,
-        parent_id.as_deref(),
-        &name,
-        &state,
-    )
-    .await?;
+    let folder =
+        get_or_create_material_folder(&project_id, parent_id.as_deref(), &name, &state).await?;
 
     if let Some(path) = folder_path_from_docs(&project_id, Some(&folder.id), &state).await? {
         std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
@@ -559,11 +699,12 @@ pub async fn delete_material_folder(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let Some(folder) = sqlx::query_as::<_, MaterialFolder>("SELECT * FROM material_folders WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| e.to_string())?
+    let Some(folder) =
+        sqlx::query_as::<_, MaterialFolder>("SELECT * FROM material_folders WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
     else {
         return Ok(false);
     };
@@ -674,6 +815,10 @@ pub async fn list_material_files(
     folder_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<MaterialFile>, String> {
+    ensure_and_sync_docs(&project_id, &state).await?;
+    sync_deleted_folders(&project_id, &state).await?;
+    cleanup_material_file_records(&project_id, &state).await?;
+
     let rows = match folder_id.as_deref() {
         Some(fid) if !fid.is_empty() => {
             sqlx::query_as::<_, MaterialFile>(
@@ -694,6 +839,195 @@ pub async fn list_material_files(
         }
     };
     rows.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn search_material_files(
+    project_id: String,
+    query: String,
+    ai_mode: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<MaterialSearchResult>, String> {
+    ensure_and_sync_docs(&project_id, &state).await?;
+    sync_deleted_folders(&project_id, &state).await?;
+    cleanup_material_file_records(&project_id, &state).await?;
+
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let files = sqlx::query_as::<_, MaterialFile>(
+        "SELECT * FROM material_files WHERE project_id = ? ORDER BY updated_at DESC",
+    )
+    .bind(&project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let folders = sqlx::query_as::<_, MaterialFolder>(
+        "SELECT * FROM material_folders WHERE project_id = ? ORDER BY sort_order, name",
+    )
+    .bind(&project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let folder_map: std::collections::HashMap<String, MaterialFolder> =
+        folders.into_iter().map(|f| (f.id.clone(), f)).collect();
+
+    let q = normalize_search_text(&query);
+    let terms: Vec<String> = q
+        .split_whitespace()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .collect();
+    let terms = if terms.is_empty() {
+        vec![q.clone()]
+    } else {
+        terms
+    };
+
+    let mut base_results: Vec<MaterialSearchResult> = Vec::new();
+    for file in &files {
+        let name = normalize_search_text(&file.original_name);
+        let desc = normalize_search_text(file.description.as_deref().unwrap_or(""));
+        let tags = normalize_search_text(&file.tags);
+        let mime = normalize_search_text(&file.mime);
+        let folder_path = folder_path_label(file.folder_id.as_deref(), &folder_map);
+        let folder_text = normalize_search_text(&folder_path);
+        let preview = read_text_preview(file, 24 * 1024);
+        let preview_text = preview
+            .as_deref()
+            .map(normalize_search_text)
+            .unwrap_or_default();
+
+        let mut score = 0i64;
+        let mut reasons: Vec<&str> = Vec::new();
+        for term in &terms {
+            if name.contains(term) {
+                score += 45;
+                reasons.push("文件名匹配");
+            }
+            if desc.contains(term) {
+                score += 38;
+                reasons.push("用途说明匹配");
+            }
+            if tags.contains(term) {
+                score += 32;
+                reasons.push("标签匹配");
+            }
+            if folder_text.contains(term) {
+                score += 20;
+                reasons.push("文件夹匹配");
+            }
+            if preview_text.contains(term) {
+                score += 24;
+                reasons.push("内容匹配");
+            }
+            if mime.contains(term) {
+                score += 8;
+                reasons.push("类型匹配");
+            }
+        }
+
+        if score > 0 {
+            reasons.sort_unstable();
+            reasons.dedup();
+            base_results.push(MaterialSearchResult {
+                file: file.clone(),
+                score,
+                match_reason: reasons.join("、"),
+                content_preview: preview.map(|text| text.chars().take(420).collect()),
+                folder_path,
+            });
+        }
+    }
+
+    base_results.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.file.updated_at.cmp(&a.file.updated_at))
+    });
+
+    if !ai_mode {
+        base_results.truncate(50);
+        return Ok(base_results);
+    }
+
+    const AI_SNIPPET_CHARS: usize = 1200;
+    let mut file_entries = Vec::with_capacity(files.len());
+    for file in &files {
+        let snippet = read_text_preview(file, 16 * 1024)
+            .map(|text| text.chars().take(AI_SNIPPET_CHARS).collect::<String>())
+            .unwrap_or_else(|| "[非文本文件或内容不可读]".to_string());
+        let entry = format!(
+            "file_id: {}\n文件名: {}\n类型: {}\n位置: {}\n用途说明: {}\n标签: {}\n内容片段:\n{}",
+            file.id,
+            file.original_name,
+            file.mime,
+            folder_path_label(file.folder_id.as_deref(), &folder_map),
+            file.description.as_deref().unwrap_or(""),
+            file.tags,
+            snippet
+        );
+        file_entries.push(entry);
+    }
+
+    let prompt = format!(
+        r#"你是物料库文件检索助手。根据用户问题，从文件名、用途说明、标签、文件位置和内容片段判断哪些文件最相关。
+
+用户要找：{}
+
+文件候选：
+{}
+
+严格只输出 JSON，不要输出 Markdown：
+{{
+  "results": [
+    {{"file_id": "文件 id", "reason": "为什么这个文件匹配，20字以内"}}
+  ]
+}}
+
+要求：
+- 最多返回 12 个结果，按相关性从高到低排序
+- 可根据文件实际作用、内容语义、近义表达判断，不要求关键词完全一致
+- 只返回上方候选中存在的 file_id
+- 没有相关文件时返回空 results"#,
+        query,
+        file_entries.join("\n\n---\n\n")
+    );
+
+    let raw = crate::agents::llm::run_system_role_text(
+        &state.db,
+        MATERIAL_AI_SYSTEM_KIND,
+        &prompt,
+        Some("你是 AutoForge 的物料库 AI 助手，负责基于文件元数据和内容片段完成语义检索与整理。只输出调用方要求的格式。"),
+    )
+        .await
+        .map_err(|e| format!("AI 查找失败: {}", e))?;
+    let start = raw.find('{').ok_or("AI 返回格式错误，未找到 JSON")?;
+    let end = raw.rfind('}').ok_or("AI 返回格式错误，JSON 不完整")?;
+    let plan: AiSearchPlan = serde_json::from_str(&raw[start..=end])
+        .map_err(|e| format!("解析 AI 查找结果失败: {}", e))?;
+
+    let file_map: std::collections::HashMap<String, MaterialFile> =
+        files.into_iter().map(|f| (f.id.clone(), f)).collect();
+    let mut results = Vec::new();
+    for (idx, item) in plan.results.into_iter().take(12).enumerate() {
+        let Some(file) = file_map.get(&item.file_id) else {
+            continue;
+        };
+        results.push(MaterialSearchResult {
+            file: file.clone(),
+            score: 10_000 - idx as i64,
+            match_reason: item.reason,
+            content_preview: read_text_preview(file, 16 * 1024)
+                .map(|text| text.chars().take(420).collect()),
+            folder_path: folder_path_label(file.folder_id.as_deref(), &folder_map),
+        });
+    }
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -731,22 +1065,33 @@ pub async fn import_material_file(
     // folder_id=None → docs root; folder_id=Some(id) → subdirectory
     let folder_id = folder_id.filter(|s| !s.is_empty());
 
-    let (stored_name, rel_path) =
-        if let Some(dir) = folder_path_from_docs(&project_id, folder_id.as_deref(), &state).await? {
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let dest = unique_child_path(&dir, &safe_name);
-            std::fs::write(&dest, &raw).map_err(|e| e.to_string())?;
-            let disk_path = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
-            let sname = dest.file_name().and_then(|v| v.to_str()).unwrap_or(&safe_name).to_string();
-            (sname, format!("{}{}", REPO_MATERIAL_PREFIX, disk_path.to_string_lossy()))
-        } else {
-            // No repo path configured — fall back to app data dir
-            let stored_name = format!("{}_{}", id, safe_name);
-            let dir = materials_dir(&project_id);
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            std::fs::write(dir.join(&stored_name), &raw).map_err(|e| e.to_string())?;
-            (stored_name.clone(), format!("{}/{}", project_id, stored_name))
-        };
+    let (stored_name, rel_path) = if let Some(dir) =
+        folder_path_from_docs(&project_id, folder_id.as_deref(), &state).await?
+    {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dest = unique_child_path(&dir, &safe_name);
+        std::fs::write(&dest, &raw).map_err(|e| e.to_string())?;
+        let disk_path = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
+        let sname = dest
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or(&safe_name)
+            .to_string();
+        (
+            sname,
+            format!("{}{}", REPO_MATERIAL_PREFIX, disk_path.to_string_lossy()),
+        )
+    } else {
+        // No repo path configured — fall back to app data dir
+        let stored_name = format!("{}_{}", id, safe_name);
+        let dir = materials_dir(&project_id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(&stored_name), &raw).map_err(|e| e.to_string())?;
+        (
+            stored_name.clone(),
+            format!("{}/{}", project_id, stored_name),
+        )
+    };
 
     if let Some((existing_id,)) = sqlx::query_as::<_, (String,)>(
         "SELECT id FROM material_files WHERE project_id = ? AND rel_path = ?",
@@ -826,7 +1171,8 @@ pub async fn move_material_file(
     let mut rel_path = file.rel_path.clone();
     let mut stored_name = file.stored_name.clone();
 
-    if let Some(dir) = folder_path_from_docs(&file.project_id, folder_id.as_deref(), &state).await? {
+    if let Some(dir) = folder_path_from_docs(&file.project_id, folder_id.as_deref(), &state).await?
+    {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let safe_name = safe_filename(&file.original_name);
         let dest = dir.join(&safe_name);
@@ -899,10 +1245,7 @@ pub async fn update_material_file_meta(
 }
 
 #[tauri::command]
-pub async fn delete_material_file(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn delete_material_file(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let file = sqlx::query_as::<_, MaterialFile>("SELECT * FROM material_files WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
@@ -926,10 +1269,7 @@ pub async fn delete_material_file(
 }
 
 #[tauri::command]
-pub async fn open_material_file(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn open_material_file(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let file = sqlx::query_as::<_, MaterialFile>("SELECT * FROM material_files WHERE id = ?")
         .bind(&id)
         .fetch_one(&state.db)
@@ -1002,16 +1342,44 @@ pub async fn ai_organize_materials(
         return Ok("暂无文件可整理".into());
     }
 
+    let existing_folders = sqlx::query_as::<_, MaterialFolder>(
+        "SELECT * FROM material_folders WHERE project_id = ? ORDER BY sort_order, name",
+    )
+    .bind(&project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let existing_folder_map: std::collections::HashMap<String, MaterialFolder> =
+        existing_folders
+            .iter()
+            .map(|f| (f.id.clone(), f.clone()))
+            .collect();
+    let existing_folder_labels: std::collections::HashSet<String> = existing_folders
+        .iter()
+        .map(|f| folder_path_label(Some(&f.id), &existing_folder_map))
+        .collect();
+    let mut existing_folder_list = existing_folder_labels
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    existing_folder_list.sort();
+    let existing_folder_text = if existing_folder_list.is_empty() {
+        "无".to_string()
+    } else {
+        existing_folder_list
+            .iter()
+            .map(|name| format!("- {}：用户已有文件夹", name))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     // Build per-file entries that include a content snippet for text files.
     const SNIPPET_CHARS: usize = 1500;
     let mut file_list: Vec<String> = Vec::with_capacity(files.len());
     for (i, f) in files.iter().enumerate() {
         let header = format!(
             "[{}] {} ({} bytes, {})",
-            i,
-            f.original_name,
-            f.size_bytes,
-            f.mime
+            i, f.original_name, f.size_bytes, f.mime
         );
         let body = if is_text_mime(&f.mime) {
             let disk_path = material_disk_path(f);
@@ -1033,8 +1401,15 @@ pub async fn ai_organize_materials(
         file_list.push(format!("{}{}", header, body));
     }
 
+    let fixed_folders = fixed_material_folder_list();
     let prompt = format!(
-        r#"你是文档整理助手。仔细阅读以下每个文件的内容预览，根据文件的实际用途和内容为它们设计合理的分类文件夹结构。
+        r#"你是文档整理助手。仔细阅读以下每个文件的内容预览，根据文件的实际用途和内容把它们归入产品物料分类。
+
+固定分类：
+{}
+
+用户已有文件夹（也可以作为 folder_name 使用，必须原样输出完整路径标签）：
+{}
 
 文件列表（共 {} 个）：
 
@@ -1042,21 +1417,21 @@ pub async fn ai_organize_materials(
 
 严格按以下 JSON 格式输出，不要输出任何其他内容：
 {{
-  "folders": [
-    {{"name": "文件夹名称"}}
-  ],
   "assignments": [
-    {{"file_index": 0, "folder_name": "文件夹名称"}}
+    {{"file_index": 0, "folder_name": "产品需求"}}
   ],
   "summary": "整理说明（不超过80字）"
 }}
 
 要求：
 - 必须为上面列出的全部 {} 个文件各分配一条 assignment，file_index 从 0 到 {}
-- 文件夹名称简洁，使用中文（如：需求文档、技术规格、测试用例、设计稿、会议记录、归档）
 - 优先根据文件内容和实际用途分类，而非文件扩展名
-- 每个文件有且只有一个 folder_name，必须来自 folders 数组中定义的名称
+- 每个文件有且只有一个 folder_name，必须来自固定分类或用户已有文件夹
+- 无法明确归类时使用 "其他"
+- 不允许创造新的 folder_name；用户已有文件夹必须完整照抄上方路径标签
 - assignments 数组长度必须等于文件总数 {}"#,
+        fixed_folders,
+        existing_folder_text,
         files.len(),
         file_list.join("\n\n---\n\n"),
         files.len(),
@@ -1064,48 +1439,74 @@ pub async fn ai_organize_materials(
         files.len(),
     );
 
-    let raw = local_claude::run_text(&prompt, None)
+    let raw = crate::agents::llm::run_system_role_text(
+        &state.db,
+        MATERIAL_AI_SYSTEM_KIND,
+        &prompt,
+        Some("你是 AutoForge 的物料库 AI 助手，负责基于文件元数据和内容片段完成语义检索与整理。只输出调用方要求的格式。"),
+    )
         .await
         .map_err(|e| format!("AI 整理失败: {}", e))?;
 
     let start = raw.find('{').ok_or("AI 返回格式错误，未找到 JSON")?;
     let end = raw.rfind('}').ok_or("AI 返回格式错误，JSON 不完整")?;
-    let plan: OrgPlan = serde_json::from_str(&raw[start..=end])
-        .map_err(|e| format!("解析 AI 输出失败: {}", e))?;
+    let plan: OrgPlan =
+        serde_json::from_str(&raw[start..=end]).map_err(|e| format!("解析 AI 输出失败: {}", e))?;
 
     let now = now_str();
+    let mut assigned_folders = vec![OTHER_MATERIAL_FOLDER.to_string(); files.len()];
+    for assignment in &plan.assignments {
+        if assignment.file_index < files.len() {
+            assigned_folders[assignment.file_index] = normalize_material_folder_name(
+                &assignment.folder_name,
+                &existing_folder_labels,
+            );
+        }
+    }
 
     // Map folder name → (db_id, disk_path)
     // We must create directories on disk so sync_repo_docs can see them later.
     let mut folder_info: std::collections::HashMap<String, (String, Option<PathBuf>)> =
         Default::default();
+    let mut used_folders = assigned_folders.clone();
+    used_folders.sort_unstable();
+    used_folders.dedup();
+    let existing_folder_by_label: std::collections::HashMap<String, MaterialFolder> =
+        existing_folders
+            .into_iter()
+            .map(|f| (folder_path_label(Some(&f.id), &existing_folder_map), f))
+            .collect();
 
-    for fd in &plan.folders {
-        let folder =
-            get_or_create_material_folder(&project_id, None, &fd.name, &state).await?;
+    for folder_name in used_folders {
+        let folder = if let Some(existing) = existing_folder_by_label.get(&folder_name) {
+            existing.clone()
+        } else {
+            get_or_create_material_folder(&project_id, None, &folder_name, &state).await?
+        };
 
         // Create the corresponding disk directory so it survives the next sync.
         let disk_path = folder_path_from_docs(&project_id, Some(&folder.id), &state).await?;
         if let Some(ref dir) = disk_path {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                warn!("[ai_organize] failed to create dir {}: {}", dir.display(), e);
+                warn!(
+                    "[ai_organize] failed to create dir {}: {}",
+                    dir.display(),
+                    e
+                );
             }
         }
 
-        folder_info.insert(fd.name.clone(), (folder.id, disk_path));
+        folder_info.insert(folder_name, (folder.id, disk_path));
     }
 
     // Move each file to its assigned folder on disk AND update the DB.
     let mut moved = 0usize;
-    for a in &plan.assignments {
-        if a.file_index >= files.len() {
-            continue;
-        }
-        let Some((folder_id, disk_dir)) = folder_info.get(&a.folder_name) else {
+    for (file_index, folder_name) in assigned_folders.iter().enumerate() {
+        let Some((folder_id, disk_dir)) = folder_info.get(folder_name.as_str()) else {
             continue;
         };
 
-        let file = &files[a.file_index];
+        let file = &files[file_index];
         let src = material_disk_path(file);
 
         let (new_rel_path, new_stored_name) = if let Some(dir) = disk_dir {
@@ -1223,13 +1624,11 @@ pub async fn backup_material_files(
     }
 
     let files: Vec<MaterialFile> = if file_ids.is_empty() {
-        sqlx::query_as::<_, MaterialFile>(
-            "SELECT * FROM material_files WHERE project_id = ?",
-        )
-        .bind(&project_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| e.to_string())?
+        sqlx::query_as::<_, MaterialFile>("SELECT * FROM material_files WHERE project_id = ?")
+            .bind(&project_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
     } else {
         let mut result = Vec::new();
         for fid in &file_ids {
@@ -1321,7 +1720,11 @@ pub async fn backup_material_files(
         )
         .bind(&status)
         .bind(&url)
-        .bind(if status == "synced" { Some(now.clone()) } else { None })
+        .bind(if status == "synced" {
+            Some(now.clone())
+        } else {
+            None
+        })
         .bind(&now)
         .bind(&file.id)
         .execute(&state.db)

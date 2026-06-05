@@ -1,4 +1,3 @@
-use crate::agents::local_claude;
 use crate::models::project::Project;
 use crate::models::spec::ProjectSpec;
 use crate::state::AppState;
@@ -14,6 +13,7 @@ const CATEGORIES: &[(&str, &str)] = &[
     ("api", "API 契约"),
     ("testing", "测试要求"),
 ];
+const SPEC_AI_SYSTEM_KIND: &str = "spec_writer";
 
 fn now_str() -> String {
     chrono::Utc::now()
@@ -374,7 +374,12 @@ pub async fn ai_generate_specs(
         tech = tech_summary,
     );
 
-    let raw = local_claude::run_text(&prompt, None)
+    let raw = crate::agents::llm::run_system_role_text(
+        &state.db,
+        SPEC_AI_SYSTEM_KIND,
+        &prompt,
+        Some("你是 AutoForge 的项目规格生成 Agent，负责把项目信息、技术文件和物料摘要转换为可执行的结构化规格约束。只输出调用方要求的 JSON。"),
+    )
         .await
         .map_err(|e| format!("AI 生成失败: {}", e))?;
 

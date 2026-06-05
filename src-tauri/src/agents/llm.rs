@@ -58,6 +58,51 @@ pub async fn run_agent_text(
     }
 }
 
+pub async fn run_system_role_text(
+    db: &crate::db::Db,
+    system_kind: &str,
+    prompt: &str,
+    fallback_system_prompt: Option<&str>,
+) -> Result<String> {
+    let agent = sqlx::query_as::<_, Agent>(
+        "SELECT * FROM agents
+         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
+           AND enabled=1
+         ORDER BY created_at
+         LIMIT 1",
+    )
+    .bind(format!("%,{},%", system_kind))
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("未配置系统角色 Agent: {}", system_kind))?;
+
+    let Some(llm_id) = &agent.llm_id else {
+        return Err(anyhow!(
+            "系统角色 Agent「{}」未绑定 LLM，请在角色指派/Agent 配置中选择可用 LLM",
+            agent.name
+        ));
+    };
+
+    let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    if cfg.provider.to_ascii_lowercase().contains("claude-cli") {
+        return Err(anyhow!(
+            "系统角色 Agent「{}」当前绑定 Claude CLI，请改用非 Claude CLI 的 LLM 配置",
+            agent.name
+        ));
+    }
+
+    let system_prompt = if agent.system_prompt.trim().is_empty() {
+        fallback_system_prompt
+    } else {
+        Some(agent.system_prompt.as_str())
+    };
+    run_agent_text(db, &agent, prompt, system_prompt, &[]).await
+}
+
 async fn run_openai_compatible(
     cfg: &LlmConfig,
     prompt: &str,

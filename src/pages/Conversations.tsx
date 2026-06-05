@@ -5,7 +5,7 @@ import { Avatar, MeAvatar } from '../components/Avatar';
 import Block from '../components/Block';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
-  listAgents, addConversationMember, removeConversationMember, deleteGroupConversation,
+  listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   clearConversationMessages, toggleMessageContext, startConversationTask,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
@@ -939,6 +939,116 @@ function NewGroupModal({ agents, projects, onClose, onCreate }: {
   );
 }
 
+function EditGroupModal({ conversation, projects, onClose, onSave }: {
+  conversation: Conversation;
+  projects: Project[];
+  onClose: () => void;
+  onSave: (conversationId: string, name: string, projectId: string | null) => void;
+}) {
+  const [name, setName] = useState(conversation.name ?? '');
+  const [projectId, setProjectId] = useState(conversation.project_id ?? '');
+  const [projOpen, setProjOpen] = useState(false);
+  const projRef = useRef<HTMLDivElement>(null);
+  const selectedProject = projects.find(p => p.id === projectId) ?? null;
+  const dirty = name.trim() !== (conversation.name ?? '') || (projectId || null) !== (conversation.project_id ?? null);
+
+  useEffect(() => {
+    if (!projOpen) return;
+    const close = (e: PointerEvent) => {
+      if (projRef.current && !projRef.current.contains(e.target as Node)) setProjOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [projOpen]);
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }} onClick={onClose}>
+      <div style={{ width: 440, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center' }}>
+          <div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">编辑会议室</span></div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-3)', marginTop: 4 }}>修改群名称和项目绑定信息</div>
+          </div>
+          <button className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose}><Icon name="x" size={18} /></button>
+        </div>
+        <div style={{ padding: '16px 20px' }}>
+          <div className="field" style={{ marginBottom: 14 }}>
+            <label>群聊名称</label>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="例如：Vocant · 导出性能优化" />
+          </div>
+          <div className="field" style={{ marginBottom: 14 }}>
+            <label>绑定项目（可选）</label>
+            <div style={{ position: 'relative' }} ref={projRef}>
+              <div
+                className="proj-select"
+                style={{ padding: '8px 12px', borderRadius: 10 }}
+                onClick={() => setProjOpen(o => !o)}
+              >
+                {selectedProject ? (
+                  <>
+                    <div className="proj-logo" style={{ background: 'var(--ember)', width: 28, height: 28, fontSize: 'var(--text-label)', borderRadius: 8 }}>
+                      {selectedProject.name[0]}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="proj-name" style={{ fontSize: 'var(--text-control)' }}>{selectedProject.name}</div>
+                      <div className="proj-meta">{selectedProject.description || selectedProject.slug}</div>
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ flex: 1, fontSize: 'var(--text-control)', color: 'var(--text-3)' }}>不绑定项目（通用群聊）</div>
+                )}
+                <Icon name="chevDown" size={15} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none', flexShrink: 0 }} />
+              </div>
+              {projOpen && (
+                <div className="mention-pop" style={{ left: 0, right: 0, top: 'calc(100% + 5px)', bottom: 'auto', width: '100%', maxHeight: 200, overflowY: 'auto', zIndex: 300 }}>
+                  <div
+                    className="mention-row"
+                    onClick={() => { setProjectId(''); setProjOpen(false); }}
+                  >
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="nm">不绑定项目</div>
+                      <div className="rl">通用群聊，无项目上下文</div>
+                    </div>
+                    {!projectId && <Icon name="check" size={13} style={{ color: 'var(--ember)', flexShrink: 0 }} />}
+                  </div>
+                  {projects.map(p => (
+                    <div
+                      key={p.id}
+                      className="mention-row"
+                      onClick={() => { setProjectId(p.id); setProjOpen(false); }}
+                    >
+                      <div className="proj-logo" style={{ background: 'var(--ember)', width: 26, height: 26, fontSize: 'var(--text-caption)', borderRadius: 7, flexShrink: 0 }}>
+                        {p.name[0]}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="nm">{p.name}</div>
+                        <div className="rl">{p.description || p.slug}</div>
+                      </div>
+                      {projectId === p.id && <Icon name="check" size={13} style={{ color: 'var(--ember)', flexShrink: 0 }} />}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            {conversation.project_id !== (projectId || null) && (
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--amber)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Icon name="alert" size={11} />
+                修改项目绑定会清空已固定的项目上下文文件
+              </div>
+            )}
+          </div>
+        </div>
+        <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onClose}>取消</button>
+          <button className="btn btn-primary" disabled={!name.trim() || !dirty} onClick={() => onSave(conversation.id, name, projectId || null)}>
+            <Icon name="check" size={15} />保存
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ConfirmModal({ msg, okLabel, onOk, onCancel }: {
   msg: string; okLabel: string; onOk: () => void; onCancel: () => void;
 }) {
@@ -964,6 +1074,7 @@ export default function ConversationsPage() {
   const [active,         setActive]         = useState('');
   const [msgs,           setMsgs]           = useState<Message[]>([]);
   const [showNew,        setShowNew]        = useState(false);
+  const [editGroup,      setEditGroup]      = useState<Conversation | null>(null);
   const [showMembers,    setShowMembers]    = useState(false);
   const [showContext,    setShowContext]     = useState(false);
   const [showSearch,     setShowSearch]     = useState(false);
@@ -1056,6 +1167,7 @@ export default function ConversationsPage() {
     setActiveSearchId(null);
     setQuoteDraft(null);
     setBubbleMenu(null);
+    setEditGroup(null);
   }, [active]);
 
   // 4. Auto-focus search input when panel opens.
@@ -1323,6 +1435,22 @@ export default function ConversationsPage() {
     setShowNew(false);
   };
 
+  const saveGroupInfo = async (conversationId: string, name: string, projectId: string | null) => {
+    setLoadError('');
+    try {
+      const updated = await updateGroupConversation(conversationId, name, projectId);
+      setConvs(cs => cs.map(c => c.id === updated.id ? updated : c));
+      setEditGroup(null);
+      setShowContext(false);
+      setWsFileContent(null);
+      if (active === updated.id) {
+        loadContextAttachments(updated.id).catch(() => {});
+      }
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  };
+
   const addMember = async (agentId: string) => {
     if (!conv) return;
     setMemberError('');
@@ -1413,6 +1541,11 @@ export default function ConversationsPage() {
                 <button className="member-stack" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); setShowSearch(false); }}
                   style={{ background: 'transparent', border: 0, padding: '0 4px', cursor: 'pointer' }}>
                   {convMembers.slice(0, 4).map(a => <Avatar key={a.id} agent={a} size={28} />)}
+                </button>
+              )}
+              {conv.conv_type === 'group' && (
+                <button className="icon-btn" title="编辑会议室" onClick={() => { setEditGroup(conv); setShowMembers(false); setShowContext(false); setShowSearch(false); }}>
+                  <Icon name="edit" size={17} />
                 </button>
               )}
               {conv.conv_type === 'group' && (
@@ -1735,6 +1868,7 @@ export default function ConversationsPage() {
       )}
 
       {showNew && <NewGroupModal agents={agents} projects={projects} onClose={() => setShowNew(false)} onCreate={handleNewGroup} />}
+      {editGroup && <EditGroupModal conversation={editGroup} projects={projects} onClose={() => setEditGroup(null)} onSave={saveGroupInfo} />}
       {bubbleMenu && (
         <div
           className="bubble-menu"

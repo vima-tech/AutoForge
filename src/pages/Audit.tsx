@@ -430,134 +430,141 @@ export default function AuditPage() {
   const canRevise = cr?.status === 'pending_review_2' && !decided;
 
   return (
-    <>
-      {/* 1. 左侧列表 + 第一个拖拽分割线 */}
-      <AuditList
-        projects={projects} activeProject={activeProject}
-        setActiveProject={p => { setActiveProject(p); setActiveCr(''); }}
-        projectReviewCounts={projectReviewCounts} crs={crs} activeCr={activeCr}
-        onSelect={id => { setActiveCr(id); setDecided(null); }}
-        devStatus={devStatus} onStartServer={doStartServer} onStopServer={doStopServer}
-        width={listWidth}
-      />
-      <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
+    <div className="audit-page">
+      <div className="audit-top" style={{ height: 56 }}>
+        <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
+          <span className="en">AUDIT</span><span className="cn">· 功能审计</span>
+        </div>
+      </div>
 
-      <div className="content">
-        {cr ? (
-          <>
-            {/* 顶部标题栏 */}
-            <div className="audit-top">
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{cr.id.slice(0, 10)}</span>
-                  <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>Change Request</span>
-                  {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
-                </div>
-                <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2 }}>
-                  {STATUS_LABEL[cr.status] ?? cr.status} · {new Date(cr.updated_at).toLocaleString('zh')}
-                </div>
-              </div>
-              <div className="audit-decide">
-                {cr.status !== 'pending_review_2'
-                  ? <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
-                      {STATUS_LABEL[cr.status] ?? cr.status}
-                    </span>
-                  : decided
-                    ? <span className={'chip ' + (decided === 'approved' ? 'green' : decided === 'rejected' ? 'red' : 'amber')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
-                        <Icon name={decided === 'approved' ? 'check' : decided === 'rejected' ? 'x' : 'refresh'} size={14} />
-                        {decided === 'approved' ? '已批准 · 合并到 dev' : decided === 'rejected' ? '已拒绝' : '已退回 · 重新执行'}
-                      </span>
-                    : <>
-                        <button className="btn btn-danger" onClick={() => doReview('rejected')} disabled={submitting}><Icon name="x" size={15} />拒绝</button>
-                        <button className="btn btn-primary" onClick={() => doReview('approved')} disabled={submitting}><Icon name="check" size={15} />批准合并</button>
-                      </>}
-              </div>
-            </div>
+      <div className="audit-workspace">
+        {/* 1. 左侧列表 + 第一个拖拽分割线 */}
+        <AuditList
+          projects={projects} activeProject={activeProject}
+          setActiveProject={p => { setActiveProject(p); setActiveCr(''); }}
+          projectReviewCounts={projectReviewCounts} crs={crs} activeCr={activeCr}
+          onSelect={id => { setActiveCr(id); setDecided(null); }}
+          devStatus={devStatus} onStartServer={doStartServer} onStopServer={doStopServer}
+          width={listWidth}
+        />
+        <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
 
-            {/* 1. 内容区三栏：left + resize + right */}
-            <div className={`audit-split${crLoading ? ' cr-loading' : ''}`}>
-              {/* 中栏：报告 / diff */}
-              <div className="audit-left">
-                <div className="diff-tabbar">
-                  <div className="seg">
-                    <button className={tab === 'report' ? 'on' : ''} onClick={() => setTab('report')}>实现报告</button>
-                    <button className={tab === 'diff' ? 'on' : ''} onClick={() => setTab('diff')}>代码 Diff</button>
+        <div className="content">
+          {cr ? (
+            <>
+              {/* 顶部标题栏 */}
+              <div className="audit-top">
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{cr.id.slice(0, 10)}</span>
+                    <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>Change Request</span>
+                    {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
                   </div>
-                  {tab === 'diff' && (
-                    <div className="seg" style={{ marginLeft: 'auto' }}>
-                      <button className={diffMode === 'unified' ? 'on' : ''} onClick={() => setDiffMode('unified')}>
-                        <Icon name="rows" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />统一
-                      </button>
-                      <button className={diffMode === 'split' ? 'on' : ''} onClick={() => setDiffMode('split')}>
-                        <Icon name="columns" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />分栏
-                      </button>
-                    </div>
-                  )}
+                  <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2 }}>
+                    {STATUS_LABEL[cr.status] ?? cr.status} · {new Date(cr.updated_at).toLocaleString('zh')}
+                  </div>
                 </div>
-                <div className="diff-viewport scroll">
-                  {tab === 'report' ? (
-                    <div className="report">
-                      {session && (session.iteration_count ?? 0) >= 3 && (
-                        <div className="iter-warn"><Icon name="alert" size={20} /><div>已迭代 <b>{session.iteration_count}</b> 轮（软上限 3）。建议手动介入或重新描述需求。</div></div>
-                      )}
-                      {report ? (
-                        <>
-                          <h2><Icon name="zap" size={18} style={{ color: 'var(--ember)' }} />改动摘要</h2>
-                          <p>{report.summary}</p>
-                          {report.files.length > 0 && (
-                            <><h2><Icon name="file" size={18} style={{ color: 'var(--blue)' }} />修改文件</h2>
-                              <div>{report.files.map((f, i) => (
-                                <span className="file-pill" key={i}><Icon name="file" size={13} />{f.name}<span className="add">+{f.add}</span>{f.del > 0 && <span className="del">-{f.del}</span>}</span>
-                              ))}</div></>
-                          )}
-                          {report.testsSection && (
-                            <><h2><Icon name="flask" size={18} style={{ color: 'var(--green)' }} />测试情况</h2><p style={{ whiteSpace: 'pre-line' }}>{report.testsSection}</p></>
-                          )}
-                          {report.risk && (
-                            <><h2><Icon name="shield" size={18} style={{ color: 'var(--violet)' }} />潜在风险</h2><p>{report.risk}</p></>
-                          )}
-                        </>
-                      ) : (
-                        <div className="empty-compact" style={{ padding: '20px 0' }}>{session ? '报告内容为空' : '加载中…'}</div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="diff">
-                      {hunks.length === 0
-                        ? <div className="empty-compact" style={{ padding: '20px 22px' }}>{diff === '' ? '加载中…' : 'Diff 为空或 worktree 不存在'}</div>
-                        : hunks.map((h, hi) => (
-                          <div key={hi}>
-                            <div className="diff-toolbar">
-                              <Icon name="file" size={15} style={{ color: 'var(--text-3)' }} />
-                              <span className="diff-file">{h.file}</span>
-                            </div>
-                            <div className="diff-hunk">{h.hunk}</div>
-                            {diffMode === 'unified'
-                              ? h.lines.map((l, i) => (
-                                <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : l.t === 'del' ? 'del' : '')}>
-                                  <span className="gut">{l.n1}</span><span className="gut">{l.n2}</span>
-                                  <span className="code">{l.t === 'add' ? '+ ' : l.t === 'del' ? '- ' : '  '}{l.code}</span>
-                                </div>
-                              ))
-                              : <div className="diff-split-wrap">
-                                  <div>{h.lines.filter(l => l.t !== 'add').map((l, i) => (
-                                    <div key={i} className={'diff-line ' + (l.t === 'del' ? 'del' : '')}>
-                                      <span className="gut">{l.n1}</span><span className="code">{l.code}</span>
-                                    </div>
-                                  ))}</div>
-                                  <div>{h.lines.filter(l => l.t !== 'del').map((l, i) => (
-                                    <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : '')}>
-                                      <span className="gut">{l.n2}</span><span className="code">{l.code}</span>
-                                    </div>
-                                  ))}</div>
-                                </div>
-                            }
-                          </div>
-                        ))}
-                    </div>
-                  )}
+                <div className="audit-decide">
+                  {cr.status !== 'pending_review_2'
+                    ? <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
+                        {STATUS_LABEL[cr.status] ?? cr.status}
+                      </span>
+                    : decided
+                      ? <span className={'chip ' + (decided === 'approved' ? 'green' : decided === 'rejected' ? 'red' : 'amber')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
+                          <Icon name={decided === 'approved' ? 'check' : decided === 'rejected' ? 'x' : 'refresh'} size={14} />
+                          {decided === 'approved' ? '已批准 · 合并到 dev' : decided === 'rejected' ? '已拒绝' : '已退回 · 重新执行'}
+                        </span>
+                      : <>
+                          <button className="btn btn-danger" onClick={() => doReview('rejected')} disabled={submitting}><Icon name="x" size={15} />拒绝</button>
+                          <button className="btn btn-primary" onClick={() => doReview('approved')} disabled={submitting}><Icon name="check" size={15} />批准合并</button>
+                        </>}
                 </div>
               </div>
+
+              {/* 1. 内容区三栏：left + resize + right */}
+              <div className={`audit-split${crLoading ? ' cr-loading' : ''}`}>
+                {/* 中栏：报告 / diff */}
+                <div className="audit-left">
+                  <div className="diff-tabbar">
+                    <div className="seg">
+                      <button className={tab === 'report' ? 'on' : ''} onClick={() => setTab('report')}>实现报告</button>
+                      <button className={tab === 'diff' ? 'on' : ''} onClick={() => setTab('diff')}>代码 Diff</button>
+                    </div>
+                    {tab === 'diff' && (
+                      <div className="seg" style={{ marginLeft: 'auto' }}>
+                        <button className={diffMode === 'unified' ? 'on' : ''} onClick={() => setDiffMode('unified')}>
+                          <Icon name="rows" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />统一
+                        </button>
+                        <button className={diffMode === 'split' ? 'on' : ''} onClick={() => setDiffMode('split')}>
+                          <Icon name="columns" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />分栏
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="diff-viewport scroll">
+                    {tab === 'report' ? (
+                      <div className="report">
+                        {session && (session.iteration_count ?? 0) >= 3 && (
+                          <div className="iter-warn"><Icon name="alert" size={20} /><div>已迭代 <b>{session.iteration_count}</b> 轮（软上限 3）。建议手动介入或重新描述需求。</div></div>
+                        )}
+                        {report ? (
+                          <>
+                            <h2><Icon name="zap" size={18} style={{ color: 'var(--ember)' }} />改动摘要</h2>
+                            <p>{report.summary}</p>
+                            {report.files.length > 0 && (
+                              <><h2><Icon name="file" size={18} style={{ color: 'var(--blue)' }} />修改文件</h2>
+                                <div>{report.files.map((f, i) => (
+                                  <span className="file-pill" key={i}><Icon name="file" size={13} />{f.name}<span className="add">+{f.add}</span>{f.del > 0 && <span className="del">-{f.del}</span>}</span>
+                                ))}</div></>
+                            )}
+                            {report.testsSection && (
+                              <><h2><Icon name="flask" size={18} style={{ color: 'var(--green)' }} />测试情况</h2><p style={{ whiteSpace: 'pre-line' }}>{report.testsSection}</p></>
+                            )}
+                            {report.risk && (
+                              <><h2><Icon name="shield" size={18} style={{ color: 'var(--violet)' }} />潜在风险</h2><p>{report.risk}</p></>
+                            )}
+                          </>
+                        ) : (
+                          <div className="empty-compact" style={{ padding: '20px 0' }}>{session ? '报告内容为空' : '加载中…'}</div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="diff">
+                        {hunks.length === 0
+                          ? <div className="empty-compact" style={{ padding: '20px 22px' }}>{diff === '' ? '加载中…' : 'Diff 为空或 worktree 不存在'}</div>
+                          : hunks.map((h, hi) => (
+                            <div key={hi}>
+                              <div className="diff-toolbar">
+                                <Icon name="file" size={15} style={{ color: 'var(--text-3)' }} />
+                                <span className="diff-file">{h.file}</span>
+                              </div>
+                              <div className="diff-hunk">{h.hunk}</div>
+                              {diffMode === 'unified'
+                                ? h.lines.map((l, i) => (
+                                  <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : l.t === 'del' ? 'del' : '')}>
+                                    <span className="gut">{l.n1}</span><span className="gut">{l.n2}</span>
+                                    <span className="code">{l.t === 'add' ? '+ ' : l.t === 'del' ? '- ' : '  '}{l.code}</span>
+                                  </div>
+                                ))
+                                : <div className="diff-split-wrap">
+                                    <div>{h.lines.filter(l => l.t !== 'add').map((l, i) => (
+                                      <div key={i} className={'diff-line ' + (l.t === 'del' ? 'del' : '')}>
+                                        <span className="gut">{l.n1}</span><span className="code">{l.code}</span>
+                                      </div>
+                                    ))}</div>
+                                    <div>{h.lines.filter(l => l.t !== 'del').map((l, i) => (
+                                      <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : '')}>
+                                        <span className="gut">{l.n2}</span><span className="code">{l.code}</span>
+                                      </div>
+                                    ))}</div>
+                                  </div>
+                              }
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
 
               {/* 1. 第二个拖拽分割线 */}
               <ResizeHandle onDrag={dx => setRightWidth(w => Math.max(200, Math.min(700, w - dx)))} />
@@ -594,12 +601,13 @@ export default function AuditPage() {
                   </div>
                 </div>
               </div>
-            </div>
-          </>
-        ) : (
-          <div className="empty" style={{ height: '100%' }}><Icon name="audit" /><div>选择一个需求查看详情</div></div>
-        )}
+              </div>
+            </>
+          ) : (
+            <div className="empty" style={{ flex: 1 }}><Icon name="audit" /><div>选择一个需求查看详情</div></div>
+          )}
+        </div>
       </div>
-    </>
+    </div>
   );
 }

@@ -35,6 +35,7 @@
   --leading-snug: 1.35;
   --leading-normal: 1.5;
   --leading-relaxed: 1.6;
+  --leading-bubble: 1.5;
   --leading-prose: 1.7;
 
   --ember: #e8772e;
@@ -1062,7 +1063,7 @@ button { font-family: inherit; cursor: pointer; }
 .bubble {
   background: var(--bubble-them); color: var(--bubble-them-text);
   padding: 11px 14px; border-radius: 4px 15px 15px 15px;
-  font-size: var(--text-body); line-height: var(--leading-relaxed); box-shadow: var(--shadow-sm);
+  font-size: var(--text-body); line-height: var(--leading-bubble); box-shadow: var(--shadow-sm);
   border: 1px solid var(--border);
   word-wrap: break-word; overflow-wrap: anywhere;
 }
@@ -1444,6 +1445,8 @@ button { font-family: inherit; cursor: pointer; }
 .iter-badge { font-family: var(--font-mono); font-size: var(--text-micro); padding: 1px 6px; border-radius: 6px; background: var(--bg-2); border: 1px solid var(--border-strong); }
 .iter-badge.hot { color: var(--amber); border-color: rgba(224,163,46,.4); background: rgba(224,163,46,.1); }
 
+.audit-page { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
+.audit-workspace { flex: 1; min-width: 0; min-height: 0; display: flex; }
 .audit-top { height: 60px; flex: none; display: flex; align-items: center; gap: 14px; padding: 0 22px; border-bottom: 1px solid var(--border); background: var(--titlebar); backdrop-filter: blur(16px); }
 .audit-decide { margin-left: auto; display: flex; gap: 8px; }
 .audit-split { flex: 1; display: flex; min-height: 0; transition: opacity 0.12s ease; }
