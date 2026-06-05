@@ -23,7 +23,7 @@ function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; 
   return createPortal(
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }} onClick={onCancel}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 360, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
-        <p style={{ margin: '0 0 20px', fontSize: 14, lineHeight: 1.6 }}>{msg}</p>
+        <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onCancel}>取消</button>
           <button className="btn btn-danger" onClick={onOk}>确认删除</button>
@@ -168,7 +168,7 @@ function LLMSettings() {
                 <div className="field full" style={{ gap: 10, marginTop: 4 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                     <Switch on={c.enabled} onToggle={() => toggleEnabled(c.id, c.enabled)} />
-                    <span style={{ fontSize: 13, color: 'var(--text-2)', flex: 1 }}>启用此连接</span>
+                    <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>启用此连接</span>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(c.id)}><Icon name="trash" size={13} />删除</button>
                       <button className="btn btn-sm" onClick={() => testConn(c.id)} disabled={testing === c.id}>
@@ -180,7 +180,7 @@ function LLMSettings() {
                     </div>
                   </div>
                   {(saveStatus[c.id] || testResult[c.id]) && (
-                    <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', lineHeight: 1.5,
+                    <div style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', lineHeight: 'var(--leading-normal)',
                       color: (saveStatus[c.id] === '已保存' || (testResult[c.id] ?? '').startsWith('连接成功'))
                         ? 'var(--green-soft)' : 'var(--red)',
                     }}>
@@ -315,13 +315,13 @@ function AgentSettings() {
                   <div className="field full">
                     <label>可用范围</label>
                     <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
-                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 13 }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
                         <Switch on={Boolean(d.enabled ?? a.enabled)} onToggle={() => setDraft(a.id, 'enabled', !(d.enabled ?? a.enabled))} />启用
                       </label>
-                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 13 }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
                         <Switch on={Boolean(d.mentionable ?? a.mentionable)} onToggle={() => setDraft(a.id, 'mentionable', !(d.mentionable ?? a.mentionable))} />可拉入群聊
                       </label>
-                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 13 }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
                         <Switch on={Boolean(d.visible_in_chat ?? a.visible_in_chat)} onToggle={() => setDraft(a.id, 'visible_in_chat', !(d.visible_in_chat ?? a.visible_in_chat))} />可私聊
                       </label>
                     </div>
@@ -332,7 +332,7 @@ function AgentSettings() {
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--border)', justifyContent: 'flex-end' }}>
                   {saveStatus[a.id] && (
-                    <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: saveStatus[a.id] === '已保存' ? 'var(--green-soft)' : 'var(--red)', marginRight: 'auto' }}>
+                    <span style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', color: saveStatus[a.id] === '已保存' ? 'var(--green-soft)' : 'var(--red)', marginRight: 'auto' }}>
                       {saveStatus[a.id]}
                     </span>
                   )}
@@ -431,7 +431,7 @@ function RoleAssignment() {
       <div className="set-desc">将 Agent 绑定到编排系统和流水线的各个职责槽位。每次只有一个 Agent 持有某项角色；模型使用该 Agent 自身的 LLM 配置。</div>
 
       {feedback && (
-        <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--green-soft)', marginBottom: 12 }}>{feedback}</div>
+        <div style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', color: 'var(--green-soft)', marginBottom: 12 }}>{feedback}</div>
       )}
 
       <div className="panel" style={{ marginBottom: 22 }}>
@@ -519,7 +519,7 @@ function ConcurrencySettings() {
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
-            {result && <span style={{ fontSize: 12, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{result}</span>}
+            {result && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{result}</span>}
           </div>
         </div>
       </div>
@@ -559,7 +559,7 @@ function SpecsSettings() {
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存文档</button>
-            {status && <span style={{ fontSize: 12, color: status === '已保存' ? 'var(--green-soft)' : 'var(--red)' }}>{status}</span>}
+            {status && <span style={{ fontSize: 'var(--text-label)', color: status === '已保存' ? 'var(--green-soft)' : 'var(--red)' }}>{status}</span>}
           </div>
         </div>
       </div>
@@ -667,7 +667,7 @@ function SecuritySettings() {
       <div className="set-desc">当前启用输入消毒、Git 代理拦截、合并唯一入口和管理员决策审计。</div>
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-head"><div className="panel-title"><Icon name="shield" size={16} style={{ color: 'var(--green)' }} />已启用防护</div></div>
-        <div style={{ padding: '12px 18px', display: 'grid', gap: 8, fontSize: 13, color: 'var(--text-2)' }}>
+        <div style={{ padding: '12px 18px', display: 'grid', gap: 8, fontSize: 'var(--text-control)', color: 'var(--text-2)' }}>
           <div>输入消毒：拦截明显 prompt injection 片段</div>
           <div>Git 代理：阻止 push main/master、force push、remote set-url、global config</div>
           <div>合并入口：只有审核 2 批准后可入队 merge</div>
@@ -686,7 +686,7 @@ function SecuritySettings() {
               <div className="cfg-sub">{d.issue_id.slice(0, 10)} · {new Date(d.created_at).toLocaleString('zh')}</div>
             </div>
           </div>
-          {d.suggestions && <div style={{ padding: '0 2px 2px', fontSize: 13, color: 'var(--text-3)' }}>{d.suggestions}</div>}
+          {d.suggestions && <div style={{ padding: '0 2px 2px', fontSize: 'var(--text-control)', color: 'var(--text-3)' }}>{d.suggestions}</div>}
         </div>
       ))}
       {decisions.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无审计记录</div>}
@@ -726,8 +726,8 @@ function AboutSettings() {
       <div className="set-h">关于 AutoForge</div>
       <div className="set-desc" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span>运行健康、Claude 认证和后台运行态概览。</span>
-        {healthError && <span style={{ fontSize: 12, color: 'var(--red)' }}>状态获取失败</span>}
-        <button className="btn" style={{ marginLeft: 'auto', fontSize: 12, padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading}>
+        {healthError && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)' }}>状态获取失败</span>}
+        <button className="btn" style={{ marginLeft: 'auto', fontSize: 'var(--text-label)', padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading}>
           {healthLoading ? '加载中…' : '刷新'}
         </button>
       </div>
@@ -747,14 +747,14 @@ function AboutSettings() {
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-head"><div className="panel-title"><Icon name="eye" size={16} style={{ color: 'var(--ember)' }} />预览环境</div><span className="sec-kicker">{previews.length}</span></div>
         <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 8 }}>
-          {previews.slice(0, 8).map(p => <div key={p.id} style={{ fontSize: 12, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{p.status} · {p.preview_url || p.id}</div>)}
+          {previews.slice(0, 8).map(p => <div key={p.id} style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{p.status} · {p.preview_url || p.id}</div>)}
           {previews.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无预览环境</div>}
         </div>
       </div>
       <div className="panel">
         <div className="panel-head"><div className="panel-title"><Icon name="flask" size={16} style={{ color: 'var(--green)' }} />测试会话</div><span className="sec-kicker">{tests.length}</span></div>
         <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 8 }}>
-          {tests.slice(0, 8).map(t => <div key={t.id} style={{ fontSize: 12, color: 'var(--text-3)' }}>{t.status} · {t.summary || t.id}</div>)}
+          {tests.slice(0, 8).map(t => <div key={t.id} style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>{t.status} · {t.summary || t.id}</div>)}
           {tests.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无测试会话</div>}
         </div>
       </div>
@@ -811,7 +811,7 @@ function WebhookSettings() {
   -H "Content-Type: application/json" \\
   -d '{"project_id":"<uuid>","title":"需求标题","description":"详细描述"}'`;
 
-  if (loading) return <div className="set-inner" style={{ color: 'var(--text-3)', fontSize: 13 }}>加载中…</div>;
+  if (loading) return <div className="set-inner" style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>;
 
   return (
     <div className="set-inner" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -822,11 +822,11 @@ function WebhookSettings() {
             <Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />
           </div>
           <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>HTTP Webhook 接口</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>外部系统通过 POST 请求推送需求到指定项目</div>
+            <div style={{ fontWeight: 600, fontSize: 'var(--text-body)' }}>HTTP Webhook 接口</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 1 }}>外部系统通过 POST 请求推送需求到指定项目</div>
           </div>
           {status && (
-            <span className={'chip ' + (status.running ? 'green' : '')} style={{ padding: '3px 10px', fontSize: 11 }}>
+            <span className={'chip ' + (status.running ? 'green' : '')} style={{ padding: '3px 10px', fontSize: 'var(--text-caption)' }}>
               <span style={{ width: 6, height: 6, borderRadius: '50%', background: status.running ? 'var(--green)' : 'var(--text-3)', display: 'inline-block', marginRight: 5 }} />
               {status.running ? `运行中 :${status.port}` : '已停止'}
             </span>
@@ -836,8 +836,8 @@ function WebhookSettings() {
         {/* 启用开关 */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--bg-3)', borderRadius: 9, marginBottom: 14 }}>
           <div>
-            <div style={{ fontWeight: 500, fontSize: 13 }}>启用 Webhook</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>开启后外部系统可向本机端口推送需求</div>
+            <div style={{ fontWeight: 500, fontSize: 'var(--text-control)' }}>启用 Webhook</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 1 }}>开启后外部系统可向本机端口推送需求</div>
           </div>
           <div role="switch" aria-checked={form.enabled} onClick={() => setForm(f => ({ ...f, enabled: !f.enabled }))}
             style={{ width: 38, height: 22, borderRadius: 11, cursor: 'pointer', flexShrink: 0, background: form.enabled ? 'var(--ember)' : 'var(--bg-3)', border: `1.5px solid ${form.enabled ? 'var(--ember-deep)' : 'var(--border-strong)'}`, position: 'relative', transition: 'background .2s, border-color .2s' }}>
@@ -854,7 +854,7 @@ function WebhookSettings() {
             <label>访问 Token</label>
             <div style={{ display: 'flex', gap: 6 }}>
               <input value={form.token} onChange={e => setForm(f => ({ ...f, token: e.target.value }))}
-                placeholder="Bearer 令牌" style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11.5 }} />
+                placeholder="Bearer 令牌" style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }} />
               <button className="btn btn-sm" onClick={genToken} style={{ flexShrink: 0 }}>
                 <Icon name="refresh" size={13} />生成
               </button>
@@ -862,30 +862,30 @@ function WebhookSettings() {
           </div>
         </div>
 
-        <div style={{ background: 'rgba(139,122,216,.08)', border: '1px solid rgba(139,122,216,.22)', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 8, marginBottom: 14 }}>
+        <div style={{ background: 'rgba(139,122,216,.08)', border: '1px solid rgba(139,122,216,.22)', borderRadius: 10, padding: '10px 14px', fontSize: 'var(--text-label)', color: 'var(--text-2)', display: 'flex', gap: 8, marginBottom: 14 }}>
           <Icon name="bell" size={13} style={{ flexShrink: 0, marginTop: 1, color: 'var(--violet)' }} />
-          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>127.0.0.1</code>（本机），不暴露公网。更改配置后点击「保存并应用」以重启服务。</div>
+          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)' }}>127.0.0.1</code>（本机），不暴露公网。更改配置后点击「保存并应用」以重启服务。</div>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <button className="btn btn-primary" onClick={save} disabled={saving}>
             <Icon name="check" size={14} />{saving ? '保存中…' : '保存并应用'}
           </button>
-          {saveOk === true && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ 已保存</span>}
-          {saveOk === false && <span style={{ fontSize: 12, color: 'var(--red)' }}>保存失败</span>}
+          {saveOk === true && <span style={{ fontSize: 'var(--text-label)', color: 'var(--green)' }}>✓ 已保存</span>}
+          {saveOk === false && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)' }}>保存失败</span>}
         </div>
       </div>
 
       {/* curl 示例卡 */}
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '18px 20px' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>curl 示例</div>
+          <div style={{ fontSize: 'var(--text-caption)', fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>curl 示例</div>
           <button className="icon-btn" style={{ width: 26, height: 26 }} title="复制"
             onClick={async () => { await navigator.clipboard.writeText(curlExample).catch(() => {}); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
             <Icon name={copied ? 'check' : 'copy'} size={13} />
           </button>
         </div>
-        <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, lineHeight: 1.6, color: 'var(--text-2)', background: 'var(--bg-3)', borderRadius: 8, padding: '12px 14px', overflowX: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', border: '1px solid var(--border)' }}>
+        <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', background: 'var(--bg-3)', borderRadius: 8, padding: '12px 14px', overflowX: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', border: '1px solid var(--border)' }}>
           {curlExample}
         </pre>
       </div>
@@ -917,7 +917,7 @@ export default function SettingsPage({
   return (
     <div className="content">
       <div className="audit-top" style={{ height: 56 }}>
-        <div className="eyebrow" style={{ fontSize: 17 }}><span className="en">SETTINGS</span><span className="cn">· 设置</span></div>
+        <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}><span className="en">SETTINGS</span><span className="cn">· 设置</span></div>
       </div>
       <div className="set-wrap">
         <div className="set-nav">

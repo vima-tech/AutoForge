@@ -123,12 +123,12 @@ export function ProjectCreateModal({ onClose, onCreated }: {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
       <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">添加项目</span></div>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">添加项目</span></div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
         <div style={{ padding: '16px 20px' }}>
           <ProjectFormFields form={form} setForm={setForm} slugTouched={slugTouched} setSlugTouched={setSlugTouched} updateName={updateName} showSlug />
-          {error && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{error}</div>}
+          {error && <div style={{ color: 'var(--red)', fontSize: 'var(--text-control)', marginTop: 10 }}>{error}</div>}
         </div>
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onClose}>取消</button>
@@ -189,12 +189,12 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
       <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">编辑项目</span> <span style={{ fontSize: 12, color: 'var(--text-3)', fontWeight: 400 }}>{project.slug}</span></div>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">编辑项目</span> <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontWeight: 400 }}>{project.slug}</span></div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
         <div style={{ padding: '16px 20px' }}>
           <ProjectFormFields form={form} setForm={setForm} slugTouched={false} setSlugTouched={() => {}} updateName={name => setForm(f => ({ ...f, name }))} showSlug={false} />
-          {error && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{error}</div>}
+          {error && <div style={{ color: 'var(--red)', fontSize: 'var(--text-control)', marginTop: 10 }}>{error}</div>}
         </div>
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onClose}>取消</button>
@@ -249,7 +249,7 @@ function ProjectFormFields({ form, setForm, slugTouched, setSlugTouched, updateN
       </div>
 
       <div style={{ height: 1, background: 'var(--border)', margin: '12px 0 10px' }} />
-      <div style={{ fontSize: 11, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600, marginBottom: 8 }}>审计预览环境</div>
+      <div style={{ fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600, marginBottom: 8 }}>审计预览环境</div>
       <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
         <div className="field full">
           <label>启动命令</label>
@@ -278,8 +278,8 @@ export function ConfirmProjectDeleteModal({ project, onCancel, onConfirm }: {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }} onClick={onCancel}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 420, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
-        <p style={{ margin: '0 0 8px', fontSize: 14, lineHeight: 1.6 }}>确认删除项目「{project.name}」？</p>
-        <p style={{ margin: '0 0 20px', fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-3)' }}>这会同时删除该项目的需求、变更请求、审核记录、预览环境和测试记录。</p>
+        <p style={{ margin: '0 0 8px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>确认删除项目「{project.name}」？</p>
+        <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>这会同时删除该项目的需求、变更请求、审核记录、预览环境和测试记录。</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onCancel}>取消</button>
           <button className="btn btn-danger" onClick={onConfirm}><Icon name="trash" size={15} />确认删除</button>

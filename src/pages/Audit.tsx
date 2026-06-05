@@ -189,7 +189,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           <div className="mention-pop audit-project-pop" style={{ left: 0, right: 0, top: 'calc(100% + 6px)', bottom: 'auto', width: '100%', marginBottom: 0 }}>
             {projects.map(p => (
               <div key={p.id} className="mention-row" onClick={() => { setActiveProject(p); setOpen(false); }}>
-                <div className="proj-logo" style={{ background: '#e8772e', width: 28, height: 28, fontSize: 12, borderRadius: 8 }}>{p.name[0]}</div>
+                <div className="proj-logo" style={{ background: '#e8772e', width: 28, height: 28, fontSize: 'var(--text-label)', borderRadius: 8 }}>{p.name[0]}</div>
                 <div style={{ minWidth: 0, flex: 1 }}>
                   <div className="nm" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     {p.name}
@@ -200,7 +200,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                   <div className="rl">{p.description || p.slug}</div>
                 </div>
                 {(projectReviewCounts[p.id] ?? 0) > 0 && (
-                  <span className="chip amber" style={{ padding: '1px 6px', fontSize: 10, flexShrink: 0 }}>
+                  <span className="chip amber" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>
                     {projectReviewCounts[p.id]}
                   </span>
                 )}
@@ -214,7 +214,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           <button className="btn" style={{ justifyContent: 'flex-start', width: '100%', gap: 6 }}
             onClick={() => openUrl(devStatus.url!).catch(() => {})}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--green)', flexShrink: 0, display: 'inline-block' }} />
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
               {devStatus.url}
             </span>
             <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} title="停止服务"
@@ -226,7 +226,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         ) : devStatus?.status === 'starting' ? (
           <button className="btn" disabled style={{ justifyContent: 'center', width: '100%', gap: 6 }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--amber)', flexShrink: 0, display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' }} />
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
               {devStatus.url ?? '启动中…'}
             </span>
           </button>
@@ -235,7 +235,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             <Icon name="play" size={15} />启动项目
           </button>
         ) : activeProject ? (
-          <div style={{ fontSize: 11.5, color: 'var(--text-faint)', textAlign: 'center', padding: '6px 8px', cursor: 'default' }}>
+          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', textAlign: 'center', padding: '6px 8px', cursor: 'default' }}>
             未配置启动命令
           </div>
         ) : null}
@@ -254,16 +254,16 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             return (
               <React.Fragment key={r.id}>
                 {showLabel && (
-                  <div style={{ padding: '8px 12px 4px', fontSize: 10.5, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
+                  <div style={{ padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
                     {STATUS_LABEL[r.status] ?? r.status}
                   </div>
                 )}
                 <div className={'req-item' + (activeCr === r.id ? ' active' : '')} onClick={() => onSelect(r.id)}>
                   <div className="req-item-top">
                     <span className="req-id">{r.id.slice(0, 8)}</span>
-                    <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 10 }}>{STATUS_LABEL[r.status] ?? r.status}</span>
+                    <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
                   </div>
-                  <div className="req-title" style={{ fontSize: 13 }}>{r.issue_id.slice(0, 24)}</div>
+                  <div className="req-title" style={{ fontSize: 'var(--text-control)' }}>{r.issue_id.slice(0, 24)}</div>
                   <div className="req-foot">
                     <span style={{ marginLeft: 'auto' }}>{new Date(r.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
                   </div>
@@ -449,21 +449,21 @@ export default function AuditPage() {
             <div className="audit-top">
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span className="req-id" style={{ fontSize: 13 }}>{cr.id.slice(0, 10)}</span>
-                  <span style={{ fontWeight: 700, fontSize: 15 }}>Change Request</span>
-                  {session && <span style={{ fontSize: 12, color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
+                  <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{cr.id.slice(0, 10)}</span>
+                  <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>Change Request</span>
+                  {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
                 </div>
-                <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 2 }}>
+                <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2 }}>
                   {STATUS_LABEL[cr.status] ?? cr.status} · {new Date(cr.updated_at).toLocaleString('zh')}
                 </div>
               </div>
               <div className="audit-decide">
                 {cr.status !== 'pending_review_2'
-                  ? <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 13 }}>
+                  ? <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
                       {STATUS_LABEL[cr.status] ?? cr.status}
                     </span>
                   : decided
-                    ? <span className={'chip ' + (decided === 'approved' ? 'green' : decided === 'rejected' ? 'red' : 'amber')} style={{ padding: '7px 14px', fontSize: 13 }}>
+                    ? <span className={'chip ' + (decided === 'approved' ? 'green' : decided === 'rejected' ? 'red' : 'amber')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
                         <Icon name={decided === 'approved' ? 'check' : decided === 'rejected' ? 'x' : 'refresh'} size={14} />
                         {decided === 'approved' ? '已批准 · 合并到 dev' : decided === 'rejected' ? '已拒绝' : '已退回 · 重新执行'}
                       </span>
@@ -566,7 +566,7 @@ export default function AuditPage() {
               <div className="audit-right" style={{ width: rightWidth }}>
                 <div className="prev-head">
                   <Icon name="eye" size={16} style={{ color: 'var(--ember)' }} />
-                  <span style={{ fontWeight: 700, fontSize: 13.5 }}>实时预览对比</span>
+                  <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>实时预览对比</span>
                 </div>
                 <div className="prev-frames">
                   <PreviewSection label="生产 main" tag="生产 main" tagClass="prod" url={parseProjectConfig(activeProject?.config_yaml ?? null).prodUrl || null} />
@@ -586,7 +586,7 @@ export default function AuditPage() {
                     />
                     {canRevise && (
                       <div className="advice-input-foot">
-                        <button className="btn" style={{ padding: '5px 12px', fontSize: 12 }} onClick={() => doReview('revision')} disabled={submitting}>
+                        <button className="btn" style={{ padding: '5px 12px', fontSize: 'var(--text-label)' }} onClick={() => doReview('revision')} disabled={submitting}>
                           <Icon name="refresh" size={14} />修改
                         </button>
                       </div>

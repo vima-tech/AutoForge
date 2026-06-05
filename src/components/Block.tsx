@@ -53,14 +53,14 @@ function CodeBlock({ lang, code, projectId }: { lang: string; code: string; proj
       <div className="codeblock-head">
         <span className="lang">{lang}</span>
         <div style={{ display: 'flex', gap: 4, marginLeft: 'auto', alignItems: 'center' }}>
-          {saveErr && <span style={{ fontSize: 10, color: 'var(--red)' }}>{saveErr}</span>}
-          {saved && <span style={{ fontSize: 10, color: 'var(--green)' }}>已存入 {saved}</span>}
+          {saveErr && <span style={{ fontSize: 'var(--text-micro)', color: 'var(--red)' }}>{saveErr}</span>}
+          {saved && <span style={{ fontSize: 'var(--text-micro)', color: 'var(--green)' }}>已存入 {saved}</span>}
           {projectId && (
             <>
-              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 10 }} disabled={saving} onClick={() => handleSave('docs')} title="存入 .autoforge/docs/">
+              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} disabled={saving} onClick={() => handleSave('docs')} title="存入 .autoforge/docs/">
                 <Icon name="folder" size={10} />docs
               </button>
-              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 10 }} disabled={saving} onClick={() => handleSave('specs')} title="存入 .autoforge/specs/">
+              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} disabled={saving} onClick={() => handleSave('specs')} title="存入 .autoforge/specs/">
                 <Icon name="folder" size={10} />specs
               </button>
             </>
@@ -157,7 +157,7 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
               <button className="btn btn-sm btn-primary" disabled={submitting} onClick={handleSubmitDraft}>
                 <Icon name="arrowUp" size={13} />{submitting ? '提交中…' : '提交到流水线'}
               </button>
-              {submitErr && <span style={{ fontSize: 11, color: 'var(--red)' }}>{submitErr}</span>}
+              {submitErr && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--red)' }}>{submitErr}</span>}
             </>
           )
         ) : null}
@@ -171,8 +171,8 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
             </button>
           </>
         )}
-        {saveErr && <span style={{ fontSize: 11, color: 'var(--red)' }}>{saveErr}</span>}
-        {saved && <span style={{ fontSize: 11, color: 'var(--green)' }}>已存入 .autoforge/{saved}</span>}
+        {saveErr && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--red)' }}>{saveErr}</span>}
+        {saved && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--green)' }}>已存入 .autoforge/{saved}</span>}
       </div>
     </div>
   );
@@ -187,21 +187,21 @@ function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> 
       border: `1px solid ${b.error ? 'var(--red)' : 'var(--ember)'}`,
       borderRadius: 10, overflow: 'hidden',
       background: b.error ? 'color-mix(in srgb, var(--red) 8%, transparent)' : 'var(--ember-tint)',
-      fontSize: 13,
+      fontSize: 'var(--text-control)',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer' }}
         onClick={() => setExpanded(v => !v)}>
         <Icon name={b.error ? 'alert' : 'file'} size={14} style={{ color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }} />
-        <span style={{ color: 'var(--text-3)', fontSize: 11, fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <span style={{ color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           .autoforge/{b.path}
         </span>
-        <span style={{ fontSize: 10.5, color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }}>
+        <span style={{ fontSize: 'var(--text-caption)', color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }}>
           {b.error ? '写入失败' : `${(b.size_bytes / 1024).toFixed(1)} KB 已写入`}
         </span>
         <Icon name={expanded ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
       {expanded && b.preview && (
-        <pre style={{ margin: 0, padding: '0 12px 10px', fontSize: 11.5, lineHeight: 1.6, color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: '1px solid var(--border)' }}>
+        <pre style={{ margin: 0, padding: '0 12px 10px', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: '1px solid var(--border)' }}>
           {b.preview}{b.size_bytes > 200 ? ' …' : ''}
         </pre>
       )}

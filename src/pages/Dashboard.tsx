@@ -29,7 +29,7 @@ function SubmitIssueModal({ projects, onClose }: { projects: Project[]; onClose:
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 60 }} onClick={onClose}>
       <div style={{ width: 480, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">提交需求</span></div>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">提交需求</span></div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
         <div style={{ padding: '16px 20px' }}>
@@ -53,7 +53,7 @@ function SubmitIssueModal({ projects, onClose }: { projects: Project[]; onClose:
                 options={[{ value: 'critical', label: 'Critical' }, { value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }]} />
             </div>
           </div>
-          {error && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 10 }}>{error}</div>}
+          {error && <div style={{ color: 'var(--red)', fontSize: 'var(--text-control)', marginTop: 10 }}>{error}</div>}
         </div>
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onClose}>取消</button>
@@ -190,8 +190,8 @@ export default function Dashboard() {
                   <div className="q-title">{q.title}</div>
                   <div className="q-meta">
                     <span className="req-id" style={{ color: 'var(--text-3)' }}>{q.id.slice(0, 10)}</span>
-                    <span className={'chip ' + (SEV_COLOR[q.category] || 'blue')} style={{ padding: '1px 7px', fontSize: 10 }}>{q.category}</span>
-                    <span className={'chip ' + (SEV_COLOR[q.severity] || '')} style={{ padding: '1px 7px', fontSize: 10 }}>{q.severity}</span>
+                    <span className={'chip ' + (SEV_COLOR[q.category] || 'blue')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{q.category}</span>
+                    <span className={'chip ' + (SEV_COLOR[q.severity] || '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{q.severity}</span>
                     <span>· {projects.find(p => p.id === q.project_id)?.name ?? '—'}</span>
                   </div>
                 </div>
@@ -250,7 +250,7 @@ export default function Dashboard() {
                 <div className="bp-bar">
                   <div className="bp-seg" style={{ width: `${pressurePct}%`, background: stats?.stage === 'paused' ? 'var(--red)' : stats?.stage === 'throttled' ? 'var(--amber)' : 'var(--green)' }} />
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--text-faint)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
                   <span>积压 {pendingReview}</span><span>暂停 {pauseThreshold}</span>
                 </div>
               </div>
@@ -261,7 +261,7 @@ export default function Dashboard() {
         {/* pipeline */}
         <div className="panel" style={{ marginBottom: 16 }}>
           <div className="panel-head">
-            <div className="eyebrow" style={{ fontSize: 14 }}><span className="en">PIPELINE</span><span className="cn">· 完整流水线</span></div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-body)' }}><span className="en">PIPELINE</span><span className="cn">· 完整流水线</span></div>
             <div className="sec-kicker">{carouselPaused ? '已暂停' : '自动轮播'} · {projectPipelines.length ? `${(carouselIndex % projectPipelines.length) + 1}/${projectPipelines.length}` : '0/0'}</div>
           </div>
           <div className="project-pipelines" onMouseEnter={() => setCarouselPaused(true)} onMouseLeave={() => setCarouselPaused(false)}>

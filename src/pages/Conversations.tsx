@@ -164,7 +164,7 @@ function ConvItem({ c, active, agentMap, onSelect }: {
   return (
     <div className={'conv-item' + (active === c.id ? ' active' : '')} onClick={() => onSelect(c.id)}>
       {isG
-        ? <div className="av sq" style={{ width: 46, height: 46, background: c.color, fontSize: 18 }}>{c.initial ?? c.name?.[0] ?? '群'}</div>
+        ? <div className="av sq" style={{ width: 46, height: 46, background: c.color, fontSize: 'var(--text-heading)' }}>{c.initial ?? c.name?.[0] ?? '群'}</div>
         : a ? <Avatar agent={a} size={46} status={c.unread > 0 ? 'online' : undefined} />
             : <div className="av" style={{ width: 46, height: 46, background: '#888' }}>?</div>}
       <div className="conv-main">
@@ -180,7 +180,7 @@ function ConvItem({ c, active, agentMap, onSelect }: {
             {convPreview(c)}
           </span>
           {isG && c.project_id && (
-            <span style={{ marginLeft: c.unread > 0 ? 0 : 'auto', fontSize: 10, color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+            <span style={{ marginLeft: c.unread > 0 ? 0 : 'auto', fontSize: 'var(--text-micro)', color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
               <Icon name="folder" size={9} />
             </span>
           )}
@@ -246,12 +246,12 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
       {me
         ? <MeAvatar size={36} />
         : a ? <Avatar agent={a} size={36} />
-            : <div className="av" style={{ width: 36, height: 36, background: '#888', fontSize: 14 }}>?</div>}
+            : <div className="av" style={{ width: 36, height: 36, background: '#888', fontSize: 'var(--text-body)' }}>?</div>}
       <div className="msg-body">
         {!me && a && (
           <div className="msg-meta">
             <span className="msg-author" style={{ color: a.color }}>{a.name}</span>
-            {isGroup && <span className="chip" style={{ padding: '0px 6px', fontSize: 9.5 }}>{a.name_en}</span>}
+            {isGroup && <span className="chip" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>{a.name_en}</span>}
             <span className="msg-time">
               {new Date(m.created_at).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}
             </span>
@@ -264,7 +264,7 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
         >
           {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
           {m.excluded_from_context && (
-            <div style={{ fontSize: 10.5, color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
               <Icon name="eye-off" size={11} />已从 AI 上下文排除
             </div>
           )}
@@ -737,7 +737,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
             </button>
           </div>
         ))}
-        <div style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', paddingRight: 4 }}>
+        <div style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', paddingRight: 4 }}>
           {isG ? '群聊共享上下文' : 'Enter 发送'}
         </div>
       </div>
@@ -844,8 +844,8 @@ function NewGroupModal({ agents, projects, onClose, onCreate }: {
       <div style={{ width: 440, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center' }}>
           <div>
-            <div className="eyebrow" style={{ fontSize: 16 }}><span className="cn">新建群聊</span></div>
-            <div style={{ fontSize: 12.5, color: 'var(--text-3)', marginTop: 4 }}>拉多个 Agent 进入群聊，共享上下文协同讨论需求</div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">新建群聊</span></div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-3)', marginTop: 4 }}>拉多个 Agent 进入群聊，共享上下文协同讨论需求</div>
           </div>
           <button className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
@@ -864,16 +864,16 @@ function NewGroupModal({ agents, projects, onClose, onCreate }: {
               >
                 {selectedProject ? (
                   <>
-                    <div className="proj-logo" style={{ background: 'var(--ember)', width: 28, height: 28, fontSize: 12, borderRadius: 8 }}>
+                    <div className="proj-logo" style={{ background: 'var(--ember)', width: 28, height: 28, fontSize: 'var(--text-label)', borderRadius: 8 }}>
                       {selectedProject.name[0]}
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="proj-name" style={{ fontSize: 13 }}>{selectedProject.name}</div>
+                      <div className="proj-name" style={{ fontSize: 'var(--text-control)' }}>{selectedProject.name}</div>
                       <div className="proj-meta">{selectedProject.description || selectedProject.slug}</div>
                     </div>
                   </>
                 ) : (
-                  <div style={{ flex: 1, fontSize: 13, color: 'var(--text-3)' }}>不绑定项目（通用群聊）</div>
+                  <div style={{ flex: 1, fontSize: 'var(--text-control)', color: 'var(--text-3)' }}>不绑定项目（通用群聊）</div>
                 )}
                 <Icon name="chevDown" size={15} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none', flexShrink: 0 }} />
               </div>
@@ -895,7 +895,7 @@ function NewGroupModal({ agents, projects, onClose, onCreate }: {
                       className="mention-row"
                       onClick={() => { setProjectId(p.id); setProjOpen(false); }}
                     >
-                      <div className="proj-logo" style={{ background: 'var(--ember)', width: 26, height: 26, fontSize: 11, borderRadius: 7, flexShrink: 0 }}>
+                      <div className="proj-logo" style={{ background: 'var(--ember)', width: 26, height: 26, fontSize: 'var(--text-caption)', borderRadius: 7, flexShrink: 0 }}>
                         {p.name[0]}
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
@@ -909,7 +909,7 @@ function NewGroupModal({ agents, projects, onClose, onCreate }: {
               )}
             </div>
             {projectId && (
-              <div style={{ fontSize: 11.5, color: 'var(--ember)', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--ember)', display: 'flex', alignItems: 'center', gap: 4 }}>
                 <Icon name="zap" size={11} />
                 claude.md / agents.md 将自动注入每次对话上下文
               </div>
@@ -945,7 +945,7 @@ function ConfirmModal({ msg, okLabel, onOk, onCancel }: {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onCancel}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 380, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
-        <p style={{ margin: '0 0 20px', fontSize: 14, lineHeight: 1.6 }}>{msg}</p>
+        <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onCancel}>取消</button>
           <button className="btn btn-danger" onClick={onOk}>{okLabel}</button>
@@ -1393,14 +1393,14 @@ export default function ConversationsPage() {
           {/* ── Chat header ── */}
           <div className="chat-head">
             {conv.conv_type === 'group'
-              ? <div className="av sq" style={{ width: 38, height: 38, background: conv.color, fontSize: 15 }}>{conv.initial ?? conv.name?.[0] ?? '群'}</div>
+              ? <div className="av sq" style={{ width: 38, height: 38, background: conv.color, fontSize: 'var(--text-title)' }}>{conv.initial ?? conv.name?.[0] ?? '群'}</div>
               : (() => { const a = agentMap[conv.members[0]]; return a ? <Avatar agent={a} size={38} status={conv.unread > 0 ? 'online' : undefined} /> : null; })()}
             <div className="chat-head-info">
               <div className="chat-head-title">
                 {conv.conv_type === 'group' ? conv.name : agentMap[conv.members[0]]?.name ?? 'Agent'}
-                {conv.conv_type === 'group' && <span className="chip" style={{ padding: '1px 7px', fontSize: 10 }}>{conv.members.length} 成员</span>}
+                {conv.conv_type === 'group' && <span className="chip" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{conv.members.length} 成员</span>}
                 {conv.conv_type === 'group' && conv.project_id && (
-                  <span className="chip" style={{ padding: '1px 7px', fontSize: 10, background: 'var(--ember-tint)', color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                  <span className="chip" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)', background: 'var(--ember-tint)', color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
                     <Icon name="folder" size={9} />
                     {projects.find(p => p.id === conv.project_id)?.name ?? '项目'}
                   </span>
@@ -1445,7 +1445,7 @@ export default function ConversationsPage() {
               {conv.conv_type === 'group' && showMembers && (
                 <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 280 }}>
                   <div className="mention-pop-label">群成员</div>
-                  {memberError && <div style={{ padding: '6px 8px', color: 'var(--red)', fontSize: 12 }}>{memberError}</div>}
+                  {memberError && <div style={{ padding: '6px 8px', color: 'var(--red)', fontSize: 'var(--text-label)' }}>{memberError}</div>}
                   {convMembers.map(a => (
                     <div key={a.id} className="mention-row">
                       <Avatar agent={a} size={32} />
@@ -1486,12 +1486,12 @@ export default function ConversationsPage() {
                 <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 360, maxHeight: 560, overflowY: 'auto' }}>
                   <div className="mention-pop-label">会议室上下文与附件</div>
                   <div style={{ padding: '7px 8px 4px' }}>
-                    <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 8 }}>
+                    <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)', marginBottom: 8 }}>
                       共 {visibleMsgCount} 条消息 ·
                       已排除 {msgs.filter(m => !m.id.startsWith('typing-') && m.excluded_from_context).length} 条 ·
                       上下文块 {contextBlocks.length} 个
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--text-label)' }}>
                       <span style={{ color: 'var(--text-3)', whiteSpace: 'nowrap' }}>窗口大小</span>
                       <input
                         type="range" min={5} max={50} step={5} value={windowSize}
@@ -1500,7 +1500,7 @@ export default function ConversationsPage() {
                       />
                       <span style={{ color: 'var(--ember)', fontFamily: 'var(--font-mono)', minWidth: 28, textAlign: 'right' }}>{windowSize}</span>
                     </div>
-                    <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 3 }}>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 3 }}>
                       发送时取最近 {windowSize} 条（排除标记的消息）
                     </div>
                   </div>
@@ -1552,7 +1552,7 @@ export default function ConversationsPage() {
                           {(['docs', 'specs'] as const).map(tab => (
                             <button key={tab} onClick={() => { setWorkspaceTab(tab); setWsFileContent(null); }}
                               className="btn btn-sm"
-                              style={{ padding: '1px 8px', fontSize: 10, background: workspaceTab === tab ? 'var(--ember)' : undefined, color: workspaceTab === tab ? '#fff' : undefined }}>
+                              style={{ padding: '1px 8px', fontSize: 'var(--text-micro)', background: workspaceTab === tab ? 'var(--ember)' : undefined, color: workspaceTab === tab ? '#fff' : undefined }}>
                               {tab}
                             </button>
                           ))}
@@ -1561,14 +1561,14 @@ export default function ConversationsPage() {
                       {/* File viewer */}
                       {wsFileContent && (
                         <div style={{ margin: '4px 8px 4px', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-                          <div style={{ padding: '6px 10px', background: 'var(--bg-3)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+                          <div style={{ padding: '6px 10px', background: 'var(--bg-3)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 'var(--text-caption)' }}>
                             <Icon name="file" size={11} style={{ color: 'var(--ember)' }} />
                             <span style={{ fontFamily: 'var(--font-mono)', flex: 1, color: 'var(--text-2)' }}>.autoforge/{wsFileContent.path}</span>
                             <button className="icon-btn" style={{ width: 20, height: 20 }} onClick={() => setWsFileContent(null)}>
                               <Icon name="x" size={11} />
                             </button>
                           </div>
-                          <pre style={{ margin: 0, padding: '8px 10px', fontSize: 11, lineHeight: 1.6, color: 'var(--text-2)', maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                          <pre style={{ margin: 0, padding: '8px 10px', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                             {wsFileContent.content}
                           </pre>
                         </div>
@@ -1577,7 +1577,7 @@ export default function ConversationsPage() {
                       {workspaceFiles.filter(f => f.subfolder === workspaceTab).length === 0 ? (
                         <div className="empty-compact" style={{ padding: '8px 8px' }}>
                           .autoforge/{workspaceTab}/ 暂无文件
-                          <span style={{ display: 'block', fontSize: 10, color: 'var(--text-faint)', marginTop: 3 }}>
+                          <span style={{ display: 'block', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 3 }}>
                             让 Agent 创建文档，或直接点击 Artifact 的"存入 {workspaceTab}"按钮
                           </span>
                         </div>
@@ -1597,7 +1597,7 @@ export default function ConversationsPage() {
                             </div>
                             <div style={{ minWidth: 0, flex: 1 }}>
                               <div className="nm">{f.name}</div>
-                              <div className="rl" style={{ fontSize: 10.5 }}>{f.modified_at} · {(f.size_bytes / 1024).toFixed(1)} KB</div>
+                              <div className="rl" style={{ fontSize: 'var(--text-caption)' }}>{f.modified_at} · {(f.size_bytes / 1024).toFixed(1)} KB</div>
                             </div>
                             <Icon name={wsFileContent?.path === f.rel_path ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
                           </div>
@@ -1620,13 +1620,13 @@ export default function ConversationsPage() {
                             <Icon name={f.is_priority ? 'zap' : 'file'} size={12} />
                           </div>
                           <div style={{ minWidth: 0, flex: 1 }}>
-                            <div className="nm" style={{ fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <div className="nm" style={{ fontSize: 'var(--text-control)', display: 'flex', alignItems: 'center', gap: 4 }}>
                               {f.name}
                               {f.is_priority && (
-                                <span style={{ fontSize: 9.5, background: 'var(--ember-tint)', color: 'var(--ember)', borderRadius: 4, padding: '0 4px' }}>自动注入</span>
+                                <span style={{ fontSize: 'var(--text-micro)', background: 'var(--ember-tint)', color: 'var(--ember)', borderRadius: 4, padding: '0 4px' }}>自动注入</span>
                               )}
                             </div>
-                            <div className="rl" style={{ fontSize: 10 }}>{f.rel_path}</div>
+                            <div className="rl" style={{ fontSize: 'var(--text-micro)' }}>{f.rel_path}</div>
                           </div>
                           {!f.is_priority && (
                             <button
@@ -1650,7 +1650,7 @@ export default function ConversationsPage() {
                           )}
                         </div>
                       ))}
-                      <div style={{ fontSize: 10.5, color: 'var(--text-faint)', padding: '4px 8px 8px' }}>
+                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', padding: '4px 8px 8px' }}>
                         只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/ 和 .autoforge/specs/
                       </div>
                     </>

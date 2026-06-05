@@ -94,13 +94,13 @@ function BackupConfigModal({ config, onSave, onClose }: {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
       <div style={{ width: 480, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '22px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-          <div className="eyebrow" style={{ fontSize: 14 }}><span className="en">BACKUP</span><span className="cn"> · 云存储备份</span></div>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-body)' }}><span className="en">BACKUP</span><span className="cn"> · 云存储备份</span></div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={16} /></button>
         </div>
 
-        {err && <div style={{ color: 'var(--red)', fontSize: 12, marginBottom: 12, padding: '6px 10px', background: 'rgba(219,90,64,.08)', borderRadius: 6 }}>{err}</div>}
+        {err && <div style={{ color: 'var(--red)', fontSize: 'var(--text-label)', marginBottom: 12, padding: '6px 10px', background: 'rgba(219,90,64,.08)', borderRadius: 6 }}>{err}</div>}
 
-        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8 }}>存储提供商</div>
+        <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 8 }}>存储提供商</div>
         <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
           {(['none', 'local', 'rclone'] as const).map(p => (
             <button key={p} className={'btn btn-sm' + (provider === p ? ' btn-primary' : '')} onClick={() => setProvider(p)}>
@@ -125,13 +125,13 @@ function BackupConfigModal({ config, onSave, onClose }: {
             <label>云端路径前缀</label>
             <input placeholder="AutoForge/materials" value={rclonePath} onChange={e => setRclonePath(e.target.value)} />
           </div>
-          <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 16, lineHeight: 1.55 }}>
+          <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginBottom: 16, lineHeight: 'var(--leading-normal)' }}>
             需预先安装并配置 rclone（<code>rclone config</code>），支持 Google Drive、S3、Dropbox、OneDrive 等。
           </div>
         </>)}
 
         {provider !== 'none' && (
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer', marginBottom: 20 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--text-control)', cursor: 'pointer', marginBottom: 20 }}>
             <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />
             启用自动备份
           </label>
@@ -169,7 +169,7 @@ function FolderTreeItem({ folder, allFolders, allFiles, depth, selectedId, onSel
           borderRadius: 6, cursor: 'pointer',
           background: active ? 'var(--ember-tint)' : hovered ? 'var(--surface-hover)' : 'transparent',
           color: active ? 'var(--ember)' : 'var(--text-2)',
-          fontSize: 12.5, userSelect: 'none',
+          fontSize: 'var(--text-control)', userSelect: 'none',
         }}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -183,7 +183,7 @@ function FolderTreeItem({ folder, allFolders, allFiles, depth, selectedId, onSel
         }
         <Icon name={active ? 'folderOpen' : 'folder'} size={13} style={{ flexShrink: 0 }} />
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{folder.name}</span>
-        {count > 0 && <span style={{ fontSize: 10, color: 'var(--text-faint)', flexShrink: 0 }}>{count}</span>}
+        {count > 0 && <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', flexShrink: 0 }}>{count}</span>}
         {hovered && (
           <div style={{ display: 'flex', gap: 1, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
             <button className="btn btn-sm" style={{ padding: '1px 3px' }} onClick={() => onCreate(folder.id)} title="新建子文件夹"><Icon name="plus" size={10} /></button>
@@ -209,9 +209,9 @@ function FileCard({ file, onOpen, onDelete, onMove }: {
   const [hovered, setHovered] = useState(false);
   const updatedTitle = new Date(file.updated_at).toLocaleString('zh-CN');
   const backupChip = file.backup_status === 'synced'
-    ? <span className="chip green" style={{ fontSize: 9, padding: '1px 5px' }}>已备份</span>
+    ? <span className="chip green" style={{ fontSize: 'var(--text-micro)', padding: '1px 5px' }}>已备份</span>
     : file.backup_status === 'error'
-    ? <span className="chip red" style={{ fontSize: 9, padding: '1px 5px' }}>备份失败</span>
+    ? <span className="chip red" style={{ fontSize: 'var(--text-micro)', padding: '1px 5px' }}>备份失败</span>
     : null;
 
   return (
@@ -230,18 +230,18 @@ function FileCard({ file, onOpen, onDelete, onMove }: {
         <Icon name={fileIcon(file.mime)} size={17} />
       </div>
       <div style={{ minWidth: 0 }}>
-        <div title={file.original_name} style={{ fontSize: 13, fontWeight: 650, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <div title={file.original_name} style={{ fontSize: 'var(--text-control)', fontWeight: 650, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {file.original_name}
         </div>
-        <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {file.description || file.mime}
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, minWidth: 110 }}>
-        <span style={{ fontSize: 11.5, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>{formatSize(file.size_bytes)}</span>
+        <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>{formatSize(file.size_bytes)}</span>
         {backupChip}
       </div>
-      <div title={`最后操作：${updatedTitle}`} style={{ fontSize: 11.5, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', textAlign: 'right' }}>
+      <div title={`最后操作：${updatedTitle}`} style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', textAlign: 'right' }}>
         {formatMaterialTime(file.updated_at)}
       </div>
       <div
@@ -443,7 +443,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
           <Icon name="refresh" size={13} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />{refreshing ? '刷新中…' : '刷新'}
         </button>
         <div style={{ flex: 1 }} />
-        {message && <span style={{ fontSize: 11.5, color: 'var(--text-3)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
+        {message && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
         <button className="btn btn-sm" onClick={doAiOrganize} disabled={aiWorking}>
           <Icon name="brain" size={13} />{aiWorking ? 'AI 整理中…' : 'AI 整理'}
         </button>
@@ -456,7 +456,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
       </div>
 
       {error && (
-        <div style={{ padding: '6px 20px', color: 'var(--red)', fontSize: 12, background: 'rgba(219,90,64,.06)', flexShrink: 0 }}>{error}</div>
+        <div style={{ padding: '6px 20px', color: 'var(--red)', fontSize: 'var(--text-label)', background: 'rgba(219,90,64,.06)', flexShrink: 0 }}>{error}</div>
       )}
 
       {/* body: folder sidebar + file grid */}
@@ -466,16 +466,16 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
         <div style={{ width: 190, flexShrink: 0, borderRight: '1px solid var(--border)', overflowY: 'auto', padding: '10px 6px' }}>
           {/* "all" root */}
           <div
-            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 12.5, marginBottom: 2, background: selectedFolderId === null ? 'var(--ember-tint)' : 'transparent', color: selectedFolderId === null ? 'var(--ember)' : 'var(--text-2)' }}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 'var(--text-control)', marginBottom: 2, background: selectedFolderId === null ? 'var(--ember-tint)' : 'transparent', color: selectedFolderId === null ? 'var(--ember)' : 'var(--text-2)' }}
             onClick={() => setSelectedFolderId(null)}
           >
             <Icon name="layers" size={13} />
             <span style={{ flex: 1 }}>根目录</span>
-            <span style={{ fontSize: 10, color: 'var(--text-faint)' }}>{rootFileCount}</span>
+            <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)' }}>{rootFileCount}</span>
           </div>
 
           {loading
-            ? <div style={{ fontSize: 11, color: 'var(--text-faint)', padding: '8px 8px' }}>加载中…</div>
+            ? <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', padding: '8px 8px' }}>加载中…</div>
             : rootFolders.map(f => (
                 <FolderTreeItem key={f.id} folder={f} allFolders={visibleFolders} allFiles={files}
                   depth={0} selectedId={selectedFolderId}
@@ -496,8 +496,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
                   onKeyDown={e => { if (e.key === 'Enter') doCreateFolder(); if (e.key === 'Escape') setCreatingFolder(null); }} />
               </div>
               <div style={{ display: 'flex', gap: 4, marginTop: 5 }}>
-                <button className="btn btn-sm btn-primary" style={{ flex: 1, fontSize: 11 }} onClick={doCreateFolder}>确认</button>
-                <button className="btn btn-sm" style={{ flex: 1, fontSize: 11 }} onClick={() => setCreatingFolder(null)}>取消</button>
+                <button className="btn btn-sm btn-primary" style={{ flex: 1, fontSize: 'var(--text-caption)' }} onClick={doCreateFolder}>确认</button>
+                <button className="btn btn-sm" style={{ flex: 1, fontSize: 'var(--text-caption)' }} onClick={() => setCreatingFolder(null)}>取消</button>
               </div>
             </div>
           )}
@@ -511,7 +511,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
           onDrop={e => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files?.length) handleFiles(e.dataTransfer.files); }}
         >
           {loading ? (
-            <div style={{ color: 'var(--text-3)', fontSize: 13 }}>加载中…</div>
+            <div style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>
           ) : displayedFiles.length === 0 ? (
             <div className="empty" style={{ minHeight: 160 }}>
               <Icon name="upload" size={34} style={{ opacity: .25 }} />
@@ -533,7 +533,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
           )}
 
           {dragOver && (
-            <div style={{ position: 'absolute', inset: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none', background: 'rgba(232,119,46,.06)', borderRadius: 10, border: '2px dashed var(--ember)', fontSize: 15, color: 'var(--ember)', fontWeight: 600 }}>
+            <div style={{ position: 'absolute', inset: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none', background: 'rgba(232,119,46,.06)', borderRadius: 10, border: '2px dashed var(--ember)', fontSize: 'var(--text-title)', color: 'var(--ember)', fontWeight: 600 }}>
               松开鼠标上传文件
             </div>
           )}
@@ -598,7 +598,7 @@ function ICard({ children, style }: { children: React.ReactNode; style?: React.C
 
 function ISectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)', marginBottom: 10 }}>
+    <div style={{ fontSize: 'var(--text-caption)', fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)', marginBottom: 10 }}>
       {children}
     </div>
   );
@@ -609,7 +609,7 @@ function IResultBanner({ ok, children }: { ok?: boolean; children: React.ReactNo
     <div style={{
       background: ok === false ? 'rgba(219,90,64,.1)' : 'rgba(79,157,107,.1)',
       border: `1px solid ${ok === false ? 'rgba(219,90,64,.3)' : 'rgba(79,157,107,.3)'}`,
-      borderRadius: 10, padding: '10px 14px', fontSize: 12.5,
+      borderRadius: 10, padding: '10px 14px', fontSize: 'var(--text-control)',
       color: ok === false ? 'var(--red)' : 'var(--green)',
       display: 'flex', alignItems: 'flex-start', gap: 8,
     }}>
@@ -667,8 +667,8 @@ function ProjectGithubTab({ projectId, cfg, onCfgChange }: {
             <Icon name="code" size={16} style={{ color: 'var(--blue)' }} />
           </div>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>GitHub Issues 同步</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>单向拉取仓库 Issues，自动去重导入本项目</div>
+            <div style={{ fontWeight: 600, fontSize: 'var(--text-body)' }}>GitHub Issues 同步</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 1 }}>单向拉取仓库 Issues，自动去重导入本项目</div>
           </div>
         </div>
 
@@ -688,22 +688,22 @@ function ProjectGithubTab({ projectId, cfg, onCfgChange }: {
         <div className="field" style={{ margin: '0 0 14px' }}>
           <label>GitHub Token（私有仓库必填，公开仓库可留空）</label>
           <input type="password" value={form.token} onChange={e => setForm(f => ({ ...f, token: e.target.value }))}
-            placeholder="ghp_xxxxxxxxxxxx" style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }} />
+            placeholder="ghp_xxxxxxxxxxxx" style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }} />
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <button className="btn btn-primary" onClick={save} disabled={saving}>
             <Icon name="check" size={14} />{saving ? '保存中…' : '保存配置'}
           </button>
-          {saveOk === true && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ 已保存</span>}
-          {saveOk === false && <span style={{ fontSize: 12, color: 'var(--red)' }}>保存失败</span>}
+          {saveOk === true && <span style={{ fontSize: 'var(--text-label)', color: 'var(--green)' }}>✓ 已保存</span>}
+          {saveOk === false && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)' }}>保存失败</span>}
         </div>
       </ICard>
 
       <ICard>
         <ISectionLabel>立即同步</ISectionLabel>
         {cfg.github_last_sync && (
-          <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 10 }}>
+          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 10 }}>
             上次同步：{new Date(cfg.github_last_sync).toLocaleString('zh-CN')}
           </div>
         )}
@@ -758,8 +758,8 @@ function ProjectScannerTab({ projectId }: { projectId: string }) {
             <Icon name="search" size={16} style={{ color: 'var(--green)' }} />
           </div>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>代码扫描</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>主动发现代码库中的问题并自动入队</div>
+            <div style={{ fontWeight: 600, fontSize: 'var(--text-body)' }}>代码扫描</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 1 }}>主动发现代码库中的问题并自动入队</div>
           </div>
         </div>
 
@@ -772,8 +772,8 @@ function ProjectScannerTab({ projectId }: { projectId: string }) {
                 <Icon name={item.icon as any} size={14} style={{ color: item.color }} />
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 500, fontSize: 13 }}>{item.title}</div>
-                <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>{item.desc}</div>
+                <div style={{ fontWeight: 500, fontSize: 'var(--text-control)' }}>{item.title}</div>
+                <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2 }}>{item.desc}</div>
               </div>
               <div style={{ width: 18, height: 18, borderRadius: 5, flexShrink: 0, background: scanTypes[item.key] ? item.color : 'transparent', border: `2px solid ${scanTypes[item.key] ? item.color : 'var(--border-strong)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background .15s, border-color .15s' }}>
                 {scanTypes[item.key] && <Icon name="check" size={10} style={{ color: '#fff' }} />}
@@ -831,8 +831,8 @@ function ProjectBulkTab({ projectId }: { projectId: string }) {
             <Icon name="arrowUp" size={16} style={{ color: 'var(--amber)' }} />
           </div>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>批量导入</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 1 }}>粘贴多条需求，一次性入队分析（最多 200 条）</div>
+            <div style={{ fontWeight: 600, fontSize: 'var(--text-body)' }}>批量导入</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 1 }}>粘贴多条需求，一次性入队分析（最多 200 条）</div>
           </div>
         </div>
 
@@ -842,8 +842,8 @@ function ProjectBulkTab({ projectId }: { projectId: string }) {
             <button key={key} className={'btn btn-sm' + (format === key ? ' btn-primary' : '')}
               onClick={() => { setFormat(key); setContent(''); }}
               style={{ flexDirection: 'column', alignItems: 'flex-start', padding: '8px 12px', height: 'auto', gap: 2 }}>
-              <span style={{ fontWeight: 600, fontSize: 12 }}>{meta.label}</span>
-              <span style={{ fontSize: 10.5, color: format === key ? 'rgba(255,255,255,.75)' : 'var(--text-2)', fontWeight: 400 }}>{meta.desc}</span>
+              <span style={{ fontWeight: 600, fontSize: 'var(--text-label)' }}>{meta.label}</span>
+              <span style={{ fontSize: 'var(--text-caption)', color: format === key ? 'rgba(255,255,255,.75)' : 'var(--text-2)', fontWeight: 400 }}>{meta.desc}</span>
             </button>
           ))}
         </div>
@@ -853,7 +853,7 @@ function ProjectBulkTab({ projectId }: { projectId: string }) {
         <ISectionLabel>内容（{content.split('\n').filter(l => l.trim()).length} 行）</ISectionLabel>
         <textarea value={content} onChange={e => setContent(e.target.value)}
           placeholder={BULK_PLACEHOLDERS[format]} rows={10}
-          style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'var(--font-mono)', fontSize: 12, lineHeight: 1.6, background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px', color: 'var(--text)', resize: 'vertical', outline: 'none' }} />
+          style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px', color: 'var(--text)', resize: 'vertical', outline: 'none' }} />
       </ICard>
 
       {result && (
@@ -901,9 +901,9 @@ function SpecCard({ spec, onEdit, onDelete }: {
     >
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)', marginBottom: 4 }}>{spec.title}</div>
+          <div style={{ fontSize: 'var(--text-control)', fontWeight: 600, color: 'var(--text-1)', marginBottom: 4 }}>{spec.title}</div>
           {spec.content && (
-            <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{spec.content}</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{spec.content}</div>
           )}
         </div>
         {hovered && (
@@ -948,22 +948,22 @@ function SpecEditModal({ spec, category, projectId, onSave, onClose }: {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
       <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '22px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
-          <div className="eyebrow" style={{ fontSize: 13 }}>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-control)' }}>
             <span className="en">{catMeta.label.toUpperCase()}</span>
             <span className="cn"> · {spec ? '编辑规格' : '新增规格'}</span>
           </div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={16} /></button>
         </div>
-        {err && <div style={{ color: 'var(--red)', fontSize: 12, marginBottom: 12, padding: '6px 10px', background: 'rgba(219,90,64,.08)', borderRadius: 6 }}>{err}</div>}
+        {err && <div style={{ color: 'var(--red)', fontSize: 'var(--text-label)', marginBottom: 12, padding: '6px 10px', background: 'rgba(219,90,64,.08)', borderRadius: 6 }}>{err}</div>}
         <div className="field" style={{ marginBottom: 14 }}>
           <label>标题</label>
           <input autoFocus placeholder="简短的规格名称" value={title} onChange={e => setTitle(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && e.ctrlKey) save(); if (e.key === 'Escape') onClose(); }} />
         </div>
         <div className="field" style={{ marginBottom: 20 }}>
-          <label>内容 <span style={{ fontWeight: 400, color: 'var(--text-faint)', fontSize: 11 }}>（{catMeta.hint}）</span></label>
+          <label>内容 <span style={{ fontWeight: 400, color: 'var(--text-faint)', fontSize: 'var(--text-caption)' }}>（{catMeta.hint}）</span></label>
           <textarea rows={5} placeholder="具体约束说明…" value={content} onChange={e => setContent(e.target.value)}
-            style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12 }} />
+            style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }} />
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
           <button className="btn btn-sm" onClick={onClose}>取消</button>
@@ -1025,7 +1025,7 @@ function SpecPanel({ projectId }: { projectId: string }) {
           <Icon name="plus" size={13} />新增规格
         </button>
         <div style={{ flex: 1 }} />
-        {message && <span style={{ fontSize: 11.5, color: 'var(--text-3)', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
+        {message && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
         <button className="btn btn-sm" onClick={doAiGenerate} disabled={aiWorking}>
           <Icon name="brain" size={13} style={aiWorking ? { animation: 'spin 1s linear infinite' } : undefined} />
           {aiWorking ? 'AI 生成中…' : 'AI 一键生成'}
@@ -1033,7 +1033,7 @@ function SpecPanel({ projectId }: { projectId: string }) {
       </div>
 
       {error && (
-        <div style={{ padding: '6px 20px', color: 'var(--red)', fontSize: 12, background: 'rgba(219,90,64,.06)', flexShrink: 0 }}>{error}</div>
+        <div style={{ padding: '6px 20px', color: 'var(--red)', fontSize: 'var(--text-label)', background: 'rgba(219,90,64,.06)', flexShrink: 0 }}>{error}</div>
       )}
 
       {/* body: category sidebar + spec list */}
@@ -1051,26 +1051,26 @@ function SpecPanel({ projectId }: { projectId: string }) {
               >
                 <Icon name={cat.icon as any} size={13} style={{ flexShrink: 0 }} />
                 <span style={{ flex: 1, textAlign: 'left' }}>{cat.label}</span>
-                {count > 0 && <span style={{ fontSize: 10, color: active ? 'var(--ember)' : 'var(--text-faint)', background: active ? 'rgba(232,119,46,.15)' : 'var(--bg-3)', borderRadius: 8, padding: '1px 6px' }}>{count}</span>}
+                {count > 0 && <span style={{ fontSize: 'var(--text-micro)', color: active ? 'var(--ember)' : 'var(--text-faint)', background: active ? 'rgba(232,119,46,.15)' : 'var(--bg-3)', borderRadius: 8, padding: '1px 6px' }}>{count}</span>}
               </button>
             );
           })}
           <div style={{ flex: 1 }} />
-          <div style={{ fontSize: 10.5, color: 'var(--text-faint)', lineHeight: 1.5, padding: '8px 6px' }}>
+          <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', lineHeight: 'var(--leading-normal)', padding: '8px 6px' }}>
             规格文件存储于项目目录<br />
-            <code style={{ fontSize: 10 }}>.autoforge/specs/</code>
+            <code style={{ fontSize: 'var(--text-micro)' }}>.autoforge/specs/</code>
           </div>
         </div>
 
         {/* spec list */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
           {loading ? (
-            <div style={{ color: 'var(--text-3)', fontSize: 13 }}>加载中…</div>
+            <div style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>
           ) : categorySpecs.length === 0 ? (
             <div className="empty" style={{ minHeight: 180 }}>
               <Icon name={SPEC_CATEGORIES.find(c => c.id === activeCategory)!.icon as any} size={32} style={{ opacity: .2 }} />
               <div>暂无{SPEC_CATEGORIES.find(c => c.id === activeCategory)!.label}规格</div>
-              <div style={{ fontSize: 11.5, color: 'var(--text-faint)' }}>{SPEC_CATEGORIES.find(c => c.id === activeCategory)!.hint}</div>
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)' }}>{SPEC_CATEGORIES.find(c => c.id === activeCategory)!.hint}</div>
               <button className="btn btn-sm" onClick={() => setEditing(null)}><Icon name="plus" size={12} />新增规格</button>
             </div>
           ) : (
@@ -1129,7 +1129,7 @@ function IntakePanel({ projectId }: { projectId: string }) {
       <div style={{ display: 'flex', gap: 2, padding: '10px 24px 0', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
         {INTAKE_SUB_TABS.map(t => (
           <button key={t.id} onClick={() => setSubTab(t.id)}
-            style={{ background: 'none', border: 'none', padding: '6px 14px', cursor: 'pointer', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, color: subTab === t.id ? 'var(--ember)' : 'var(--text-3)', borderBottom: subTab === t.id ? '2px solid var(--ember)' : '2px solid transparent', marginBottom: -1, transition: 'color .15s' }}>
+            style={{ background: 'none', border: 'none', padding: '6px 14px', cursor: 'pointer', fontSize: 'var(--text-control)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, color: subTab === t.id ? 'var(--ember)' : 'var(--text-3)', borderBottom: subTab === t.id ? '2px solid var(--ember)' : '2px solid transparent', marginBottom: -1, transition: 'color .15s' }}>
             <Icon name={t.ic as any} size={13} />{t.label}
           </button>
         ))}
@@ -1139,7 +1139,7 @@ function IntakePanel({ projectId }: { projectId: string }) {
       <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
         {loadErr && <IResultBanner ok={false}>{loadErr}</IResultBanner>}
         {loading ? (
-          <div style={{ color: 'var(--text-3)', fontSize: 13 }}>加载中…</div>
+          <div style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>
         ) : cfg ? (
           <>
             {subTab === 'github'  && <ProjectGithubTab projectId={projectId} cfg={cfg} onCfgChange={setCfg} />}
@@ -1156,24 +1156,24 @@ function IntakePanel({ projectId }: { projectId: string }) {
 
 function ProjectInfoTab({ project }: { project: Project }) {
   const rows: { label: string; value: React.ReactNode }[] = [
-    { label: '仓库路径', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{project.repo_path || '未配置'}</code> },
-    { label: '开发分支', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{project.branch_dev}</code> },
-    { label: '主分支',   value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{project.branch_main}</code> },
-    { label: '项目标识', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{project.slug}</code> },
-    { label: '创建时间', value: <span style={{ fontSize: 12, color: 'var(--text-3)' }}>{project.created_at.replace('T', ' ').replace('Z', '')}</span> },
+    { label: '仓库路径', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.repo_path || '未配置'}</code> },
+    { label: '开发分支', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.branch_dev}</code> },
+    { label: '主分支',   value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.branch_main}</code> },
+    { label: '项目标识', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.slug}</code> },
+    { label: '创建时间', value: <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>{project.created_at.replace('T', ' ').replace('Z', '')}</span> },
   ];
 
   return (
     <div style={{ padding: '20px 24px', overflowY: 'auto', height: '100%' }}>
       {project.description && (
-        <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 20, lineHeight: 1.6, padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
+        <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', marginBottom: 20, lineHeight: 'var(--leading-relaxed)', padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
           {project.description}
         </div>
       )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
         {rows.map(r => (
           <div key={r.label} style={{ display: 'flex', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
-            <div style={{ width: 90, fontSize: 12, color: 'var(--text-faint)', flexShrink: 0 }}>{r.label}</div>
+            <div style={{ width: 90, fontSize: 'var(--text-label)', color: 'var(--text-faint)', flexShrink: 0 }}>{r.label}</div>
             <div style={{ flex: 1 }}>{r.value}</div>
           </div>
         ))}
@@ -1181,8 +1181,8 @@ function ProjectInfoTab({ project }: { project: Project }) {
 
       {project.config_yaml && (
         <details style={{ marginTop: 20 }}>
-          <summary style={{ fontSize: 12, color: 'var(--text-3)', cursor: 'pointer', userSelect: 'none' }}>项目配置 YAML</summary>
-          <pre style={{ marginTop: 8, padding: '10px 12px', background: 'var(--bg-3)', borderRadius: 8, fontSize: 11.5, fontFamily: 'var(--font-mono)', overflowX: 'auto', color: 'var(--text-2)', border: '1px solid var(--border)' }}>
+          <summary style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', cursor: 'pointer', userSelect: 'none' }}>项目配置 YAML</summary>
+          <pre style={{ marginTop: 8, padding: '10px 12px', background: 'var(--bg-3)', borderRadius: 8, fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', overflowX: 'auto', color: 'var(--text-2)', border: '1px solid var(--border)' }}>
             {project.config_yaml}
           </pre>
         </details>
@@ -1203,17 +1203,17 @@ function ProjectNavItem({ project, active, onClick }: {
       style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 3, padding: '9px 12px' }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%' }}>
-        <div style={{ width: 26, height: 26, borderRadius: 7, background: active ? 'var(--ember)' : 'var(--bg-3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 800, color: active ? '#fff' : 'var(--text-3)', flexShrink: 0, fontFamily: 'var(--font-display)' }}>
+        <div style={{ width: 26, height: 26, borderRadius: 7, background: active ? 'var(--ember)' : 'var(--bg-3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 'var(--text-label)', fontWeight: 800, color: active ? '#fff' : 'var(--text-3)', flexShrink: 0, fontFamily: 'var(--font-display)' }}>
           {project.name[0]}
         </div>
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13.5, fontWeight: 600 }}>
+        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-body)', fontWeight: 600 }}>
           {project.name}
         </span>
-        <span className={'chip ' + (project.status === 'active' ? 'green' : '')} style={{ fontSize: 9, padding: '1px 5px', flexShrink: 0 }}>
+        <span className={'chip ' + (project.status === 'active' ? 'green' : '')} style={{ fontSize: 'var(--text-micro)', padding: '1px 5px', flexShrink: 0 }}>
           {project.status === 'active' ? '启用' : '停用'}
         </span>
       </div>
-      <div style={{ paddingLeft: 34, fontSize: 11, color: active ? 'var(--ember-soft)' : 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', width: '100%' }}>
+      <div style={{ paddingLeft: 34, fontSize: 'var(--text-caption)', color: active ? 'var(--ember-soft)' : 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', width: '100%' }}>
         {project.description || project.slug}
       </div>
     </div>
@@ -1292,7 +1292,7 @@ export default function ProjectsPage() {
     <div className="content">
       {/* top bar */}
       <div className="audit-top" style={{ height: 56 }}>
-        <div className="eyebrow" style={{ fontSize: 17 }}>
+        <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">PROJECTS</span><span className="cn">· 项目管理</span>
         </div>
         <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
@@ -1306,10 +1306,10 @@ export default function ProjectsPage() {
         {/* left: project list */}
         <div className="set-nav" style={{ width: 220, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
           {error && (
-            <div style={{ fontSize: 11, color: 'var(--red)', padding: '6px 10px', margin: '0 0 6px' }}>{error}</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--red)', padding: '6px 10px', margin: '0 0 6px' }}>{error}</div>
           )}
           {loading ? (
-            <div style={{ fontSize: 12, color: 'var(--text-faint)', padding: '12px 12px' }}>加载中…</div>
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', padding: '12px 12px' }}>加载中…</div>
           ) : projects.length === 0 ? (
             <div style={{ padding: '24px 12px', textAlign: 'center' }}>
               <div className="empty-line" style={{ marginBottom: 10 }}>暂无项目</div>
@@ -1331,17 +1331,17 @@ export default function ProjectsPage() {
               {/* project header */}
               <div style={{ padding: '14px 24px 0', flexShrink: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
-                  <div style={{ width: 44, height: 44, borderRadius: 12, background: 'var(--ember)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, fontWeight: 800, color: '#fff', fontFamily: 'var(--font-display)', flexShrink: 0 }}>
+                  <div style={{ width: 44, height: 44, borderRadius: 12, background: 'var(--ember)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 'var(--text-heading)', fontWeight: 800, color: '#fff', fontFamily: 'var(--font-display)', flexShrink: 0 }}>
                     {selectedProject.name[0]}
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 16, fontWeight: 700 }}>{selectedProject.name}</span>
-                      <span className={'chip ' + (selectedProject.status === 'active' ? 'green' : '')} style={{ fontSize: 10, padding: '1px 7px' }}>
+                      <span style={{ fontSize: 'var(--text-section)', fontWeight: 700 }}>{selectedProject.name}</span>
+                      <span className={'chip ' + (selectedProject.status === 'active' ? 'green' : '')} style={{ fontSize: 'var(--text-micro)', padding: '1px 7px' }}>
                         {selectedProject.status === 'active' ? '启用中' : '已停用'}
                       </span>
                     </div>
-                    <div style={{ fontSize: 12, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
+                    <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
                       {selectedProject.repo_path || '仓库路径未配置'}
                     </div>
                   </div>
@@ -1367,7 +1367,7 @@ export default function ProjectsPage() {
                       onClick={() => setActiveTab(id as Tab)}
                       style={{
                         background: 'none', border: 'none', padding: '7px 14px', cursor: 'pointer',
-                        fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
+                        fontSize: 'var(--text-control)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
                         color: activeTab === id ? 'var(--ember)' : 'var(--text-3)',
                         borderBottom: activeTab === id ? '2px solid var(--ember)' : '2px solid transparent',
                         marginBottom: -1, transition: 'color .15s',
