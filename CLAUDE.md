@@ -9,6 +9,24 @@ AI 全自动处理需求分析→代码实现→测试；人类只在两个审�
 
 ---
 
+## 🎨 设计风格锁定（必读 — 不得跑偏）
+
+本项目 UI 的**设计契约**是根目录的 **[`DESIGN.md`](./DESIGN.md)**（遵循 Google Labs `design.md` 规范，含机器可读 token + 设计意图）。
+
+**任何前端页面/组件改动，必须先读 `DESIGN.md` 并严格遵守，禁止偏离既定风格：**
+
+- 主题：温暖深色优先的「熔炉/余烬（Ember）」风格，唯一品牌强调色是 **ember 橙**；绿/蓝/紫/红/琥珀仅作语义状态色，不作装饰。
+- 真源：所有颜色、字号、圆角、阴影、间距**只引用 `src/index.css` 的 CSS 变量**（`var(--ember)`、`var(--bg-2)`、`var(--text-body)` 等），**禁止硬编码**十六进制色值或 px 字号——否则会破坏 dark/light × palette 主题切换。
+- 字族：Archivo（display）/ Noto Sans SC（正文）/ JetBrains Mono（代码、标签、kicker）。
+- 组件：复用 `src/index.css` 已有类（`.btn` / `.chip` / `.panel` / `.stat` / `.field` / `.seg` / `.proj-select`…），不另起平行样式体系。
+- 下拉统一用 `proj-select + mention-pop + mention-row`，**禁用原生 `<select>`**。
+- 图标统一走 `<Icon name="..." />`。
+- 每屏至多一个 `.btn-primary` 主操作；动效保持微妙且尊重 `prefers-reduced-motion`。
+
+> 改 UI 前先对照 `DESIGN.md` 的 "Do's and Don'ts"。新增颜色/字号/组件时，先在 `src/index.css` 加变量/类，再在 `DESIGN.md` 同步登记，保持二者一致。
+
+---
+
 ## ⚠️ Tauri 版本锁定（必读）
 
 本项目使用 **Tauri 2.x**，与 Tauri 1.x 有重大 API 不兼容。**所有涉及 Tauri 的代码修改必须基于 2.x API**，不得参考 1.x 文档或示例。
@@ -362,6 +380,7 @@ Claude Code 在 worktree 内执行时额外禁止 git 工具：`--disallowedTool
 
 以下为 AutoForge 管理的项目规格约束，AI 执行任务时必须遵守：
 
+@DESIGN.md
 @.autoforge/specs/tech_stack.md
 @.autoforge/specs/architecture.md
 @.autoforge/specs/coding.md
