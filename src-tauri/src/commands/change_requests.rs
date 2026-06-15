@@ -373,6 +373,10 @@ pub async fn review_2(
 
         state.concurrency.release_pending_review();
 
+        // Innate: close the recall feedback loop with a negative signal — the
+        // recalled knowledge fed code a human rejected at review 2.
+        crate::knowledge::consume_trace_outcome(&state.db, &cr_id, "fail", Some("down")).await;
+
         crate::core::event::emit(
             &app,
             crate::core::event::AppEvent::WorktreeUpdate {
@@ -399,6 +403,9 @@ pub async fn review_2(
             decision.suggestions.as_deref(),
         )
         .await?;
+
+        // Leaving pending_review_2 back to execution frees the review slot.
+        state.concurrency.release_pending_review();
 
         // Send back to execution
         sqlx::query(

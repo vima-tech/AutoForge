@@ -7,12 +7,22 @@ use uuid::Uuid;
 
 // ---- LLM Configs ----
 
+/// Never ship the raw API key to the webview. The key stays in SQLite and is
+/// read backend-side when calling providers; the UI only learns whether one is
+/// set. The frontend sends `api_key` back only when the user actually edits it,
+/// so blanking it here does not clobber the stored value on unrelated saves.
+fn mask_key(mut cfg: LlmConfig) -> LlmConfig {
+    cfg.api_key = String::new();
+    cfg
+}
+
 #[tauri::command]
 pub async fn list_llm_configs(state: State<'_, AppState>) -> Result<Vec<LlmConfig>, String> {
-    sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs ORDER BY created_at")
+    let rows = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs ORDER BY created_at")
         .fetch_all(&state.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(mask_key).collect())
 }
 
 #[tauri::command]
@@ -44,6 +54,7 @@ pub async fn create_llm_config(
         .bind(&id)
         .fetch_one(&state.db)
         .await
+        .map(mask_key)
         .map_err(|e| e.to_string())
 }
 
@@ -94,6 +105,7 @@ pub async fn update_llm_config(
             .bind(&id)
             .fetch_one(&state.db)
             .await
+            .map(mask_key)
             .map_err(|e| e.to_string());
     }
 
@@ -111,6 +123,7 @@ pub async fn update_llm_config(
         .bind(&id)
         .fetch_one(&state.db)
         .await
+        .map(mask_key)
         .map_err(|e| e.to_string())
 }
 

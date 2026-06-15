@@ -349,6 +349,18 @@ export const startConversationTask = (payload: {
 }) => ipc<ConversationTask>('start_conversation_task', { payload });
 export const listConversationTasks = (conversationId: string) =>
   ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
+
+// ── Innate 知识库（会议室命令 + 自成长配置） ─────────────────────────────────
+export const INNATE_SENDER = '__innate__';
+export type ConvCommandName = 'remember' | 'recall' | 'evolve' | 'innate';
+export const runConversationCommand = (payload: {
+  conversation_id: string; command: ConvCommandName; arg: string;
+}) => ipc<Message>('run_conversation_command', { payload });
+export interface KnowledgeSettings { evolve_interval_hours: number; capture_threshold: number; }
+export const getKnowledgeSettings = () =>
+  ipc<KnowledgeSettings>('get_knowledge_settings');
+export const setKnowledgeSettings = (payload: KnowledgeSettings) =>
+  ipc<KnowledgeSettings>('set_knowledge_settings', { payload });
 export const listProjectFiles = (projectId: string, conversationId?: string) =>
   ipc<ProjectContextFile[]>('list_project_files', { projectId, conversationId: conversationId ?? null });
 export const readProjectFile = (projectId: string, relPath: string) =>

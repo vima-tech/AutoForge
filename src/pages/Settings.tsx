@@ -13,6 +13,7 @@ import {
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
+  getKnowledgeSettings, setKnowledgeSettings,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
   type NotifyChannel, type AutoPassPolicy, type RoleSlot,
@@ -572,6 +573,52 @@ function ConcurrencySettings() {
   );
 }
 
+function KnowledgeSettings() {
+  const [form, setForm] = useState({ evolve_interval_hours: 12, capture_threshold: 8 });
+  const [result, setResult] = useState('');
+
+  useEffect(() => {
+    getKnowledgeSettings().then(s => setForm(s)).catch(e => setResult(String(e)));
+  }, []);
+
+  const save = async () => {
+    try {
+      const s = await setKnowledgeSettings(form);
+      setForm(s);
+      setResult('已保存 · 后台自成长配置已生效');
+    } catch (e) {
+      setResult(String(e));
+    }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">知识库自成长（Innate）</div>
+      <div className="set-desc">
+        AutoForge 在后台持续把交付经验蒸馏进各项目知识库。捕获达到阈值即自动进化，定时器作为低活跃项目的兜底；会议室里用 <code>/remember</code> <code>/recall</code> <code>/evolve</code> <code>/innate</code> 手动驱动。
+      </div>
+      <div className="cfg-card">
+        <div className="cfg-fields">
+          <div className="field"><label>定时进化间隔（小时）</label>
+            <input type="number" min="0" max="720" value={form.evolve_interval_hours}
+              onChange={e => setForm(f => ({ ...f, evolve_interval_hours: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>0 = 关闭定时器（仍按捕获阈值进化）</span>
+          </div>
+          <div className="field"><label>捕获阈值（次/项目）</label>
+            <input type="number" min="0" max="1000" value={form.capture_threshold}
+              onChange={e => setForm(f => ({ ...f, capture_threshold: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>累计这么多次捕获后自动进化；0 = 关闭事件触发</span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
+            {result && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{result}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const SPEC_FILES = ['analysis-spec.md', 'coding-spec.md', 'review-spec.md', 'testing-spec.md'];
 
 function SpecsSettings() {
@@ -1058,6 +1105,7 @@ const SET_ITEMS = [
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
   { id: 'roles',       name: '角色 Agent',         ic: 'bot' },
   { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+  { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
   { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
   { id: 'notify',      name: '通知通道',     ic: 'bell' },
@@ -1093,13 +1141,14 @@ export default function SettingsPage({
           {sec === 'llm'         && <LLMSettings />}
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
+          {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','roles','concurrency','security','webhook','notify','gating','specs','about'].includes(sec) && (
+          {!['theme','llm','roles','concurrency','knowledge','security','webhook','notify','gating','specs','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

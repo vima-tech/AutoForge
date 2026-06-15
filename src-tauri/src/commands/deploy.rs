@@ -133,15 +133,16 @@ pub async fn confirm_deploy(
     .await
     .map_err(|e| e.to_string())?;
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(600),
-        Command::new("sh")
-            .arg("-lc")
-            .arg(&dep.script)
-            .current_dir(&project.repo_path)
-            .output(),
-    )
-    .await;
+    let mut deploy_cmd = Command::new("sh");
+    deploy_cmd
+        .arg("-lc")
+        .arg(&dep.script)
+        .current_dir(&project.repo_path)
+        // Own process group + kill-on-drop so a timed-out deploy script (and its
+        // children) is reaped instead of leaking after the 600s deadline.
+        .process_group(0)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(600), deploy_cmd.output()).await;
 
     let (status, log) = match output {
         Ok(Ok(out)) => {

@@ -10,8 +10,9 @@ import {
   clearConversationMessages, toggleMessageContext, startConversationTask,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
   listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
+  runConversationCommand, INNATE_SENDER,
   type Conversation, type Message, type Agent, type ConversationAttachment,
-  type Project, type ProjectContextFile, type WorkspaceFile,
+  type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
 } from '../services';
 import type { BlockType } from '../data/mock';
 
@@ -26,6 +27,25 @@ interface PendingAttachment {
   id: string;
   file: File;
   mode: 'file' | 'image';
+}
+
+// Innate 知识库斜杠命令：在私聊/群聊里手动触发记忆存储、召回、进化与状态查看。
+interface SlashCommand { name: ConvCommandName; usage: string; desc: string; icon: string; }
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: 'remember', usage: '/remember [内容]', desc: '存入知识库（留空则记住最近对话）', icon: 'brain' },
+  { name: 'recall',   usage: '/recall 关键词',   desc: '召回相关经验',                   icon: 'search' },
+  { name: 'evolve',   usage: '/evolve',          desc: '立即蒸馏整理（进化）',           icon: 'zap' },
+  { name: 'innate',   usage: '/innate',          desc: '查看知识库健康度',               icon: 'flask' },
+];
+/** 解析以 `/` 开头的输入；返回命令与参数，未知命令 name 为 null。 */
+function parseSlashCommand(text: string): { name: ConvCommandName | null; raw: string; arg: string } | null {
+  const t = text.trimStart();
+  if (!t.startsWith('/')) return null;
+  const m = t.slice(1).match(/^(\S+)\s*([\s\S]*)$/);
+  const raw = m ? m[1].toLowerCase() : '';
+  const arg = m ? m[2].trim() : '';
+  const known = SLASH_COMMANDS.find(c => c.name === raw);
+  return { name: known ? known.name : null, raw, arg };
 }
 
 interface QuoteDraft {
@@ -236,22 +256,27 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
   projectId?: string;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
+  const isInnate = m.from_agent === INNATE_SENDER;
   const me = !m.from_agent;
-  const a  = me ? null : agentMap[m.from_agent!];
-  const author = me ? '我' : (a?.name ?? 'Agent');
+  const a  = me || isInnate ? null : agentMap[m.from_agent!];
+  const author = me ? '我' : isInnate ? 'Innate' : (a?.name ?? 'Agent');
   const blocks = visibleMessageBlocks(m);
   const quote = messageQuote(m);
   return (
     <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
       {me
         ? <MeAvatar size={36} />
+        : isInnate
+            ? <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Innate 知识库"><Icon name="brain" size={20} /></div>
         : a ? <Avatar agent={a} size={36} />
             : <div className="av" style={{ width: 36, height: 36, background: '#888', fontSize: 'var(--text-body)' }}>?</div>}
       <div className="msg-body">
-        {!me && a && (
+        {!me && (a || isInnate) && (
           <div className="msg-meta">
-            <span className="msg-author" style={{ color: a.color }}>{a.name}</span>
-            {isGroup && <span className="chip" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>{a.name_en}</span>}
+            <span className="msg-author" style={{ color: isInnate ? 'var(--ember)' : a!.color }}>{author}</span>
+            {isInnate
+              ? <span className="chip ember" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>KNOWLEDGE</span>
+              : isGroup && <span className="chip" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>{a!.name_en}</span>}
             <span className="msg-time">
               {new Date(m.created_at).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}
             </span>
@@ -507,6 +532,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     editor.focus();
   };
 
+  const pickSlashCommand = (c: SlashCommand) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.textContent = '';
+    setCaretToEnd();
+    insertPlainText('/' + c.name + ' ');
+  };
+
   const pickContextAttachment = (a: ConversationAttachment) => {
     const editor = editorRef.current;
     if (!editor) return;
@@ -698,6 +731,16 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
   };
   const removePending = (id: string) => setPending(items => items.filter(item => item.id !== id));
 
+  // Innate 斜杠命令补全：仍在输入命令名（首个 token 内、尚无空格）时给出候选。
+  const slashToken = (() => {
+    const t = text.trimStart();
+    if (!t.startsWith('/') || t.includes(' ') || t.includes('\n')) return null;
+    return t.slice(1).toLowerCase();
+  })();
+  const slashMatches = slashToken !== null
+    ? SLASH_COMMANDS.filter(c => c.name.startsWith(slashToken))
+    : [];
+
   return (
     <div ref={composerRef} className="composer">
       <div className="composer-tools">
@@ -752,6 +795,22 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
         </div>
       )}
       <div className="composer-box" style={{ position: 'relative' }}>
+        {slashMatches.length > 0 && !showMention && !showAttachmentPicker && (
+          <div className="mention-pop">
+            <div className="mention-pop-label">Innate 知识库命令</div>
+            {slashMatches.map(c => (
+              <div key={c.name} className="mention-row"
+                onMouseDown={e => e.preventDefault()}
+                onClick={() => pickSlashCommand(c)}>
+                <div className="attachment-row-ic"><Icon name={c.icon} size={15} /></div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="nm" style={{ fontFamily: 'var(--font-mono)' }}>{c.usage}</div>
+                  <div className="rl">{c.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
         {showMention && members.length > 0 && (
           <div className="mention-pop">
             <div className="mention-pop-label">@ 指定 Agent 回答</div>
@@ -1402,6 +1461,20 @@ export default function ConversationsPage() {
       loadConvs().catch(() => {});
       if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
       setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
+
+      // Innate 斜杠命令：不触发 AI 编排任务，改为运行知识库命令并回插系统消息。
+      const slash = parseSlashCommand(text);
+      if (slash) {
+        const reply = await runConversationCommand({
+          conversation_id: conv.id,
+          command: (slash.name ?? slash.raw) as ConvCommandName,
+          arg: slash.arg,
+        });
+        setMsgs(ms => [...ms, reply]);
+        loadConvs().catch(() => {});
+        setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
+        return true;
+      }
 
       const shouldStartTask = text.trim().length > 0 || contextRefs.length > 0 || attachments.length > 0;
       if (shouldStartTask) {

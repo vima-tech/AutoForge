@@ -42,7 +42,25 @@ pub(crate) struct CheckResult {
     pub(crate) stderr: String,
 }
 
+/// Job entry point (kept for the dispatch table). Delegates to `run_and_gate`
+/// and discards the pass/fail result.
 pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+    run_and_gate(db, tx, app, cr_id).await.map(|_| ())
+}
+
+/// Run the project's configured checks for a change request.
+///
+/// Checks run against the CR's worktree (the not-yet-merged branch) when one is
+/// still on disk, otherwise against the project repo. Returns `Ok(true)` when
+/// every check passes (or none are configured) and `Ok(false)` when any fails.
+/// On failure a follow-up bug issue and scan finding are recorded so the failure
+/// is tracked even though the merge is blocked upstream.
+pub async fn run_and_gate(
+    db: &Db,
+    tx: &JobSender,
+    app: &tauri::AppHandle,
+    cr_id: &str,
+) -> Result<bool> {
     let cr = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
         "SELECT * FROM change_requests WHERE id=?",
     )
@@ -58,11 +76,25 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .await?
             .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
 
+    // Prefer the CR's worktree (the un-merged branch) so tests gate BEFORE the
+    // merge instead of validating dev after the fact.
+    let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
+        "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await?;
+    let test_path = session
+        .as_ref()
+        .map(|s| s.worktree_path.clone())
+        .filter(|p| std::path::Path::new(p).exists())
+        .unwrap_or_else(|| project.repo_path.clone());
+
     let session_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO test_sessions
          (id, project_id, session_type, change_request_id, trigger, status, started_at)
-         VALUES (?, ?, 'reactive', ?, 'merge', 'running', datetime('now'))",
+         VALUES (?, ?, 'reactive', ?, 'pre_merge', 'running', datetime('now'))",
     )
     .bind(&session_id)
     .bind(&project.id)
@@ -73,7 +105,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     let checks = configured_checks(project.config_yaml.as_deref());
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
-        results.push(run_check(&project.repo_path, name, command, timeout).await);
+        results.push(run_check(&test_path, name, command, timeout).await);
     }
 
     let failed = results.iter().filter(|r| !r.ok).collect::<Vec<_>>();
@@ -104,7 +136,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
 
     let mut issues_created = Vec::new();
     if !failed.is_empty() {
-        let title = format!("合并后测试失败：{}", cr_id);
+        let title = format!("合并前测试失败：{}", cr_id);
         let description = failed
             .iter()
             .map(|r| {
@@ -192,7 +224,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     );
 
-    Ok(())
+    Ok(failed.is_empty())
 }
 
 pub(crate) fn configured_checks(config_yaml: Option<&str>) -> Vec<(String, String, u64)> {
@@ -240,15 +272,15 @@ pub(crate) async fn run_check(
     command: String,
     timeout_secs: u64,
 ) -> CheckResult {
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        Command::new("sh")
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(repo_path)
-            .output(),
-    )
-    .await;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-lc")
+        .arg(&command)
+        .current_dir(repo_path)
+        // Own process group so a timeout can be reaped, and ensure the child is
+        // killed if this future is dropped (e.g. on timeout) instead of leaking.
+        .process_group(0)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
     match output {
         Ok(Ok(output)) => {

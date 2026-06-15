@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tauri::State;
 use tracing::info;
 
@@ -35,6 +35,31 @@ fn validate_workspace_path(rel_path: &str) -> Result<(), String> {
 
 fn workspace_root(repo_path: &str) -> PathBuf {
     PathBuf::from(repo_path).join(AUTOFORGE_DIR)
+}
+
+/// Ensure `target` resolves inside `base` even when symlinks are involved.
+/// `target` need not exist yet (for writes): the closest existing ancestor is
+/// canonicalized, so a symlinked `docs/`/`specs/` subdir pointing outside the
+/// workspace is rejected.
+fn ensure_within_workspace(base: &Path, target: &Path) -> Result<(), String> {
+    let base_canon = base
+        .canonicalize()
+        .map_err(|_| "工作区目录不存在".to_string())?;
+    let mut probe = target;
+    let canon = loop {
+        match probe.canonicalize() {
+            Ok(c) => break c,
+            Err(_) => match probe.parent() {
+                Some(p) => probe = p,
+                None => return Err("路径无效".to_string()),
+            },
+        }
+    };
+    if canon.starts_with(&base_canon) {
+        Ok(())
+    } else {
+        Err("路径越界：解析后超出 .autoforge/ 工作区".to_string())
+    }
 }
 
 #[tauri::command]
@@ -138,10 +163,12 @@ pub async fn read_workspace_file(
     let (repo_path,) = row.ok_or("项目不存在")?;
 
     validate_workspace_path(&rel_path)?;
-    let full = workspace_root(&repo_path).join(&rel_path);
+    let base = workspace_root(&repo_path);
+    let full = base.join(&rel_path);
     if !full.is_file() {
         return Err(format!("{} 不存在", rel_path));
     }
+    ensure_within_workspace(&base, &full)?;
     if full.metadata().map(|m| m.len()).unwrap_or(0) > 2 * 1024 * 1024 {
         return Err("文件超过 2 MB".to_string());
     }
@@ -170,12 +197,14 @@ pub async fn write_workspace_file(
 
     validate_workspace_path(&rel_path)?;
 
-    let full = workspace_root(&repo_path).join(&rel_path);
+    let base = workspace_root(&repo_path);
+    let full = base.join(&rel_path);
     if let Some(parent) = full.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| e.to_string())?;
     }
+    ensure_within_workspace(&base, &full)?;
 
     let bytes = content.as_bytes();
     tokio::fs::write(&full, bytes)
@@ -285,6 +314,9 @@ pub async fn execute_agent_writes(
         let full = base.join(&rel_path);
         if let Some(parent) = full.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if ensure_within_workspace(&base, &full).is_err() {
+            continue;
         }
         match tokio::fs::write(&full, content.as_bytes()).await {
             Ok(_) => {

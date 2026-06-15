@@ -30,8 +30,10 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     // Layer 1 (design §4.3): deeper LLM sanitization beyond the regex fast-reject.
     // Trusted internal sources skip the LLM check; external sources always run it.
     // Gracefully degrades to "allow" when the claude CLI is unavailable.
+    // "github" is intentionally NOT trusted: GitHub issue text is externally
+    // authored (anyone can open an issue) and must run the LLM sanitizer.
     const TRUSTED_SOURCES: &[&str] = &[
-        "scan", "monitor", "github", "todo_scan", "security_audit", "ci_monitor",
+        "scan", "monitor", "todo_scan", "security_audit", "ci_monitor",
     ];
     if !TRUSTED_SOURCES.contains(&issue.source_type.as_str()) {
         let combined = format!("{}\n{}", issue.title, issue.description);

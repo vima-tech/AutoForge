@@ -5,11 +5,19 @@ use sha2::{Digest, Sha256};
 static INJECTION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     [
         "ignore\\s+(all\\s+)?(previous|above|prior)\\s+instructions?",
+        "disregard\\s+(all\\s+)?(previous|above|prior)\\s+instructions?",
         "you\\s+are\\s+now\\s+",
         "system\\s+prompt",
+        "(reveal|print|show|repeat|leak)\\s+(your\\s+|the\\s+)?(system\\s+)?(prompt|instructions)",
         "jailbreak",
         "DAN\\b",
-        "forget\\s+(your\\s+)?(rules|constraints|instructions)",
+        "developer\\s+mode",
+        "forget\\s+(your\\s+|all\\s+)?(rules|constraints|instructions)",
+        "(new|updated)\\s+instructions\\s*:",
+        "(act|behave|respond)\\s+as\\s+(if|though|an?)\\b",
+        "pretend\\s+(to\\s+be|you\\s+are)\\b",
+        "<\\|?(im_start|im_end|system|endoftext)\\|?>",
+        "\\[/?(INST|SYS)\\]",
     ]
     .iter()
     .map(|p| Regex::new(&format!("(?i){}", p)).unwrap())

@@ -132,6 +132,9 @@ pub async fn clone_project_from_git(
         .env("GIT_ASKPASS", &askpass_path)
         .env("SSH_ASKPASS", &askpass_path)
         .env("GCM_INTERACTIVE", "never")
+        // Restrict transports to a safe whitelist so a hostile URL cannot use
+        // remote helpers like `ext::sh -c ...` to achieve command execution.
+        .env("GIT_ALLOW_PROTOCOL", "http:https:ssh:git:file")
         .env("AUTOFORGE_GIT_USERNAME", username)
         .env("AUTOFORGE_GIT_PASSWORD", password);
     let output = match timeout(Duration::from_secs(600), cmd.output()).await {

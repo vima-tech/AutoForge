@@ -270,6 +270,13 @@ pub async fn run(
         .arg("--disallowedTools")
         .arg("Bash(git *)")
         .current_dir(worktree_path)
+        // Defense-in-depth: `--disallowedTools "Bash(git *)"` only blocks the
+        // direct `git ` form; the agent could still shell out via `sh -c`,
+        // scripts, etc. Disabling all git transport protocols neutralizes any
+        // remote git operation (push/fetch/clone) no matter how it is invoked,
+        // while local commits/builds/tests in the worktree keep working.
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

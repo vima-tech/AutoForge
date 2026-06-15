@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConcurrencyStatus {
@@ -11,45 +10,43 @@ pub struct ConcurrencyStatus {
     pub stage: String,
 }
 
+/// In-memory accounting for the pipeline. The authoritative admission control
+/// (which CR may start executing) is enforced atomically in SQL by the task
+/// runner; these counters exist so the dashboard can report live slot/queue
+/// usage without re-querying the database on every status call.
 pub struct ConcurrencyManager {
-    semaphore: Arc<Semaphore>,
-    max_slots: Arc<Mutex<usize>>,
-    pending_review: Arc<Mutex<usize>>,
-    pause_threshold: Arc<Mutex<usize>>,
-    queue_strategy: Arc<Mutex<String>>,
-    reserved_permits: Arc<Mutex<Vec<OwnedSemaphorePermit>>>,
+    max_slots: Mutex<usize>,
+    /// CRs currently in the `executing` phase.
+    active: Mutex<usize>,
+    /// CRs sitting in `pending_review_2` awaiting human review.
+    pending_review: Mutex<usize>,
+    pause_threshold: Mutex<usize>,
+    queue_strategy: Mutex<String>,
 }
 
 impl ConcurrencyManager {
-    pub fn new(max_slots: usize, pause_threshold: usize) -> Arc<Self> {
-        Arc::new(Self {
-            semaphore: Arc::new(Semaphore::new(max_slots)),
-            max_slots: Arc::new(Mutex::new(max_slots)),
-            pending_review: Arc::new(Mutex::new(0)),
-            pause_threshold: Arc::new(Mutex::new(pause_threshold)),
-            queue_strategy: Arc::new(Mutex::new("priority".to_string())),
-            reserved_permits: Arc::new(Mutex::new(Vec::new())),
+    pub fn new(max_slots: usize, pause_threshold: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            max_slots: Mutex::new(max_slots.max(1)),
+            active: Mutex::new(0),
+            pending_review: Mutex::new(0),
+            pause_threshold: Mutex::new(pause_threshold.max(1)),
+            queue_strategy: Mutex::new("priority".to_string()),
         })
     }
 
-    pub async fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        let pending = {
-            let guard = self.pending_review.lock().unwrap();
-            *guard
-        };
-        let pause_threshold = {
-            let guard = self.pause_threshold.lock().unwrap();
-            *guard
-        };
-        if pending >= pause_threshold {
-            return None;
-        }
+    /// A CR has begun executing (a slot is now occupied).
+    pub fn slot_acquired(&self) {
+        let mut g = self.active.lock().unwrap();
+        *g += 1;
+    }
 
-        let status = self.status();
-        if status.active_slots >= status.max_slots {
-            return None;
+    /// A CR has finished executing (the slot is freed).
+    pub fn slot_released(&self) {
+        let mut g = self.active.lock().unwrap();
+        if *g > 0 {
+            *g -= 1;
         }
-        self.semaphore.clone().try_acquire_owned().ok()
     }
 
     pub fn transition_to_pending_review(&self) {
@@ -65,20 +62,10 @@ impl ConcurrencyManager {
     }
 
     pub fn status(&self) -> ConcurrencyStatus {
-        let pending = {
-            let guard = self.pending_review.lock().unwrap();
-            *guard
-        };
-        let max_slots = {
-            let guard = self.max_slots.lock().unwrap();
-            *guard
-        };
-        let pause_threshold = {
-            let guard = self.pause_threshold.lock().unwrap();
-            *guard
-        };
-        let available = self.semaphore.available_permits();
-        let active_slots = max_slots.saturating_sub(available);
+        let active = *self.active.lock().unwrap();
+        let pending = *self.pending_review.lock().unwrap();
+        let max_slots = *self.max_slots.lock().unwrap();
+        let pause_threshold = *self.pause_threshold.lock().unwrap();
 
         let stage = if pending >= pause_threshold {
             "paused".to_string()
@@ -89,7 +76,7 @@ impl ConcurrencyManager {
         };
 
         ConcurrencyStatus {
-            active_slots,
+            active_slots: active,
             max_slots,
             pending_review: pending,
             pause_threshold,
@@ -104,52 +91,22 @@ impl ConcurrencyManager {
         queue_strategy: Option<String>,
     ) -> ConcurrencyStatus {
         if let Some(new_max) = max_slots {
-            let new_max = new_max.max(1);
-            let mut current = self.max_slots.lock().unwrap();
-            if new_max < *current {
-                let shrink_by = *current - new_max;
-                let mut reserved = self.reserved_permits.lock().unwrap();
-                for _ in 0..shrink_by {
-                    if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
-                        reserved.push(permit);
-                    }
-                }
-            } else if new_max > *current {
-                let mut grow_by = new_max - *current;
-                let mut reserved = self.reserved_permits.lock().unwrap();
-                while grow_by > 0 {
-                    if reserved.pop().is_some() {
-                        grow_by -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                if grow_by > 0 {
-                    self.semaphore.add_permits(grow_by);
-                }
-            }
-            *current = new_max;
+            *self.max_slots.lock().unwrap() = new_max.max(1);
         }
-
         if let Some(new_threshold) = pause_threshold {
-            let mut guard = self.pause_threshold.lock().unwrap();
-            *guard = new_threshold.max(1);
+            *self.pause_threshold.lock().unwrap() = new_threshold.max(1);
         }
-
         if let Some(strategy) = queue_strategy {
             let normalized = match strategy.as_str() {
                 "fifo" | "priority" | "oldest" => strategy,
                 _ => "priority".to_string(),
             };
-            let mut guard = self.queue_strategy.lock().unwrap();
-            *guard = normalized;
+            *self.queue_strategy.lock().unwrap() = normalized;
         }
-
         self.status()
     }
 
     pub fn queue_strategy(&self) -> String {
-        let guard = self.queue_strategy.lock().unwrap();
-        guard.clone()
+        self.queue_strategy.lock().unwrap().clone()
     }
 }

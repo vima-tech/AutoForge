@@ -412,11 +412,6 @@ pub async fn load_project_context_for_conversation(
     .unwrap_or_default();
 
     for (rel_path,) in pinned {
-        for comp in PathBuf::from(&rel_path).components() {
-            if matches!(comp, Component::ParentDir | Component::RootDir) {
-                continue;
-            }
-        }
         // Skip if already loaded as priority
         let name = PathBuf::from(&rel_path)
             .file_name()
@@ -427,7 +422,12 @@ pub async fn load_project_context_for_conversation(
             continue;
         }
 
-        let full = base.join(&rel_path);
+        // Resolve safely: reject traversal / symlink escape (the previous
+        // component loop `continue`d the inner loop and was a no-op).
+        let full = match safe_join(&base, &rel_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         if !full.is_file() {
             continue;
         }

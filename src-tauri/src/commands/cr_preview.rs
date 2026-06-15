@@ -249,7 +249,7 @@ pub async fn start_cr_preview(
         let mut servers = state.dev_servers.lock().await;
         if let Some(old) = servers.remove(&key) {
             if let Some(child) = old.child.lock().await.as_mut() {
-                let _ = child.kill().await;
+                crate::commands::dev_server::kill_child_group(child).await;
             }
         }
     }
@@ -262,6 +262,9 @@ pub async fn start_cr_preview(
         .env("PORT", port.to_string())
         .stdout(out)
         .stderr(err)
+        // Own process group so the whole preview tree (sh → vite → node …) can be
+        // torn down together instead of orphaning grandchildren.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("启动失败: {e}"))?;
 
@@ -298,7 +301,7 @@ pub async fn stop_cr_preview(cr_id: String, state: State<'_, AppState>) -> Resul
     for key in [format!("cr:{cr_id}"), format!("cr:app:{cr_id}")] {
         if let Some(handle) = servers.remove(&key) {
             if let Some(child) = handle.child.lock().await.as_mut() {
-                let _ = child.kill().await;
+                crate::commands::dev_server::kill_child_group(child).await;
             }
         }
     }
@@ -324,7 +327,7 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         let mut servers = state.dev_servers.lock().await;
         if let Some(old) = servers.remove(&key) {
             if let Some(child) = old.child.lock().await.as_mut() {
-                let _ = child.kill().await;
+                crate::commands::dev_server::kill_child_group(child).await;
             }
         }
     }
@@ -336,6 +339,8 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         .current_dir(&session.worktree_path)
         .stdout(out)
         .stderr(err)
+        // Own process group so the launched app tree can be torn down together.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("启动失败: {e}"))?;
 

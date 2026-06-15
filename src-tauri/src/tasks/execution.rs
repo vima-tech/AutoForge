@@ -199,17 +199,34 @@ pub async fn run(
     }
 
     // Innate: recall procedural knowledge (project ⊕ shared) into the coding prompt.
-    let recalled = crate::knowledge::kb_recall(
+    // Traced recall captures the project-db trace id + chunk ids so the eventual
+    // outcome (merge = success / review_2 reject = failure) closes the loop.
+    let recall = crate::knowledge::kb_recall_traced(
         &cr.project_id,
         &format!("{} {}", issue.title, issue.description),
     )
     .await;
-    let analysis_summary = if recalled.trim().is_empty() {
+    if let Some(trace_id) = recall.trace_id.as_deref() {
+        let _ = sqlx::query(
+            "INSERT INTO kb_traces (change_request_id, project_id, trace_id, used_ids, created_at)
+             VALUES (?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(change_request_id) DO UPDATE SET
+                 project_id=excluded.project_id, trace_id=excluded.trace_id,
+                 used_ids=excluded.used_ids, created_at=excluded.created_at",
+        )
+        .bind(cr_id)
+        .bind(&cr.project_id)
+        .bind(trace_id)
+        .bind(recall.used_ids.join(","))
+        .execute(db)
+        .await;
+    }
+    let analysis_summary = if recall.text.trim().is_empty() {
         analysis_summary
     } else {
         format!(
             "{}\n\n## 历史经验与技能（Innate 召回）\n{}",
-            analysis_summary, recalled
+            analysis_summary, recall.text
         )
     };
 

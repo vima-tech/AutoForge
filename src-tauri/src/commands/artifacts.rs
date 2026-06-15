@@ -176,7 +176,18 @@ pub async fn delivery_artifact_data_url(
             .map_err(|e| e.to_string())?;
     let (project_id, rel_path, mime) = row.ok_or("产物不存在")?;
     let repo = repo_path(&state.db, &project_id).await?;
-    let bytes = tokio::fs::read(PathBuf::from(&repo).join(&rel_path))
+    let full = PathBuf::from(&repo).join(&rel_path);
+    // Cap inline data URLs so a large artifact can't balloon memory / freeze the webview.
+    const MAX_DATA_URL_BYTES: u64 = 16 * 1024 * 1024;
+    if tokio::fs::metadata(&full)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0)
+        > MAX_DATA_URL_BYTES
+    {
+        return Err("产物超过 16 MB，无法内联预览/下载".to_string());
+    }
+    let bytes = tokio::fs::read(&full)
         .await
         .map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);

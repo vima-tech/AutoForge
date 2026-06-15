@@ -89,6 +89,36 @@ pub fn run() {
                 }
             });
 
+            // Innate 自成长驱动器：启动时同步事件阈值，并按间隔对活跃项目跑 evolve（蒸馏 + 整理）作为兜底。
+            let db_for_kb = db.clone();
+            tauri::async_runtime::spawn(async move {
+                let settings = commands::knowledge::load_knowledge_settings(&db_for_kb).await;
+                knowledge::set_evolve_threshold(settings.capture_threshold);
+                loop {
+                    let hours = commands::knowledge::load_knowledge_settings(&db_for_kb)
+                        .await
+                        .evolve_interval_hours;
+                    if hours == 0 {
+                        // 定时器关闭：每小时复查一次配置是否被重新开启。
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        continue;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(hours as u64 * 3600)).await;
+                    if let Ok(projects) = sqlx::query_as::<_, (String,)>(
+                        "SELECT id FROM projects WHERE status='active'",
+                    )
+                    .fetch_all(&db_for_kb)
+                    .await
+                    {
+                        for (pid,) in projects {
+                            knowledge::kb_evolve(&pid).await;
+                        }
+                    }
+                    // 通用（跨项目）库也定期整理。
+                    knowledge::kb_evolve_shared().await;
+                }
+            });
+
             // 启动 webhook server（若配置中已启用）
             let db_for_wh = db.clone();
             let app_for_wh = app_handle.clone();
@@ -187,6 +217,9 @@ pub fn run() {
             commands::workspace::write_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::list_conversation_tasks,
+            commands::knowledge::run_conversation_command,
+            commands::knowledge::get_knowledge_settings,
+            commands::knowledge::set_knowledge_settings,
             commands::settings::list_llm_configs,
             commands::settings::create_llm_config,
             commands::settings::update_llm_config,

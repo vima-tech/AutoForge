@@ -31,6 +31,34 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .await?
             .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
 
+    // Quality gate: run configured tests on the un-merged worktree branch
+    // FIRST. A failing gate must block the merge (spec: testing.md).
+    let passed = crate::tasks::testing::run_and_gate(db, tx, app, cr_id).await?;
+    if !passed {
+        info!("pre-merge tests failed for cr {}, blocking merge", cr_id);
+        sqlx::query(
+            "UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(cr_id)
+        .execute(db)
+        .await?;
+        sqlx::query(
+            "UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(&cr.issue_id)
+        .execute(db)
+        .await?;
+        event::emit(
+            app,
+            event::AppEvent::WorktreeUpdate {
+                cr_id: cr_id.to_string(),
+                status: "merge_failed".to_string(),
+                message: Some("合并前测试未通过，已阻断合并".to_string()),
+            },
+        );
+        return Ok(());
+    }
+
     let git = GitProxy::new(&project.repo_path);
 
     // Checkout dev branch and merge
@@ -130,18 +158,10 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     );
 
-    let _ = enqueue(
-        db,
-        tx,
-        "testing",
-        &format!("testing:{}", cr_id),
-        JobPayload::Testing {
-            change_request_id: cr_id.to_string(),
-        },
-    )
-    .await;
+    // Note: tests already ran as a pre-merge gate above, so there is no
+    // post-merge testing job to enqueue here.
 
-    // Node 07: run a security audit on the merged diff in parallel with testing.
+    // Node 07: run a security audit on the merged diff.
     let _ = enqueue(
         db,
         tx,
@@ -173,6 +193,10 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         let trigger = format!("实现该项目同类需求时可参考的成功改动方案；相关需求：{}", issue_title);
         crate::knowledge::kb_add(&cr.project_id, &content, &trigger).await;
     }
+
+    // Innate: close the recall feedback loop — the recalled knowledge fed code
+    // that passed review 2 + tests and merged, so reinforce it (positive signal).
+    crate::knowledge::consume_trace_outcome(db, cr_id, "ok", Some("up")).await;
 
     // Innate: distil this project's accumulated logs into knowledge after a successful merge.
     crate::knowledge::kb_evolve(&cr.project_id).await;

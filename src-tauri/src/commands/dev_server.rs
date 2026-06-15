@@ -201,7 +201,7 @@ pub async fn start_dev_server(
         if let Some(old) = servers.remove(&project_id) {
             let mut guard = old.child.lock().await;
             if let Some(child) = guard.as_mut() {
-                let _ = child.kill().await;
+                kill_child_group(child).await;
             }
         }
     }
@@ -234,6 +234,9 @@ pub async fn start_dev_server(
         .env("PORT", port.to_string())
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(log_err))
+        // Run in its own process group so the whole tree (sh → npm → node …)
+        // can be torn down together; killing only `sh` would orphan the rest.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("启动失败: {}", e))?;
 
@@ -277,10 +280,28 @@ pub async fn stop_dev_server(project_id: String, state: State<'_, AppState>) -> 
     if let Some(handle) = servers.remove(&project_id) {
         let mut guard = handle.child.lock().await;
         if let Some(child) = guard.as_mut() {
-            child.kill().await.map_err(|e| e.to_string())?;
+            kill_child_group(child).await;
         }
     }
     Ok(())
+}
+
+/// Kill an entire dev-server process group. The child is spawned with
+/// `process_group(0)`, so its PID equals the group id; sending the signal to the
+/// negative PID reaps the whole tree (sh, npm, node, …). Falls back to killing
+/// the direct child for reaping and on non-unix platforms.
+pub(crate) async fn kill_child_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{}", pid))
+                .output()
+                .await;
+        }
+    }
+    let _ = child.kill().await;
 }
 
 #[cfg(test)]
