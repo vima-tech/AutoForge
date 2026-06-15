@@ -3,6 +3,7 @@ mod commands;
 mod core;
 mod db;
 mod intake;
+mod knowledge;
 mod models;
 mod state;
 mod tasks;
@@ -31,9 +32,11 @@ pub fn run() {
             let worktrees = data_dir.join("worktrees").to_string_lossy().to_string();
             let attachments = data_dir.join("attachments").to_string_lossy().to_string();
             let materials = data_dir.join("materials").to_string_lossy().to_string();
+            let kb = data_dir.join("kb").to_string_lossy().to_string();
             state::init_worktrees_base(worktrees);
             state::init_attachments_base(attachments);
             state::init_materials_base(materials);
+            state::init_kb_base(kb);
 
             let db = tauri::async_runtime::block_on(async {
                 db::init(&db_path).await.expect("db init failed")
@@ -57,6 +60,33 @@ pub fn run() {
                     std::collections::HashMap::new(),
                 )),
                 webhook_handle: webhook_handle.clone(),
+            });
+
+            // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
+            let db_for_scan = db.clone();
+            let tx_for_scan = job_tx.clone();
+            let app_for_scan = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                    if let Ok(projects) = sqlx::query_as::<_, (String,)>(
+                        "SELECT id FROM projects WHERE status='active'",
+                    )
+                    .fetch_all(&db_for_scan)
+                    .await
+                    {
+                        for (pid,) in projects {
+                            let _ = tasks::scan::run_proactive(
+                                &db_for_scan,
+                                &tx_for_scan,
+                                &app_for_scan,
+                                &pid,
+                                "scheduled",
+                            )
+                            .await;
+                        }
+                    }
+                }
             });
 
             // 启动 webhook server（若配置中已启用）
@@ -128,6 +158,8 @@ pub fn run() {
             commands::change_requests::get_code_diff,
             commands::change_requests::review_1,
             commands::change_requests::review_2,
+            commands::change_requests::retry_change_request,
+            commands::change_requests::delete_change_request,
             commands::conversations::list_conversations,
             commands::conversations::list_messages,
             commands::conversations::send_message,
@@ -165,6 +197,8 @@ pub fn run() {
             commands::settings::update_agent,
             commands::settings::delete_agent,
             commands::settings::set_agent_forge_role,
+            commands::settings::list_role_catalog,
+            commands::settings::set_role_slot,
             commands::system::system_health,
             commands::system::check_claude_auth,
             commands::system::pipeline_stats,
@@ -181,6 +215,12 @@ pub fn run() {
             commands::dev_server::get_dev_server_status,
             commands::dev_server::start_dev_server,
             commands::dev_server::stop_dev_server,
+            commands::dev_server::get_dev_server_log,
+            commands::cr_preview::get_cr_preview,
+            commands::cr_preview::start_cr_preview,
+            commands::cr_preview::stop_cr_preview,
+            commands::cr_preview::launch_cr_app,
+            commands::cr_preview::get_cr_preview_log,
             commands::materials::list_material_folders,
             commands::materials::create_material_folder,
             commands::materials::rename_material_folder,
@@ -201,6 +241,32 @@ pub fn run() {
             commands::specs::upsert_project_spec,
             commands::specs::delete_project_spec,
             commands::specs::ai_generate_specs,
+            commands::security::list_security_audits,
+            commands::deploy::list_deployments,
+            commands::deploy::generate_deploy_script,
+            commands::deploy::confirm_deploy,
+            commands::prototype::list_prototype_prompts,
+            commands::prototype::generate_prototype_prompt,
+            commands::prototype::delete_prototype_prompt,
+            commands::prototype::update_prototype_prompt,
+            commands::artifacts::list_delivery_artifacts,
+            commands::artifacts::import_delivery_artifact,
+            commands::artifacts::update_delivery_artifact_meta,
+            commands::artifacts::delete_delivery_artifact,
+            commands::artifacts::delivery_artifact_data_url,
+            commands::scan::run_proactive_scan,
+            commands::grading::get_cr_grade,
+            commands::grading::list_auto_pass_policy,
+            commands::grading::get_auto_pass_enabled,
+            commands::grading::set_auto_pass_enabled,
+            commands::notify::list_notify_channels,
+            commands::notify::create_notify_channel,
+            commands::notify::update_notify_channel,
+            commands::notify::delete_notify_channel,
+            commands::notify::test_notify_channel,
+            commands::widget::get_widget_snippet,
+            commands::preview::mask_preview_data,
+            commands::preview::provision_preview_container,
         ])
         .run(tauri::generate_context!())
         .expect("error running AutoForge");

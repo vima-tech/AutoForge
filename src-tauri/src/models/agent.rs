@@ -18,7 +18,20 @@ pub struct Agent {
     pub visible_in_chat: bool,
     pub mentionable: bool,
     pub enabled: bool,
+    #[sqlx(default)]
+    #[serde(default = "default_prompt_mode")]
+    pub prompt_mode: String,
+    #[sqlx(default)]
+    #[serde(default = "default_true")]
+    pub memory_enabled: bool,
     pub created_at: String,
+}
+
+fn default_prompt_mode() -> String {
+    "builtin".to_string()
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +50,8 @@ pub struct CreateAgent {
     pub visible_in_chat: Option<bool>,
     pub mentionable: Option<bool>,
     pub enabled: Option<bool>,
+    pub prompt_mode: Option<String>,
+    pub memory_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,4 +70,6 @@ pub struct UpdateAgent {
     pub visible_in_chat: Option<bool>,
     pub mentionable: Option<bool>,
     pub enabled: Option<bool>,
+    pub prompt_mode: Option<String>,
+    pub memory_enabled: Option<bool>,
 }

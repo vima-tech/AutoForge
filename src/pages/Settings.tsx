@@ -6,12 +6,16 @@ import Select from '../components/Select';
 import { THEME_PALETTES, type ThemeMode, type ThemeSelection } from '../theme';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
-  listAgents, createAgent, updateAgent, deleteAgent, setAgentForgeRole,
+  listAgents, createAgent, updateAgent, deleteAgent,
+  listRoleCatalog, setRoleSlot,
   getSystemHealth, updateConcurrencyConfig, readSpec, writeSpec,
   listPreviewEnvironments, listTestSessions, listAdminDecisions,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
+  listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
+  listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
+  type NotifyChannel, type AutoPassPolicy, type RoleSlot,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -21,7 +25,7 @@ function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
 
 function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
   return createPortal(
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }} onClick={onCancel}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 360, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
@@ -198,9 +202,18 @@ function LLMSettings() {
   );
 }
 
-// ── Agent Settings ────────────────────────────────────────────────────────────
-function AgentSettings() {
+// ── 对话角色（自定义业务 Agent，群聊/私聊用）────────────────────────────────────
+// 起手模板，避免空白页。
+const AGENT_TEMPLATES: { label: string; prompt: string }[] = [
+  { label: '通用助手', prompt: '你是一个专业、严谨的助手。理解用户意图，给出结构化、可执行的回答；信息不足时主动澄清，不臆造。' },
+  { label: '评审', prompt: '你是资深代码/方案评审者。逐项指出问题（正确性、边界、安全、可维护性），区分严重级别，并给出具体修改建议。' },
+  { label: '文案', prompt: '你是产品文案专家。用简洁、准确、有说服力的中文表达，匹配目标受众与场景，避免空话套话。' },
+  { label: '分析', prompt: '你是分析师。基于事实拆解问题，给出选项、取舍与明确建议，必要时量化，并标注假设与不确定性。' },
+];
+
+function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [hideIds, setHideIds] = useState<Set<string>>(new Set());
   const [llmNames, setLlmNames] = useState<{ id: string; name: string }[]>([]);
   const [exp, setExp] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Partial<Agent>>>({});
@@ -209,8 +222,9 @@ function AgentSettings() {
   const [loading, setLoading] = useState(true);
 
   const reload = () =>
-    Promise.all([listAgents(), listLlmConfigs()]).then(([ags, llms]) => {
+    Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog()]).then(([ags, llms, cat]) => {
       setAgents(ags);
+      setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
       setLlmNames(llms.map(l => ({ id: l.id, name: l.name })));
       setLoading(false);
     }).catch(() => setLoading(false));
@@ -238,63 +252,35 @@ function AgentSettings() {
     await deleteAgent(id);
     setAgents(as => as.filter(a => a.id !== id));
     setConfirmDel(null);
+    onChanged();
   };
 
   const addNew = async () => {
-    const a = await createAgent({ name: '新 Agent', system_prompt: '' });
+    const a = await createAgent({ name: '新对话角色', system_prompt: AGENT_TEMPLATES[0].prompt, prompt_mode: 'custom', role_type: 'business' });
     setAgents(as => [...as, a]);
     setExp(a.id);
+    onChanged();
   };
 
-  if (loading) return (
-    <div className="set-inner">
-      <div className="set-h">Agent 配置</div>
-      <div style={{ color: 'var(--text-3)', marginTop: 20 }}>加载中…</div>
-    </div>
-  );
+  // 仅展示未被系统/流水线角色占用的业务 Agent（其余在上方以角色卡管理）。
+  const customAgents = agents.filter(a => !hideIds.has(a.id) && a.role_type !== 'system');
 
-  const systemKindLabels: Record<string, string> = {
-    planner: 'Planner 调度器',
-    summarizer: 'Summarizer 总结器',
-    doc_writer: 'Doc Writer 文档生成器',
-    context_compressor: 'Context Compressor',
-    material_ai: 'Material AI 物料助手',
-    spec_writer: 'Spec Writer 规格生成器',
-  };
-  const systemKinds = (a: Agent) => (a.system_kind ?? '').split(',').map(v => v.trim()).filter(Boolean);
+  if (loading) return <div style={{ color: 'var(--text-3)', marginTop: 12 }}>加载中…</div>;
 
   return (
-    <div className="set-inner rise">
-      {confirmDel && <ConfirmModal msg="确认删除此 Agent？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
-      <div className="set-h">Agent 配置</div>
-      <div className="set-desc">配置 Agent 的名称、LLM、系统提示词及可用范围。角色绑定请前往「角色指派」页。</div>
-
-      <div className="sec-kicker" style={{ marginBottom: 12 }}>全部 Agent · {agents.length}</div>
-      {agents.map(a => {
+    <div>
+      {confirmDel && <ConfirmModal msg="确认删除此对话角色？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
+      {customAgents.map(a => {
         const d = drafts[a.id] ?? {};
         const v = (f: keyof Agent) => d[f as keyof typeof d] !== undefined
           ? String(d[f as keyof typeof d] ?? '')
           : String(a[f] ?? '');
-        const roleTags = (a.forge_role ?? '').split(',').map(r =>
-          r === 'analysis' ? '需求分析' : r === 'test' ? '测试' : null
-        ).filter(Boolean) as string[];
-        systemKinds(a).forEach(kind => {
-          roleTags.unshift(systemKindLabels[kind] ?? kind);
-        });
-        const shownRoleTags = roleTags.slice(0, 2);
-        const hiddenRoleCount = Math.max(0, roleTags.length - shownRoleTags.length);
         return (
-          <div className="cfg-card" key={a.id} style={exp === a.id ? { borderColor: 'var(--ember-tint-strong)' } : {}}>
-            <div className="cfg-top" onClick={() => setExp(exp === a.id ? null : a.id)} style={{ cursor: 'pointer' }}>
-              <Avatar agent={a} size={40} />
+          <div className="cfg-card" key={a.id} style={{ padding: exp === a.id ? '13px 16px' : '8px 12px', marginBottom: 6, ...(exp === a.id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+            <div className="cfg-top" onClick={() => setExp(exp === a.id ? null : a.id)} style={{ cursor: 'pointer', gap: 10 }}>
+              <Avatar agent={a} size={32} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="cfg-name cfg-name-line">
-                  <span className="cfg-name-text">{v('name')}</span>
-                  <span className="cfg-role-tags">
-                    {shownRoleTags.map(tag => <span key={tag} className="chip ember">{tag}</span>)}
-                    {hiddenRoleCount > 0 && <span className="chip ember" title={roleTags.join(' · ')}>...</span>}
-                  </span>
-                </div>
+                <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{v('name')}</span></div>
                 <div className="cfg-sub">{formatAgentSub(a, llmNames)}</div>
               </div>
               <Icon name={exp === a.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
@@ -302,7 +288,7 @@ function AgentSettings() {
             {exp === a.id && (
               <div className="rise" style={{ marginTop: 15 }}>
                 <div className="cfg-fields">
-                  <div className="field"><label>Agent 名称</label>
+                  <div className="field"><label>名称</label>
                     <input value={v('name')} onChange={e => setDraft(a.id, 'name', e.target.value)} />
                   </div>
                   <div className="field"><label>使用的 LLM</label>
@@ -328,7 +314,16 @@ function AgentSettings() {
                       </label>
                     </div>
                   </div>
-                  <div className="field full"><label>系统提示词</label>
+                  <div className="field full">
+                    <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <span>系统提示词</span>
+                      <span style={{ display: 'flex', gap: 4 }}>
+                        {AGENT_TEMPLATES.map(t => (
+                          <button key={t.label} className="btn btn-sm" style={{ padding: '2px 8px', fontSize: 'var(--text-micro)' }}
+                            onClick={() => setDraft(a.id, 'system_prompt', t.prompt)}>{t.label}</button>
+                        ))}
+                      </span>
+                    </label>
                     <textarea className="mono" rows={5} value={v('system_prompt')} onChange={e => setDraft(a.id, 'system_prompt', e.target.value)} />
                   </div>
                 </div>
@@ -348,144 +343,190 @@ function AgentSettings() {
           </div>
         );
       })}
-      <div className="cfg-card add" onClick={addNew}><Icon name="plus" size={18} />添加 Agent</div>
+      <div className="cfg-card add" onClick={addNew} style={{ padding: 12, marginBottom: 0 }}><Icon name="plus" size={16} />新建对话角色</div>
     </div>
   );
 }
 
-// ── Role Assignment ───────────────────────────────────────────────────────────
-function RoleAssignment() {
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    listAgents().then(ags => { setAgents(ags); setLoading(false); }).catch(() => setLoading(false));
-  }, []);
+// ── 系统角色卡（角色即 Agent，内置专业提示词）─────────────────────────────────
+const PROMPT_MODES: { id: 'builtin' | 'append' | 'custom'; label: string }[] = [
+  { id: 'builtin', label: '内置' },
+  { id: 'append', label: '内置+补充' },
+  { id: 'custom', label: '自定义' },
+];
 
-  const agentOpts = [{ value: '', label: '— 未指派 —' }, ...agents.map(a => ({ value: a.id, label: a.name }))];
-  const analystId = agents.find(a => a.forge_role?.split(',').includes('analysis'))?.id ?? '';
-  const testerId  = agents.find(a => a.forge_role?.split(',').includes('test'))?.id ?? '';
+function RoleSlotCard({ slot, llms, onApply }: {
+  slot: RoleSlot;
+  llms: { id: string; name: string }[];
+  onApply: (kind: string, payload: Parameters<typeof setRoleSlot>[1]) => Promise<void>;
+}) {
+  const h = slot.holder;
+  const mode = (h?.prompt_mode ?? 'builtin') as 'builtin' | 'append' | 'custom';
+  const [supplement, setSupplement] = useState(h?.system_prompt ?? '');
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  const dirty = supplement !== (h?.system_prompt ?? '');
 
-  const assignRole = async (val: string, role: 'analysis' | 'test') => {
-    const fresh = await setAgentForgeRole(val, role);
-    setAgents(fresh);
+  const apply = async (payload: Parameters<typeof setRoleSlot>[1]) => {
+    setBusy(true);
+    try { await onApply(slot.kind, payload); } finally { setBusy(false); }
   };
 
-  const systemKinds = (a: Agent) => (a.system_kind ?? '').split(',').map(v => v.trim()).filter(Boolean);
-  const hasSystemKind = (a: Agent, kind: string) => systemKinds(a).includes(kind);
-  const systemKindValue = (a: Agent, add?: string, remove?: string) => {
-    const kinds = new Set(systemKinds(a));
-    if (remove) kinds.delete(remove);
-    if (add) kinds.add(add);
-    return Array.from(kinds).join(',') || null;
-  };
-
-  const updateLocal = async (id: string, payload: Partial<Agent>, status = '已指派') => {
-    try {
-      const updated = await updateAgent(id, payload);
-      setAgents(as => as.map(a => a.id === id ? updated : a));
-      setSaveStatus(s => ({ ...s, [id]: status }));
-      setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
-    } catch (e) {
-      setSaveStatus(s => ({ ...s, [id]: '保存失败: ' + String(e) }));
-    }
-  };
-
-  const setSystemRoleAgent = async (kind: string, id: string) => {
-    const current = agents.filter(a => hasSystemKind(a, kind));
-    if (!id) {
-      for (const holder of current) {
-        await updateLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消');
-      }
-      return;
-    }
-    for (const holder of current) {
-      if (holder.id !== id) {
-        await updateLocal(holder.id, { system_kind: systemKindValue(holder, undefined, kind) }, '已取消');
-      }
-    }
-    const selected = agents.find(a => a.id === id);
-    if (selected) {
-      await updateLocal(id, { system_kind: systemKindValue(selected, kind) });
-    }
-  };
-
-  const systemRoleRows = [
-    { kind: 'planner',           title: 'Planner 调度器',              icon: 'layers', color: 'var(--blue)',   desc: '解析群聊自然语言请求，生成多 Agent 并发/串行编排计划' },
-    { kind: 'summarizer',        title: 'Summarizer 总结器',            icon: 'quote',  color: 'var(--violet)', desc: '综合多个 Agent 的发言，形成结论、裁决和下一步建议' },
-    { kind: 'doc_writer',        title: 'Doc Writer 文档生成器',        icon: 'file',   color: 'var(--amber)',  desc: '把讨论结果整理成 PRD、ADR、测试计划等文档产物' },
-    { kind: 'context_compressor',title: 'Context Compressor 压缩器',   icon: 'layers', color: 'var(--green)',  desc: '压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度' },
-    { kind: 'material_ai',       title: 'Material AI 物料助手',         icon: 'folder', color: 'var(--ember)',  desc: '驱动物料库 AI 搜索和 AI 整理，使用该 Agent 自身的 LLM 配置' },
-    { kind: 'spec_writer',       title: 'Spec Writer 规格生成器',       icon: 'file',   color: 'var(--blue)',   desc: '驱动项目规格页 AI 一键生成，使用该 Agent 自身的 LLM 配置' },
-  ];
-
-  if (loading) return (
-    <div className="set-inner">
-      <div className="set-h">角色指派</div>
-      <div style={{ color: 'var(--text-3)', marginTop: 20 }}>加载中…</div>
-    </div>
-  );
-
-  const feedback = Object.values(saveStatus)[0];
+  const status = !h ? { t: '未配置', c: '' }
+    : !h.enabled ? { t: '已停用', c: '' }
+    : !h.llm_id ? { t: '缺 LLM', c: 'amber' }
+    : { t: '已启用', c: 'green' };
+  const llmName = h?.llm_id ? (llms.find(l => l.id === h.llm_id)?.name ?? h.llm_id) : '未指定 LLM';
+  const modeLabel = PROMPT_MODES.find(m => m.id === mode)?.label ?? '内置';
 
   return (
-    <div className="set-inner rise">
-      <div className="set-h">角色指派</div>
-      <div className="set-desc">将 Agent 绑定到编排系统和流水线的各个职责槽位。每次只有一个 Agent 持有某项角色；模型使用该 Agent 自身的 LLM 配置。</div>
-
-      {feedback && (
-        <div style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', color: 'var(--green-soft)', marginBottom: 12 }}>{feedback}</div>
-      )}
-
-      <div className="panel" style={{ marginBottom: 22 }}>
-        <div className="panel-head">
-          <div className="panel-title"><Icon name="bot" size={16} style={{ color: 'var(--blue)' }} />系统角色指派</div>
-          <div className="panel-sub">群聊编排引擎的内置职责</div>
+    <div className="cfg-card" style={{ padding: open ? '13px 16px' : '8px 12px', marginBottom: 0, ...(open ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+      <div className="cfg-top" onClick={() => setOpen(o => !o)} style={{ cursor: 'pointer', gap: 10 }}>
+        <div className="cfg-logo" style={{ background: slot.color, width: 28, height: 28 }}><Icon name={slot.icon} size={15} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="cfg-name cfg-name-line">
+            <span className="cfg-name-text">{slot.name}</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{slot.name_en}</span>
+          </div>
+          <div className="cfg-sub" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {open ? slot.desc : (h ? `${llmName} · 提示词 ${modeLabel}` : slot.desc)}
+          </div>
         </div>
-        <div style={{ padding: '4px 18px 14px' }}>
-          {systemRoleRows.map(row => {
-            const holder = agents.find(a => hasSystemKind(a, row.kind));
-            return (
-              <div className="assign-row" key={row.kind}>
-                <div className="cfg-logo" style={{ background: row.color, width: 34, height: 34 }}><Icon name={row.icon} size={17} /></div>
-                <div className="assign-info">
-                  <div className="assign-title">{row.title}</div>
-                  <div className="assign-desc">{row.desc}</div>
-                </div>
-                <Select style={{ width: 180 }} value={holder?.id ?? ''} options={agentOpts}
-                  onChange={val => setSystemRoleAgent(row.kind, val)} />
-              </div>
-            );
-          })}
+        {!open && h?.mentionable && <span className="chip" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }} title="可拉入群聊">群</span>}
+        {!open && h?.visible_in_chat && <span className="chip" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }} title="可私聊">私</span>}
+        {!open && h?.memory_enabled && <span className="chip ember" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }} title="已启用 Innate 记忆召回">记</span>}
+        <span className={'chip ' + status.c} style={{ flexShrink: 0 }}>{status.t}</span>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+      </div>
+      {open && (
+      <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+        <div className="field"><label>使用的 LLM</label>
+          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定 —' }, ...llms.map(l => ({ value: l.id, label: l.name }))]}
+            onChange={val => apply({ llm_id: val, enabled: true })} />
+        </div>
+        <div className="field"><label>提示词</label>
+          <div className="seg">
+            {PROMPT_MODES.map(m => (
+              <button key={m.id} className={mode === m.id ? 'on' : ''} disabled={busy}
+                onClick={() => apply({ prompt_mode: m.id })}>{m.label}</button>
+            ))}
+          </div>
+        </div>
+        {mode !== 'builtin' && (
+          <div className="field full">
+            <label>{mode === 'append' ? '补充指令（追加在内置提示词之后）' : '自定义提示词（替换内置）'}</label>
+            <textarea className="mono" rows={4} value={supplement} onChange={e => setSupplement(e.target.value)}
+              placeholder={mode === 'append' ? '例如：输出务必使用简体中文；遵守项目 DESIGN.md…' : '完全自定义该角色的系统提示词'} />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+              <button className="btn btn-sm btn-primary" disabled={busy || !dirty} onClick={() => apply({ supplement })}>
+                <Icon name="check" size={13} />保存提示词
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="field full">
+          <label>可用范围</label>
+          <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+              <Switch on={Boolean(h?.enabled)} onToggle={() => apply({ enabled: !(h?.enabled) })} />启用
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+              <Switch on={Boolean(h?.mentionable)} onToggle={() => apply({ mentionable: !(h?.mentionable) })} />可拉入群聊
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+              <Switch on={Boolean(h?.visible_in_chat)} onToggle={() => apply({ visible_in_chat: !(h?.visible_in_chat) })} />可私聊
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }} title="开启后该角色会召回本项目历史经验注入提示词，随使用越来越准（需安装 innate CLI）">
+              <Switch on={h ? Boolean(h.memory_enabled) : true} onToggle={() => apply({ memory_enabled: !(h?.memory_enabled ?? true) })} />启用记忆
+            </label>
+          </div>
         </div>
       </div>
+      )}
+    </div>
+  );
+}
 
-      <div className="panel" style={{ marginBottom: 22 }}>
-        <div className="panel-head">
-          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />流水线角色指派</div>
-          <div className="panel-sub">需求流水线各阶段的 Agent 绑定</div>
-        </div>
-        <div style={{ padding: '4px 18px 14px' }}>
-          <div className="assign-row">
-            <div className="cfg-logo" style={{ background: 'var(--violet)', width: 34, height: 34 }}><Icon name="search" size={17} /></div>
-            <div className="assign-info">
-              <div className="assign-title">需求分析</div>
-              <div className="assign-desc">在审核节点 1 前评估真实性、可行性、优先级</div>
+const ROLE_GROUPS: { id: RoleSlot['group']; title: string; icon: string; color: string; sub: string }[] = [
+  { id: 'orchestration', title: '群聊编排角色', icon: 'bot',     color: 'var(--blue)',  sub: '会议室多 Agent 协作的内置职责' },
+  { id: 'delivery',      title: '交付与项目角色', icon: 'package', color: 'var(--green)', sub: '交付流水线与项目工具的 AI 职责' },
+  { id: 'pipeline',      title: '需求流水线角色', icon: 'sliders', color: 'var(--ember)', sub: '分析 / 测试阶段' },
+];
+
+function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
+  const [slots, setSlots] = useState<RoleSlot[]>([]);
+  const [llms, setLlms] = useState<{ id: string; name: string }[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({}); // 默认收起
+
+  useEffect(() => {
+    Promise.all([listRoleCatalog(), listLlmConfigs()]).then(([s, l]) => {
+      setSlots(s); setLlms(l.map(x => ({ id: x.id, name: x.name }))); setLoading(false);
+    }).catch(e => { setErr(String(e)); setLoading(false); });
+  }, []);
+
+  const apply = async (kind: string, payload: Parameters<typeof setRoleSlot>[1]) => {
+    try { setSlots(await setRoleSlot(kind, payload)); onChanged(); }
+    catch (e) { setErr(String(e)); }
+  };
+
+  if (loading) return <div style={{ color: 'var(--text-3)', marginTop: 12 }}>加载中…</div>;
+
+  return (
+    <div>
+      {err && <div className="chip red" style={{ marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
+      {ROLE_GROUPS.map(g => {
+        const rows = slots.filter(s => s.group === g.id);
+        if (rows.length === 0) return null;
+        const open = !!openGroups[g.id];
+        // 完整配置 = 有持有 Agent + 已启用 + 已绑定 LLM（缺一即不计入）
+        const active = rows.filter(r => r.holder?.enabled && r.holder?.llm_id).length;
+        const complete = active === rows.length;
+        return (
+          <div className="panel" style={{ marginBottom: 12 }} key={g.id}>
+            <div className="panel-head" onClick={() => setOpenGroups(c => ({ ...c, [g.id]: !open }))} style={{ cursor: 'pointer' }}>
+              <div className="panel-title">
+                <Icon name={g.icon} size={16} style={{ color: g.color }} />{g.title}
+                {!complete && <Icon name="alert" size={13} style={{ color: 'var(--amber)', marginLeft: 6 }} />}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className={'chip ' + (complete ? 'green' : 'amber')} style={{ fontSize: 'var(--text-micro)', padding: '1px 7px' }}>{active}/{rows.length}</span>
+                <Icon name={open ? 'chevDown' : 'chevRight'} size={16} style={{ color: 'var(--text-3)' }} />
+              </div>
             </div>
-            <Select style={{ width: 180 }} value={analystId} options={agentOpts}
-              onChange={val => assignRole(val, 'analysis')} />
+            {open && (
+              <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {rows.map(s => <RoleSlotCard key={s.kind} slot={s} llms={llms} onApply={apply} />)}
+              </div>
+            )}
           </div>
-          <div className="assign-row">
-            <div className="cfg-logo" style={{ background: 'var(--green)', width: 34, height: 34 }}><Icon name="flask" size={17} /></div>
-            <div className="assign-info">
-              <div className="assign-title">测试</div>
-              <div className="assign-desc">合并后被动响应 + 每日主动巡检</div>
-            </div>
-            <Select style={{ width: 180 }} value={testerId} options={agentOpts}
-              onChange={val => assignRole(val, 'test')} />
-          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function RolesPage() {
+  const [bump, setBump] = useState(0);
+  const [showCustom, setShowCustom] = useState(false);
+  const onChanged = () => setBump(b => b + 1);
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">角色 Agent</div>
+      <div className="set-desc">两层模型：角色即 Agent。系统角色自带专业内置提示词，选 LLM 即可启用，可"内置+补充"或自定义；对话角色用于群聊/私聊，可自由创建。</div>
+      <RoleCardsSection onChanged={onChanged} />
+      <div className="panel" style={{ marginBottom: 12 }}>
+        <div className="panel-head" onClick={() => setShowCustom(v => !v)} style={{ cursor: 'pointer' }}>
+          <div className="panel-title"><Icon name="bot" size={16} style={{ color: 'var(--violet)' }} />对话角色 · 自定义</div>
+          <Icon name={showCustom ? 'chevDown' : 'chevRight'} size={16} style={{ color: 'var(--text-3)' }} />
         </div>
+        {showCustom && (
+          <div style={{ padding: '8px 12px' }}>
+            <CustomAgents key={'ca' + bump} onChanged={onChanged} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -768,6 +809,121 @@ function AboutSettings() {
 
 // ── WebhookSettings ───────────────────────────────────────────────────────────
 
+const notifyInputStyle: React.CSSProperties = {
+  background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 9,
+  padding: '8px 10px', color: 'var(--text)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-control)',
+};
+
+function NotifySettings() {
+  const [channels, setChannels] = useState<NotifyChannel[]>([]);
+  const [form, setForm] = useState({ name: '', kind: 'slack', target: '' });
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+
+  const reload = () => { listNotifyChannels().then(setChannels).catch(() => setChannels([])); };
+  useEffect(() => { reload(); }, []);
+
+  const run = async (key: string, fn: () => Promise<unknown>) => {
+    setErr(''); setBusy(key);
+    try { await fn(); reload(); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(''); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">通知通道</div>
+      <div className="set-desc">全局通知通道，用于推送流水线事件（审核、部署、安全告警等）。所有项目共享。</div>
+      {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
+      <div className="panel">
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="bell" size={16} style={{ color: 'var(--ember)' }} />通知通道</div>
+          <span className="sec-kicker">全局 · {channels.length} 个</span>
+        </div>
+        <div style={{ display: 'flex', gap: 8, padding: '12px 16px', borderTop: '1px solid var(--border)', alignItems: 'center', flexWrap: 'wrap' }}>
+          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="名称" style={{ ...notifyInputStyle, width: 120 }} />
+          <div style={{ minWidth: 130 }}>
+            <Select value={form.kind} onChange={v => setForm(f => ({ ...f, kind: v }))}
+              options={[{ value: 'slack', label: 'Slack' }, { value: 'wecom', label: '企业微信' }, { value: 'webhook', label: '通用 Webhook' }]} />
+          </div>
+          <input value={form.target} onChange={e => setForm(f => ({ ...f, target: e.target.value }))} placeholder="Webhook URL" style={{ ...notifyInputStyle, flex: 1, minWidth: 200 }} />
+          <button className="btn btn-primary btn-sm" disabled={!form.name.trim() || !form.target.trim() || busy === 'add'}
+            onClick={() => run('add', async () => { await createNotifyChannel(form); setForm({ name: '', kind: 'slack', target: '' }); })}>
+            <Icon name="plus" size={14} />添加
+          </button>
+        </div>
+        {channels.map(c => (
+          <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <span className="chip">{c.kind}</span>
+              <span style={{ fontWeight: 600 }}>{c.name}</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>{c.target}</span>
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button className="btn btn-sm" disabled={busy === 'test' + c.id} onClick={() => run('test' + c.id, () => testNotifyChannel(c.kind, c.target))}><Icon name="send" size={13} />测试</button>
+              <button className="btn btn-sm btn-danger" onClick={() => run('del' + c.id, () => deleteNotifyChannel(c.id))}><Icon name="trash" size={13} /></button>
+            </div>
+          </div>
+        ))}
+        {channels.length === 0 && <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无通知通道</div>}
+      </div>
+    </div>
+  );
+}
+
+function GatingSettings() {
+  const [policies, setPolicies] = useState<AutoPassPolicy[]>([]);
+  const [autoPassOn, setAutoPassOn] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const reload = () => {
+    listAutoPassPolicy().then(setPolicies).catch(() => setPolicies([]));
+    getAutoPassEnabled().then(setAutoPassOn).catch(() => {});
+  };
+  useEffect(() => { reload(); }, []);
+
+  const toggle = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !autoPassOn; await setAutoPassEnabled(next); setAutoPassOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">门控降级</div>
+      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过审核 2 自动合并。</div>
+      {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
+      <div className="panel">
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />门控降级（自动放行）</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (autoPassOn ? 'green' : '')}>{autoPassOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggle}>
+              <Icon name={autoPassOn ? 'pause' : 'play'} size={13} />{autoPassOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过审核 2 直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
+        </div>
+        {policies.length === 0
+          ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
+          : policies.map(p => (
+            <div key={p.change_class} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 16px', borderTop: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className={'chip ' + (p.trust_state === 'auto' ? 'green' : p.trust_state === 'eligible' ? 'amber' : '')}>{p.trust_state}</span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)' }}>{p.change_class}</span>
+              </div>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>批准连胜 {p.approve_count} · 退改 {p.reject_count}</span>
+            </div>
+          ))}
+      </div>
+    </div>
+  );
+}
+
 function WebhookSettings() {
   const [cfg, setCfg]     = useState<IntakeConfig | null>(null);
   const [status, setStatus] = useState<WebhookStatus | null>(null);
@@ -900,11 +1056,12 @@ function WebhookSettings() {
 const SET_ITEMS = [
   { id: 'theme',       name: '主题设置',     ic: 'palette' },
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-  { id: 'agents',      name: 'Agent 配置',   ic: 'bot' },
-  { id: 'roles',       name: '角色指派',     ic: 'layers' },
+  { id: 'roles',       name: '角色 Agent',         ic: 'bot' },
   { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
   { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
+  { id: 'notify',      name: '通知通道',     ic: 'bell' },
+  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
   { id: 'specs',       name: '规范文档',     ic: 'file' },
   { id: 'about',       name: '关于 AutoForge', ic: 'box' },
 ];
@@ -934,14 +1091,15 @@ export default function SettingsPage({
         <div className="set-body scroll">
           {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
           {sec === 'llm'         && <LLMSettings />}
-          {sec === 'agents'      && <AgentSettings />}
-          {sec === 'roles'       && <RoleAssignment />}
+          {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
+          {sec === 'notify'      && <NotifySettings />}
+          {sec === 'gating'      && <GatingSettings />}
           {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','agents','roles','concurrency','security','webhook','specs','about'].includes(sec) && (
+          {!['theme','llm','roles','concurrency','security','webhook','notify','gating','specs','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

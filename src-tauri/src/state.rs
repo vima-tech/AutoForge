@@ -21,6 +21,7 @@ pub struct AppState {
 static WORKTREES_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ATTACHMENTS_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static MATERIALS_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static KB_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 pub fn init_worktrees_base(path: String) {
     WORKTREES_BASE.set(path).ok();
@@ -53,4 +54,15 @@ pub fn materials_base() -> String {
         .get()
         .cloned()
         .unwrap_or_else(|| "/tmp/autoforge-materials".to_string())
+}
+
+pub fn init_kb_base(path: String) {
+    KB_BASE.set(path).ok();
+}
+
+pub fn kb_base() -> String {
+    KB_BASE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "/tmp/autoforge-kb".to_string())
 }

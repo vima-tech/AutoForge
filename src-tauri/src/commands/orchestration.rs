@@ -137,7 +137,7 @@ async fn execute_conversation_task(
 ) -> Result<(), String> {
     let planner = load_planner_agent(&db).await?;
     let window_size = payload.window_size.unwrap_or(30).clamp(5, 100);
-    if let Err(e) = maybe_compress_context(&db, &app, &payload.conversation_id, window_size).await {
+    if let Err(e) = maybe_compress_context(&db, &app, &payload.conversation_id, window_size, conversation.project_id.as_deref()).await {
         warn!("[orchestration] context compression skipped: {}", e);
     }
     let project_prefix =
@@ -269,6 +269,7 @@ async fn execute_conversation_task(
                 &payload.instruction,
                 &snapshot,
                 &accumulated,
+                conversation.project_id.as_deref(),
             )
             .await?;
             if !outcome.ok {
@@ -291,6 +292,7 @@ async fn execute_conversation_task(
                 &payload.instruction,
                 &snapshot,
                 &accumulated,
+                conversation.project_id.as_deref(),
             )
             .await?;
             if !outcome.ok {
@@ -370,7 +372,7 @@ async fn build_plan(
     }
 
     if let Some(planner) = planner {
-        match ask_planner(db, planner, instruction, &mentioned, members, snapshot).await {
+        match ask_planner(db, planner, instruction, &mentioned, members, snapshot, conversation.project_id.as_deref()).await {
             Ok(plan) => return validate_plan(plan, members, instruction),
             Err(e) => warn!("[orchestration] planner failed, using fallback plan: {}", e),
         }
@@ -386,6 +388,7 @@ async fn ask_planner(
     mentioned_agent_ids: &[String],
     members: &[Agent],
     snapshot: &str,
+    project_id: Option<&str>,
 ) -> Result<ConversationPlan, String> {
     let candidates = members
         .iter()
@@ -430,12 +433,16 @@ async fn ask_planner(
         instruction
     );
 
-    let system_prompt = if planner.system_prompt.trim().is_empty() {
-        None
-    } else {
-        Some(planner.system_prompt.as_str())
-    };
-    let raw = crate::agents::llm::run_agent_text(db, planner, &prompt, system_prompt, &[])
+    // 群聊编排：用注册表内置提示词（按 prompt_mode）+ 以用户请求为键的 Innate 召回。
+    let system_prompt = crate::agents::llm::build_role_system_prompt(
+        planner,
+        Some("planner"),
+        None,
+        project_id,
+        Some(instruction),
+    )
+    .await;
+    let raw = crate::agents::llm::run_agent_text(db, planner, &prompt, system_prompt.as_deref(), &[])
         .await
         .map_err(|e| e.to_string())?;
     parse_plan_json(&raw)
@@ -656,6 +663,7 @@ async fn run_summarizer(
     instruction: &str,
     snapshot: &str,
     accumulated: &str,
+    project_id: Option<&str>,
 ) -> Result<AgentOutcome, String> {
     let prompt = format!(
         "以下是群聊对话快照：\n{}\n\n本轮 Agent 发言：\n{}\n\n用户原始请求：\n{}\n\n请作为群聊总结器输出最终结论。要求：\n- 综合各方观点，不重复完整原文。\n- 如果用户要求裁决，明确给出裁决和理由。\n- 输出后续行动建议。\n- 使用结构化 Markdown。",
@@ -665,7 +673,11 @@ async fn run_summarizer(
     );
     let fallback_system =
         "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。";
-    run_system_agent_markdown(db, app, conversation_id, agent, &prompt, fallback_system).await
+    run_system_agent_markdown(
+        db, app, conversation_id, agent, "summarizer", &prompt, fallback_system,
+        project_id, Some(instruction),
+    )
+    .await
 }
 
 async fn run_doc_writer(
@@ -676,6 +688,7 @@ async fn run_doc_writer(
     instruction: &str,
     snapshot: &str,
     accumulated: &str,
+    project_id: Option<&str>,
 ) -> Result<AgentOutcome, String> {
     let default_kind = infer_artifact_kind(instruction);
     let prompt = format!(
@@ -712,7 +725,10 @@ JSON 结构：
     );
     let fallback_system =
         "你是 AutoForge 的系统文档生成器，负责把群聊讨论沉淀为可引用、可迭代的文档产物。";
-    let (ok, raw) = run_system_agent_text(db, agent, &prompt, fallback_system).await;
+    let (ok, raw) = run_system_agent_text(
+        db, agent, "doc_writer", &prompt, fallback_system, project_id, Some(instruction),
+    )
+    .await;
     if !ok {
         let message_id =
             insert_agent_markdown_message(db, conversation_id, &agent.id, &raw).await?;
@@ -751,10 +767,14 @@ async fn run_system_agent_markdown(
     app: &AppHandle,
     conversation_id: &str,
     agent: &Agent,
+    kind: &str,
     prompt: &str,
     fallback_system_prompt: &str,
+    project_id: Option<&str>,
+    recall_key: Option<&str>,
 ) -> Result<AgentOutcome, String> {
-    let (ok, text) = run_system_agent_text(db, agent, prompt, fallback_system_prompt).await;
+    let (ok, text) =
+        run_system_agent_text(db, agent, kind, prompt, fallback_system_prompt, project_id, recall_key).await;
     let message_id = insert_agent_markdown_message(db, conversation_id, &agent.id, &text).await?;
     event::emit(
         app,
@@ -774,15 +794,22 @@ async fn run_system_agent_markdown(
 async fn run_system_agent_text(
     db: &crate::db::Db,
     agent: &Agent,
+    kind: &str,
     prompt: &str,
     fallback_system_prompt: &str,
+    project_id: Option<&str>,
+    recall_key: Option<&str>,
 ) -> (bool, String) {
-    let system_prompt = if agent.system_prompt.trim().is_empty() {
-        fallback_system_prompt
-    } else {
-        agent.system_prompt.as_str()
-    };
-    match crate::agents::llm::run_agent_text(db, agent, prompt, Some(system_prompt), &[]).await {
+    // 用注册表内置提示词（按 prompt_mode）+ Innate 召回，让群聊系统角色随经验越用越好。
+    let system_prompt = crate::agents::llm::build_role_system_prompt(
+        agent,
+        Some(kind),
+        Some(fallback_system_prompt),
+        project_id,
+        recall_key,
+    )
+    .await;
+    match crate::agents::llm::run_agent_text(db, agent, prompt, system_prompt.as_deref(), &[]).await {
         Ok(text) => (true, text),
         Err(e) => (false, format!("[系统错误: {}]", e)),
     }
@@ -793,6 +820,7 @@ async fn maybe_compress_context(
     app: &AppHandle,
     conversation_id: &str,
     window_size: i64,
+    project_id: Option<&str>,
 ) -> Result<(), String> {
     let Some(compressor) = load_system_role_agent(db, "context_compressor").await? else {
         return Ok(());
@@ -829,7 +857,11 @@ async fn maybe_compress_context(
         source
     );
     let fallback_system = "你是 AutoForge 的上下文压缩器，负责在长对话超过窗口条数后生成可靠摘要，降低后续 Agent 的上下文负担。";
-    let (ok, summary) = run_system_agent_text(db, &compressor, &prompt, fallback_system).await;
+    // 召回键用待压缩内容，命中该对话主题相关的项目经验。
+    let (ok, summary) = run_system_agent_text(
+        db, &compressor, "context_compressor", &prompt, fallback_system, project_id, Some(&source),
+    )
+    .await;
     if !ok {
         return Err(summary);
     }

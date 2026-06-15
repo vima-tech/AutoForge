@@ -379,6 +379,8 @@ pub async fn ai_generate_specs(
         SPEC_AI_SYSTEM_KIND,
         &prompt,
         Some("你是 AutoForge 的项目规格生成 Agent，负责把项目信息、技术文件和物料摘要转换为可执行的结构化规格约束。只输出调用方要求的 JSON。"),
+        Some(&project_id),
+        None, // 规格生成的 prompt 已含项目技术上下文，作召回键足够
     )
         .await
         .map_err(|e| format!("AI 生成失败: {}", e))?;

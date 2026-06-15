@@ -1513,6 +1513,12 @@ button { font-family: inherit; cursor: pointer; }
 .advice-input:focus-within { border-color: var(--ember); }
 .advice-input textarea { flex: 1; background: transparent; border: none; padding: 10px 13px 6px; color: var(--text); font-family: var(--font-sans); font-size: var(--text-control); resize: none; outline: none; min-height: 52px; }
 .advice-input-foot { display: flex; justify-content: flex-end; padding: 4px 8px 7px; }
+/* 无预览时：管理员建议占满整个右栏 */
+.advice-wrap.advice-expanded { flex: 1; min-height: 0; border-top: none; display: flex; flex-direction: column; padding: 14px 14px 16px; }
+.advice-wrap.advice-expanded .advice-input { flex: 1; }
+.advice-wrap.advice-expanded .advice-input textarea { flex: 1; min-height: 160px; }
+.advice-hint { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; padding: 9px 11px; border-radius: 10px; background: var(--bg-2); border: 1px solid var(--border); color: var(--text-3); font-size: var(--text-label); line-height: var(--leading-normal); }
+.advice-hint svg { flex: none; margin-top: 2px; color: var(--text-faint); }
 /* Legacy .advice-box keep for compat */
 .advice-box { margin: 4px 12px 14px; }
 .advice-box textarea { width: 100%; background: var(--bg-3); border: 1px solid var(--border-strong); border-radius: 12px; padding: 11px 13px; color: var(--text); font-family: var(--font-sans); font-size: var(--text-control); resize: none; outline: none; min-height: 70px; }
@@ -1536,6 +1542,11 @@ button { font-family: inherit; cursor: pointer; }
 .set-nav-item svg { width: 18px; height: 18px; }
 .set-body { flex: 1; overflow-y: auto; }
 .set-inner { max-width: 760px; padding: 28px 36px 50px; }
+
+/* 交付流水线：当前阶段面板自动占满剩余高度 */
+.del-stage { flex: 1; display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.del-stage > .panel { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.del-stage > .panel > .panel-head { position: sticky; top: 0; z-index: 1; flex: none; background: var(--bg-2); }
 .set-h { font-family: var(--font-display); font-size: var(--text-page-title); font-weight: 800; letter-spacing: -.01em; }
 .set-desc { color: var(--text-3); font-size: var(--text-body); margin: 6px 0 22px; line-height: var(--leading-relaxed); }
 

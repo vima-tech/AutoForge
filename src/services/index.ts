@@ -41,7 +41,17 @@ export interface Agent {
   role_type: 'business' | 'system'; system_kind: string | null;
   capabilities_json: string; max_concurrency: number;
   visible_in_chat: boolean; mentionable: boolean; enabled: boolean;
+  prompt_mode: 'builtin' | 'append' | 'custom';
+  memory_enabled: boolean;
   created_at: string;
+}
+export interface RoleSlot {
+  kind: string; name: string; name_en: string;
+  group: 'orchestration' | 'delivery' | 'pipeline';
+  binding: 'system_kind' | 'forge_role';
+  desc: string; color: string; icon: string;
+  builtin_prompt: string;
+  holder: Agent | null;
 }
 export interface Project {
   id: string; name: string; slug: string; description: string;
@@ -60,7 +70,56 @@ export interface IssueAnalysis {
   feasibility_score: number | null; priority_suggestion: number | null;
   category_suggestion: string | null; severity_suggestion: string | null;
   duplicate_of: string | null; affected_modules: string | null;
-  analysis_summary: string; raw_llm_output: string | null; created_at: string;
+  analysis_summary: string; raw_llm_output: string | null;
+  analysis_json: string | null; created_at: string;
+}
+
+// 完整结构化分析规格（对齐 src-tauri/src/agents/schemas/issue_analysis.schema.json v1.0）
+export interface IssueAnalysisSpec {
+  schema_version: string;
+  triage: {
+    authenticity_score: number; feasibility_score: number; priority_suggestion: number;
+    category_suggestion: string; severity_suggestion: string; is_duplicate: boolean;
+    duplicate_of: string | null; duplicate_hint: string; analysis_summary: string; confidence: number;
+  };
+  understanding: {
+    problem_type: string; restated_requirement: string; user_story: string | null;
+    current_behavior: string | null; expected_behavior: string | null;
+    reproduction_steps: string[]; background: string | null;
+  };
+  root_cause: {
+    hypothesis: string; evidence: string[];
+    suspected_locations: { file: string; symbol: string | null; reason: string }[];
+    confidence: number;
+  } | null;
+  scope: {
+    affected_modules: string[];
+    affected_files: { path: string; change_type: string; reason: string; confidence?: number | null }[];
+    related_files: string[]; entry_points: string[]; out_of_scope: string[]; blast_radius: string;
+  };
+  implementation_plan: {
+    approach: string;
+    steps: { order: number; action: string; target_files: string[]; details: string | null }[];
+    alternatives: { option: string; tradeoff: string }[];
+    data_model_changes: { kind: string; description: string }[];
+    new_dependencies: string[];
+  };
+  acceptance_criteria: { id: string; statement: string; verify: string | null }[];
+  test_plan: { unit: string[]; integration: string[]; manual: string[]; edge_cases: string[] };
+  risks: { description: string; severity: string; mitigation: string | null }[];
+  constraints: { must: string[]; must_not: string[] };
+  assumptions: string[];
+  open_questions: string[];
+  estimate: { complexity: string; confidence: number | null; rationale: string | null } | null;
+  claude_code_brief: {
+    objective: string; instructions: string[]; do: string[]; dont: string[];
+    files_to_touch: string[]; definition_of_done: string[];
+  };
+}
+
+export function parseAnalysisSpec(json: string | null | undefined): IssueAnalysisSpec | null {
+  if (!json) return null;
+  try { return JSON.parse(json) as IssueAnalysisSpec; } catch { return null; }
 }
 export interface ChangeRequest {
   id: string; project_id: string; issue_id: string; status: string;
@@ -245,6 +304,10 @@ export const review1 = (issueId: string, decision: {
 export const review2 = (crId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
 }) => ipc<ChangeRequest>('review_2', { crId, decision });
+export const retryChangeRequest = (crId: string) =>
+  ipc<ChangeRequest>('retry_change_request', { crId });
+export const deleteChangeRequest = (crId: string) =>
+  ipc<void>('delete_change_request', { crId });
 
 // ── Conversations ────────────────────────────────────────────────────────────
 export const listConversations = () => ipc<Conversation[]>('list_conversations');
@@ -332,6 +395,7 @@ export const createAgent = (payload: {
   role_type?: 'business' | 'system'; system_kind?: string | null;
   capabilities_json?: string; max_concurrency?: number;
   visible_in_chat?: boolean; mentionable?: boolean; enabled?: boolean;
+  prompt_mode?: 'builtin' | 'append' | 'custom'; memory_enabled?: boolean;
 }) => ipc<Agent>('create_agent', { payload });
 export const updateAgent = (id: string, payload: Partial<{
   name: string; name_en: string; role: string; color: string;
@@ -339,10 +403,19 @@ export const updateAgent = (id: string, payload: Partial<{
   role_type: 'business' | 'system'; system_kind: string | null;
   capabilities_json: string; max_concurrency: number;
   visible_in_chat: boolean; mentionable: boolean; enabled: boolean;
+  prompt_mode: 'builtin' | 'append' | 'custom'; memory_enabled: boolean;
 }>) => ipc<Agent>('update_agent', { id, payload });
 export const deleteAgent = (id: string) => ipc<void>('delete_agent', { id });
 export const setAgentForgeRole = (agentId: string, role: string) =>
   ipc<Agent[]>('set_agent_forge_role', { agentId, role });
+
+// ── Settings — Role catalog (两层模型) ──────────────────────────────────────
+export const listRoleCatalog = () => ipc<RoleSlot[]>('list_role_catalog');
+export const setRoleSlot = (kind: string, payload: {
+  llm_id?: string; prompt_mode?: 'builtin' | 'append' | 'custom';
+  supplement?: string; enabled?: boolean;
+  visible_in_chat?: boolean; mentionable?: boolean; memory_enabled?: boolean;
+}) => ipc<RoleSlot[]>('set_role_slot', { kind, payload });
 
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
 
@@ -443,6 +516,27 @@ export const startDevServer = (projectId: string) =>
   ipc<DevServerStatus>('start_dev_server', { projectId });
 export const stopDevServer = (projectId: string) =>
   ipc<void>('stop_dev_server', { projectId });
+export const getDevServerLog = (projectId: string) =>
+  ipc<string>('get_dev_server_log', { projectId });
+
+// ── CR worktree preview (本次改动) ──────────────────────────────────────────────
+export interface CrPreviewStatus {
+  cr_id: string;
+  kind: 'web' | 'tauri' | 'none';
+  status: 'no_config' | 'no_session' | 'idle' | 'starting' | 'running' | 'stopped';
+  url: string | null;
+  can_launch_app: boolean;
+}
+export const getCrPreview = (crId: string) =>
+  ipc<CrPreviewStatus>('get_cr_preview', { crId });
+export const startCrPreview = (crId: string) =>
+  ipc<CrPreviewStatus>('start_cr_preview', { crId });
+export const stopCrPreview = (crId: string) =>
+  ipc<void>('stop_cr_preview', { crId });
+export const launchCrApp = (crId: string) =>
+  ipc<void>('launch_cr_app', { crId });
+export const getCrPreviewLog = (crId: string) =>
+  ipc<string>('get_cr_preview_log', { crId });
 
 // ── Specs ─────────────────────────────────────────────────────────────────────
 
@@ -468,3 +562,114 @@ export const deleteProjectSpec = (id: string) =>
   ipc<boolean>('delete_project_spec', { id });
 export const aiGenerateSpecs = (projectId: string) =>
   ipc<string>('ai_generate_specs', { projectId });
+
+// ── Delivery pipeline: prototype (03) / security (07) / deploy (08) / scan (06) ──
+
+export interface PrototypePrompt {
+  id: string; project_id: string; issue_id: string | null;
+  tool_target: string; title: string; prompt: string; created_at: string;
+}
+export interface SecurityAudit {
+  id: string; project_id: string; change_request_id: string | null;
+  status: string; severity: string; summary: string;
+  findings_json: string; issues_created: string;
+  started_at: string; completed_at: string | null;
+}
+export interface Deployment {
+  id: string; project_id: string; change_request_id: string | null;
+  target_env: string; script: string; status: string; log: string;
+  created_at: string; confirmed_at: string | null; completed_at: string | null;
+}
+export interface CrGrade {
+  change_request_id: string; tier: string; score: number;
+  rationale: string; change_class: string; created_at: string;
+}
+export interface AutoPassPolicy {
+  change_class: string; trust_state: string;
+  approve_count: number; reject_count: number; updated_at: string;
+}
+
+// Node 03 — prototype design prompts
+export const listPrototypePrompts = (projectId?: string) =>
+  ipc<PrototypePrompt[]>('list_prototype_prompts', { projectId: projectId ?? null });
+export const generatePrototypePrompt = (projectId: string, issueId?: string | null, toolTarget?: string) =>
+  ipc<PrototypePrompt>('generate_prototype_prompt', {
+    projectId, issueId: issueId ?? null, toolTarget: toolTarget ?? null,
+  });
+
+// Node 07 — security audits
+export const listSecurityAudits = (projectId?: string) =>
+  ipc<SecurityAudit[]>('list_security_audits', { projectId: projectId ?? null });
+
+// Node 08 — deployments
+export const listDeployments = (projectId?: string) =>
+  ipc<Deployment[]>('list_deployments', { projectId: projectId ?? null });
+export const generateDeployScript = (projectId: string, targetEnv?: string) =>
+  ipc<Deployment>('generate_deploy_script', { projectId, targetEnv: targetEnv ?? null });
+export const confirmDeploy = (deploymentId: string) =>
+  ipc<Deployment>('confirm_deploy', { deploymentId });
+
+// Node 06 — proactive inspection
+export const runProactiveScan = (projectId: string) =>
+  ipc<void>('run_proactive_scan', { projectId });
+
+// §7 — diff risk grade
+export const getCrGrade = (crId: string) =>
+  ipc<CrGrade | null>('get_cr_grade', { crId });
+export const listAutoPassPolicy = () =>
+  ipc<AutoPassPolicy[]>('list_auto_pass_policy');
+export const getAutoPassEnabled = () =>
+  ipc<boolean>('get_auto_pass_enabled');
+export const setAutoPassEnabled = (enabled: boolean) =>
+  ipc<void>('set_auto_pass_enabled', { enabled });
+
+// M5 — preview data masking + container preview
+export const maskPreviewData = (crId: string) =>
+  ipc<void>('mask_preview_data', { crId });
+export const provisionPreviewContainer = (crId: string) =>
+  ipc<string>('provision_preview_container', { crId });
+
+// M11 — notification hub
+export interface NotifyChannel {
+  id: string; name: string; kind: string;
+  target: string; events: string; enabled: boolean; created_at: string;
+}
+export const listNotifyChannels = () => ipc<NotifyChannel[]>('list_notify_channels');
+export const createNotifyChannel = (payload: {
+  name: string; kind: string; target: string; events?: string; enabled?: boolean;
+}) => ipc<NotifyChannel>('create_notify_channel', { payload });
+export const updateNotifyChannel = (id: string, payload: {
+  name: string; kind: string; target: string; events?: string; enabled?: boolean;
+}) => ipc<NotifyChannel>('update_notify_channel', { id, payload });
+export const deleteNotifyChannel = (id: string) =>
+  ipc<void>('delete_notify_channel', { id });
+export const testNotifyChannel = (kind: string, target: string) =>
+  ipc<void>('test_notify_channel', { kind, target });
+
+// M10 — embeddable feedback widget
+export const getWidgetSnippet = (projectId: string) =>
+  ipc<string>('get_widget_snippet', { projectId });
+
+// Node 03 — prototype prompt edit / delete
+export const deletePrototypePrompt = (id: string) =>
+  ipc<void>('delete_prototype_prompt', { id });
+export const updatePrototypePrompt = (id: string, title: string, prompt: string) =>
+  ipc<PrototypePrompt>('update_prototype_prompt', { id, title, prompt });
+
+// Delivery node artifacts (persisted to .autoforge/deliverables/<node>/)
+export interface DeliveryArtifact {
+  id: string; project_id: string; node: string; original_name: string;
+  stored_name: string; rel_path: string; mime: string; size_bytes: number;
+  sha256: string; description: string; created_at: string;
+}
+export const listDeliveryArtifacts = (projectId: string, node?: string) =>
+  ipc<DeliveryArtifact[]>('list_delivery_artifacts', { projectId, node: node ?? null });
+export const importDeliveryArtifact = (
+  projectId: string, node: string, fileName: string, mime: string, dataBase64: string,
+) => ipc<DeliveryArtifact>('import_delivery_artifact', { projectId, node, fileName, mime, dataBase64 });
+export const updateDeliveryArtifactMeta = (id: string, description: string) =>
+  ipc<DeliveryArtifact>('update_delivery_artifact_meta', { id, description });
+export const deleteDeliveryArtifact = (id: string) =>
+  ipc<void>('delete_delivery_artifact', { id });
+export const deliveryArtifactDataUrl = (id: string) =>
+  ipc<string>('delivery_artifact_data_url', { id });

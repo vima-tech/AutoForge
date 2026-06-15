@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoforge.local/schemas/issue_analysis.schema.json",
+  "title": "AutoForge 需求分析结果",
+  "description": "需求分析 Agent 的固定输出格式。前半部分为分流(triage)字段，与 issue_analyses 表对齐；后半部分为可直接喂给 Claude Code 的实现规格。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "triage",
+    "understanding",
+    "scope",
+    "implementation_plan",
+    "acceptance_criteria",
+    "claude_code_brief"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Schema 版本，便于后续演进与兼容判断。"
+    },
+
+    "triage": {
+      "type": "object",
+      "description": "分流评估。字段名与现有 issue_analyses 表/AnalysisResult 保持一致，便于直接落库。",
+      "additionalProperties": false,
+      "required": [
+        "authenticity_score", "feasibility_score", "priority_suggestion",
+        "category_suggestion", "severity_suggestion", "is_duplicate",
+        "analysis_summary", "confidence"
+      ],
+      "properties": {
+        "authenticity_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "需求是否真实、明确、有业务价值。" },
+        "feasibility_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "结合技术栈与现有模块判断技术可行性。" },
+        "priority_suggestion": { "type": "integer", "minimum": 1, "maximum": 10, "description": "综合业务价值与紧迫性的优先级。" },
+        "category_suggestion": { "type": "string", "enum": ["Feature", "Bug", "Debt", "Improvement"] },
+        "severity_suggestion": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "is_duplicate": { "type": "boolean", "description": "是否疑似与既有需求重复（保守判断）。" },
+        "duplicate_of": { "type": ["string", "null"], "description": "疑似重复的目标 issue id，未知则为 null。" },
+        "duplicate_hint": { "type": "string", "description": "疑似重复的简述，否则为空字符串。" },
+        "analysis_summary": { "type": "string", "maxLength": 120, "description": "一句话摘要（≤120 字）。" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "本次分析整体置信度；低置信时应在 open_questions 中列出待确认项。" }
+      }
+    },
+
+    "understanding": {
+      "type": "object",
+      "description": "对需求的理解与还原。bug 类需求需补充复现与现状/预期。",
+      "additionalProperties": false,
+      "required": ["problem_type", "restated_requirement"],
+      "properties": {
+        "problem_type": { "type": "string", "enum": ["bug", "feature", "enhancement", "refactor", "tech_debt", "question"] },
+        "restated_requirement": { "type": "string", "description": "用实现视角重述需求，消除歧义。" },
+        "user_story": { "type": ["string", "null"], "description": "作为<角色>，我希望<能力>，以便<价值>。无则 null。" },
+        "current_behavior": { "type": ["string", "null"], "description": "bug：当前的错误行为；非 bug 为 null。" },
+        "expected_behavior": { "type": ["string", "null"], "description": "期望达到的行为/结果。" },
+        "reproduction_steps": { "type": "array", "items": { "type": "string" }, "description": "bug 复现步骤；非 bug 留空数组。" },
+        "background": { "type": ["string", "null"], "description": "相关业务/历史背景，可选。" }
+      }
+    },
+
+    "root_cause": {
+      "type": ["object", "null"],
+      "description": "根因分析，主要用于 bug；feature 可为 null。",
+      "additionalProperties": false,
+      "required": ["hypothesis", "confidence"],
+      "properties": {
+        "hypothesis": { "type": "string", "description": "最可能的根因假设。" },
+        "evidence": { "type": "array", "items": { "type": "string" }, "description": "支撑根因的证据（日志、代码线索等）。" },
+        "suspected_locations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "reason"],
+            "properties": {
+              "file": { "type": "string", "description": "相对仓库根的文件路径。" },
+              "symbol": { "type": ["string", "null"], "description": "函数/组件/类型名，可选。" },
+              "reason": { "type": "string", "description": "为何怀疑此处。" }
+            }
+          }
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+
+    "scope": {
+      "type": "object",
+      "description": "影响范围。affected_files 是给 Claude Code 的关键定位信息。",
+      "additionalProperties": false,
+      "required": ["affected_modules", "affected_files", "blast_radius"],
+      "properties": {
+        "affected_modules": { "type": "array", "items": { "type": "string" }, "description": "受影响的逻辑模块（与 issue_analyses.affected_modules 对齐）。" },
+        "affected_files": {
+          "type": "array",
+          "description": "预计需要改动或排查的文件清单。",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "change_type", "reason"],
+            "properties": {
+              "path": { "type": "string", "description": "相对仓库根的文件路径。" },
+              "change_type": { "type": "string", "enum": ["add", "modify", "delete", "investigate"] },
+              "reason": { "type": "string", "description": "为何改动/排查此文件。" },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+            }
+          }
+        },
+        "related_files": { "type": "array", "items": { "type": "string" }, "description": "需阅读但不一定改动的参考文件。" },
+        "entry_points": { "type": "array", "items": { "type": "string" }, "description": "建议的入手点（函数/路由/命令/UI 位置）。" },
+        "out_of_scope": { "type": "array", "items": { "type": "string" }, "description": "明确不在本次范围内的内容。" },
+        "blast_radius": { "type": "string", "enum": ["isolated", "module", "cross_module", "systemic"], "description": "改动影响半径。" }
+      }
+    },
+
+    "implementation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approach", "steps"],
+      "properties": {
+        "approach": { "type": "string", "description": "总体实现思路（1-3 句）。" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["order", "action"],
+            "properties": {
+              "order": { "type": "integer", "minimum": 1 },
+              "action": { "type": "string", "description": "该步骤要做的具体动作（命令式）。" },
+              "target_files": { "type": "array", "items": { "type": "string" } },
+              "details": { "type": ["string", "null"], "description": "实现要点/注意事项，可选。" }
+            }
+          }
+        },
+        "alternatives": {
+          "type": "array",
+          "description": "考虑过但未采用的方案及取舍。",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["option", "tradeoff"],
+            "properties": {
+              "option": { "type": "string" },
+              "tradeoff": { "type": "string" }
+            }
+          }
+        },
+        "data_model_changes": {
+          "type": "array",
+          "description": "数据库/模型改动；遵守迁移文件不可变、只能新增的规则。",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "description"],
+            "properties": {
+              "kind": { "type": "string", "enum": ["migration", "model", "none"] },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "new_dependencies": { "type": "array", "items": { "type": "string" }, "description": "需要新增的依赖（应尽量避免，列出即提示人工关注）。" }
+      }
+    },
+
+    "acceptance_criteria": {
+      "type": "array",
+      "description": "可验证的验收标准；完成判定的依据。",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "statement"],
+        "properties": {
+          "id": { "type": "string", "description": "如 AC-1。" },
+          "statement": { "type": "string", "description": "可观测、可验证的标准描述。" },
+          "verify": { "type": ["string", "null"], "description": "如何验证（手动步骤/测试名），可选。" }
+        }
+      }
+    },
+
+    "test_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unit": { "type": "array", "items": { "type": "string" } },
+        "integration": { "type": "array", "items": { "type": "string" } },
+        "manual": { "type": "array", "items": { "type": "string" } },
+        "edge_cases": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["description", "severity"],
+        "properties": {
+          "description": { "type": "string" },
+          "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+          "mitigation": { "type": ["string", "null"] }
+        }
+      }
+    },
+
+    "constraints": {
+      "type": "object",
+      "description": "硬性约束，直接来自项目规范（如 Tauri 2.x、设计 token、IPC 单一入口等）。",
+      "additionalProperties": false,
+      "properties": {
+        "must": { "type": "array", "items": { "type": "string" } },
+        "must_not": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "assumptions": { "type": "array", "items": { "type": "string" }, "description": "分析时所做的假设。" },
+    "open_questions": { "type": "array", "items": { "type": "string" }, "description": "需要人工在审核 1 澄清的问题。" },
+
+    "estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complexity"],
+      "properties": {
+        "complexity": { "type": "string", "enum": ["xs", "s", "m", "l", "xl"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rationale": { "type": ["string", "null"] }
+      }
+    },
+
+    "claude_code_brief": {
+      "type": "object",
+      "description": "蒸馏后的执行指令，code_agent 直接拼入喂给 Claude Code 的 prompt。",
+      "additionalProperties": false,
+      "required": ["objective", "instructions", "definition_of_done"],
+      "properties": {
+        "objective": { "type": "string", "description": "一句话目标。" },
+        "instructions": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "有序的命令式执行指令。" },
+        "do": { "type": "array", "items": { "type": "string" }, "description": "务必遵守。" },
+        "dont": { "type": "array", "items": { "type": "string" }, "description": "禁止事项。" },
+        "files_to_touch": { "type": "array", "items": { "type": "string" }, "description": "预计改动文件（scope.affected_files 的精简路径列表）。" },
+        "definition_of_done": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "完成判定清单。" }
+      }
+    }
+  }
+}

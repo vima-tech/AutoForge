@@ -33,13 +33,13 @@ struct QualityConfig {
     security: Option<String>,
 }
 
-struct CheckResult {
-    name: String,
-    command: String,
-    ok: bool,
-    code: i32,
-    stdout: String,
-    stderr: String,
+pub(crate) struct CheckResult {
+    pub(crate) name: String,
+    pub(crate) command: String,
+    pub(crate) ok: bool,
+    pub(crate) code: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
@@ -178,6 +178,10 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     .execute(db)
     .await?;
 
+    if status == "failed" {
+        crate::core::notify::dispatch(db, "test_failed", "测试失败", &summary).await;
+    }
+
     event::emit(
         app,
         event::AppEvent::TestCompleted {
@@ -191,7 +195,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     Ok(())
 }
 
-fn configured_checks(config_yaml: Option<&str>) -> Vec<(String, String, u64)> {
+pub(crate) fn configured_checks(config_yaml: Option<&str>) -> Vec<(String, String, u64)> {
     let Some(raw) = config_yaml else {
         return Vec::new();
     };
@@ -230,7 +234,7 @@ fn configured_checks(config_yaml: Option<&str>) -> Vec<(String, String, u64)> {
     checks
 }
 
-async fn run_check(
+pub(crate) async fn run_check(
     repo_path: &str,
     name: String,
     command: String,

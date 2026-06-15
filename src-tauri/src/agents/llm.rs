@@ -63,6 +63,8 @@ pub async fn run_system_role_text(
     system_kind: &str,
     prompt: &str,
     fallback_system_prompt: Option<&str>,
+    project_id: Option<&str>,
+    recall_query: Option<&str>,
 ) -> Result<String> {
     let agent = sqlx::query_as::<_, Agent>(
         "SELECT * FROM agents
@@ -95,12 +97,55 @@ pub async fn run_system_role_text(
         ));
     }
 
-    let system_prompt = if agent.system_prompt.trim().is_empty() {
-        fallback_system_prompt
+    // 缺省召回键回退到 prompt；交给共享组装器处理 prompt_mode 组合 + 记忆召回。
+    let key = recall_query.filter(|q| !q.trim().is_empty()).or(Some(prompt));
+    let system_prompt = build_role_system_prompt(
+        &agent,
+        Some(system_kind),
+        fallback_system_prompt,
+        project_id,
+        key,
+    )
+    .await;
+    run_agent_text(db, &agent, prompt, system_prompt.as_deref(), &[]).await
+}
+
+/// 组装系统角色 Agent 的最终系统提示词：注册表内置（按 `prompt_mode`）+ 可选 Innate 召回
+/// （受 `agent.memory_enabled` 与 `project_id` 门控；`recall_key` 为空则不召回）。
+/// 供 `run_system_role_text` 与群聊编排（planner/summarizer/doc_writer/context_compressor）共用，
+/// 确保两条路径的角色都用同一份升级后的内置提示词，并都能长记忆。best-effort，召回失败不影响主流程。
+pub async fn build_role_system_prompt(
+    agent: &Agent,
+    kind: Option<&str>,
+    fallback: Option<&str>,
+    project_id: Option<&str>,
+    recall_key: Option<&str>,
+) -> Option<String> {
+    let composed =
+        crate::agents::roles::compose_system_prompt(kind, &agent.prompt_mode, &agent.system_prompt);
+    let mut system_prompt = if composed.trim().is_empty() {
+        fallback.map(|s| s.to_string())
     } else {
-        Some(agent.system_prompt.as_str())
+        Some(composed)
     };
-    run_agent_text(db, &agent, prompt, system_prompt, &[]).await
+
+    if agent.memory_enabled {
+        if let (Some(pid), Some(k)) = (
+            project_id.filter(|p| !p.is_empty()),
+            recall_key.filter(|q| !q.trim().is_empty()),
+        ) {
+            let recalled = crate::knowledge::kb_recall(pid, k).await;
+            if !recalled.trim().is_empty() {
+                let head = system_prompt.take().unwrap_or_default();
+                system_prompt = Some(if head.trim().is_empty() {
+                    format!("## 历史经验与技能（Innate 召回）\n{}", recalled)
+                } else {
+                    format!("{}\n\n## 历史经验与技能（Innate 召回）\n{}", head, recalled)
+                });
+            }
+        }
+    }
+    system_prompt
 }
 
 async fn run_openai_compatible(

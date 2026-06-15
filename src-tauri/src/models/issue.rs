@@ -31,6 +31,8 @@ pub struct IssueAnalysis {
     pub affected_modules: Option<String>,
     pub analysis_summary: String,
     pub raw_llm_output: Option<String>,
+    #[sqlx(default)]
+    pub analysis_json: Option<String>,
     pub created_at: String,
 }
 

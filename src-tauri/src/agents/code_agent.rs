@@ -1,11 +1,14 @@
 use anyhow::Result;
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub fn build_prompt(
     title: &str,
     desc: &str,
     analysis_summary: &str,
+    spec: Option<&crate::agents::analysis::IssueAnalysisSpec>,
     admin_suggestions: Option<&str>,
     iteration: u32,
     repo_path: &str,
@@ -25,6 +28,11 @@ pub fn build_prompt(
 "#,
         title, desc, analysis_summary
     );
+
+    // 结构化分析规格（issue_analysis.schema.json v1.0）—— 给 Claude Code 的精准工单
+    if let Some(spec) = spec {
+        prompt.push_str(&render_spec_brief(spec));
+    }
 
     if let Some(s) = admin_suggestions {
         if !s.is_empty() {
@@ -77,6 +85,159 @@ pub fn build_prompt(
     prompt
 }
 
+/// Render the structured analysis spec into a Claude Code work-order section.
+/// Only non-empty parts are emitted, so feature/bug specs stay concise.
+fn render_spec_brief(spec: &crate::agents::analysis::IssueAnalysisSpec) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+
+    let u = &spec.understanding;
+    if !u.restated_requirement.is_empty() || !u.problem_type.is_empty() {
+        s.push_str("\n## 需求理解\n");
+        if !u.problem_type.is_empty() {
+            let _ = writeln!(s, "- 类型：{}", u.problem_type);
+        }
+        if !u.restated_requirement.is_empty() {
+            let _ = writeln!(s, "- 重述：{}", u.restated_requirement);
+        }
+        if let Some(cur) = u.current_behavior.as_deref().filter(|v| !v.is_empty()) {
+            let _ = writeln!(s, "- 当前行为：{}", cur);
+        }
+        if let Some(exp) = u.expected_behavior.as_deref().filter(|v| !v.is_empty()) {
+            let _ = writeln!(s, "- 期望行为：{}", exp);
+        }
+        if !u.reproduction_steps.is_empty() {
+            s.push_str("- 复现步骤：\n");
+            for (i, step) in u.reproduction_steps.iter().enumerate() {
+                let _ = writeln!(s, "  {}. {}", i + 1, step);
+            }
+        }
+    }
+
+    if let Some(rc) = &spec.root_cause {
+        if !rc.hypothesis.is_empty() {
+            s.push_str("\n## 根因分析\n");
+            let _ = writeln!(s, "- 假设：{}", rc.hypothesis);
+            for ev in &rc.evidence {
+                let _ = writeln!(s, "- 证据：{}", ev);
+            }
+            for loc in &rc.suspected_locations {
+                let sym = loc.symbol.as_deref().filter(|v| !v.is_empty()).map(|v| format!(" :: {}", v)).unwrap_or_default();
+                let _ = writeln!(s, "- 可疑位置：{}{} — {}", loc.file, sym, loc.reason);
+            }
+        }
+    }
+
+    let sc = &spec.scope;
+    if !sc.affected_files.is_empty() || !sc.entry_points.is_empty() {
+        s.push_str("\n## 影响范围\n");
+        if !sc.blast_radius.is_empty() {
+            let _ = writeln!(s, "- 影响半径：{}", sc.blast_radius);
+        }
+        for f in &sc.affected_files {
+            let _ = writeln!(s, "- [{}] {} — {}", f.change_type, f.path, f.reason);
+        }
+        if !sc.related_files.is_empty() {
+            let _ = writeln!(s, "- 参考文件：{}", sc.related_files.join(", "));
+        }
+        if !sc.entry_points.is_empty() {
+            let _ = writeln!(s, "- 入手点：{}", sc.entry_points.join("; "));
+        }
+        if !sc.out_of_scope.is_empty() {
+            let _ = writeln!(s, "- 不在范围内：{}", sc.out_of_scope.join("; "));
+        }
+    }
+
+    let plan = &spec.implementation_plan;
+    if !plan.approach.is_empty() || !plan.steps.is_empty() {
+        s.push_str("\n## 实现计划\n");
+        if !plan.approach.is_empty() {
+            let _ = writeln!(s, "{}\n", plan.approach);
+        }
+        let mut steps = plan.steps.clone();
+        steps.sort_by_key(|st| st.order);
+        for st in &steps {
+            let files = if st.target_files.is_empty() { String::new() } else { format!("（{}）", st.target_files.join(", ")) };
+            let _ = writeln!(s, "{}. {}{}", st.order, st.action, files);
+            if let Some(d) = st.details.as_deref().filter(|v| !v.is_empty()) {
+                let _ = writeln!(s, "   - {}", d);
+            }
+        }
+        for dm in &plan.data_model_changes {
+            if dm.kind != "none" && !dm.description.is_empty() {
+                let _ = writeln!(s, "- 数据模型变更（{}）：{}", dm.kind, dm.description);
+            }
+        }
+        if !plan.new_dependencies.is_empty() {
+            let _ = writeln!(s, "- 新增依赖（需谨慎）：{}", plan.new_dependencies.join(", "));
+        }
+    }
+
+    if !spec.acceptance_criteria.is_empty() {
+        s.push_str("\n## 验收标准\n");
+        for ac in &spec.acceptance_criteria {
+            let _ = writeln!(s, "- {} {}", ac.id, ac.statement);
+        }
+    }
+
+    let c = &spec.constraints;
+    if !c.must.is_empty() || !c.must_not.is_empty() {
+        s.push_str("\n## 约束\n");
+        for m in &c.must {
+            let _ = writeln!(s, "- 必须：{}", m);
+        }
+        for m in &c.must_not {
+            let _ = writeln!(s, "- 禁止：{}", m);
+        }
+    }
+
+    if !spec.risks.is_empty() {
+        s.push_str("\n## 风险\n");
+        for r in &spec.risks {
+            let mit = r.mitigation.as_deref().filter(|v| !v.is_empty()).map(|v| format!("（缓解：{}）", v)).unwrap_or_default();
+            let _ = writeln!(s, "- [{}] {}{}", r.severity, r.description, mit);
+        }
+    }
+
+    let b = &spec.claude_code_brief;
+    if !b.objective.is_empty() || !b.instructions.is_empty() {
+        s.push_str("\n## 执行工单（务必遵循）\n");
+        if !b.objective.is_empty() {
+            let _ = writeln!(s, "目标：{}", b.objective);
+        }
+        if !b.instructions.is_empty() {
+            s.push_str("步骤：\n");
+            for (i, ins) in b.instructions.iter().enumerate() {
+                let _ = writeln!(s, "  {}. {}", i + 1, ins);
+            }
+        }
+        for d in &b.r#do {
+            let _ = writeln!(s, "- ✅ {}", d);
+        }
+        for d in &b.dont {
+            let _ = writeln!(s, "- ❌ {}", d);
+        }
+        if !b.files_to_touch.is_empty() {
+            let _ = writeln!(s, "- 预计改动文件：{}", b.files_to_touch.join(", "));
+        }
+        if !b.definition_of_done.is_empty() {
+            s.push_str("- 完成判定：\n");
+            for d in &b.definition_of_done {
+                let _ = writeln!(s, "  - {}", d);
+            }
+        }
+    }
+
+    if !spec.open_questions.is_empty() {
+        s.push_str("\n## 待澄清（如阻塞实现，请在报告中说明）\n");
+        for q in &spec.open_questions {
+            let _ = writeln!(s, "- {}", q);
+        }
+    }
+
+    s
+}
+
 fn read_factory_spec(name: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let root = if cwd.file_name().and_then(|v| v.to_str()) == Some("src-tauri") {
@@ -98,16 +259,28 @@ pub async fn run(
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<(i32, String, String)> {
+    // The prompt is fed via stdin rather than as a positional argument: claude's
+    // `--disallowedTools` flag is variadic and would otherwise greedily consume
+    // the prompt as a list of tool names, leaving the run with no actual prompt
+    // ("Input must be provided ... when using --print").
     let mut cmd = Command::new("claude");
     cmd.arg("--print")
         .arg("--permission-mode")
         .arg("acceptEdits")
         .arg("--disallowedTools")
         .arg("Bash(git *)")
-        .arg(prompt)
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes()).await?;
+        stdin.shutdown().await?; // close stdin so claude stops waiting for input
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
         .await
         .map_err(|_| anyhow::anyhow!("claude code agent timed out after {}s", timeout_secs))??;
 

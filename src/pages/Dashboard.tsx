@@ -2,7 +2,8 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
-import { getPipelineStats, listActiveProjects, listIssues, submitIssue, type PipelineStats, type Project, type Issue } from '../services';
+import IntakePanel from '../components/IntakePanel';
+import { getPipelineStats, listActiveProjects, listIssues, type PipelineStats, type Project, type Issue } from '../services';
 
 const SEV_COLOR: Record<string, string> = {
   critical: 'red', high: 'amber', medium: 'blue', low: 'green',
@@ -10,56 +11,27 @@ const SEV_COLOR: Record<string, string> = {
 };
 
 // ── Submit Issue Modal ────────────────────────────────────────────────────────
+// Hosts the shared IntakePanel (手动提交 / GitHub / 代码扫描 / 批量导入) so the
+// homepage entry stays consistent with the project-level「需求入口」in Audit.
 function SubmitIssueModal({ projects, onClose }: { projects: Project[]; onClose: () => void }) {
-  const [form, setForm] = useState({ project_id: projects[0]?.id ?? '', title: '', description: '', category: 'Feature', severity: 'medium' });
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const submit = async () => {
-    if (!form.title.trim()) { setError('标题不能为空'); return; }
-    setLoading(true);
-    try {
-      await submitIssue(form);
-      onClose();
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  };
+  const [projectId, setProjectId] = useState(projects[0]?.id ?? '');
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 60 }} onClick={onClose}>
-      <div style={{ width: 480, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
-        <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">提交需求</span></div>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 60 }}>
+      <div style={{ width: 720, maxHeight: 'min(800px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-section)', flexShrink: 0 }}><span className="cn">需求入口</span></div>
+          <div style={{ marginLeft: 'auto', minWidth: 200 }}>
+            <Select value={projectId} onChange={setProjectId}
+              options={projects.map(p => ({ value: p.id, label: p.name }))}
+              placeholder="选择项目" />
+          </div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
-        <div style={{ padding: '16px 20px' }}>
-          <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
-            <div className="field full"><label>项目</label>
-              <Select value={form.project_id} onChange={val => setForm(f => ({ ...f, project_id: val }))}
-                options={projects.map(p => ({ value: p.id, label: p.name }))} />
-            </div>
-            <div className="field full"><label>需求标题</label>
-              <input value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} placeholder="简洁描述需求" />
-            </div>
-            <div className="field full"><label>详细描述</label>
-              <textarea rows={3} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="背景、期望行为、截图说明等" />
-            </div>
-            <div className="field"><label>分类</label>
-              <Select value={form.category} onChange={val => setForm(f => ({ ...f, category: val }))}
-                options={['Feature', 'Bug', 'Improvement', 'Debt'].map(v => ({ value: v, label: v }))} />
-            </div>
-            <div className="field"><label>严重级别</label>
-              <Select value={form.severity} onChange={val => setForm(f => ({ ...f, severity: val }))}
-                options={[{ value: 'critical', label: 'Critical' }, { value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }]} />
-            </div>
-          </div>
-          {error && <div style={{ color: 'var(--red)', fontSize: 'var(--text-control)', marginTop: 10 }}>{error}</div>}
-        </div>
-        <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-          <button className="btn" onClick={onClose}>取消</button>
-          <button className="btn btn-primary" onClick={submit} disabled={loading}>
-            <Icon name="send" size={15} />{loading ? '提交中…' : '提交需求'}
-          </button>
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          {projectId
+            ? <IntakePanel key={projectId} projectId={projectId} />
+            : <div className="empty" style={{ flex: 1 }}><Icon name="inbox" /><div>请先在「项目管理」添加项目</div></div>}
         </div>
       </div>
     </div>
@@ -67,7 +39,9 @@ function SubmitIssueModal({ projects, onClose }: { projects: Project[]; onClose:
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
-export default function Dashboard() {
+export default function Dashboard({ onOpenInAudit }: {
+  onOpenInAudit: (target: { projectId: string; issueId: string }) => void;
+}) {
   const [stats, setStats] = useState<PipelineStats | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -184,7 +158,8 @@ export default function Dashboard() {
             {queueIssues.length === 0
               ? <div className="empty-compact" style={{ padding: '20px 18px' }}>暂无需求</div>
               : queueIssues.map((q, i) => (
-              <div className="q-row" key={q.id}>
+              <div className="q-row" key={q.id} onClick={() => onOpenInAudit({ projectId: q.project_id, issueId: q.id })}
+                style={{ cursor: 'pointer' }} title="在功能审计中查看">
                 <div className="q-pr">{i + 1}</div>
                 <div className="q-main">
                   <div className="q-title">{q.title}</div>
@@ -195,7 +170,12 @@ export default function Dashboard() {
                     <span>· {projects.find(p => p.id === q.project_id)?.name ?? '—'}</span>
                   </div>
                 </div>
-                <span className={'chip ' + (q.status.includes('review') ? 'amber' : q.status === 'executing' ? 'ember' : '')}>{q.status.replace(/_/g,' ')}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                  <span className={'chip ' + (q.status === 'pending_review_1' ? 'amber' : q.status.includes('review') ? 'amber' : q.status === 'executing' ? 'ember' : '')}>
+                    {q.status === 'pending_review_1' ? '待需求审核' : q.status.replace(/_/g, ' ')}
+                  </span>
+                  <Icon name="chevRight" size={15} style={{ color: 'var(--text-faint)' }} />
+                </div>
               </div>
             ))}
           </div>

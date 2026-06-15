@@ -38,14 +38,17 @@ function getNestedValue(sectionLines: string[], key: string): string {
 }
 
 export function parseProjectConfig(configYaml: string | null) {
-  if (!configYaml) return { devCommand: '', devUrl: '', prodUrl: '' };
+  if (!configYaml) return { devCommand: '', devUrl: '', prodUrl: '', devKind: 'web', appCommand: '' };
   const sections = splitYamlSections(configYaml);
   const dev = sections.find(s => s.key === 'dev');
   const prod = sections.find(s => s.key === 'prod');
+  const kind = dev ? getNestedValue(dev.lines, 'kind') : '';
   return {
     devCommand: dev ? getNestedValue(dev.lines, 'command') : '',
     devUrl: dev ? getNestedValue(dev.lines, 'url') : '',
     prodUrl: prod ? getNestedValue(prod.lines, 'url') : '',
+    devKind: kind === 'tauri' ? 'tauri' : 'web',
+    appCommand: dev ? getNestedValue(dev.lines, 'app_command') : '',
   };
 }
 
@@ -54,10 +57,14 @@ function buildConfigYaml(
   devCommand: string,
   devUrl: string,
   prodUrl: string,
+  devKind: string,
+  appCommand: string,
 ): string | undefined {
   const cmd = devCommand.trim();
   const dUrl = devUrl.trim();
   const pUrl = prodUrl.trim();
+  const kind = devKind === 'tauri' ? 'tauri' : 'web';
+  const appCmd = appCommand.trim();
 
   // Preserve sections we don't manage (test, quality, etc.)
   const preserved = existing
@@ -69,8 +76,11 @@ function buildConfigYaml(
   const parts: string[] = [];
   if (cmd || dUrl) {
     const devLines = ['dev:'];
+    // web 是默认值，仅 tauri 时显式写入 kind / app_command，保持 yaml 简洁
+    if (kind === 'tauri') devLines.push(`  kind: "tauri"`);
     if (cmd)  devLines.push(`  command: ${JSON.stringify(cmd)}`);
     if (dUrl) devLines.push(`  url: ${JSON.stringify(dUrl)}`);
+    if (kind === 'tauri' && appCmd) devLines.push(`  app_command: ${JSON.stringify(appCmd)}`);
     parts.push(devLines.join('\n'));
   }
   if (pUrl) {
@@ -92,7 +102,7 @@ export function ProjectCreateModal({ onClose, onCreated }: {
     name: '', slug: '', description: '', repo_path: '',
     git_url: '', target_path: '', clone_branch: '', git_username: '', git_password: '',
     branch_dev: 'dev', branch_main: 'main',
-    dev_command: '', dev_url: '', prod_url: '',
+    dev_command: '', dev_url: '', prod_url: '', dev_kind: 'web', app_command: '',
   });
   const [slugTouched, setSlugTouched] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -122,7 +132,7 @@ export function ProjectCreateModal({ onClose, onCreated }: {
         description: form.description.trim(),
         branch_dev: form.branch_dev.trim() || 'dev',
         branch_main: form.branch_main.trim() || 'main',
-        config_yaml: buildConfigYaml(null, form.dev_command, form.dev_url, form.prod_url),
+        config_yaml: buildConfigYaml(null, form.dev_command, form.dev_url, form.prod_url, form.dev_kind, form.app_command),
       };
       const project = mode === 'local'
         ? await createLocalProject({ ...common, repo_path: repoPath })
@@ -140,7 +150,7 @@ export function ProjectCreateModal({ onClose, onCreated }: {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 560, maxHeight: 'min(760px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">添加项目</span></div>
@@ -220,6 +230,8 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
     dev_command: parsed.devCommand,
     dev_url: parsed.devUrl,
     prod_url: parsed.prodUrl,
+    dev_kind: parsed.devKind,
+    app_command: parsed.appCommand,
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -240,6 +252,8 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
           form.dev_command,
           form.dev_url,
           form.prod_url,
+          form.dev_kind,
+          form.app_command,
         ) ?? '',
       });
       onSaved(saved);
@@ -248,7 +262,7 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }} onClick={onClose}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">编辑项目</span> <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontWeight: 400 }}>{project.slug}</span></div>
@@ -275,6 +289,7 @@ type FormState = {
   name: string; description: string; repo_path: string;
   branch_dev: string; branch_main: string;
   dev_command: string; dev_url: string; prod_url: string;
+  dev_kind: string; app_command: string;
   slug?: string;
 };
 
@@ -320,19 +335,36 @@ function ProjectFormFields({
 
       <div style={{ height: 1, background: 'var(--border)', margin: '12px 0 10px' }} />
       <div style={{ fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600, marginBottom: 8 }}>审计预览环境</div>
+      <div className="field" style={{ marginBottom: 10 }}>
+        <label>应用类型</label>
+        <div className="seg" style={{ alignSelf: 'flex-start' }}>
+          <button type="button" className={form.dev_kind !== 'tauri' ? 'on' : ''} onClick={() => setForm((f: any) => ({ ...f, dev_kind: 'web' }))}>Web 应用</button>
+          <button type="button" className={form.dev_kind === 'tauri' ? 'on' : ''} onClick={() => setForm((f: any) => ({ ...f, dev_kind: 'tauri' }))}>Tauri 桌面</button>
+        </div>
+      </div>
       <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
         <div className="field full">
-          <label>启动命令</label>
-          <input value={form.dev_command} onChange={e => setForm((f: any) => ({ ...f, dev_command: e.target.value }))} placeholder="npm run dev" />
+          <label>{form.dev_kind === 'tauri' ? '前端预览启动命令' : '启动命令'}</label>
+          <input value={form.dev_command} onChange={e => setForm((f: any) => ({ ...f, dev_command: e.target.value }))} placeholder={form.dev_kind === 'tauri' ? 'npm run dev -- --port {port}' : 'npm run dev -- --port {port}'} />
         </div>
         <div className="field">
           <label>开发预览地址</label>
-          <input value={form.dev_url} onChange={e => setForm((f: any) => ({ ...f, dev_url: e.target.value }))} placeholder="http://localhost:5173" />
+          <input value={form.dev_url} onChange={e => setForm((f: any) => ({ ...f, dev_url: e.target.value }))} placeholder="http://localhost:{port}" />
         </div>
         <div className="field">
           <label>生产环境地址</label>
           <input value={form.prod_url} onChange={e => setForm((f: any) => ({ ...f, prod_url: e.target.value }))} placeholder="https://app.example.com" />
         </div>
+        {form.dev_kind === 'tauri' && (
+          <div className="field full">
+            <label>桌面应用启动命令（可选，逃生口）</label>
+            <input value={form.app_command} onChange={e => setForm((f: any) => ({ ...f, app_command: e.target.value }))} placeholder="npm run tauri:dev" />
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 7, lineHeight: 'var(--leading-normal)' }}>
+        命令与地址中的 <code style={{ fontFamily: 'var(--font-mono)' }}>{'{port}'}</code> 会按每个变更自动替换为独立端口，避免并发预览撞端口。
+        {form.dev_kind === 'tauri' && ' Tauri 项目的 iframe 仅预览 web 前端，桌面应用命令用于打开原生窗口对照。'}
       </div>
     </>
   );
@@ -349,7 +381,7 @@ export function ConfirmModal({ msg, sub, okLabel = '确认', danger = true, onOk
   onCancel: () => void;
 }) {
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }} onClick={onCancel}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 400, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: sub ? '0 0 8px' : '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         {sub && <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>{sub}</p>}
@@ -370,7 +402,7 @@ export function ConfirmProjectDeleteModal({ project, onCancel, onConfirm }: {
   onConfirm: () => void;
 }) {
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }} onClick={onCancel}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 420, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 8px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>确认删除项目「{project.name}」？</p>
         <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>这会同时删除该项目的需求、变更请求、审核记录、预览环境和测试记录。</p>

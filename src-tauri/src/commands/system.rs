@@ -218,11 +218,15 @@ pub async fn get_badge_counts(state: State<'_, AppState>) -> Result<BadgeCounts,
     .await
     .map_err(|e| e.to_string())?;
 
-    let (audit_pending,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
+    // 功能审计页统一管理两个审核节点：审核 1（issues.pending_review_1）+ 审核 2（change_requests.pending_review_2）
+    let (audit_pending,): (i64,) = sqlx::query_as(
+        "SELECT
+           (SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2')
+         + (SELECT COUNT(*) FROM issues WHERE status='pending_review_1')",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     debug!(
         "[cmd] get_badge_counts done: chat={} audit={}",

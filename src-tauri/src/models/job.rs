@@ -32,4 +32,7 @@ pub enum JobPayload {
     Merge {
         change_request_id: String,
     },
+    SecurityAudit {
+        change_request_id: String,
+    },
 }

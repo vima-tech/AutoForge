@@ -1,5 +1,8 @@
 pub mod analysis;
 pub mod execution;
 pub mod merge;
+pub mod preview;
 pub mod runner;
+pub mod scan;
+pub mod security_audit;
 pub mod testing;

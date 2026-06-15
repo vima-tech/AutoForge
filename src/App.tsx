@@ -8,11 +8,12 @@ import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
 import ProjectsPage from './pages/Projects';
+import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
 import { THEME_STORAGE_KEY, oppositeMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
-type Page = 'home' | 'chat' | 'projects' | 'audit' | 'settings';
+type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
@@ -104,17 +105,25 @@ const NAV: { id: Page; name: string; ic: string }[] = [
   { id: 'home',     name: '主页',     ic: 'home' },
   { id: 'chat',     name: '会议室',   ic: 'chat' },
   { id: 'projects', name: '项目管理', ic: 'box' },
+  { id: 'delivery', name: '交付流水线', ic: 'package' },
   { id: 'audit',    name: '功能审计', ic: 'audit' },
 ];
 
 export default function App() {
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
-    return saved && (['home', 'chat', 'projects', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
+    return saved && (['home', 'chat', 'projects', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
+  // Cross-page jump target: Dashboard → Audit (a requirement to open in 功能审计).
+  const [auditTarget, setAuditTarget] = useState<{ projectId: string; issueId: string } | null>(null);
+  const goToAudit = useCallback((target: { projectId: string; issueId: string }) => {
+    setAuditTarget(target);
+    setPage('audit');
+    sessionStorage.setItem('AutoForge:page', 'audit');
+  }, []);
 
   const badgeRefreshInFlight = useRef(false);
   const refreshBadges = useCallback(async () => {
@@ -299,10 +308,11 @@ export default function App() {
           </div>
         </div>
 
-        {page === 'home'     && <Dashboard />}
+        {page === 'home'     && <Dashboard onOpenInAudit={goToAudit} />}
         {page === 'chat'     && <ConversationsPage />}
         {page === 'projects' && <ProjectsPage />}
-        {page === 'audit'    && <AuditPage />}
+        {page === 'delivery' && <DeliveryPage />}
+        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
     </div>

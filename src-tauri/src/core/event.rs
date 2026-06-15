@@ -37,6 +37,12 @@ pub enum AppEvent {
         cr_id: String,
         project_id: String,
     },
+    SecurityAuditCompleted {
+        cr_id: String,
+        audit_id: String,
+        severity: String,
+        summary: String,
+    },
     IterationWarning {
         cr_id: String,
         iteration: i64,

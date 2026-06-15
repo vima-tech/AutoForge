@@ -1002,6 +1002,8 @@ pub async fn search_material_files(
         MATERIAL_AI_SYSTEM_KIND,
         &prompt,
         Some("你是 AutoForge 的物料库 AI 助手，负责基于文件元数据和内容片段完成语义检索与整理。只输出调用方要求的格式。"),
+        Some(&project_id),
+        Some(&query), // 召回键直接用用户搜索词，命中本项目相关物料经验
     )
         .await
         .map_err(|e| format!("AI 查找失败: {}", e))?;
@@ -1444,6 +1446,8 @@ pub async fn ai_organize_materials(
         MATERIAL_AI_SYSTEM_KIND,
         &prompt,
         Some("你是 AutoForge 的物料库 AI 助手，负责基于文件元数据和内容片段完成语义检索与整理。只输出调用方要求的格式。"),
+        Some(&project_id),
+        None, // 整理任务的 prompt 已是文件清单内容，直接作召回键即可
     )
         .await
         .map_err(|e| format!("AI 整理失败: {}", e))?;

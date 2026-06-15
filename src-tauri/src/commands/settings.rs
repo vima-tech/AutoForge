@@ -241,14 +241,16 @@ pub async fn create_agent(
     let visible_in_chat = payload.visible_in_chat.unwrap_or(role_type == "business");
     let mentionable = payload.mentionable.unwrap_or(role_type == "business");
     let enabled = payload.enabled.unwrap_or(true);
+    let prompt_mode = normalize_prompt_mode(payload.prompt_mode.as_deref());
+    let memory_enabled = payload.memory_enabled.unwrap_or(true);
 
     sqlx::query(
         "INSERT INTO agents (
             id, name, name_en, role, color, initial, llm_id, system_prompt,
             role_type, system_kind, capabilities_json, max_concurrency,
-            visible_in_chat, mentionable, enabled
+            visible_in_chat, mentionable, enabled, prompt_mode, memory_enabled
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&payload.name)
@@ -265,6 +267,8 @@ pub async fn create_agent(
     .bind(visible_in_chat)
     .bind(mentionable)
     .bind(enabled)
+    .bind(prompt_mode)
+    .bind(memory_enabled)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -362,6 +366,14 @@ pub async fn update_agent(
         sets.push("enabled=?");
         values.push(AgentUpdateValue::Bool(v));
     }
+    if let Some(ref v) = payload.prompt_mode {
+        sets.push("prompt_mode=?");
+        values.push(AgentUpdateValue::Text(normalize_prompt_mode(Some(v)).to_string()));
+    }
+    if let Some(v) = payload.memory_enabled {
+        sets.push("memory_enabled=?");
+        values.push(AgentUpdateValue::Bool(v));
+    }
 
     if sets.is_empty() {
         return sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE id=?")
@@ -412,6 +424,232 @@ fn normalize_system_kind(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn normalize_prompt_mode(value: Option<&str>) -> &'static str {
+    match value {
+        Some("append") => "append",
+        Some("custom") => "custom",
+        _ => "builtin",
+    }
+}
+
+// ---- Role catalog (两层模型：角色即 Agent，内置专业提示词) ----
+
+#[derive(serde::Serialize)]
+pub struct RoleSlot {
+    pub kind: String,
+    pub name: String,
+    pub name_en: String,
+    pub group: String,   // orchestration | delivery | pipeline
+    pub binding: String, // system_kind | forge_role
+    pub desc: String,
+    pub color: String,
+    pub icon: String,
+    pub builtin_prompt: String,
+    pub holder: Option<Agent>,
+}
+
+fn group_str(g: crate::agents::roles::RoleGroup) -> &'static str {
+    use crate::agents::roles::RoleGroup::*;
+    match g {
+        Orchestration => "orchestration",
+        Delivery => "delivery",
+        Pipeline => "pipeline",
+    }
+}
+
+fn agent_holds(a: &Agent, binding: crate::agents::roles::RoleBinding, kind: &str) -> bool {
+    use crate::agents::roles::RoleBinding::*;
+    let field = match binding {
+        SystemKind => a.system_kind.as_deref(),
+        ForgeRole => a.forge_role.as_deref(),
+    };
+    field
+        .map(|s| s.split(',').any(|k| k.trim() == kind))
+        .unwrap_or(false)
+}
+
+/// 返回内置角色目录 + 各角色当前持有的 Agent（驱动「角色」页系统角色卡）。
+#[tauri::command]
+pub async fn list_role_catalog(state: State<'_, AppState>) -> Result<Vec<RoleSlot>, String> {
+    let agents = sqlx::query_as::<_, Agent>("SELECT * FROM agents")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for def in crate::agents::roles::registry() {
+        let binding = match def.binding {
+            crate::agents::roles::RoleBinding::SystemKind => "system_kind",
+            crate::agents::roles::RoleBinding::ForgeRole => "forge_role",
+        };
+        let holder = agents
+            .iter()
+            .find(|a| agent_holds(a, def.binding, def.kind))
+            .cloned();
+        out.push(RoleSlot {
+            kind: def.kind.to_string(),
+            name: def.name.to_string(),
+            name_en: def.name_en.to_string(),
+            group: group_str(def.group).to_string(),
+            binding: binding.to_string(),
+            desc: def.desc.to_string(),
+            color: def.color.to_string(),
+            icon: def.icon.to_string(),
+            builtin_prompt: def.builtin_prompt.to_string(),
+            holder,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetRoleSlotPayload {
+    /// Some("")=解绑 LLM；Some(id)=设置；None=不改
+    pub llm_id: Option<String>,
+    pub prompt_mode: Option<String>,
+    pub supplement: Option<String>, // 映射到 agents.system_prompt
+    pub enabled: Option<bool>,
+    pub visible_in_chat: Option<bool>,
+    pub mentionable: Option<bool>,
+    pub memory_enabled: Option<bool>,
+}
+
+/// 配置某个内置角色：自动确保单一持有 Agent（无则按注册表默认创建），并应用配置。
+/// 不支持一个 Agent 兼多角色——该 slot 的 Agent 只持有此 kind。
+#[tauri::command]
+pub async fn set_role_slot(
+    kind: String,
+    payload: SetRoleSlotPayload,
+    state: State<'_, AppState>,
+) -> Result<Vec<RoleSlot>, String> {
+    let def = *crate::agents::roles::find(&kind).ok_or_else(|| format!("未知角色: {}", kind))?;
+    let col = match def.binding {
+        crate::agents::roles::RoleBinding::SystemKind => "system_kind",
+        crate::agents::roles::RoleBinding::ForgeRole => "forge_role",
+    };
+
+    let agents = sqlx::query_as::<_, Agent>("SELECT * FROM agents")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let holders: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| agent_holds(a, def.binding, &kind))
+        .collect();
+
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+
+    // 取第一个持有者为该 slot 的 Agent；其余清除该 kind（保证单一持有）。
+    let primary_id: String = if let Some(first) = holders.first() {
+        for extra in holders.iter().skip(1) {
+            let remaining: Vec<&str> = extra
+                .system_kind
+                .as_deref()
+                .or(extra.forge_role.as_deref())
+                .unwrap_or("")
+                .split(',')
+                .filter(|k| k.trim() != kind && !k.trim().is_empty())
+                .collect();
+            let new_val: Option<String> = if remaining.is_empty() { None } else { Some(remaining.join(",")) };
+            sqlx::query(&format!("UPDATE agents SET {col}=? WHERE id=?"))
+                .bind(&new_val)
+                .bind(&extra.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        first.id.clone()
+    } else {
+        // 无持有者：按注册表默认创建一个专属 Agent。
+        let id = Uuid::new_v4().to_string();
+        let role_type = match def.binding {
+            crate::agents::roles::RoleBinding::ForgeRole => "business",
+            crate::agents::roles::RoleBinding::SystemKind => "system",
+        };
+        let (sk, fr): (Option<&str>, Option<&str>) = match def.binding {
+            crate::agents::roles::RoleBinding::SystemKind => (Some(def.kind), None),
+            crate::agents::roles::RoleBinding::ForgeRole => (None, Some(def.kind)),
+        };
+        sqlx::query(
+            "INSERT INTO agents (
+                id, name, name_en, role, color, initial, llm_id, system_prompt,
+                forge_role, role_type, system_kind, capabilities_json, max_concurrency,
+                visible_in_chat, mentionable, enabled, prompt_mode
+             ) VALUES (?, ?, ?, ?, ?, ?, NULL, '', ?, ?, ?, ?, 1, ?, ?, 1, 'builtin')",
+        )
+        .bind(&id)
+        .bind(def.name)
+        .bind(def.name_en)
+        .bind(def.desc)
+        .bind(def.color)
+        .bind(def.initial)
+        .bind(fr)
+        .bind(role_type)
+        .bind(sk)
+        .bind(def.default_caps)
+        .bind(def.default_chat)
+        .bind(def.default_chat)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        id
+    };
+
+    // 应用配置（仅 provided 字段）。
+    let mut sets: Vec<String> = Vec::new();
+    let mut vals: Vec<AgentUpdateValue> = Vec::new();
+    if let Some(ref llm) = payload.llm_id {
+        if llm.trim().is_empty() {
+            sets.push("llm_id=NULL".to_string());
+        } else {
+            sets.push("llm_id=?".to_string());
+            vals.push(AgentUpdateValue::Text(llm.clone()));
+        }
+    }
+    if let Some(ref m) = payload.prompt_mode {
+        sets.push("prompt_mode=?".to_string());
+        vals.push(AgentUpdateValue::Text(normalize_prompt_mode(Some(m)).to_string()));
+    }
+    if let Some(ref s) = payload.supplement {
+        sets.push("system_prompt=?".to_string());
+        vals.push(AgentUpdateValue::Text(s.clone()));
+    }
+    if let Some(v) = payload.enabled {
+        sets.push("enabled=?".to_string());
+        vals.push(AgentUpdateValue::Bool(v));
+    }
+    if let Some(v) = payload.visible_in_chat {
+        sets.push("visible_in_chat=?".to_string());
+        vals.push(AgentUpdateValue::Bool(v));
+    }
+    if let Some(v) = payload.mentionable {
+        sets.push("mentionable=?".to_string());
+        vals.push(AgentUpdateValue::Bool(v));
+    }
+    if let Some(v) = payload.memory_enabled {
+        sets.push("memory_enabled=?".to_string());
+        vals.push(AgentUpdateValue::Bool(v));
+    }
+    if !sets.is_empty() {
+        let sql = format!("UPDATE agents SET {} WHERE id=?", sets.join(", "));
+        let mut q = sqlx::query(&sql);
+        for v in &vals {
+            q = match v {
+                AgentUpdateValue::Text(v) => q.bind(v),
+                AgentUpdateValue::Int(v) => q.bind(v),
+                AgentUpdateValue::Bool(v) => q.bind(v),
+            };
+        }
+        q.bind(&primary_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    list_role_catalog(state).await
 }
 
 #[tauri::command]

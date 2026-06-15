@@ -94,12 +94,15 @@ async fn dispatch_job(db: &Db, tx: &JobSender, app: &tauri::AppHandle, msg: &Job
         JobPayload::Execution {
             change_request_id,
             project_id,
-        } => crate::tasks::execution::run(db, app, change_request_id, project_id).await,
+        } => crate::tasks::execution::run(db, tx, app, change_request_id, project_id).await,
         JobPayload::Testing { change_request_id } => {
             crate::tasks::testing::run(db, tx, app, change_request_id).await
         }
         JobPayload::Merge { change_request_id } => {
             crate::tasks::merge::run(db, tx, app, change_request_id).await
+        }
+        JobPayload::SecurityAudit { change_request_id } => {
+            crate::tasks::security_audit::run(db, tx, app, change_request_id).await
         }
     }
 }

@@ -68,8 +68,9 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
         None
     };
 
-    // Run analysis
+    // Run analysis (uses the analysis Agent's bound custom LLM; CLI only as fallback)
     let result = crate::agents::analysis::analyze(
+        db,
         &issue.title,
         &issue.description,
         project_context.as_deref(),
@@ -83,8 +84,9 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     sqlx::query(
         "INSERT OR REPLACE INTO issue_analyses
          (id, issue_id, authenticity_score, feasibility_score, priority_suggestion,
-          category_suggestion, severity_suggestion, affected_modules, analysis_summary, raw_llm_output)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          category_suggestion, severity_suggestion, affected_modules, analysis_summary,
+          raw_llm_output, analysis_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&analysis_id)
     .bind(&issue.id)
@@ -96,6 +98,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     .bind(&affected_modules_json)
     .bind(&result.analysis_summary)
     .bind(&result.raw_output)
+    .bind(&result.analysis_json)
     .execute(db)
     .await?;
 

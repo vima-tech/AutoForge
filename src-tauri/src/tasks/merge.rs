@@ -49,6 +49,21 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
 
     if merge_code != 0 {
         info!("merge failed ({}): {}", merge_code, merge_err);
+        // Abort the half-applied merge so the dev branch / worktree stays clean
+        // for a later retry, then surface the reason in the audit page.
+        let _ = git.run(&["merge", "--abort"]).await;
+        let fail_reason = format!(
+            "## 合并失败\n\n无法将分支 `{}` 合并到 `{}`（退出码 {}）。常见原因为代码冲突，可在修复后重新执行。\n\n```\n{}\n```\n",
+            session.branch_name, project.branch_dev, merge_code,
+            merge_err.chars().take(2000).collect::<String>()
+        );
+        let _ = sqlx::query(
+            "UPDATE worktree_sessions SET report_content=? WHERE id=?",
+        )
+        .bind(&fail_reason)
+        .bind(&session.id)
+        .execute(db)
+        .await;
         sqlx::query(
             "UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
         )
@@ -125,6 +140,42 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     )
     .await;
+
+    // Node 07: run a security audit on the merged diff in parallel with testing.
+    let _ = enqueue(
+        db,
+        tx,
+        "security_audit",
+        &format!("security_audit:{}", cr_id),
+        JobPayload::SecurityAudit {
+            change_request_id: cr_id.to_string(),
+        },
+    )
+    .await;
+
+    crate::core::notify::dispatch(db, "cr_merged", "已合并到 dev", cr_id).await;
+
+    // Innate: capture the merged implementation as a SUCCESS exemplar (positive signal) —
+    // 它已通过审核 2 + 测试并合并，是"这类需求该怎么改"的高质量样本，供需求分析/代码实现角色召回。
+    let issue_title: String = sqlx::query_as::<_, (String,)>("SELECT title FROM issues WHERE id=?")
+        .bind(&cr.issue_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.0)
+        .unwrap_or_default();
+    if let Some(report) = session.report_content.as_deref().filter(|r| !r.trim().is_empty()) {
+        let content = format!(
+            "已合并需求「{}」的成功实现方案（通过审核 2 与测试）：\n\n{}",
+            issue_title, report
+        );
+        let trigger = format!("实现该项目同类需求时可参考的成功改动方案；相关需求：{}", issue_title);
+        crate::knowledge::kb_add(&cr.project_id, &content, &trigger).await;
+    }
+
+    // Innate: distil this project's accumulated logs into knowledge after a successful merge.
+    crate::knowledge::kb_evolve(&cr.project_id).await;
 
     info!("merge completed for cr {}", cr_id);
     Ok(())

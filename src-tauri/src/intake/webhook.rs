@@ -2,9 +2,11 @@ use super::IntakePayload;
 use crate::db::Db;
 use crate::tasks::runner::JobSender;
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    routing::post,
+    extract::{Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -40,7 +42,9 @@ pub async fn start(
 ) -> anyhow::Result<()> {
     let state = WebhookState { db, job_tx, app, token };
     let router = Router::new()
-        .route("/webhook/issues", post(handle_issue))
+        .route("/webhook/issues", post(handle_issue).options(preflight))
+        .route("/widget.js", get(serve_widget))
+        .layer(middleware::from_fn(add_cors))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -108,4 +112,37 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+// ── M10 embeddable widget ──────────────────────────────────────────────────────
+const WIDGET_JS: &str = include_str!("../../assets/widget.js");
+
+async fn serve_widget() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        WIDGET_JS,
+    )
+}
+
+async fn preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// Permissive CORS so the widget can be embedded on any origin and POST feedback.
+async fn add_cors(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::HeaderValue::from_static("authorization,content-type"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::HeaderValue::from_static("POST,GET,OPTIONS"),
+    );
+    resp
 }
