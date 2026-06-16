@@ -1427,6 +1427,8 @@ export default function ConversationsPage() {
   const [loadError,      setLoadError]      = useState('');
   const [quoteDraft,     setQuoteDraft]     = useState<QuoteDraft | null>(null);
   const [bubbleMenu,     setBubbleMenu]     = useState<BubbleMenuState | null>(null);
+  const [reader,         setReader]         = useState<{ message: Message; author: string } | null>(null);
+  const [readerScale,    setReaderScale]    = useState(() => Number(localStorage.getItem('conv.readerScale')) || 1.15);
   const [contextAttachments, setContextAttachments] = useState<ConversationAttachment[]>([]);
   const [windowSize,         setWindowSize]         = useState(20);
   const [listCollapsed,  setListCollapsed]  = useState(() => localStorage.getItem('conv.listCollapsed') === '1');
@@ -1649,8 +1651,8 @@ export default function ConversationsPage() {
   const openBubbleMenu = (e: React.MouseEvent, message: Message, author: string) => {
     e.preventDefault();
     setBubbleMenu({
-      x: Math.min(e.clientX, window.innerWidth - 132),
-      y: Math.min(e.clientY, window.innerHeight - 96),
+      x: Math.min(e.clientX, window.innerWidth - 148),
+      y: Math.min(e.clientY, window.innerHeight - 168),
       message,
       author,
     });
@@ -1691,6 +1693,25 @@ export default function ConversationsPage() {
       setLoadError(String(e));
     }
   };
+
+  const openReader = () => {
+    if (!bubbleMenu) return;
+    setReader({ message: bubbleMenu.message, author: bubbleMenu.author });
+    setBubbleMenu(null);
+  };
+  const bumpReaderScale = (delta: number) => {
+    setReaderScale(s => {
+      const next = Math.min(2, Math.max(0.85, Math.round((s + delta) * 100) / 100));
+      localStorage.setItem('conv.readerScale', String(next));
+      return next;
+    });
+  };
+  useEffect(() => {
+    if (!reader) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setReader(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [reader]);
 
   const onSend = async (
     text: string,
@@ -2255,12 +2276,44 @@ export default function ConversationsPage() {
           onPointerDown={e => e.stopPropagation()}
           onContextMenu={e => e.preventDefault()}
         >
+          <button onClick={openReader}><Icon name="maximize" size={14} />阅读模式</button>
           <button onClick={copyBubbleMessage}><Icon name="copy" size={14} />复制</button>
           <button onClick={quoteBubbleMessage}><Icon name="quote" size={14} />引用</button>
           <button onClick={toggleContextBubbleMessage} title={bubbleMenu.message.excluded_from_context ? '恢复：重新加入上下文' : '排除：不进入 AI 上下文'}>
             <Icon name={bubbleMenu.message.excluded_from_context ? 'eye' : 'eye-off'} size={14} />
             {bubbleMenu.message.excluded_from_context ? '恢复' : '排除'}
           </button>
+        </div>
+      )}
+      {reader && (
+        <div className="reader-overlay" onClick={e => { if (e.target === e.currentTarget) setReader(null); }}>
+          <div className="reader-bar">
+            <div className="reader-bar-info">
+              <Icon name="maximize" size={15} />
+              <span className="reader-bar-title">{reader.author}</span>
+              <span className="reader-bar-time">{fmtFull(reader.message.created_at)}</span>
+            </div>
+            <div className="reader-bar-tools">
+              <button className="icon-btn" title="缩小字号" onClick={() => bumpReaderScale(-0.1)} disabled={readerScale <= 0.85}>
+                <span style={{ fontSize: 'var(--text-label)', fontWeight: 700 }}>A−</span>
+              </button>
+              <span className="reader-scale-val">{Math.round(readerScale * 100)}%</span>
+              <button className="icon-btn" title="放大字号" onClick={() => bumpReaderScale(0.1)} disabled={readerScale >= 2}>
+                <span style={{ fontSize: 'var(--text-section)', fontWeight: 700 }}>A+</span>
+              </button>
+              <div className="chat-head-sep" />
+              <button className="icon-btn" title="退出阅读模式 (Esc)" onClick={() => setReader(null)}>
+                <Icon name="x" size={18} />
+              </button>
+            </div>
+          </div>
+          <div className="reader-scroll scroll">
+            <div className="bubble doc reader-doc" style={{ ['--rs' as string]: String(readerScale) }}>
+              {visibleMessageBlocks(reader.message).map((b, i) => (
+                <Block key={i} b={b} projectId={conv?.project_id ?? undefined} />
+              ))}
+            </div>
+          </div>
         </div>
       )}
       {confirmDissolve && (
