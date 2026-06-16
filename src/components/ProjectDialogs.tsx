@@ -9,87 +9,8 @@ const slugify = (name: string) => {
 
 type ProjectCreateMode = 'local' | 'git';
 
-// ── Config YAML helpers ───────────────────────────────────────────────────────
-
-type YamlSection = { key: string; lines: string[] };
-
-function splitYamlSections(yaml: string): YamlSection[] {
-  const sections: YamlSection[] = [];
-  let cur: YamlSection | null = null;
-  for (const line of yaml.split('\n')) {
-    const top = /^([a-z_][a-z0-9_]*):/i.exec(line);
-    if (top && !line.startsWith(' ') && !line.startsWith('\t')) {
-      if (cur) sections.push(cur);
-      cur = { key: top[1], lines: [line] };
-    } else if (cur) {
-      cur.lines.push(line);
-    }
-  }
-  if (cur) sections.push(cur);
-  return sections;
-}
-
-function getNestedValue(sectionLines: string[], key: string): string {
-  for (const line of sectionLines) {
-    const m = line.match(new RegExp(`^\\s+${key}:\\s*"?([^"\\n]+?)"?\\s*$`));
-    if (m) return m[1].trim();
-  }
-  return '';
-}
-
-export function parseProjectConfig(configYaml: string | null) {
-  if (!configYaml) return { devCommand: '', devUrl: '', prodUrl: '', devKind: 'web', appCommand: '' };
-  const sections = splitYamlSections(configYaml);
-  const dev = sections.find(s => s.key === 'dev');
-  const prod = sections.find(s => s.key === 'prod');
-  const kind = dev ? getNestedValue(dev.lines, 'kind') : '';
-  return {
-    devCommand: dev ? getNestedValue(dev.lines, 'command') : '',
-    devUrl: dev ? getNestedValue(dev.lines, 'url') : '',
-    prodUrl: prod ? getNestedValue(prod.lines, 'url') : '',
-    devKind: kind === 'tauri' ? 'tauri' : 'web',
-    appCommand: dev ? getNestedValue(dev.lines, 'app_command') : '',
-  };
-}
-
-function buildConfigYaml(
-  existing: string | null,
-  devCommand: string,
-  devUrl: string,
-  prodUrl: string,
-  devKind: string,
-  appCommand: string,
-): string | undefined {
-  const cmd = devCommand.trim();
-  const dUrl = devUrl.trim();
-  const pUrl = prodUrl.trim();
-  const kind = devKind === 'tauri' ? 'tauri' : 'web';
-  const appCmd = appCommand.trim();
-
-  // Preserve sections we don't manage (test, quality, etc.)
-  const preserved = existing
-    ? splitYamlSections(existing)
-        .filter(s => s.key !== 'dev' && s.key !== 'prod')
-        .map(s => s.lines.join('\n'))
-    : [];
-
-  const parts: string[] = [];
-  if (cmd || dUrl) {
-    const devLines = ['dev:'];
-    // web 是默认值，仅 tauri 时显式写入 kind / app_command，保持 yaml 简洁
-    if (kind === 'tauri') devLines.push(`  kind: "tauri"`);
-    if (cmd)  devLines.push(`  command: ${JSON.stringify(cmd)}`);
-    if (dUrl) devLines.push(`  url: ${JSON.stringify(dUrl)}`);
-    if (kind === 'tauri' && appCmd) devLines.push(`  app_command: ${JSON.stringify(appCmd)}`);
-    parts.push(devLines.join('\n'));
-  }
-  if (pUrl) {
-    parts.push(`prod:\n  url: ${JSON.stringify(pUrl)}`);
-  }
-  parts.push(...preserved);
-
-  return parts.length > 0 ? parts.join('\n') : undefined;
-}
+// 运行配置（dev/prod/test/quality/preview/deploy…）统一在「项目管理 → 运行配置」tab
+// 维护，见 src/utils/projectConfig.ts。创建/编辑弹窗只负责项目身份信息。
 
 // ── ProjectCreateModal ────────────────────────────────────────────────────────
 
@@ -102,7 +23,6 @@ export function ProjectCreateModal({ onClose, onCreated }: {
     name: '', slug: '', description: '', repo_path: '',
     git_url: '', target_path: '', clone_branch: '', git_username: '', git_password: '',
     branch_dev: 'dev', branch_main: 'main',
-    dev_command: '', dev_url: '', prod_url: '', dev_kind: 'web', app_command: '',
   });
   const [slugTouched, setSlugTouched] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -132,7 +52,6 @@ export function ProjectCreateModal({ onClose, onCreated }: {
         description: form.description.trim(),
         branch_dev: form.branch_dev.trim() || 'dev',
         branch_main: form.branch_main.trim() || 'main',
-        config_yaml: buildConfigYaml(null, form.dev_command, form.dev_url, form.prod_url, form.dev_kind, form.app_command),
       };
       const project = mode === 'local'
         ? await createLocalProject({ ...common, repo_path: repoPath })
@@ -150,7 +69,7 @@ export function ProjectCreateModal({ onClose, onCreated }: {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 560, maxHeight: 'min(760px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">添加项目</span></div>
@@ -220,18 +139,12 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
   onClose: () => void;
   onSaved: (project: Project) => void;
 }) {
-  const parsed = parseProjectConfig(project.config_yaml);
   const [form, setForm] = useState({
     name: project.name,
     description: project.description,
     repo_path: project.repo_path,
     branch_dev: project.branch_dev,
     branch_main: project.branch_main,
-    dev_command: parsed.devCommand,
-    dev_url: parsed.devUrl,
-    prod_url: parsed.prodUrl,
-    dev_kind: parsed.devKind,
-    app_command: parsed.appCommand,
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -247,14 +160,6 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
         repo_path: form.repo_path.trim(),
         branch_dev: form.branch_dev.trim() || 'dev',
         branch_main: form.branch_main.trim() || 'main',
-        config_yaml: buildConfigYaml(
-          project.config_yaml,
-          form.dev_command,
-          form.dev_url,
-          form.prod_url,
-          form.dev_kind,
-          form.app_command,
-        ) ?? '',
       });
       onSaved(saved);
     } catch (e) { setError(String(e)); }
@@ -262,7 +167,7 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">编辑项目</span> <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontWeight: 400 }}>{project.slug}</span></div>
@@ -288,8 +193,6 @@ export function ProjectEditModal({ project, onClose, onSaved }: {
 type FormState = {
   name: string; description: string; repo_path: string;
   branch_dev: string; branch_main: string;
-  dev_command: string; dev_url: string; prod_url: string;
-  dev_kind: string; app_command: string;
   slug?: string;
 };
 
@@ -332,39 +235,8 @@ function ProjectFormFields({
         <div className="field"><label>开发分支</label><input value={form.branch_dev} onChange={e => setForm((f: any) => ({ ...f, branch_dev: e.target.value }))} /></div>
         <div className="field"><label>主分支</label><input value={form.branch_main} onChange={e => setForm((f: any) => ({ ...f, branch_main: e.target.value }))} /></div>
       </div>
-
-      <div style={{ height: 1, background: 'var(--border)', margin: '12px 0 10px' }} />
-      <div style={{ fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600, marginBottom: 8 }}>审计预览环境</div>
-      <div className="field" style={{ marginBottom: 10 }}>
-        <label>应用类型</label>
-        <div className="seg" style={{ alignSelf: 'flex-start' }}>
-          <button type="button" className={form.dev_kind !== 'tauri' ? 'on' : ''} onClick={() => setForm((f: any) => ({ ...f, dev_kind: 'web' }))}>Web 应用</button>
-          <button type="button" className={form.dev_kind === 'tauri' ? 'on' : ''} onClick={() => setForm((f: any) => ({ ...f, dev_kind: 'tauri' }))}>Tauri 桌面</button>
-        </div>
-      </div>
-      <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
-        <div className="field full">
-          <label>{form.dev_kind === 'tauri' ? '前端预览启动命令' : '启动命令'}</label>
-          <input value={form.dev_command} onChange={e => setForm((f: any) => ({ ...f, dev_command: e.target.value }))} placeholder={form.dev_kind === 'tauri' ? 'npm run dev -- --port {port}' : 'npm run dev -- --port {port}'} />
-        </div>
-        <div className="field">
-          <label>开发预览地址</label>
-          <input value={form.dev_url} onChange={e => setForm((f: any) => ({ ...f, dev_url: e.target.value }))} placeholder="http://localhost:{port}" />
-        </div>
-        <div className="field">
-          <label>生产环境地址</label>
-          <input value={form.prod_url} onChange={e => setForm((f: any) => ({ ...f, prod_url: e.target.value }))} placeholder="https://app.example.com" />
-        </div>
-        {form.dev_kind === 'tauri' && (
-          <div className="field full">
-            <label>桌面应用启动命令（可选，逃生口）</label>
-            <input value={form.app_command} onChange={e => setForm((f: any) => ({ ...f, app_command: e.target.value }))} placeholder="npm run tauri:dev" />
-          </div>
-        )}
-      </div>
-      <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 7, lineHeight: 'var(--leading-normal)' }}>
-        命令与地址中的 <code style={{ fontFamily: 'var(--font-mono)' }}>{'{port}'}</code> 会按每个变更自动替换为独立端口，避免并发预览撞端口。
-        {form.dev_kind === 'tauri' && ' Tauri 项目的 iframe 仅预览 web 前端，桌面应用命令用于打开原生窗口对照。'}
+      <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 9, lineHeight: 'var(--leading-normal)' }}>
+        预览 / 测试 / 部署等运行配置在创建后于「运行配置」标签页维护。
       </div>
     </>
   );
@@ -381,7 +253,7 @@ export function ConfirmModal({ msg, sub, okLabel = '确认', danger = true, onOk
   onCancel: () => void;
 }) {
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 400, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: sub ? '0 0 8px' : '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         {sub && <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>{sub}</p>}
@@ -402,7 +274,7 @@ export function ConfirmProjectDeleteModal({ project, onCancel, onConfirm }: {
   onConfirm: () => void;
 }) {
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 420, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 8px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>确认删除项目「{project.name}」？</p>
         <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>这会同时删除该项目的需求、变更请求、审核记录、预览环境和测试记录。</p>

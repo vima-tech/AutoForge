@@ -26,8 +26,8 @@ export default function Markdown({ md }: { md: string }) {
 
   while (i < lines.length) {
     const ln = lines[i];
-    if (/^#{1,3}\s/.test(ln)) {
-      const lvl = ln.match(/^#+/)![0].length;
+    if (/^#{1,6}\s/.test(ln)) {
+      const lvl = Math.min(ln.match(/^#+/)![0].length, 6);
       blocks.push({ tag: 'h' + lvl, html: renderInline(ln.replace(/^#+\s/, '')) });
       i++;
     } else if (/^---+$|^\*\*\*+$|^___+$/.test(ln.trim())) {

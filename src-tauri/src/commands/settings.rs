@@ -1,18 +1,38 @@
 use crate::models::agent::{Agent, CreateAgent, UpdateAgent};
 use crate::models::llm_config::{CreateLlmConfig, LlmConfig, UpdateLlmConfig};
 use crate::state::AppState;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tauri::State;
 use uuid::Uuid;
 
 // ---- LLM Configs ----
 
+/// Never ship the raw API key to the webview. The key stays in SQLite and is
+/// read backend-side when calling providers; the UI only learns whether one is
+/// set. The frontend sends `api_key` back only when the user actually edits it,
+/// so blanking it here does not clobber the stored value on unrelated saves.
+fn mask_key(mut cfg: LlmConfig) -> LlmConfig {
+    cfg.api_key = String::new();
+    cfg
+}
+
+/// 归一化接口规范，目前仅支持 openai、anthropic 两种 HTTP wire 格式，其余一律回退 openai。
+/// api_spec 是接口规范的唯一真源（provider 字段已移除）。
+fn normalize_api_spec(explicit: Option<&str>) -> &'static str {
+    match explicit.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("anthropic") => "anthropic",
+        _ => "openai",
+    }
+}
+
 #[tauri::command]
 pub async fn list_llm_configs(state: State<'_, AppState>) -> Result<Vec<LlmConfig>, String> {
-    sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs ORDER BY created_at")
+    let rows = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs ORDER BY created_at")
         .fetch_all(&state.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(mask_key).collect())
 }
 
 #[tauri::command]
@@ -23,19 +43,20 @@ pub async fn create_llm_config(
     let id = Uuid::new_v4().to_string();
     let ctx_window = payload.ctx_window.unwrap_or_else(|| "200K".to_string());
     let temperature = payload.temperature.unwrap_or(0.3);
+    let api_spec = normalize_api_spec(payload.api_spec.as_deref());
 
     sqlx::query(
-        "INSERT INTO llm_configs (id, name, provider, model, endpoint, api_key, ctx_window, temperature)
+        "INSERT INTO llm_configs (id, name, model, endpoint, api_key, ctx_window, temperature, api_spec)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(&payload.name)
-    .bind(&payload.provider)
     .bind(&payload.model)
     .bind(&payload.endpoint)
     .bind(&payload.api_key)
     .bind(&ctx_window)
     .bind(temperature)
+    .bind(api_spec)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -44,6 +65,7 @@ pub async fn create_llm_config(
         .bind(&id)
         .fetch_one(&state.db)
         .await
+        .map(mask_key)
         .map_err(|e| e.to_string())
 }
 
@@ -58,10 +80,6 @@ pub async fn update_llm_config(
 
     if let Some(ref v) = payload.name {
         sets.push("name=?");
-        values.push(v.clone());
-    }
-    if let Some(ref v) = payload.provider {
-        sets.push("provider=?");
         values.push(v.clone());
     }
     if let Some(ref v) = payload.model {
@@ -88,12 +106,17 @@ pub async fn update_llm_config(
         sets.push("enabled=?");
         values.push(if v { "1" } else { "0" }.to_string());
     }
+    if let Some(ref v) = payload.api_spec {
+        sets.push("api_spec=?");
+        values.push(normalize_api_spec(Some(v)).to_string());
+    }
 
     if sets.is_empty() {
         return sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
             .bind(&id)
             .fetch_one(&state.db)
             .await
+            .map(mask_key)
             .map_err(|e| e.to_string());
     }
 
@@ -111,6 +134,7 @@ pub async fn update_llm_config(
         .bind(&id)
         .fetch_one(&state.db)
         .await
+        .map(mask_key)
         .map_err(|e| e.to_string())
 }
 
@@ -132,13 +156,46 @@ pub async fn delete_llm_config(id: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-pub async fn test_llm_connection(id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+pub async fn test_llm_connection(
+    id: String,
+    draft: Option<UpdateLlmConfig>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("LLM 配置不存在: {}", id))?;
+
+    // 用前台尚未保存的草稿覆盖落库值，使「填写后立即测试」反映最新输入，
+    // 而非已保存的旧数据。
+    if let Some(d) = draft {
+        if let Some(v) = d.name {
+            cfg.name = v;
+        }
+        if let Some(v) = d.model {
+            cfg.model = v;
+        }
+        if let Some(v) = d.endpoint {
+            cfg.endpoint = v;
+        }
+        if let Some(v) = d.api_key {
+            cfg.api_key = v;
+        }
+        if let Some(v) = d.ctx_window {
+            cfg.ctx_window = v;
+        }
+        if let Some(v) = d.temperature {
+            cfg.temperature = v;
+        }
+        if let Some(v) = d.enabled {
+            cfg.enabled = v;
+        }
+        if let Some(v) = d.api_spec {
+            cfg.api_spec = v;
+        }
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -146,16 +203,10 @@ pub async fn test_llm_connection(id: String, state: State<'_, AppState>) -> Resu
         .map_err(|e| e.to_string())?;
 
     let started = Instant::now();
-    let provider = cfg.provider.to_ascii_lowercase();
+    let api_spec = cfg.api_spec.to_ascii_lowercase();
     let endpoint = cfg.endpoint.trim_end_matches('/');
 
-    let response = if provider.contains("ollama") {
-        client
-            .get(join_endpoint(endpoint, "/api/tags"))
-            .send()
-            .await
-            .map_err(|e| format!("连接失败: {}", e))?
-    } else if provider.contains("anthropic") {
+    let response = if api_spec == "anthropic" {
         // Anthropic native API — distinct /v1/messages format
         client
             .post(join_endpoint(endpoint, "/v1/messages"))
@@ -441,12 +492,14 @@ pub struct RoleSlot {
     pub kind: String,
     pub name: String,
     pub name_en: String,
-    pub group: String,   // orchestration | delivery | pipeline
+    pub group: String,   // orchestration | delivery | pipeline | knowledge
     pub binding: String, // system_kind | forge_role
     pub desc: String,
     pub color: String,
     pub icon: String,
     pub builtin_prompt: String,
+    /// 仅绑定 LLM 的角色（知识层）：前端只渲染 LLM 选择器，隐藏 prompt/群聊等开关。
+    pub llm_only: bool,
     pub holder: Option<Agent>,
 }
 
@@ -456,6 +509,7 @@ fn group_str(g: crate::agents::roles::RoleGroup) -> &'static str {
         Orchestration => "orchestration",
         Delivery => "delivery",
         Pipeline => "pipeline",
+        Knowledge => "knowledge",
     }
 }
 
@@ -498,6 +552,7 @@ pub async fn list_role_catalog(state: State<'_, AppState>) -> Result<Vec<RoleSlo
             color: def.color.to_string(),
             icon: def.icon.to_string(),
             builtin_prompt: def.builtin_prompt.to_string(),
+            llm_only: def.llm_only,
             holder,
         });
     }
@@ -649,6 +704,12 @@ pub async fn set_role_slot(
     }
 
     tx.commit().await.map_err(|e| e.to_string())?;
+
+    // 知识层蒸馏 LLM 改动后，刷新 in-process Innate 模型配置（best-effort，不阻断保存）。
+    if kind == "kb_distill" {
+        crate::knowledge::refresh_kb_models(&state.db).await;
+    }
+
     list_role_catalog(state).await
 }
 
@@ -734,4 +795,87 @@ pub async fn set_agent_forge_role(
         .fetch_all(&state.db)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ---- 工具：Web 搜索配置（存 app_settings，供 agents/tools/web_search 读取）----
+
+/// 回传给前端的 Web 搜索配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchSettings {
+    pub provider: String,
+    pub endpoint: String,
+    pub max_results: u32,
+    pub api_key_set: bool,
+}
+
+async fn read_setting(state: &AppState, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key=?")
+        .bind(key)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn write_setting(state: &AppState, key: &str, value: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_web_search_settings(
+    state: State<'_, AppState>,
+) -> Result<WebSearchSettings, String> {
+    let provider = read_setting(&state, "web_search.provider")
+        .await
+        .unwrap_or_default();
+    let endpoint = read_setting(&state, "web_search.endpoint")
+        .await
+        .unwrap_or_default();
+    let max_results = read_setting(&state, "web_search.max_results")
+        .await
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(5);
+    let api_key_set = read_setting(&state, "web_search.api_key")
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    Ok(WebSearchSettings {
+        provider,
+        endpoint,
+        max_results,
+        api_key_set,
+    })
+}
+
+/// 保存 Web 搜索配置。`api_key` 为 None 时不改动已存的 key（与 LLM 配置一致的语义）。
+#[tauri::command]
+pub async fn set_web_search_settings(
+    provider: String,
+    endpoint: String,
+    max_results: u32,
+    api_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<WebSearchSettings, String> {
+    write_setting(&state, "web_search.provider", provider.trim()).await?;
+    write_setting(&state, "web_search.endpoint", endpoint.trim()).await?;
+    write_setting(
+        &state,
+        "web_search.max_results",
+        &max_results.clamp(1, 10).to_string(),
+    )
+    .await?;
+    if let Some(key) = api_key {
+        write_setting(&state, "web_search.api_key", key.trim()).await?;
+    }
+    get_web_search_settings(state).await
 }

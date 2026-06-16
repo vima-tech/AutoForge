@@ -21,63 +21,107 @@ impl GitProxy {
 
     fn check_args(&self, args: &[&str]) -> Result<(), GitSecurityViolation> {
         let joined = args.join(" ");
+        let deny = |reason: &str| {
+            Err(GitSecurityViolation::Forbidden(format!(
+                "{}: {}",
+                reason, joined
+            )))
+        };
 
-        // Forbid push to main/master
-        if args.first() == Some(&"push") {
-            let rest = &args[1..].join(" ");
-            if rest.contains("main") || rest.contains("master") {
-                return Err(GitSecurityViolation::Forbidden(format!(
-                    "push to main/master is not allowed: {}",
-                    joined
-                )));
+        // Resolve the real subcommand, skipping leading global options so callers
+        // (or args) cannot hide a `push`/`config` behind `-c key=val` / `-C dir`.
+        // `-c`/`-C`/`--git-dir`/`--work-tree`/`--namespace` consume the next token.
+        let mut idx = 0usize;
+        while idx < args.len() {
+            let a = args[idx];
+            // Reject `-c` overrides that can enable code execution or weaken safety.
+            if a == "-c" {
+                if let Some(kv) = args.get(idx + 1) {
+                    let key = kv.split('=').next().unwrap_or("").to_ascii_lowercase();
+                    let dangerous = key.starts_with("alias.")
+                        || key.starts_with("protocol.")
+                        || key == "core.sshcommand"
+                        || key == "core.fsmonitor"
+                        || key == "core.pager"
+                        || key == "core.editor"
+                        || key == "core.hookspath"
+                        || key == "uploadpack.packobjectshook"
+                        || key.ends_with("helper"); // credential.*.helper, etc.
+                    if dangerous {
+                        return deny("dangerous -c override is not allowed");
+                    }
+                }
+                idx += 2;
+                continue;
             }
-            // Forbid force push
-            if args.iter().any(|a| *a == "--force" || *a == "-f") {
-                return Err(GitSecurityViolation::Forbidden(format!(
-                    "force push is not allowed: {}",
-                    joined
-                )));
+            if matches!(a, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+                idx += 2;
+                continue;
             }
+            if a.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+            break;
         }
+        let subcmd = args.get(idx).copied().unwrap_or("");
+        let rest = if idx + 1 <= args.len() {
+            &args[idx..]
+        } else {
+            &[][..]
+        };
 
-        // Forbid branch -D except autoforge/* prefix
-        if args.first() == Some(&"branch") {
-            if args.iter().any(|a| *a == "-D") {
-                let branch_name = args.last().unwrap_or(&"");
-                if !branch_name.starts_with("autoforge/") {
-                    return Err(GitSecurityViolation::Forbidden(format!(
-                        "branch -D only allowed for autoforge/* branches: {}",
-                        joined
-                    )));
+        match subcmd {
+            "push" => {
+                let push_args = &rest[1..];
+                // Forbid pushes that target main/master via any refspec form.
+                let touches_protected = push_args.iter().any(|a| {
+                    let ref_tail = a.rsplit([':', '/']).next().unwrap_or(a);
+                    ref_tail == "main" || ref_tail == "master" || *a == "main" || *a == "master"
+                }) || push_args.iter().any(|a| a.contains("main") || a.contains("master"));
+                if touches_protected {
+                    return deny("push to main/master is not allowed");
+                }
+                // Forbid force / destructive push forms.
+                if push_args.iter().any(|a| {
+                    *a == "--force"
+                        || *a == "-f"
+                        || a.starts_with("--force-with-lease")
+                        || a.starts_with("--force-if-includes")
+                        || *a == "--mirror"
+                        || *a == "--delete"
+                        || *a == "-d"
+                }) || push_args.iter().any(|a| a.starts_with('+'))
+                {
+                    return deny("force/destructive push is not allowed");
                 }
             }
-        }
-
-        // Forbid dangerous operations
-        let forbidden_subcmds = ["symbolic-ref", "update-ref"];
-        if let Some(first) = args.first() {
-            if forbidden_subcmds.contains(first) {
-                return Err(GitSecurityViolation::Forbidden(format!(
-                    "forbidden git subcommand: {}",
-                    joined
-                )));
+            "branch" => {
+                if rest.iter().any(|a| *a == "-D" || *a == "-d" || *a == "--delete") {
+                    // Every non-flag operand must be an autoforge/* branch.
+                    let bad = rest[1..]
+                        .iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .any(|a| !a.starts_with("autoforge/"));
+                    if bad {
+                        return deny("branch delete only allowed for autoforge/* branches");
+                    }
+                }
             }
-        }
-
-        // Forbid remote set-url
-        if args.first() == Some(&"remote") && args.get(1) == Some(&"set-url") {
-            return Err(GitSecurityViolation::Forbidden(format!(
-                "remote set-url is not allowed: {}",
-                joined
-            )));
-        }
-
-        // Forbid config --global
-        if args.first() == Some(&"config") && args.iter().any(|a| *a == "--global") {
-            return Err(GitSecurityViolation::Forbidden(format!(
-                "config --global is not allowed: {}",
-                joined
-            )));
+            "symbolic-ref" | "update-ref" | "fast-import" | "filter-branch" | "daemon" => {
+                return deny("forbidden git subcommand");
+            }
+            "remote" => {
+                if rest.get(1) == Some(&"set-url") || rest.get(1) == Some(&"add") {
+                    return deny("modifying remotes is not allowed");
+                }
+            }
+            "config" => {
+                if rest.iter().any(|a| *a == "--global" || *a == "--system") {
+                    return deny("config --global/--system is not allowed");
+                }
+            }
+            _ => {}
         }
 
         Ok(())

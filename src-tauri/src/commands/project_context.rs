@@ -412,11 +412,6 @@ pub async fn load_project_context_for_conversation(
     .unwrap_or_default();
 
     for (rel_path,) in pinned {
-        for comp in PathBuf::from(&rel_path).components() {
-            if matches!(comp, Component::ParentDir | Component::RootDir) {
-                continue;
-            }
-        }
         // Skip if already loaded as priority
         let name = PathBuf::from(&rel_path)
             .file_name()
@@ -427,7 +422,12 @@ pub async fn load_project_context_for_conversation(
             continue;
         }
 
-        let full = base.join(&rel_path);
+        // Resolve safely: reject traversal / symlink escape (the previous
+        // component loop `continue`d the inner loop and was a no-op).
+        let full = match safe_join(&base, &rel_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         if !full.is_file() {
             continue;
         }
@@ -447,19 +447,37 @@ pub async fn load_project_context_for_conversation(
         }
     }
 
-    // 3. Workspace instructions and existing workspace files
+    // 3. Existing workspace files. The write-rule instructions are kept separate
+    //    so they always survive the context budget enforced below.
     let workspace_ctx = crate::commands::workspace::load_workspace_context(&repo_path).await;
     if !workspace_ctx.is_empty() {
         parts.push(workspace_ctx);
     }
-    parts.push(crate::commands::workspace::WORKSPACE_INSTRUCTIONS.to_string());
+    let instructions = crate::commands::workspace::WORKSPACE_INSTRUCTIONS;
 
     if parts.is_empty() {
-        return String::new();
+        return format!("## 项目上下文\n\n{}\n\n---\n", instructions);
     }
 
-    format!(
-        "## 项目上下文\n\n{}\n\n---\n",
-        parts.join("\n\n")
-    )
+    // Cap the assembled file content to a total byte budget so a large CLAUDE.md
+    // or several pinned files can't bloat every agent prompt (this whole block is
+    // re-sent to every agent on every step/round). Priority files (claude.md /
+    // agents.md) are first, so truncation drops the least-critical tail first.
+    const MAX_PROJECT_CTX_BYTES: usize = 16 * 1024;
+    let body = truncate_to_bytes(&parts.join("\n\n"), MAX_PROJECT_CTX_BYTES);
+
+    format!("## 项目上下文\n\n{}\n\n{}\n\n---\n", body, instructions)
+}
+
+/// Truncate a string to at most `max_bytes`, on a char boundary, appending a
+/// notice when content was dropped.
+fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n\n…[项目上下文过长，已截断]", &s[..end])
 }

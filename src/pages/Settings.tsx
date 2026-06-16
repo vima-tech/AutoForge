@@ -3,19 +3,27 @@ import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
 import Select from '../components/Select';
-import { THEME_PALETTES, type ThemeMode, type ThemeSelection } from '../theme';
+import { THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode, type ThemeMode, type ThemeSelection, type RailMode } from '../theme';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
-  getSystemHealth, updateConcurrencyConfig, readSpec, writeSpec,
+  getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
   listPreviewEnvironments, listTestSessions, listAdminDecisions,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
+  getKnowledgeSettings, setKnowledgeSettings,
+  getKnowledgeEmbedding, setKnowledgeEmbedding,
+  listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
+  getWebSearchSettings, setWebSearchSettings,
+  listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
+  type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
-  type NotifyChannel, type AutoPassPolicy, type RoleSlot,
+  type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
+  type WebSearchSettings,
+  type Project, type SelfUpdateStatus, type SelfUpdateResult,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -25,7 +33,7 @@ function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
 
 function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
   return createPortal(
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 360, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
@@ -38,17 +46,36 @@ function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; 
   );
 }
 
-const llmColor = (provider: string) => {
-  const p = provider.toLowerCase();
+const llmColor = (apiSpec: string) => {
+  const p = (apiSpec || '').toLowerCase();
   if (p.includes('anthropic')) return '#8b7ad8';
   if (p.includes('openai')) return '#4f8ed1';
   if (p.includes('ollama')) return '#4f9d6b';
   return '#e8772e';
 };
 
-function formatAgentSub(agent: Agent, llmNames: { id: string; name: string }[]) {
-  const llmName = llmNames.find(l => l.id === agent.llm_id)?.name ?? '未指定 LLM';
-  return `LLM: ${llmName}`;
+const API_SPEC_LABEL: Record<string, string> = {
+  openai: 'OpenAI 兼容', anthropic: 'Anthropic',
+};
+
+type LlmRef = { id: string; name: string; enabled: boolean };
+
+// 角色/Agent 绑定的 LLM 健康状态：未绑定 / 正常 / 已停用 / 配置缺失。
+function llmBindingState(llmId: string | null | undefined, llms: LlmRef[]): 'none' | 'ok' | 'disabled' | 'missing' {
+  if (!llmId) return 'none';
+  const m = llms.find(l => l.id === llmId);
+  if (!m) return 'missing';
+  return m.enabled ? 'ok' : 'disabled';
+}
+
+// 下拉项标签：已停用的 LLM 追加标记，避免误选到不可用配置。
+const llmOptionLabel = (l: LlmRef) => l.enabled ? l.name : `${l.name}（已停用）`;
+
+function formatAgentSub(agent: Agent, llms: LlmRef[]) {
+  if (!agent.llm_id) return 'LLM: 未指定 LLM';
+  const m = llms.find(l => l.id === agent.llm_id);
+  if (!m) return `LLM: ${agent.llm_id}（配置缺失）`;
+  return `LLM: ${m.name}${m.enabled ? '' : '（已停用）'}`;
 }
 
 // 从后端返回的完整错误字符串中提取简短摘要，保留 HTTP 状态码 + 核心 message
@@ -110,7 +137,7 @@ function LLMSettings() {
   const testConn = async (id: string) => {
     setTesting(id);
     setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
-    const result = await testLlmConnection(id).catch(e => String(e));
+    const result = await testLlmConnection(id, drafts[id]).catch(e => String(e));
     setTestResult(r => ({ ...r, [id]: result }));
     setTesting(null);
   };
@@ -123,7 +150,7 @@ function LLMSettings() {
 
   const addNew = async () => {
     const c = await createLlmConfig({
-      name: '新 LLM 配置', provider: 'Anthropic',
+      name: '新 LLM 配置', api_spec: 'anthropic',
       model: 'claude-sonnet-4-20250514', endpoint: 'https://api.anthropic.com', api_key: '',
     });
     setConfigs(cs => [...cs, c]);
@@ -143,10 +170,10 @@ function LLMSettings() {
         return (
           <div className="cfg-card" key={c.id} style={exp === c.id ? { borderColor: 'var(--ember-tint-strong)' } : {}}>
             <div className="cfg-top" onClick={() => setExp(exp === c.id ? null : c.id)} style={{ cursor: 'pointer' }}>
-              <div className="cfg-logo" style={{ background: llmColor(String(v('provider'))) }}><Icon name="brain" size={20} /></div>
+              <div className="cfg-logo" style={{ background: llmColor(v('api_spec')) }}><Icon name="brain" size={20} /></div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="cfg-name">{v('name')}</div>
-                <div className="cfg-sub">{v('provider')} · {v('model')}</div>
+                <div className="cfg-sub">{API_SPEC_LABEL[v('api_spec')] ?? v('api_spec')} · {v('model')}</div>
               </div>
               <span className={'chip ' + (c.enabled ? 'green' : '')}>{c.enabled ? '● 已启用' : '未启用'}</span>
               <Icon name={exp === c.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', marginLeft: 4 }} />
@@ -154,9 +181,12 @@ function LLMSettings() {
             {exp === c.id && (
               <div className="cfg-fields rise">
                 <div className="field full"><label>名称</label><input value={v('name')} onChange={e => setDraft(c.id, 'name', e.target.value)} /></div>
-                <div className="field"><label>Provider</label>
-                  <Select value={v('provider')} onChange={val => setDraft(c.id, 'provider', val)}
-                    options={['Anthropic', 'OpenAI', 'Ollama', 'Azure', '自定义'].map(v => ({ value: v, label: v }))} />
+                <div className="field"><label>接口规范 · 工具调用格式</label>
+                  <Select value={v('api_spec') || 'openai'} onChange={val => setDraft(c.id, 'api_spec', val)}
+                    options={[
+                      { value: 'openai', label: 'OpenAI 兼容' },
+                      { value: 'anthropic', label: 'Anthropic' },
+                    ]} />
                 </div>
                 <div className="field"><label>Model</label><input className="mono" value={v('model')} onChange={e => setDraft(c.id, 'model', e.target.value)} /></div>
                 <div className="field full"><label>API Endpoint</label><input className="mono" value={v('endpoint')} onChange={e => setDraft(c.id, 'endpoint', e.target.value)} /></div>
@@ -211,10 +241,255 @@ const AGENT_TEMPLATES: { label: string; prompt: string }[] = [
   { label: '分析', prompt: '你是分析师。基于事实拆解问题，给出选项、取舍与明确建议，必要时量化，并标注假设与不确定性。' },
 ];
 
+// capabilities_json 工具白名单读写：约定 {"tools":["web_search",...]}。
+function agentHasTool(capJson: string | undefined, tool: string): boolean {
+  try {
+    const arr = (JSON.parse(capJson || '{}') as { tools?: unknown }).tools;
+    return Array.isArray(arr) && arr.includes(tool);
+  } catch { return false; }
+}
+function toggleAgentTool(capJson: string | undefined, tool: string, on: boolean): string {
+  let obj: Record<string, unknown> = {};
+  try { obj = (JSON.parse(capJson || '{}') as Record<string, unknown>) || {}; } catch { obj = {}; }
+  const set = new Set<string>(Array.isArray(obj.tools) ? (obj.tools as string[]) : []);
+  if (on) set.add(tool); else set.delete(tool);
+  obj.tools = [...set];
+  return JSON.stringify(obj);
+}
+
+function ToolsSettings() {
+  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false });
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
+
+  const enabled =
+    (ws.provider === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
+    (ws.provider === 'searxng' && ws.endpoint.trim().length > 0);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await setWebSearchSettings(ws.provider, ws.endpoint, ws.max_results, apiKey.trim() || undefined);
+      setWs(r); setApiKey(''); setStatus('已保存');
+    } catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">工具 & MCP</div>
+      <div className="set-desc">为 Agent 启用外部工具。工具结果视为不可信外部输入，回灌上下文前自动过安全过滤。仅 OpenAI 兼容 / Anthropic 接口规范的 LLM 支持工具调用。</div>
+
+      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-top" style={{ gap: 10 }}>
+          <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="search" size={15} /></div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>TOOL</span>
+            </div>
+            <div className="cfg-sub">检索互联网并把标题/链接/摘要回灌给 Agent</div>
+          </div>
+          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
+        </div>
+
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field"><label>搜索 Provider</label>
+            <Select value={ws.provider || 'off'} onChange={val => setWs(w => ({ ...w, provider: val === 'off' ? '' : val }))}
+              options={[
+                { value: 'off', label: '关闭' },
+                { value: 'tavily', label: 'Tavily（需 API Key）' },
+                { value: 'searxng', label: 'SearXNG（自托管，无需 Key）' },
+              ]} />
+          </div>
+          <div className="field"><label>返回结果数</label>
+            <input type="number" min="1" max="10" value={ws.max_results}
+              onChange={e => setWs(w => ({ ...w, max_results: Math.max(1, Math.min(10, Number(e.target.value) || 5)) }))} />
+          </div>
+          {ws.provider === 'searxng' && (
+            <div className="field full"><label>SearXNG Endpoint</label>
+              <input type="text" className="mono" value={ws.endpoint} placeholder="https://searx.example.com"
+                onChange={e => setWs(w => ({ ...w, endpoint: e.target.value }))} />
+            </div>
+          )}
+          {ws.provider === 'tavily' && (
+            <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Tavily API Key</label>
+              <input type="password" className="mono" value={apiKey}
+                placeholder={ws.api_key_set ? '已设置（留空则不修改）' : 'tvly-...'}
+                onChange={e => setApiKey(e.target.value)} />
+            </div>
+          )}
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存工具配置</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+          <div className="field full">
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+              启用后，在「角色 Agent / 自定义 Agent」的能力中勾选 web_search 的 Agent 才会实际调用此工具。
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <McpServers />
+    </div>
+  );
+}
+
+function McpServers() {
+  const [servers, setServers] = useState<McpServer[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [exp, setExp] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, McpServerInput>>({});
+  const [test, setTest] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+
+  const reload = () => Promise.all([listMcpServers(), listAgents()])
+    .then(([s, a]) => { setServers(s); setAgents(a); })
+    .catch(() => {});
+  useEffect(() => { reload(); }, []);
+
+  const setDraft = (id: string, field: keyof McpServerInput, val: unknown) =>
+    setDrafts(d => ({ ...d, [id]: { ...d[id], [field]: val } }));
+
+  const val = <K extends keyof McpServer>(s: McpServer, d: McpServerInput, f: K): McpServer[K] =>
+    (d[f as keyof McpServerInput] as McpServer[K] | undefined) ?? s[f];
+
+  const scopedAgents = (s: McpServer, d: McpServerInput): string[] => {
+    try { return JSON.parse(String(val(s, d, 'agent_ids_json') ?? '[]')); } catch { return []; }
+  };
+  const toggleAgent = (s: McpServer, d: McpServerInput, agentId: string) => {
+    const cur = new Set(scopedAgents(s, d));
+    if (cur.has(agentId)) cur.delete(agentId); else cur.add(agentId);
+    setDraft(s.id, 'agent_ids_json', JSON.stringify([...cur]));
+  };
+
+  const save = async (id: string) => {
+    const d = drafts[id] ?? {};
+    if (Object.keys(d).length === 0) { setExp(null); return; }
+    setBusy(id);
+    try {
+      const updated = await updateMcpServer(id, d);
+      setServers(ss => ss.map(s => s.id === id ? updated : s));
+      setDrafts(x => { const n = { ...x }; delete n[id]; return n; });
+    } catch (e) { setTest(t => ({ ...t, [id]: '保存失败: ' + String(e) })); }
+    finally { setBusy(null); }
+  };
+  const addNew = async () => {
+    const s = await createMcpServer({ name: '新 MCP Server', transport: 'stdio' });
+    setServers(ss => [...ss, s]); setExp(s.id);
+  };
+  const doDelete = async (id: string) => {
+    await deleteMcpServer(id);
+    setServers(ss => ss.filter(s => s.id !== id));
+    setConfirmDel(null);
+  };
+  const runTest = async (id: string) => {
+    setBusy(id); setTest(t => ({ ...t, [id]: '连接中…' }));
+    try {
+      const tools = await testMcpConnection(id);
+      setTest(t => ({ ...t, [id]: tools.length ? `✓ 发现 ${tools.length} 个工具：${tools.join(', ')}` : '✓ 已连接，但无工具' }));
+    } catch (e) { setTest(t => ({ ...t, [id]: '✗ ' + String(e) })); }
+    finally { setBusy(null); }
+  };
+
+  return (
+    <div style={{ marginTop: 22 }}>
+      {confirmDel && <ConfirmModal msg="确认删除此 MCP Server？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
+      <div className="set-h" style={{ fontSize: 'var(--text-section)' }}>MCP Servers</div>
+      <div className="set-desc">接入外部 MCP 工具生态。每个 server 勾选适用的 Agent —— 仅被勾选的 Agent 会加载其工具。MCP 工具结果同样过安全过滤。</div>
+
+      {servers.map(s => {
+        const d = drafts[s.id] ?? {};
+        const transport = String(val(s, d, 'transport') ?? 'stdio') as McpTransport;
+        const scoped = scopedAgents(s, d);
+        const en = Boolean(d.enabled ?? s.enabled);
+        return (
+          <div className="cfg-card" key={s.id} style={{ padding: exp === s.id ? '13px 16px' : '8px 12px', marginBottom: 6, ...(exp === s.id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+            <div className="cfg-top" onClick={() => setExp(exp === s.id ? null : s.id)} style={{ cursor: 'pointer', gap: 10 }}>
+              <div className="cfg-logo" style={{ background: 'var(--blue, #4f8ed1)', width: 28, height: 28 }}><Icon name="zap" size={15} /></div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{String(val(s, d, 'name') ?? '')}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{transport.toUpperCase()}</span>
+                </div>
+                <div className="cfg-sub">{scoped.length ? `适用 ${scoped.length} 个 Agent` : '未勾选任何 Agent'}</div>
+              </div>
+              <span className={'chip ' + (en ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{en ? '已启用' : '未启用'}</span>
+              <Icon name={exp === s.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
+            </div>
+            {exp === s.id && (
+              <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+                <div className="field"><label>名称</label>
+                  <input value={String(val(s, d, 'name') ?? '')} onChange={e => setDraft(s.id, 'name', e.target.value)} />
+                </div>
+                <div className="field"><label>传输方式</label>
+                  <Select value={transport} onChange={v => setDraft(s.id, 'transport', v)}
+                    options={[{ value: 'stdio', label: 'stdio（本地子进程）' }, { value: 'http', label: 'HTTP（远程 streamable）' }]} />
+                </div>
+                {transport === 'stdio' ? (<>
+                  <div className="field full"><label>启动命令 command</label>
+                    <input className="mono" value={String(val(s, d, 'command') ?? '')} placeholder="npx / uvx / node …"
+                      onChange={e => setDraft(s.id, 'command', e.target.value)} />
+                  </div>
+                  <div className="field full"><label>参数 args（JSON 数组）</label>
+                    <input className="mono" value={String(val(s, d, 'args_json') ?? '[]')} placeholder='["-y","@modelcontextprotocol/server-filesystem","/path"]'
+                      onChange={e => setDraft(s.id, 'args_json', e.target.value)} />
+                  </div>
+                  <div className="field full"><label>环境变量 env（JSON 对象，密钥留空则不改）</label>
+                    <input className="mono" value={String(val(s, d, 'env_json') ?? '{}')} placeholder='{"API_KEY":""}'
+                      onChange={e => setDraft(s.id, 'env_json', e.target.value)} />
+                  </div>
+                </>) : (<>
+                  <div className="field full"><label>服务 URL</label>
+                    <input className="mono" value={String(val(s, d, 'url') ?? '')} placeholder="https://host/mcp"
+                      onChange={e => setDraft(s.id, 'url', e.target.value)} />
+                  </div>
+                  <div className="field full"><label>请求头 headers（JSON 对象，密钥留空则不改）</label>
+                    <input className="mono" value={String(val(s, d, 'headers_json') ?? '{}')} placeholder='{"Authorization":"Bearer "}'
+                      onChange={e => setDraft(s.id, 'headers_json', e.target.value)} />
+                  </div>
+                </>)}
+                <div className="field full"><label>适用 Agent（勾选后该 Agent 加载本 server 的工具）</label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '6px 0' }}>
+                    {agents.length === 0 && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>暂无 Agent</span>}
+                    {agents.map(a => {
+                      const on = scoped.includes(a.id);
+                      return (
+                        <button key={a.id} className={'chip ' + (on ? 'ember' : '')} style={{ cursor: 'pointer', border: on ? undefined : '1px solid var(--border-strong)' }}
+                          onClick={() => toggleAgent(s, d, a.id)}>
+                          {on ? '✓ ' : ''}{a.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingTop: 4 }}>
+                  <Switch on={en} onToggle={() => setDraft(s.id, 'enabled', !en)} />
+                  <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>启用此 server</span>
+                  <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(s.id)}><Icon name="trash" size={13} />删除</button>
+                  <button className="btn btn-sm" disabled={busy === s.id} onClick={() => runTest(s.id)}><Icon name="zap" size={13} />测试连接</button>
+                  <button className="btn btn-sm btn-primary" disabled={busy === s.id} onClick={() => save(s.id)}><Icon name="check" size={13} />保存</button>
+                </div>
+                {test[s.id] && (
+                  <div className="field full"><span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{test[s.id]}</span></div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div className="cfg-card add" onClick={addNew} style={{ padding: 12, marginBottom: 0 }}><Icon name="plus" size={16} />新增 MCP Server</div>
+    </div>
+  );
+}
+
 function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hideIds, setHideIds] = useState<Set<string>>(new Set());
-  const [llmNames, setLlmNames] = useState<{ id: string; name: string }[]>([]);
+  const [llmNames, setLlmNames] = useState<LlmRef[]>([]);
   const [exp, setExp] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Partial<Agent>>>({});
   const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
@@ -225,7 +500,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
     Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog()]).then(([ags, llms, cat]) => {
       setAgents(ags);
       setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
-      setLlmNames(llms.map(l => ({ id: l.id, name: l.name })));
+      setLlmNames(llms.map(l => ({ id: l.id, name: l.name, enabled: l.enabled })));
       setLoading(false);
     }).catch(() => setLoading(false));
 
@@ -283,6 +558,13 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                 <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{v('name')}</span></div>
                 <div className="cfg-sub">{formatAgentSub(a, llmNames)}</div>
               </div>
+              {(() => {
+                const st = llmBindingState(a.llm_id, llmNames);
+                if (!a.enabled || st === 'ok' || st === 'none') return null;
+                return <span className="chip red" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }}
+                  title={st === 'disabled' ? '绑定的 LLM 已停用，运行将失败' : '绑定的 LLM 配置已删除，运行将失败'}>
+                  <Icon name="alert" size={11} />{st === 'disabled' ? 'LLM 已停用' : 'LLM 缺失'}</span>;
+              })()}
               <Icon name={exp === a.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
             </div>
             {exp === a.id && (
@@ -295,7 +577,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                     <Select
                       value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
                       onChange={val => setDraft(a.id, 'llm_id', val || null)}
-                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: l.name }))]} />
+                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]} />
                   </div>
                   <div className="field full"><label>职责标签</label>
                     <input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} />
@@ -312,6 +594,21 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                       <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
                         <Switch on={Boolean(d.visible_in_chat ?? a.visible_in_chat)} onToggle={() => setDraft(a.id, 'visible_in_chat', !(d.visible_in_chat ?? a.visible_in_chat))} />可私聊
                       </label>
+                    </div>
+                  </div>
+                  <div className="field full">
+                    <label>工具能力</label>
+                    <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
+                      {(() => {
+                        const cap = d.capabilities_json !== undefined ? String(d.capabilities_json ?? '') : a.capabilities_json;
+                        const on = agentHasTool(cap, 'web_search');
+                        return (
+                          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+                            <Switch on={on} onToggle={() => setDraft(a.id, 'capabilities_json', toggleAgentTool(cap, 'web_search', !on))} />联网搜索 web_search
+                          </label>
+                        );
+                      })()}
+                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>需在「工具 & MCP」中先配置搜索 Provider；仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
                     </div>
                   </div>
                   <div className="field full">
@@ -358,7 +655,7 @@ const PROMPT_MODES: { id: 'builtin' | 'append' | 'custom'; label: string }[] = [
 
 function RoleSlotCard({ slot, llms, onApply }: {
   slot: RoleSlot;
-  llms: { id: string; name: string }[];
+  llms: LlmRef[];
   onApply: (kind: string, payload: Parameters<typeof setRoleSlot>[1]) => Promise<void>;
 }) {
   const h = slot.holder;
@@ -373,11 +670,17 @@ function RoleSlotCard({ slot, llms, onApply }: {
     try { await onApply(slot.kind, payload); } finally { setBusy(false); }
   };
 
+  const llmState = llmBindingState(h?.llm_id, llms);
   const status = !h ? { t: '未配置', c: '' }
     : !h.enabled ? { t: '已停用', c: '' }
     : !h.llm_id ? { t: '缺 LLM', c: 'amber' }
+    : llmState === 'disabled' ? { t: 'LLM 已停用', c: 'red' }
+    : llmState === 'missing' ? { t: 'LLM 缺失', c: 'red' }
     : { t: '已启用', c: 'green' };
-  const llmName = h?.llm_id ? (llms.find(l => l.id === h.llm_id)?.name ?? h.llm_id) : '未指定 LLM';
+  const boundLlm = h?.llm_id ? llms.find(l => l.id === h.llm_id) : undefined;
+  const llmName = h?.llm_id
+    ? (boundLlm ? `${boundLlm.name}${boundLlm.enabled ? '' : '（已停用）'}` : `${h.llm_id}（缺失）`)
+    : '未指定 LLM';
   const modeLabel = PROMPT_MODES.find(m => m.id === mode)?.label ?? '内置';
 
   return (
@@ -390,7 +693,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{slot.name_en}</span>
           </div>
           <div className="cfg-sub" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {open ? slot.desc : (h ? `${llmName} · 提示词 ${modeLabel}` : slot.desc)}
+            {open ? slot.desc : (h ? (slot.llm_only ? llmName : `${llmName} · 提示词 ${modeLabel}`) : slot.desc)}
           </div>
         </div>
         {!open && h?.mentionable && <span className="chip" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }} title="可拉入群聊">群</span>}
@@ -399,10 +702,24 @@ function RoleSlotCard({ slot, llms, onApply }: {
         <span className={'chip ' + status.c} style={{ flexShrink: 0 }}>{status.t}</span>
         <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
-      {open && (
+      {open && slot.llm_only && (
+      <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+        <div className="field full"><label>使用的 LLM</label>
+          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定（Innate 回退启发式蒸馏）—' }, ...llms.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]}
+            onChange={val => apply({ llm_id: val, enabled: true })} />
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>仅支持有 HTTP API 的 LLM（OpenAI 兼容 / Anthropic）；Claude CLI 无法用于 Innate。Innate 已内置进程内，配置即时生效、不写任何全局文件。</span>
+        </div>
+        <div className="field full">
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+            <Switch on={Boolean(h?.enabled)} onToggle={() => apply({ enabled: !(h?.enabled) })} />启用
+          </label>
+        </div>
+      </div>
+      )}
+      {open && !slot.llm_only && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field"><label>使用的 LLM</label>
-          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定 —' }, ...llms.map(l => ({ value: l.id, label: l.name }))]}
+          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定 —' }, ...llms.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]}
             onChange={val => apply({ llm_id: val, enabled: true })} />
         </div>
         <div className="field"><label>提示词</label>
@@ -437,7 +754,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
               <Switch on={Boolean(h?.visible_in_chat)} onToggle={() => apply({ visible_in_chat: !(h?.visible_in_chat) })} />可私聊
             </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }} title="开启后该角色会召回本项目历史经验注入提示词，随使用越来越准（需安装 innate CLI）">
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }} title="开启后该角色会召回本项目历史经验注入提示词，随使用越来越准（Innate 已内置，无需外部安装）">
               <Switch on={h ? Boolean(h.memory_enabled) : true} onToggle={() => apply({ memory_enabled: !(h?.memory_enabled ?? true) })} />启用记忆
             </label>
           </div>
@@ -452,18 +769,85 @@ const ROLE_GROUPS: { id: RoleSlot['group']; title: string; icon: string; color: 
   { id: 'orchestration', title: '群聊编排角色', icon: 'bot',     color: 'var(--blue)',  sub: '会议室多 Agent 协作的内置职责' },
   { id: 'delivery',      title: '交付与项目角色', icon: 'package', color: 'var(--green)', sub: '交付流水线与项目工具的 AI 职责' },
   { id: 'pipeline',      title: '需求流水线角色', icon: 'sliders', color: 'var(--ember)', sub: '分析 / 测试阶段' },
+  { id: 'knowledge',     title: '知识层（Innate）', icon: 'brain', color: 'var(--ember)', sub: 'Innate 自成长用的蒸馏 LLM 与 Embedding 模型' },
 ];
+
+// Innate embedding 模型配置卡（recall 语义检索用；非聊天 LLM，独立于 llm_configs）。
+function EmbeddingConfigCard() {
+  const [form, setForm] = useState<EmbeddingSettings>({ provider: 'openai', base_url: '', model_id: '', api_key: '', dim: 1536 });
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getKnowledgeEmbedding().then(setForm).catch(e => setStatus(String(e))); }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try { setForm(await setKnowledgeEmbedding(form)); setStatus('已保存 · 已同步至 Innate'); }
+    catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const configured = form.model_id.trim().length > 0;
+  return (
+    <div className="cfg-card" style={{ padding: open ? '13px 16px' : '8px 12px', marginBottom: 0, ...(open ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+      <div className="cfg-top" onClick={() => setOpen(o => !o)} style={{ cursor: 'pointer', gap: 10 }}>
+        <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="layers" size={15} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="cfg-name cfg-name-line"><span className="cfg-name-text">Embedding 模型</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>Embedding</span>
+          </div>
+          <div className="cfg-sub" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {open ? '语义召回（innate recall）用的向量模型' : (configured ? `${form.model_id} · dim ${form.dim}` : '语义召回向量模型（未配置则用哈希占位）')}
+          </div>
+        </div>
+        <span className={'chip ' + (configured ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{configured ? '已配置' : '未配置'}</span>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+      </div>
+      {open && (
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field"><label>Provider</label>
+            <Select value={form.provider || 'openai'} options={[{ value: 'openai', label: 'openai（兼容）' }]}
+              onChange={val => setForm(f => ({ ...f, provider: val }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>Anthropic 无 embedding API，仅 OpenAI 兼容端点。</span>
+          </div>
+          <div className="field"><label>向量维度 dim</label>
+            <input type="number" min="1" max="8192" value={form.dim}
+              onChange={e => setForm(f => ({ ...f, dim: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>须与模型实际产出一致（如 text-embedding-v4=1024）。</span>
+          </div>
+          <div className="field full"><label>Base URL</label>
+            <input type="text" value={form.base_url} placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
+              onChange={e => setForm(f => ({ ...f, base_url: e.target.value }))} />
+          </div>
+          <div className="field full"><label>Model ID</label>
+            <input type="text" value={form.model_id} placeholder="text-embedding-v4 / text-embedding-3-small"
+              onChange={e => setForm(f => ({ ...f, model_id: e.target.value }))} />
+          </div>
+          <div className="field full"><label>API Key</label>
+            <input type="password" value={form.api_key} placeholder="embedding API Key"
+              onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存 Embedding</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   const [slots, setSlots] = useState<RoleSlot[]>([]);
-  const [llms, setLlms] = useState<{ id: string; name: string }[]>([]);
+  const [llms, setLlms] = useState<LlmRef[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({}); // 默认收起
 
   useEffect(() => {
     Promise.all([listRoleCatalog(), listLlmConfigs()]).then(([s, l]) => {
-      setSlots(s); setLlms(l.map(x => ({ id: x.id, name: x.name }))); setLoading(false);
+      setSlots(s); setLlms(l.map(x => ({ id: x.id, name: x.name, enabled: x.enabled }))); setLoading(false);
     }).catch(e => { setErr(String(e)); setLoading(false); });
   }, []);
 
@@ -481,8 +865,8 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
         const rows = slots.filter(s => s.group === g.id);
         if (rows.length === 0) return null;
         const open = !!openGroups[g.id];
-        // 完整配置 = 有持有 Agent + 已启用 + 已绑定 LLM（缺一即不计入）
-        const active = rows.filter(r => r.holder?.enabled && r.holder?.llm_id).length;
+        // 完整配置 = 有持有 Agent + 已启用 + 绑定的 LLM 本身可用（停用/缺失均不计入）
+        const active = rows.filter(r => r.holder?.enabled && llmBindingState(r.holder?.llm_id, llms) === 'ok').length;
         const complete = active === rows.length;
         return (
           <div className="panel" style={{ marginBottom: 12 }} key={g.id}>
@@ -499,6 +883,7 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
             {open && (
               <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {rows.map(s => <RoleSlotCard key={s.kind} slot={s} llms={llms} onApply={apply} />)}
+                {g.id === 'knowledge' && <EmbeddingConfigCard />}
               </div>
             )}
           </div>
@@ -572,39 +957,46 @@ function ConcurrencySettings() {
   );
 }
 
-const SPEC_FILES = ['analysis-spec.md', 'coding-spec.md', 'review-spec.md', 'testing-spec.md'];
-
-function SpecsSettings() {
-  const [name, setName] = useState(SPEC_FILES[0]);
-  const [content, setContent] = useState('');
-  const [status, setStatus] = useState('');
+function KnowledgeSettings() {
+  const [form, setForm] = useState({ evolve_interval_hours: 12, capture_threshold: 8 });
+  const [result, setResult] = useState('');
 
   useEffect(() => {
-    readSpec(name).then(doc => { setContent(doc.content); setStatus(''); }).catch(e => setStatus(String(e)));
-  }, [name]);
+    getKnowledgeSettings().then(s => setForm(s)).catch(e => setResult(String(e)));
+  }, []);
 
   const save = async () => {
-    const doc = await writeSpec(name, content);
-    setContent(doc.content);
-    setStatus('已保存');
+    try {
+      const s = await setKnowledgeSettings(form);
+      setForm(s);
+      setResult('已保存 · 后台自成长配置已生效');
+    } catch (e) {
+      setResult(String(e));
+    }
   };
 
   return (
     <div className="set-inner rise">
-      <div className="set-h">规范文档</div>
-      <div className="set-desc">这些文档会注入 Agent prompt，直接约束分析、编码和测试行为。</div>
+      <div className="set-h">知识库自成长（Innate）</div>
+      <div className="set-desc">
+        AutoForge 在后台持续把交付经验蒸馏进各项目知识库。捕获达到阈值即自动进化，定时器作为低活跃项目的兜底；会议室里用 <code>/remember</code> <code>/recall</code> <code>/evolve</code> <code>/innate</code> 手动驱动。
+        <br />本页只管<strong>调度</strong>；Innate 用的<strong>蒸馏 LLM 与 Embedding 模型</strong>在「角色 Agent → 知识层（Innate）」配置。
+      </div>
       <div className="cfg-card">
         <div className="cfg-fields">
-          <div className="field full"><label>文档</label>
-            <Select value={name} onChange={setName}
-              options={SPEC_FILES.map(f => ({ value: f, label: f }))} />
+          <div className="field"><label>定时进化间隔（小时）</label>
+            <input type="number" min="0" max="720" value={form.evolve_interval_hours}
+              onChange={e => setForm(f => ({ ...f, evolve_interval_hours: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>0 = 关闭定时器（仍按捕获阈值进化）</span>
           </div>
-          <div className="field full"><label>内容</label>
-            <textarea className="mono" rows={18} value={content} onChange={e => setContent(e.target.value)} />
+          <div className="field"><label>捕获阈值（次/项目）</label>
+            <input type="number" min="0" max="1000" value={form.capture_threshold}
+              onChange={e => setForm(f => ({ ...f, capture_threshold: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>累计这么多次捕获后自动进化；0 = 关闭事件触发</span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-            <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存文档</button>
-            {status && <span style={{ fontSize: 'var(--text-label)', color: status === '已保存' ? 'var(--green-soft)' : 'var(--red)' }}>{status}</span>}
+            <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
+            {result && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{result}</span>}
           </div>
         </div>
       </div>
@@ -622,10 +1014,29 @@ function ThemeSettings({
   const setMode = (mode: ThemeMode) => onThemeChange(t => ({ ...t, mode }));
   const selected = THEME_PALETTES.find(p => p.id === theme.palette) ?? THEME_PALETTES[0];
 
+  const [railMode, setRailMode] = useState<RailMode>(() => parseRailMode(localStorage.getItem(RAIL_STORAGE_KEY)));
+  useEffect(() => {
+    localStorage.setItem(RAIL_STORAGE_KEY, railMode);
+    applyRailMode(railMode);
+  }, [railMode]);
+
   return (
     <div className="set-inner set-inner-wide rise">
       <div className="set-h">主题设置</div>
       <div className="set-desc">当前明暗主题已归入 Forge Ember。选择任一主题族后，可在深色和浅色两种风格间切换。</div>
+
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head"><div className="panel-title"><Icon name="columns" size={16} />导航栏</div></div>
+        <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>悬停展开导航栏</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+              开启后鼠标悬停可展开标签；关闭则锁定为收起状态，悬停不再触发展开。
+            </div>
+          </div>
+          <Switch on={railMode === 'hover'} onToggle={() => setRailMode(m => (m === 'hover' ? 'locked' : 'hover'))} />
+        </div>
+      </div>
 
       <div className="theme-toolbar">
         <div>
@@ -743,6 +1154,8 @@ function AboutSettings() {
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [healthError, setHealthError] = useState(false);
   const [healthLoading, setHealthLoading] = useState(true);
+  const [auth, setAuth] = useState<boolean | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [previews, setPreviews] = useState<PreviewEnvironment[]>([]);
   const [tests, setTests] = useState<TestSession[]>([]);
 
@@ -753,6 +1166,13 @@ function AboutSettings() {
       .then(h => { setHealth(h); setHealthError(false); })
       .catch(() => { setHealth(null); setHealthError(true); })
       .finally(() => setHealthLoading(false));
+    // system_health 永远返回 claude_auth=true（避开启动期 SIGTRAP），
+    // 真实登录态需走专用的 check_claude_auth 命令（进程组隔离后可安全调用）。
+    setAuthLoading(true);
+    checkClaudeAuth()
+      .then(ok => setAuth(ok))
+      .catch(() => setAuth(null))
+      .finally(() => setAuthLoading(false));
   };
 
   useEffect(() => {
@@ -763,8 +1183,11 @@ function AboutSettings() {
 
   const dbVal   = healthLoading ? '…' : health?.db_ok ? 'OK' : healthError ? '错误' : '—';
   const dbColor = healthLoading ? 'var(--text-3)' : health?.db_ok ? 'var(--green)' : healthError ? 'var(--red)' : 'var(--text-3)';
-  const authVal   = healthLoading ? '…' : health ? (health.claude_auth ? 'OK' : '未登录') : '—';
-  const authColor = healthLoading ? 'var(--text-3)' : (health?.claude_auth) ? 'var(--green)' : health ? 'var(--red)' : 'var(--text-3)';
+  const authVal   = authLoading ? '…' : auth === null ? '—' : auth ? 'OK' : '未登录';
+  const authColor = authLoading ? 'var(--text-3)' : auth === null ? 'var(--text-3)' : auth ? 'var(--green)' : 'var(--red)';
+  const stageVal  = healthLoading ? '…'
+    : health ? (health.stage === 'paused' ? '已暂停' : health.stage === 'throttled' ? '降速' : '正常')
+    : '—';
 
   return (
     <div className="set-inner rise">
@@ -772,20 +1195,25 @@ function AboutSettings() {
       <div className="set-desc" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span>运行健康、Claude 认证和后台运行态概览。</span>
         {healthError && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)' }}>状态获取失败</span>}
-        <button className="btn" style={{ marginLeft: 'auto', fontSize: 'var(--text-label)', padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading}>
-          {healthLoading ? '加载中…' : '刷新'}
+        <button className="btn" style={{ marginLeft: 'auto', fontSize: 'var(--text-label)', padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading || authLoading}>
+          {(healthLoading || authLoading) ? '加载中…' : '刷新'}
         </button>
       </div>
       <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', marginBottom: 16 }}>
         {[
-          { label: '数据库',     val: dbVal,                         color: dbColor },
-          { label: 'Claude Auth', val: authVal,                      color: authColor },
-          { label: '版本',       val: health?.version ?? (healthLoading ? '…' : '—'), color: 'var(--blue)' },
-          { label: '阶段',       val: health?.stage    ?? (healthLoading ? '…' : '—'), color: 'var(--ember)' },
+          { label: '数据库',      val: dbVal,    color: dbColor,        ic: 'layers' },
+          { label: 'Claude Auth', val: authVal,  color: authColor,      ic: 'shield' },
+          { label: '版本',        val: health?.version ?? (healthLoading ? '…' : '—'), color: 'var(--blue)', ic: 'package' },
+          { label: '阶段',        val: stageVal, color: 'var(--ember)', ic: 'zap' },
         ].map(x => (
           <div className="stat" key={x.label}>
-            <div className="stat-val" style={{ color: x.color }}>{x.val}</div>
-            <div className="stat-label">{x.label}</div>
+            <div className="stat-ic" style={{ background: `color-mix(in oklab, ${x.color} 16%, transparent)`, color: x.color }}>
+              <Icon name={x.ic} size={18} />
+            </div>
+            <div className="stat-main">
+              <div className="stat-label">{x.label}</div>
+              <div className="stat-val" style={{ color: x.color, fontSize: 'var(--text-section)' }}>{x.val}</div>
+            </div>
           </div>
         ))}
       </div>
@@ -1053,16 +1481,130 @@ function WebhookSettings() {
   );
 }
 
+// ── 自更新（AutoForge 管理自身仓库时的安全同步）──────────────────────────────
+function SelfUpdateSettings() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [pid, setPid] = useState('');
+  const [st, setSt] = useState<SelfUpdateStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [pulling, setPulling] = useState(false);
+  const [result, setResult] = useState<SelfUpdateResult | null>(null);
+
+  useEffect(() => {
+    listProjects().then(ps => {
+      setProjects(ps);
+      if (ps.length) setPid(ps[0].id);
+    }).catch(() => {});
+  }, []);
+
+  const refresh = async (id: string) => {
+    if (!id) return;
+    setLoading(true); setResult(null); setSt(null);
+    try { setSt(await selfUpdateStatus(id)); }
+    catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { refresh(pid); /* eslint-disable-next-line */ }, [pid]);
+
+  const doPull = async () => {
+    setConfirm(false); setPulling(true); setResult(null);
+    try { setResult(await selfUpdatePull(pid)); }
+    catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
+    finally { setPulling(false); refresh(pid); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">同步更新（自更新）</div>
+      <div className="set-desc">
+        当 AutoForge 用自身作为项目运行时，交付合并会在隔离 worktree 中完成并<strong>推送到 origin/dev</strong>，不改动正在运行的工作区。
+        在此一键拉取最新代码（仅快进，git 自身会拒绝覆盖未提交改动以防丢失）。
+        <br /><strong>注意</strong>：拉取会改动源码，开发模式将<strong>自动重新编译并重启</strong>，请先确认无未保存/未提交的工作。
+      </div>
+      <div className="cfg-card">
+        <div className="cfg-fields">
+          <div className="field full"><label>项目</label>
+            <Select value={pid} onChange={setPid}
+              options={projects.map(p => ({ value: p.id, label: p.name }))} placeholder="选择项目" />
+          </div>
+
+          {loading && <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>加载状态中…</div>}
+
+          {st && (
+            <div className="field full" style={{ gap: 8 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                <span className="chip">{st.branch || '游离 HEAD'}</span>
+                {st.is_self_managed
+                  ? <span className="chip ember">自管理仓库</span>
+                  : <span className="chip">普通项目</span>}
+                {st.behind > 0
+                  ? <span className="chip amber">落后 {st.behind}</span>
+                  : <span className="chip green">已最新</span>}
+                {st.ahead > 0 && <span className="chip blue">领先 {st.ahead}</span>}
+                {st.dirty && <span className="chip red">有未提交改动</span>}
+              </div>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>{st.repo_path}</span>
+            </div>
+          )}
+
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={pulling || loading || !st || st.behind === 0}
+              onClick={() => setConfirm(true)}>
+              <Icon name="refresh" size={14} />{pulling ? '同步中…' : '同步更新'}
+              {st && st.behind > 0 && (
+                <span className="set-nav-badge" style={{ marginLeft: 6 }}>{st.behind}</span>
+              )}
+            </button>
+            {result && (
+              <span style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap',
+                lineHeight: 'var(--leading-normal)', color: result.ok ? 'var(--green-soft)' : 'var(--red)' }}>
+                {result.message}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {confirm && createPortal(
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
+          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 400, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+            <p style={{ margin: '0 0 14px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>
+              将拉取 origin/{st?.branch || 'dev'} 的 {st?.behind ?? 0} 个新提交到本地。
+            </p>
+            <p style={{ margin: '0 0 20px', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--amber-soft)' }}>
+              ⚠ 源码将被更新，开发模式会<strong>自动重新编译并重启</strong>（运行中状态丢失）。
+              {st?.dirty && ' 当前有未提交改动；若与更新冲突，git 会拒绝拉取以免覆盖你的工作。'}
+              请确认已保存/提交重要工作后再继续。
+            </p>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={() => setConfirm(false)}>取消</button>
+              <button className="btn btn-primary" onClick={doPull}><Icon name="refresh" size={14} />确认同步并接受重启</button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
 const SET_ITEMS = [
-  { id: 'theme',       name: '主题设置',     ic: 'palette' },
+  // —— AI 核心：搭建智能体的地基（模型 → 能力 → 角色 → 记忆）——
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-  { id: 'roles',       name: '角色 Agent',         ic: 'bot' },
+  { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
+  { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
+  { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
+  // —— 运行与流控 ——
   { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
+  // —— 集成与通知 ——
   { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
   { id: 'notify',      name: '通知通道',     ic: 'bell' },
-  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
-  { id: 'specs',       name: '规范文档',     ic: 'file' },
+  // —— 系统 ——
+  { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+  { id: 'theme',       name: '主题设置',     ic: 'palette' },
   { id: 'about',       name: '关于 AutoForge', ic: 'box' },
 ];
 
@@ -1075,6 +1617,18 @@ export default function SettingsPage({
 }) {
   const [sec, setSec] = useState('llm');
   const cur = SET_ITEMS.find(i => i.id === sec)!;
+
+  // 待拉取提交数角标：每分钟检查一次自管理仓库落后 origin/dev 的提交数。
+  const [pendingBehind, setPendingBehind] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const tick = () => selfUpdatePending()
+      .then(r => { if (alive) setPendingBehind(r.behind); })
+      .catch(() => {});
+    tick();
+    const t = setInterval(tick, 60_000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
   return (
     <div className="content">
       <div className="audit-top" style={{ height: 56 }}>
@@ -1085,21 +1639,26 @@ export default function SettingsPage({
           {SET_ITEMS.map(it => (
             <div key={it.id} className={'set-nav-item' + (sec === it.id ? ' active' : '')} onClick={() => setSec(it.id)}>
               <Icon name={it.ic} size={18} />{it.name}
+              {it.id === 'selfupdate' && pendingBehind > 0 && (
+                <span className="set-nav-badge" title={`有 ${pendingBehind} 个提交待拉取`}>{pendingBehind}</span>
+              )}
             </div>
           ))}
         </div>
         <div className="set-body scroll">
           {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
           {sec === 'llm'         && <LLMSettings />}
+          {sec === 'tools'       && <ToolsSettings />}
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
+          {sec === 'selfupdate'  && <SelfUpdateSettings />}
+          {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
-          {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','roles','concurrency','security','webhook','notify','gating','specs','about'].includes(sec) && (
+          {!['theme','llm','tools','roles','concurrency','selfupdate','knowledge','security','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

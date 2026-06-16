@@ -154,6 +154,9 @@ async fn execute_conversation_task(
     )
     .await?;
     let members = load_schedulable_members(&db, &payload.conversation_id).await?;
+    // Roster of who else is in the room (name + specialty), injected into every
+    // agent prompt so agents know whom they can @ to bring in the right expert.
+    let roster = build_member_roster(&members);
 
     let plan = build_plan(
         &db,
@@ -177,77 +180,98 @@ async fn execute_conversation_task(
 
     emit_task_update(&app, &payload.conversation_id, &task_id, "running");
 
+    // Cap on the running transcript of agent replies fed into each subsequent
+    // prompt; keeps the most recent tail so growth (steps + chained rounds) is
+    // bounded.
+    const MAX_ACCUMULATED_BYTES: usize = 12 * 1024;
     let mut accumulated = String::new();
     let mut any_failed = false;
-    for (index, step) in plan.steps.iter().enumerate() {
-        let step_id = Uuid::new_v4().to_string();
-        let agent_ids_json = serde_json::to_string(&step.agents).map_err(|e| e.to_string())?;
-        sqlx::query(
-            "INSERT INTO conversation_task_steps
-             (id, task_id, step_index, step_type, agent_ids_json, instruction, status, started_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'running', datetime('now'))",
+    // Agents that have already spoken in this task (so a chained @mention never
+    // re-triggers the same agent and the follow-up phase always terminates).
+    let mut triggered: HashSet<String> = HashSet::new();
+    // Raw outputs produced in the most recent round, scanned for fresh @mentions.
+    let mut pending_texts: Vec<String> = Vec::new();
+    let mut next_step_index = 0usize;
+
+    for step in plan.steps.iter() {
+        let (outcomes, step_failed) = run_plan_step(
+            &db,
+            &app,
+            &task_id,
+            &payload.conversation_id,
+            next_step_index,
+            &step.step_type,
+            &step.agents,
+            &step.instruction,
+            &snapshot,
+            &accumulated,
+            &roster,
         )
-        .bind(&step_id)
-        .bind(&task_id)
-        .bind(index as i64)
-        .bind(&step.step_type)
-        .bind(&agent_ids_json)
-        .bind(&step.instruction)
-        .execute(&db)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let mut calls = Vec::new();
-        for agent_id in &step.agents {
-            calls.push(run_agent_for_step(
-                db.clone(),
-                app.clone(),
-                task_id.clone(),
-                step_id.clone(),
-                payload.conversation_id.clone(),
-                agent_id.clone(),
-                step.instruction.clone(),
-                snapshot.clone(),
-                accumulated.clone(),
+        .await?;
+        next_step_index += 1;
+        any_failed |= step_failed;
+        for outcome in &outcomes {
+            if !outcome.agent_id.is_empty() {
+                triggered.insert(outcome.agent_id.clone());
+            }
+            accumulated.push_str(&format!(
+                "\n\n[{} / {}]\n{}",
+                outcome.agent_name, outcome.agent_id, outcome.text
             ));
+            pending_texts.push(outcome.text.clone());
         }
+        accumulated =
+            truncate_keep_tail(&accumulated, MAX_ACCUMULATED_BYTES, "…[较早发言已省略]");
+    }
 
-        let outcomes = join_all(calls).await;
-        let mut step_failed = false;
-        for outcome in outcomes {
-            match outcome {
-                Ok(outcome) => {
-                    if !outcome.ok {
-                        step_failed = true;
-                    }
-                    accumulated.push_str(&format!(
-                        "\n\n[{} / {}]\n{}",
-                        outcome.agent_name, outcome.agent_id, outcome.text
-                    ));
-                }
-                Err(e) => {
-                    step_failed = true;
-                    accumulated.push_str(&format!("\n\n[执行失败]\n{}", e));
+    // Chained @mentions: if an agent's reply @-points at another schedulable
+    // member who hasn't spoken yet, let that member respond. Each agent answers
+    // at most once via this path, and MAX_CHAIN_ROUNDS hard-caps the depth.
+    const MAX_CHAIN_ROUNDS: usize = 4;
+    for _ in 0..MAX_CHAIN_ROUNDS {
+        let mut to_run: Vec<String> = Vec::new();
+        for text in &pending_texts {
+            for id in detect_mentioned_agents(text, &members) {
+                if !triggered.contains(&id) && !to_run.contains(&id) {
+                    to_run.push(id);
                 }
             }
         }
-
-        any_failed |= step_failed;
-        sqlx::query(
-            "UPDATE conversation_task_steps
-             SET status=?, completed_at=datetime('now'), error=?
-             WHERE id=?",
+        if to_run.is_empty() {
+            break;
+        }
+        let step_type = if to_run.len() > 1 { "parallel" } else { "single" };
+        let instruction =
+            "你在群聊中被其他 Agent @ 点名。请针对点名你的发言内容作出明确回应（同意/反对/补充并说明理由）。";
+        let (outcomes, step_failed) = run_plan_step(
+            &db,
+            &app,
+            &task_id,
+            &payload.conversation_id,
+            next_step_index,
+            step_type,
+            &to_run,
+            instruction,
+            &snapshot,
+            &accumulated,
+            &roster,
         )
-        .bind(if step_failed { "failed" } else { "completed" })
-        .bind(if step_failed {
-            Some("部分 Agent 执行失败")
-        } else {
-            None::<&str>
-        })
-        .bind(&step_id)
-        .execute(&db)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
+        next_step_index += 1;
+        any_failed |= step_failed;
+        pending_texts.clear();
+        for outcome in &outcomes {
+            if !outcome.agent_id.is_empty() {
+                triggered.insert(outcome.agent_id.clone());
+            }
+            accumulated.push_str(&format!(
+                "\n\n[{} / {}]\n{}",
+                outcome.agent_name, outcome.agent_id, outcome.text
+            ));
+            pending_texts.push(outcome.text.clone());
+        }
+        accumulated =
+            truncate_keep_tail(&accumulated, MAX_ACCUMULATED_BYTES, "…[较早发言已省略]");
     }
 
     // Only fire post-plan system agents when the planner didn't already produce
@@ -357,6 +381,14 @@ async fn build_plan(
 
     let needs_planner = mentioned.is_empty() || asks_for_sequence(instruction);
     if !needs_planner {
+        // `@所有人`：被点名的恰好覆盖全部可调度成员（且不止一人）。让全员并发就同一话题
+        // 表态，并显式要求互相分析、@ 彼此尽快收敛到一致意见（后续链式 @ 跟进阶段接力）。
+        let is_everyone = mentioned.len() > 1 && mentioned.len() == members.len();
+        let step_instruction = if is_everyone {
+            consensus_instruction(instruction)
+        } else {
+            instruction.to_string()
+        };
         return Ok(ConversationPlan {
             steps: vec![ConversationPlanStep {
                 step_type: if mentioned.len() > 1 {
@@ -366,7 +398,7 @@ async fn build_plan(
                 }
                 .to_string(),
                 agents: mentioned,
-                instruction: instruction.to_string(),
+                instruction: step_instruction,
             }],
         });
     }
@@ -547,6 +579,172 @@ fn fallback_plan(
     })
 }
 
+/// Run one orchestration step (records the step row, fans the agents out
+/// concurrently, then marks the step done). Returns each agent's outcome plus
+/// whether any agent in the step failed. Shared by the plan loop and the
+/// chained-@mention follow-up phase.
+async fn run_plan_step(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    task_id: &str,
+    conversation_id: &str,
+    step_index: usize,
+    step_type: &str,
+    agents: &[String],
+    instruction: &str,
+    snapshot: &str,
+    accumulated: &str,
+    roster: &str,
+) -> Result<(Vec<AgentOutcome>, bool), String> {
+    let step_id = Uuid::new_v4().to_string();
+    let agent_ids_json = serde_json::to_string(agents).map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO conversation_task_steps
+         (id, task_id, step_index, step_type, agent_ids_json, instruction, status, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'running', datetime('now'))",
+    )
+    .bind(&step_id)
+    .bind(task_id)
+    .bind(step_index as i64)
+    .bind(step_type)
+    .bind(&agent_ids_json)
+    .bind(instruction)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut calls = Vec::new();
+    for agent_id in agents {
+        calls.push(run_agent_for_step(
+            db.clone(),
+            app.clone(),
+            task_id.to_string(),
+            step_id.clone(),
+            conversation_id.to_string(),
+            agent_id.clone(),
+            instruction.to_string(),
+            snapshot.to_string(),
+            accumulated.to_string(),
+            roster.to_string(),
+        ));
+    }
+
+    let results = join_all(calls).await;
+    let mut outcomes = Vec::new();
+    let mut step_failed = false;
+    for result in results {
+        match result {
+            Ok(outcome) => {
+                if !outcome.ok {
+                    step_failed = true;
+                }
+                outcomes.push(outcome);
+            }
+            Err(e) => {
+                step_failed = true;
+                outcomes.push(AgentOutcome {
+                    agent_id: String::new(),
+                    agent_name: "执行失败".to_string(),
+                    ok: false,
+                    text: e,
+                });
+            }
+        }
+    }
+
+    sqlx::query(
+        "UPDATE conversation_task_steps
+         SET status=?, completed_at=datetime('now'), error=?
+         WHERE id=?",
+    )
+    .bind(if step_failed { "failed" } else { "completed" })
+    .bind(if step_failed {
+        Some("部分 Agent 执行失败")
+    } else {
+        None::<&str>
+    })
+    .bind(&step_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok((outcomes, step_failed))
+}
+
+/// Wrap a user topic with `@所有人` collaboration framing: every member states a
+/// clear position, analyzes the others' points, and @-mentions peers to converge
+/// on a shared conclusion quickly. The chained-@mention follow-up phase then lets
+/// the named members respond, so the discussion actually iterates toward consensus.
+fn consensus_instruction(instruction: &str) -> String {
+    // 去掉 composer 注入的 `@所有人` 字面前缀，只保留真正的话题。
+    let topic = instruction.trim().trim_start_matches("@所有人").trim();
+    let topic = if topic.is_empty() { "（见上文对话）" } else { topic };
+    format!(
+        "群聊全员讨论以下话题，目标是尽快达成一致结论：\n{}\n\n请每位成员：\n\
+1. 先基于自身专长给出明确立场和理由；\n\
+2. 认真分析其他成员的发言，明确表示同意 / 反对 / 补充，并说明依据；\n\
+3. 用 @对方名字 点名你想回应或邀请表态的成员，推动观点收敛；\n\
+4. 如果已与他人观点一致，请直接说明并归纳共识，不要为了发言而重复。\n\
+保持简洁、聚焦分歧点，避免空泛附和。",
+        topic
+    )
+}
+
+/// Build a human-readable roster of the schedulable group members, one per line
+/// as `@名字（角色/专长）`, so each agent knows who else is in the room and whom
+/// to @ for a given problem. The `@` prefix matches the mention syntax agents
+/// are asked to use.
+fn build_member_roster(members: &[Agent]) -> String {
+    members
+        .iter()
+        .filter(|a| !a.name.trim().is_empty())
+        .map(|a| {
+            let role = a.role.trim();
+            if role.is_empty() {
+                format!("- @{}", a.name)
+            } else {
+                format!("- @{}（{}）", a.name, role)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Scan an agent reply for `@AgentName` references to schedulable members.
+/// Returns the matched agent ids. A match requires a word boundary after the
+/// name so `@设计` does not match member `设计师` and `@Bob` does not match
+/// `Bobby`.
+fn detect_mentioned_agents(text: &str, members: &[Agent]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for member in members {
+        let name = member.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let needle = format!("@{}", name);
+        let mut start = 0usize;
+        while let Some(rel) = text[start..].find(&needle) {
+            let abs = start + rel;
+            let after = abs + needle.len();
+            let boundary = match text[after..].chars().next() {
+                None => true,
+                Some(c) => !(c.is_alphanumeric() || c == '_'),
+            };
+            if boundary {
+                if !found.contains(&member.id) {
+                    found.push(member.id.clone());
+                }
+                break;
+            }
+            start = after;
+            if start >= text.len() {
+                break;
+            }
+        }
+    }
+    found
+}
+
 async fn run_agent_for_step(
     db: crate::db::Db,
     app: AppHandle,
@@ -557,6 +755,7 @@ async fn run_agent_for_step(
     instruction: String,
     snapshot: String,
     accumulated: String,
+    roster: String,
 ) -> Result<AgentOutcome, String> {
     let run_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -573,8 +772,17 @@ async fn run_agent_for_step(
     .map_err(|e| e.to_string())?;
 
     let agent = load_agent(&db, &agent_id).await?;
+    let roster_section = if roster.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "群聊成员名单（可用 @名字 点名协作，发挥各自专长）：\n{}\n\n",
+            roster
+        )
+    };
     let prompt = format!(
-        "以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。",
+        "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n如果某个问题更适合其他成员的专长，用 @对方名字 点名邀请其参与（仅 @ 名单中的成员）。",
+        roster_section,
         snapshot,
         if accumulated.trim().is_empty() { "无" } else { &accumulated },
         instruction,
@@ -585,7 +793,11 @@ async fn run_agent_for_step(
     } else {
         Some(agent.system_prompt.as_str())
     };
-    let result = crate::agents::llm::run_agent_text(&db, &agent, &prompt, system_prompt, &[]).await;
+    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 勾选了它的 MCP server 工具。
+    let registry = crate::agents::tools::build_registry_for_agent(&db, &agent).await;
+    let result =
+        crate::agents::llm::run_agent_text_with_tools(&db, &agent, &prompt, system_prompt, &[], &registry)
+            .await;
 
     let (ok, text, error) = match result {
         Ok(text) => (true, text, None),
@@ -911,11 +1123,29 @@ async fn build_context_snapshot(
 
     let ordered = candidates.iter().rev().cloned().collect::<Vec<_>>();
     let conv_text = messages_to_context_text(db, &ordered).await?;
+    // The message window is bounded by count, not size; a few large messages
+    // (e.g. pasted files) can still blow it up. Cap by bytes, keeping the most
+    // recent tail since that is what agents reason about.
+    const MAX_SNAPSHOT_BYTES: usize = 24 * 1024;
+    let conv_text = truncate_keep_tail(&conv_text, MAX_SNAPSHOT_BYTES, "…[较早对话已省略]");
 
     if project_prefix.is_empty() {
         return Ok(conv_text);
     }
     Ok(format!("{}{}", project_prefix, conv_text))
+}
+
+/// Truncate a string to at most `max_bytes`, keeping the tail (most recent
+/// content) on a char boundary and prepending `notice` when content was dropped.
+fn truncate_keep_tail(s: &str, max_bytes: usize, notice: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{}\n\n{}", notice, &s[start..])
 }
 
 async fn messages_to_context_text(

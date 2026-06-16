@@ -25,6 +25,8 @@ pub enum RoleGroup {
     Delivery,
     /// 需求流水线
     Pipeline,
+    /// 知识层（Innate 自成长）
+    Knowledge,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +44,9 @@ pub struct RoleDef {
     pub desc: &'static str,
     /// 默认是否允许进入群聊 / 私聊（仍可被用户在角色卡覆盖）
     pub default_chat: bool,
+    /// 仅需绑定 LLM（无内置提示词参与文本生成）。知识层角色（如 kb_distill）置 true，
+    /// 前端据此只渲染 LLM 选择器，隐藏 prompt_mode / 补充文本 / 群聊·私聊·记忆开关。
+    pub llm_only: bool,
 }
 
 pub fn registry() -> &'static [RoleDef] {
@@ -113,40 +118,44 @@ pub static ROLE_REGISTRY: &[RoleDef] = &[
     // ── 群聊编排 ──
     RoleDef { kind: "planner", name: "调度器", name_en: "Planner", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_PLANNER, default_caps: "[\"planning\",\"routing\",\"orchestration\"]", color: "#6f7d91", icon: "layers", initial: "调",
-        desc: "解析群聊自然语言请求，生成多 Agent 并发/串行编排计划", default_chat: false },
+        desc: "解析群聊自然语言请求，生成多 Agent 并发/串行编排计划", default_chat: false, llm_only: false },
     RoleDef { kind: "summarizer", name: "总结器", name_en: "Summarizer", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SUMMARIZER, default_caps: "[\"summarizing\",\"synthesis\",\"adjudication\"]", color: "#5a8a6f", icon: "quote", initial: "结",
-        desc: "综合多个 Agent 的发言，形成结论、裁决和下一步建议", default_chat: false },
+        desc: "综合多个 Agent 的发言，形成结论、裁决和下一步建议", default_chat: false, llm_only: false },
     RoleDef { kind: "doc_writer", name: "文档生成器", name_en: "Doc Writer", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_DOC_WRITER, default_caps: "[\"documentation\",\"prd\",\"adr\",\"spec\"]", color: "#7a6faa", icon: "file", initial: "文",
-        desc: "把讨论结果整理成 PRD、ADR、测试计划等文档产物", default_chat: false },
+        desc: "把讨论结果整理成 PRD、ADR、测试计划等文档产物", default_chat: false, llm_only: false },
     RoleDef { kind: "context_compressor", name: "上下文压缩器", name_en: "Context Compressor", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_CONTEXT_COMPRESSOR, default_caps: "[\"compression\",\"summarization\",\"context_management\"]", color: "#6f8a9a", icon: "layers", initial: "压",
-        desc: "压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度", default_chat: false },
+        desc: "压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度", default_chat: false, llm_only: false },
     // ── 交付与项目 ──
     RoleDef { kind: "grader", name: "风险分级器", name_en: "Grader", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_GRADER, default_caps: "[\"risk\",\"grading\"]", color: "#e0a32e", icon: "sliders", initial: "级",
-        desc: "代码实现后给 diff 评 T0–T3 风险等级，决定能否门控降级自动放行", default_chat: false },
+        desc: "代码实现后给 diff 评 T0–T3 风险等级，决定能否门控降级自动放行", default_chat: false, llm_only: false },
     RoleDef { kind: "security", name: "安全审查", name_en: "Security", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SECURITY, default_caps: "[\"security\",\"audit\"]", color: "#4f9d6b", icon: "shield", initial: "安",
-        desc: "合并后审查改动的安全风险，高危发现自动回填为需求", default_chat: false },
+        desc: "合并后审查改动的安全风险，高危发现自动回填为需求", default_chat: false, llm_only: false },
     RoleDef { kind: "prototype", name: "设计原型师", name_en: "Design Prototyper", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_PROTOTYPE, default_caps: "[\"design\",\"prototype\"]", color: "#7a6faa", icon: "palette", initial: "原",
-        desc: "交付·设计阶段，为设计工具生成原型设计提示词", default_chat: false },
+        desc: "交付·设计阶段，为设计工具生成原型设计提示词", default_chat: false, llm_only: false },
     RoleDef { kind: "deploy", name: "部署官", name_en: "Deployer", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_DEPLOY, default_caps: "[\"deploy\",\"release\"]", color: "#4f8ed1", icon: "cloudUpload", initial: "部",
-        desc: "交付·部署阶段，按目标环境生成部署脚本", default_chat: false },
+        desc: "交付·部署阶段，按目标环境生成部署脚本", default_chat: false, llm_only: false },
     RoleDef { kind: "material_ai", name: "物料助手", name_en: "Material AI", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_MATERIAL_AI, default_caps: "[\"materials\",\"semantic_search\",\"organizing\"]", color: "#b97842", icon: "folder", initial: "物",
-        desc: "驱动物料库 AI 搜索与 AI 整理", default_chat: false },
+        desc: "驱动物料库 AI 搜索与 AI 整理", default_chat: false, llm_only: false },
     RoleDef { kind: "spec_writer", name: "规格生成器", name_en: "Spec Writer", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SPEC_WRITER, default_caps: "[\"spec\",\"technical_constraints\"]", color: "#4f8ed1", icon: "file", initial: "规",
-        desc: "驱动项目规格页 AI 一键生成技术约束", default_chat: false },
+        desc: "驱动项目规格页 AI 一键生成技术约束", default_chat: false, llm_only: false },
     // ── 需求流水线（forge_role）──
     RoleDef { kind: "analysis", name: "需求分析师", name_en: "Analyst", group: RoleGroup::Pipeline, binding: RoleBinding::ForgeRole,
         builtin_prompt: crate::agents::analysis::SYSTEM_PROMPT, default_caps: "[\"analysis\",\"triage\"]", color: "#8b7ad8", icon: "search", initial: "析",
-        desc: "审核 1 前评估真实性、可行性、优先级，产出结构化实现计划", default_chat: true },
+        desc: "审核 1 前评估真实性、可行性、优先级，产出结构化实现计划", default_chat: true, llm_only: false },
     RoleDef { kind: "test", name: "测试工程师", name_en: "Test Engineer", group: RoleGroup::Pipeline, binding: RoleBinding::ForgeRole,
         builtin_prompt: PROMPT_TEST, default_caps: "[\"testing\",\"qa\"]", color: "#4f9d6b", icon: "flask", initial: "测",
-        desc: "设计测试用例、诊断测试失败根因（合并后被动响应 + 主动巡检）", default_chat: true },
+        desc: "设计测试用例、诊断测试失败根因（合并后被动响应 + 主动巡检）", default_chat: true, llm_only: false },
+    // ── 知识层（Innate 自成长）──
+    RoleDef { kind: "kb_distill", name: "蒸馏 LLM", name_en: "Distiller", group: RoleGroup::Knowledge, binding: RoleBinding::SystemKind,
+        builtin_prompt: "", default_caps: "[\"distillation\",\"knowledge\"]", color: "#b97842", icon: "brain", initial: "蒸",
+        desc: "Innate 自成长用来蒸馏经验（evolve）的生成模型；仅绑定 LLM，进程内生效、不写任何全局文件", default_chat: false, llm_only: true },
 ];

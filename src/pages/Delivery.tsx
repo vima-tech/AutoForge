@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
-  listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy,
-  runProactiveScan, listTestSessions, getWidgetSnippet,
-  listDeliveryArtifacts, importDeliveryArtifact, deleteDeliveryArtifact, deliveryArtifactDataUrl,
+  listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
+  runProactiveScan, listTestSessions, getWidgetSnippet, getWebhookStatus,
+  listDeliveryArtifacts, importDeliveryArtifact, deleteDeliveryArtifact, revealDeliveryArtifact,
   type Project, type PrototypePrompt, type SecurityAudit, type Deployment, type TestSession,
-  type DeliveryArtifact,
+  type DeliveryArtifact, type WebhookStatus,
 } from '../services';
 
 const ART_NODE_OPTS = [
@@ -21,6 +22,45 @@ function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// 数出项目 config_yaml 中已配置、巡检会真正执行的检查项（与后端 configured_checks 同义：
+// test.unit / test.integration / quality.{lint,typing,security}）。0 = 巡检会直接跳过。
+function countConfiguredChecks(configYaml: string | null): number {
+  if (!configYaml) return 0;
+  let section = '';
+  let count = 0;
+  for (const raw of configYaml.split('\n')) {
+    if (!raw.trim() || raw.trimStart().startsWith('#')) continue;
+    const indent = raw.length - raw.trimStart().length;
+    const line = raw.trim();
+    if (indent === 0 && line.endsWith(':')) { section = line.slice(0, -1); continue; }
+    if (section === 'test' && /^(unit|integration)\s*:/.test(line)) count++;
+    else if (section === 'quality' && /^(lint|typing|security)\s*:\s*\S/.test(line)) count++;
+  }
+  return count;
+}
+
+// 项目是否配了 deploy/preview 命令——没有时部署只能生成通用 git 骨架脚本。
+function hasDeployConfig(configYaml: string | null): boolean {
+  return !!configYaml && /^(deploy|preview)\s*:/m.test(configYaml);
+}
+
+// 前置条件提示条：点明该交付功能"能真正跑起来"的条件，避免空态被误认为假数据。
+// Inline hint shown as an icon next to a panel title; the note text appears on
+// hover (native title tooltip — plain text only, no markup).
+function InfoHint({ text, variant = 'info' }: { text: string; variant?: 'info' | 'warn' | 'ok' }) {
+  const map = {
+    info: { icon: 'alert', color: 'var(--text-faint)' },
+    warn: { icon: 'alert', color: 'var(--amber)' },
+    ok: { icon: 'check', color: 'var(--green)' },
+  } as const;
+  const m = map[variant];
+  return (
+    <span title={text} style={{ display: 'inline-flex', alignItems: 'center', cursor: 'help', color: m.color }}>
+      <Icon name={m.icon} size={14} />
+    </span>
+  );
 }
 
 const codeBlock: React.CSSProperties = {
@@ -58,12 +98,21 @@ function ts(s: string | null): string {
 }
 
 type StageId = 'design' | 'release' | 'operate' | 'archive';
-const STAGES: { id: StageId; en: string; cn: string; ic: string; color: string }[] = [
-  { id: 'design',  en: 'DESIGN',  cn: '设计原型', ic: 'palette',     color: 'var(--violet)' },
-  { id: 'release', en: 'RELEASE', cn: '安全发布', ic: 'cloudUpload', color: 'var(--blue)' },
-  { id: 'operate', en: 'OPERATE', cn: '运维监控', ic: 'flask',       color: 'var(--ember)' },
-  { id: 'archive', en: 'ARCHIVE', cn: '交付归档', ic: 'package',     color: 'var(--green)' },
-];
+
+function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
+  return createPortal(
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }} onClick={onCancel}>
+      <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 360, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onCancel}>取消</button>
+          <button className="btn btn-danger" onClick={onOk}>确认删除</button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 export default function Delivery() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -81,8 +130,12 @@ export default function Delivery() {
   const [snippet, setSnippet] = useState('');
 
   const [editProto, setEditProto] = useState<{ id: string; title: string; prompt: string } | null>(null);
+  const [editDeploy, setEditDeploy] = useState<{ id: string; script: string } | null>(null);
+  const [confirmDelDeploy, setConfirmDelDeploy] = useState<Deployment | null>(null);
   const [artifacts, setArtifacts] = useState<DeliveryArtifact[]>([]);
   const [artNode, setArtNode] = useState('prototype');
+  const [confirmDelArt, setConfirmDelArt] = useState<DeliveryArtifact | null>(null);
+  const [webhook, setWebhook] = useState<WebhookStatus | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -92,12 +145,13 @@ export default function Delivery() {
         if (ps.length && !projectId) setProjectId(ps[0].id);
       })
       .catch(() => setProjects([]));
+    // Webhook 是全局服务（非按项目），用于判断反馈 Widget 嵌入脚本是否可达。
+    getWebhookStatus().then(setWebhook).catch(() => setWebhook(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const load = useCallback(async (pid: string) => {
     if (!pid) return;
-    setSnippet('');
     try {
       const [pp, sa, dp, tsx, ar] = await Promise.all([
         listPrototypePrompts(pid).catch(() => []),
@@ -114,7 +168,9 @@ export default function Delivery() {
     } catch (e) { setErr(String(e)); }
   }, []);
 
-  useEffect(() => { load(projectId); }, [projectId, load]);
+  // Clear the generated widget snippet only when switching projects — not after
+  // every `run` action (which calls load), otherwise generating it would wipe it.
+  useEffect(() => { setSnippet(''); load(projectId); }, [projectId, load]);
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setErr(''); setBusy(key);
@@ -142,13 +198,17 @@ export default function Delivery() {
     }
     e.target.value = '';
   };
-  const download = async (a: DeliveryArtifact) => {
+  const reveal = async (a: DeliveryArtifact) => {
+    setErr('');
     try {
-      const url = await deliveryArtifactDataUrl(a.id);
-      const link = document.createElement('a');
-      link.href = url; link.download = a.original_name; link.click();
+      await revealDeliveryArtifact(a.id);
     } catch (x) { setErr(String(x)); }
   };
+
+  const activeProject = projects.find(p => p.id === projectId) ?? null;
+  const checkCount = countConfiguredChecks(activeProject?.config_yaml ?? null);
+  const deployConfigured = hasDeployConfig(activeProject?.config_yaml ?? null);
+  const webhookReachable = webhook?.running === true;
 
   const totalArtSize = artifacts.reduce((sum, a) => sum + a.size_bytes, 0);
   const OVERVIEW: { id: StageId; label: string; ic: string; color: string; count: number; delta: string }[] = [
@@ -185,8 +245,8 @@ export default function Delivery() {
                       </div>
                       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-body)', fontWeight: 600 }}>{p.name}</span>
                     </div>
-                    <div style={{ paddingLeft: 34, fontSize: 'var(--text-caption)', color: active ? 'var(--ember-soft)' : 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', width: '100%', fontFamily: 'var(--font-mono)' }}>
-                      {p.slug}
+                    <div style={{ paddingLeft: 34, fontSize: 'var(--text-caption)', color: active ? 'var(--ember-soft)' : 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', width: '100%' }}>
+                      {p.description || p.slug}
                     </div>
                   </div>
                 );
@@ -196,33 +256,30 @@ export default function Delivery() {
         {/* 右：交付内容 */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
         <div className="scroll" style={{ flex: 1, minWidth: 0, overflow: 'auto', background: 'var(--bg)' }}>
-        <div className="rise" style={{ maxWidth: 1080, width: '100%', margin: '0 auto', padding: '22px 24px 48px', minHeight: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div className="rise" style={{ maxWidth: 1280, width: '100%', margin: '0 auto', padding: '22px 24px', minHeight: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: 16 }}>
         {err && <div className="chip red" style={{ alignSelf: 'flex-start' }}><Icon name="alert" size={12} />{err}</div>}
         {!projectId && <div className="empty-compact" style={{ padding: '24px 18px' }}>请从左侧选择一个在产项目</div>}
 
         {projectId && <>
-          {/* 概览：四个交付阶段的实时统计，点击切换 */}
+          {/* 概览即导航：四个交付阶段的实时统计卡同时作为阶段切换器，点击切换当前阶段 */}
           <div className="stat-grid" style={{ marginBottom: 0 }}>
-            {OVERVIEW.map(o => (
-              <button key={o.id} className="stat" onClick={() => setStage(o.id)}
-                style={{ textAlign: 'left', cursor: 'pointer', border: stage === o.id ? '1px solid var(--border-strong)' : undefined, outline: stage === o.id ? '2px solid var(--ember-tint-strong)' : 'none' }}>
-                <div className="stat-ic" style={{ background: `color-mix(in oklab, ${o.color} 16%, transparent)`, color: o.color }}><Icon name={o.ic} size={18} /></div>
-                <div className="stat-main">
-                  <div className="stat-label">{o.label}</div>
-                  <div className="stat-val">{o.count}</div>
-                </div>
-                <div className="stat-delta">{o.delta}</div>
-              </button>
-            ))}
-          </div>
-
-          {/* 阶段切换：交付生命周期 设计 → 发布 → 运维 → 归档 */}
-          <div className="seg" style={{ alignSelf: 'flex-start' }}>
-            {STAGES.map(s => (
-              <button key={s.id} className={stage === s.id ? 'on' : ''} onClick={() => setStage(s.id)}>
-                <Icon name={s.ic} size={13} style={{ verticalAlign: -2, marginRight: 5, color: stage === s.id ? s.color : undefined }} />{s.cn}
-              </button>
-            ))}
+            {OVERVIEW.map(o => {
+              const on = stage === o.id;
+              return (
+                <button key={o.id} className="stat" onClick={() => setStage(o.id)} aria-pressed={on}
+                  style={{ textAlign: 'left', cursor: 'pointer', transition: 'border-color .12s, background .12s, box-shadow .12s',
+                    border: on ? '1px solid var(--ember)' : '1px solid var(--border)',
+                    background: on ? 'var(--ember-tint)' : 'var(--bg-2)',
+                    boxShadow: on ? '0 0 0 3px var(--ember-tint)' : 'none' }}>
+                  <div className="stat-ic" style={{ background: `color-mix(in oklab, ${o.color} 16%, transparent)`, color: o.color }}><Icon name={o.ic} size={18} /></div>
+                  <div className="stat-main">
+                    <div className="stat-label">{o.label}</div>
+                    <div className="stat-val">{o.count}</div>
+                  </div>
+                  <div className="stat-delta">{o.delta}</div>
+                </button>
+              );
+            })}
           </div>
 
           <div className="del-stage">
@@ -230,7 +287,10 @@ export default function Delivery() {
           {stage === 'design' && (
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="palette" size={17} style={{ color: 'var(--violet)' }} />原型设计提示词</div>
+              <div className="panel-title">
+                <Icon name="palette" size={17} style={{ color: 'var(--violet)' }} />原型设计提示词
+                <InfoHint text="提示词由项目根目录的 DESIGN.md 与技术规格喂给设计角色生成；仓库内有 DESIGN.md 时质量最佳，缺失时退回通用启发式模板。" />
+              </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div style={{ minWidth: 150 }}>
                   <Select value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
@@ -275,7 +335,12 @@ export default function Delivery() {
           {stage === 'release' && <>
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="shield" size={17} style={{ color: 'var(--green)' }} />安全审查</div>
+              <div className="panel-title">
+                <Icon name="shield" size={17} style={{ color: 'var(--green)' }} />安全审查
+                {audits.length === 0 && (
+                  <InfoHint text="安全审查会在每次 CR 合并时自动运行（扫描合并 diff 的密钥/危险操作）。该项目还没有合并记录，故暂无结果——无需手动触发。" />
+                )}
+              </div>
               <span className="sec-kicker">合并时自动运行</span>
             </div>
             {audits.length === 0
@@ -294,7 +359,12 @@ export default function Delivery() {
 
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="cloudUpload" size={17} style={{ color: 'var(--blue)' }} />部署上线</div>
+              <div className="panel-title">
+                <Icon name="cloudUpload" size={17} style={{ color: 'var(--blue)' }} />部署上线
+                {!deployConfigured && (
+                  <InfoHint variant="warn" text="项目未配置 deploy / preview 命令，生成的脚本只是通用 git 拉取骨架。建议在「项目管理 → 运行配置」补充 preview.build / preview.start 或 deploy.command，脚本才会贴合真实部署流程。" />
+                )}
+              </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div style={{ minWidth: 130 }}>
                   <Select value={targetEnv} onChange={setTargetEnv} options={ENV_OPTS} />
@@ -320,6 +390,21 @@ export default function Delivery() {
                         <Icon name={openDeploy === d.id ? 'eye-off' : 'eye'} size={13} />{openDeploy === d.id ? '收起' : '查看'}
                       </button>
                       {d.status === 'pending_confirm' && (
+                        <button className="btn btn-sm"
+                          onClick={() => {
+                            setOpenDeploy(d.id);
+                            setEditDeploy(editDeploy?.id === d.id ? null : { id: d.id, script: d.script });
+                          }}>
+                          <Icon name="edit" size={13} />{editDeploy?.id === d.id ? '取消编辑' : '编辑'}
+                        </button>
+                      )}
+                      {d.status !== 'running' && (
+                        <button className="btn btn-sm btn-danger" disabled={busy === 'deldeploy' + d.id}
+                          onClick={() => setConfirmDelDeploy(d)}>
+                          <Icon name="trash" size={13} />
+                        </button>
+                      )}
+                      {d.status === 'pending_confirm' && (
                         <button className="btn btn-primary btn-sm" disabled={busy === 'confirm' + d.id}
                           onClick={() => run('confirm' + d.id, () => confirmDeploy(d.id))}>
                           <Icon name="play" size={13} />{busy === 'confirm' + d.id ? '部署中…' : '确认部署'}
@@ -330,7 +415,19 @@ export default function Delivery() {
                   {openDeploy === d.id && (
                     <div style={{ marginTop: 8 }}>
                       <div className="sec-kicker" style={{ marginBottom: 4 }}>部署脚本</div>
-                      <pre style={{ margin: 0, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', maxHeight: 160, overflow: 'auto', background: 'var(--code-bg)', borderRadius: 8, padding: '8px 10px' }}>{d.script}</pre>
+                      {editDeploy?.id === d.id
+                        ? <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                            <textarea value={editDeploy.script} onChange={e => setEditDeploy(s => s && { ...s, script: e.target.value })}
+                              style={{ ...inputStyle, minHeight: 160, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', resize: 'vertical' }} />
+                            <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                              <button className="btn btn-sm" onClick={() => setEditDeploy(null)}>取消</button>
+                              <button className="btn btn-sm btn-primary" disabled={busy === 'savedeploy'}
+                                onClick={() => run('savedeploy', async () => { await updateDeployScript(editDeploy.id, editDeploy.script); setEditDeploy(null); })}>
+                                <Icon name="check" size={13} />保存
+                              </button>
+                            </div>
+                          </div>
+                        : <pre style={{ margin: 0, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', maxHeight: 160, overflow: 'auto', background: 'var(--code-bg)', borderRadius: 8, padding: '8px 10px' }}>{d.script}</pre>}
                       {d.log && <>
                         <div className="sec-kicker" style={{ margin: '8px 0 4px' }}>执行日志</div>
                         <pre style={{ margin: 0, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', maxHeight: 160, overflow: 'auto', background: 'var(--code-bg)', borderRadius: 8, padding: '8px 10px' }}>{d.log}</pre>
@@ -346,9 +443,20 @@ export default function Delivery() {
           {stage === 'operate' && <>
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="flask" size={17} style={{ color: 'var(--ember)' }} />主动巡检</div>
+              <div className="panel-title">
+                <Icon name="flask" size={17} style={{ color: 'var(--ember)' }} />主动巡检
+                {checkCount === 0
+                  ? <InfoHint variant="warn" text="项目未配置任何检查命令，点击巡检会直接跳过、不会产生有意义的结果。请在「项目管理 → 运行配置」的 test.unit / test.integration / quality.lint / quality.typing / quality.security 中至少填一条命令。" />
+                  : <InfoHint variant="ok" text={`已配置 ${checkCount} 项检查命令，巡检会在主仓库依次执行，失败项自动建为需求重进流水线。`} />}
+              </div>
               <button className="btn btn-sm" disabled={busy === 'scan'}
-                onClick={() => run('scan', () => runProactiveScan(projectId))}>
+                onClick={() => {
+                  if (checkCount === 0) {
+                    setErr('项目未配置任何检查命令，无需巡检。请先在「项目管理 → 运行配置」的 test / quality 中至少填写一条检查命令。');
+                    return;
+                  }
+                  run('scan', () => runProactiveScan(projectId));
+                }}>
                 <Icon name="refresh" size={14} />{busy === 'scan' ? '巡检中…' : '立即巡检'}
               </button>
             </div>
@@ -368,7 +476,12 @@ export default function Delivery() {
 
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="code" size={17} style={{ color: 'var(--blue)' }} />反馈 Widget</div>
+              <div className="panel-title">
+                <Icon name="code" size={17} style={{ color: 'var(--blue)' }} />反馈 Widget
+                {!webhookReachable
+                  ? <InfoHint variant="warn" text="反馈 Widget 依赖本地 Webhook 服务，当前未运行，嵌入脚本里的 localhost 地址不可达。请在「设置 → 需求接收」启用 Webhook（需同时设置端口与 Token）。" />
+                  : <InfoHint variant="ok" text={`Webhook 服务运行中（端口 ${webhook?.port}），嵌入脚本可正常接收反馈。`} />}
+              </div>
               <button className="btn btn-sm" disabled={busy === 'widget'}
                 onClick={() => run('widget', async () => { setSnippet(await getWidgetSnippet(projectId)); })}>
                 <Icon name="code" size={14} />{busy === 'widget' ? '生成中…' : '生成嵌入代码'}
@@ -390,7 +503,10 @@ export default function Delivery() {
           {stage === 'archive' && (
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="package" size={17} style={{ color: 'var(--green)' }} />交付产物</div>
+              <div className="panel-title">
+                <Icon name="package" size={17} style={{ color: 'var(--green)' }} />交付产物
+                <InfoHint text="持久化到项目仓库的 .autoforge/deliverables/<节点>/，统一管理全部交付材料。" />
+              </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div style={{ minWidth: 120 }}>
                   <Select value={artNode} onChange={setArtNode} options={ART_NODE_OPTS} />
@@ -400,9 +516,6 @@ export default function Delivery() {
                 </button>
                 <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={onUpload} />
               </div>
-            </div>
-            <div style={{ padding: '8px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-              持久化到项目仓库的 <span style={{ fontFamily: 'var(--font-mono)' }}>.autoforge/deliverables/&lt;节点&gt;/</span>，统一管理全部交付材料。
             </div>
             {artifacts.length === 0
               ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无交付产物</div>
@@ -414,8 +527,8 @@ export default function Delivery() {
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{fmtSize(a.size_bytes)}</span>
                   </div>
                   <div style={{ display: 'flex', gap: 6 }}>
-                    <button className="btn btn-sm" onClick={() => download(a)}><Icon name="download" size={13} />下载</button>
-                    <button className="btn btn-sm btn-danger" disabled={busy === 'delart' + a.id} onClick={() => run('delart' + a.id, async () => { await deleteDeliveryArtifact(a.id); })}><Icon name="trash" size={13} /></button>
+                    <button className="btn btn-sm" onClick={() => reveal(a)}><Icon name="folderOpen" size={13} />打开所在文件夹</button>
+                    <button className="btn btn-sm btn-danger" disabled={busy === 'delart' + a.id} onClick={() => setConfirmDelArt(a)}><Icon name="trash" size={13} /></button>
                   </div>
                 </div>
               ))}
@@ -427,6 +540,20 @@ export default function Delivery() {
         </div>
         </div>
       </div>
+      {confirmDelArt && (
+        <ConfirmModal
+          msg={`确认删除交付产物「${confirmDelArt.original_name}」？此操作会同时删除磁盘文件，且不可恢复。`}
+          onOk={() => { const a = confirmDelArt; setConfirmDelArt(null); run('delart' + a.id, async () => { await deleteDeliveryArtifact(a.id); }); }}
+          onCancel={() => setConfirmDelArt(null)}
+        />
+      )}
+      {confirmDelDeploy && (
+        <ConfirmModal
+          msg={`确认删除该部署记录（${confirmDelDeploy.target_env} · ${confirmDelDeploy.status.replace(/_/g, ' ')}）？此操作不可恢复。`}
+          onOk={() => { const dep = confirmDelDeploy; setConfirmDelDeploy(null); run('deldeploy' + dep.id, async () => { await deleteDeployment(dep.id); if (editDeploy?.id === dep.id) setEditDeploy(null); if (openDeploy === dep.id) setOpenDeploy(''); }); }}
+          onCancel={() => setConfirmDelDeploy(null)}
+        />
+      )}
     </div>
   );
 }

@@ -22,7 +22,8 @@ struct PreviewSection {
 }
 
 pub async fn apply_preview_masking(db: &Db, project: &Project, preview_id: &str, worktree_path: &str) {
-    let Some(yaml) = project.config_yaml.as_deref() else {
+    let cfg_src = crate::commands::run_config::effective_config(project);
+    let Some(yaml) = cfg_src.as_deref() else {
         return;
     };
     let statements = mask::statements_from_yaml(yaml);
@@ -141,8 +142,7 @@ pub async fn provision_container(
         return Err("worktree 缺少 Dockerfile".into());
     }
 
-    let cfg: ContainerYaml = project
-        .config_yaml
+    let cfg: ContainerYaml = crate::commands::run_config::effective_config(project)
         .as_deref()
         .and_then(|y| serde_yaml::from_str(y).ok())
         .unwrap_or_default();

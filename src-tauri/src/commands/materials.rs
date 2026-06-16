@@ -1307,7 +1307,21 @@ pub async fn material_file_data_url(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Cap inline previews: base64-encoding a large file into a data URL would
+    // balloon memory and freeze the webview.
+    const MAX_DATA_URL_BYTES: i64 = 16 * 1024 * 1024; // 16 MB
+    if file.size_bytes > MAX_DATA_URL_BYTES {
+        return Err(format!(
+            "文件超过 {} MB，无法内联预览",
+            MAX_DATA_URL_BYTES / 1024 / 1024
+        ));
+    }
+
     let full_path = material_disk_path(&file);
+    let meta = std::fs::metadata(&full_path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_DATA_URL_BYTES as u64 {
+        return Err("文件超过内联预览大小上限".to_string());
+    }
     let bytes = std::fs::read(&full_path).map_err(|e| e.to_string())?;
     let b64 = general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{};base64,{}", file.mime, b64))

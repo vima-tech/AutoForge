@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tauri::State;
 use tracing::info;
 
@@ -35,6 +35,31 @@ fn validate_workspace_path(rel_path: &str) -> Result<(), String> {
 
 fn workspace_root(repo_path: &str) -> PathBuf {
     PathBuf::from(repo_path).join(AUTOFORGE_DIR)
+}
+
+/// Ensure `target` resolves inside `base` even when symlinks are involved.
+/// `target` need not exist yet (for writes): the closest existing ancestor is
+/// canonicalized, so a symlinked `docs/`/`specs/` subdir pointing outside the
+/// workspace is rejected.
+fn ensure_within_workspace(base: &Path, target: &Path) -> Result<(), String> {
+    let base_canon = base
+        .canonicalize()
+        .map_err(|_| "工作区目录不存在".to_string())?;
+    let mut probe = target;
+    let canon = loop {
+        match probe.canonicalize() {
+            Ok(c) => break c,
+            Err(_) => match probe.parent() {
+                Some(p) => probe = p,
+                None => return Err("路径无效".to_string()),
+            },
+        }
+    };
+    if canon.starts_with(&base_canon) {
+        Ok(())
+    } else {
+        Err("路径越界：解析后超出 .autoforge/ 工作区".to_string())
+    }
 }
 
 #[tauri::command]
@@ -84,38 +109,56 @@ pub async fn list_workspace_files(
     let mut files = Vec::new();
 
     for subfolder in &["docs", "specs"] {
-        let dir = base.join(subfolder);
-        if !dir.exists() {
+        let root = base.join(subfolder);
+        if !root.exists() {
             continue;
         }
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if !path.is_file() { continue; }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') { continue; }
-            let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
+        // Walk recursively so files in nested subfolders (e.g. docs/sub/x.md)
+        // are listed, not just top-level entries. Iterative to avoid async recursion.
+        const MAX_DEPTH: u32 = 8;
+        let mut stack: Vec<(PathBuf, u32)> = vec![(root.clone(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
                 Err(_) => continue,
             };
-            let modified_at = meta.modified()
-                .map(|t| {
-                    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    chrono::DateTime::from_timestamp(secs as i64, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            files.push(WorkspaceFile {
-                rel_path: format!("{}/{}", subfolder, name),
-                name,
-                subfolder: subfolder.to_string(),
-                size_bytes: meta.len(),
-                modified_at,
-            });
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                if entry_name.starts_with('.') { continue; }
+                let meta = match tokio::fs::metadata(&path).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.is_dir() {
+                    if depth < MAX_DEPTH {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                if !meta.is_file() { continue; }
+                // Path relative to the subfolder root (e.g. "sub/x.md"), so files
+                // in different subfolders stay distinguishable in the list.
+                let rel_in_sub = path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| entry_name.clone());
+                let modified_at = meta.modified()
+                    .map(|t| {
+                        let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        chrono::DateTime::from_timestamp(secs as i64, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                files.push(WorkspaceFile {
+                    rel_path: format!("{}/{}", subfolder, rel_in_sub),
+                    name: rel_in_sub,
+                    subfolder: subfolder.to_string(),
+                    size_bytes: meta.len(),
+                    modified_at,
+                });
+            }
         }
     }
 
@@ -138,10 +181,12 @@ pub async fn read_workspace_file(
     let (repo_path,) = row.ok_or("项目不存在")?;
 
     validate_workspace_path(&rel_path)?;
-    let full = workspace_root(&repo_path).join(&rel_path);
+    let base = workspace_root(&repo_path);
+    let full = base.join(&rel_path);
     if !full.is_file() {
         return Err(format!("{} 不存在", rel_path));
     }
+    ensure_within_workspace(&base, &full)?;
     if full.metadata().map(|m| m.len()).unwrap_or(0) > 2 * 1024 * 1024 {
         return Err("文件超过 2 MB".to_string());
     }
@@ -170,12 +215,14 @@ pub async fn write_workspace_file(
 
     validate_workspace_path(&rel_path)?;
 
-    let full = workspace_root(&repo_path).join(&rel_path);
+    let base = workspace_root(&repo_path);
+    let full = base.join(&rel_path);
     if let Some(parent) = full.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| e.to_string())?;
     }
+    ensure_within_workspace(&base, &full)?;
 
     let bytes = content.as_bytes();
     tokio::fs::write(&full, bytes)
@@ -285,6 +332,9 @@ pub async fn execute_agent_writes(
         let full = base.join(&rel_path);
         if let Some(parent) = full.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if ensure_within_workspace(&base, &full).is_err() {
+            continue;
         }
         match tokio::fs::write(&full, content.as_bytes()).await {
             Ok(_) => {

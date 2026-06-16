@@ -140,3 +140,18 @@ export function parseTheme(value: string | null | undefined): ThemeSelection {
 export function oppositeMode(mode: ThemeMode): ThemeMode {
   return mode === 'dark' ? 'light' : 'dark';
 }
+
+// Nav rail expand behavior:
+//   'hover'  — rail expands to show labels on hover (default)
+//   'locked' — rail is locked collapsed; hover never triggers the expanded state
+export type RailMode = 'hover' | 'locked';
+
+export const RAIL_STORAGE_KEY = 'AutoForge:railMode';
+
+export function parseRailMode(value: string | null | undefined): RailMode {
+  return value === 'locked' ? 'locked' : 'hover';
+}
+
+export function applyRailMode(mode: RailMode): void {
+  document.documentElement.setAttribute('data-rail', mode);
+}

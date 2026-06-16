@@ -89,6 +89,39 @@ pub fn run() {
                 }
             });
 
+            // Innate 自成长驱动器：启动时同步事件阈值，并按间隔对活跃项目跑 evolve（蒸馏 + 整理）作为兜底。
+            let db_for_kb = db.clone();
+            tauri::async_runtime::spawn(async move {
+                let settings = commands::knowledge::load_knowledge_settings(&db_for_kb).await;
+                knowledge::set_evolve_threshold(settings.capture_threshold);
+                // 启动时把统一配置（蒸馏 LLM + embedding）载入 in-process Innate，
+                // 确保即使只在 DB 改过配置、未手动保存，Innate 也用上最新模型。
+                knowledge::refresh_kb_models(&db_for_kb).await;
+                loop {
+                    let hours = commands::knowledge::load_knowledge_settings(&db_for_kb)
+                        .await
+                        .evolve_interval_hours;
+                    if hours == 0 {
+                        // 定时器关闭：每小时复查一次配置是否被重新开启。
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        continue;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(hours as u64 * 3600)).await;
+                    if let Ok(projects) = sqlx::query_as::<_, (String,)>(
+                        "SELECT id FROM projects WHERE status='active'",
+                    )
+                    .fetch_all(&db_for_kb)
+                    .await
+                    {
+                        for (pid,) in projects {
+                            knowledge::kb_evolve(&pid).await;
+                        }
+                    }
+                    // 通用（跨项目）库也定期整理。
+                    knowledge::kb_evolve_shared().await;
+                }
+            });
+
             // 启动 webhook server（若配置中已启用）
             let db_for_wh = db.clone();
             let app_for_wh = app_handle.clone();
@@ -173,6 +206,11 @@ pub fn run() {
             commands::conversations::remove_conversation_member,
             commands::conversations::delete_group_conversation,
             commands::conversations::clear_conversation_messages,
+            commands::conversation_archives::archive_conversation,
+            commands::conversation_archives::list_conversation_archives,
+            commands::conversation_archives::get_conversation_archive,
+            commands::conversation_archives::search_conversation_archives,
+            commands::conversation_archives::delete_conversation_archive,
             commands::conversations::mark_conversation_read,
             commands::conversations::agent_reply,
             commands::conversations::toggle_message_context,
@@ -187,11 +225,23 @@ pub fn run() {
             commands::workspace::write_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::list_conversation_tasks,
+            commands::knowledge::run_conversation_command,
+            commands::knowledge::get_knowledge_settings,
+            commands::knowledge::set_knowledge_settings,
+            commands::knowledge::get_knowledge_embedding,
+            commands::knowledge::set_knowledge_embedding,
             commands::settings::list_llm_configs,
             commands::settings::create_llm_config,
             commands::settings::update_llm_config,
             commands::settings::delete_llm_config,
             commands::settings::test_llm_connection,
+            commands::settings::get_web_search_settings,
+            commands::settings::set_web_search_settings,
+            commands::mcp::list_mcp_servers,
+            commands::mcp::create_mcp_server,
+            commands::mcp::update_mcp_server,
+            commands::mcp::delete_mcp_server,
+            commands::mcp::test_mcp_connection,
             commands::settings::list_agents,
             commands::settings::create_agent,
             commands::settings::update_agent,
@@ -203,14 +253,15 @@ pub fn run() {
             commands::system::check_claude_auth,
             commands::system::pipeline_stats,
             commands::system::get_badge_counts,
-            commands::system::read_spec,
-            commands::system::write_spec,
             commands::system::update_concurrency_config,
             commands::system::get_concurrency_config,
             commands::system::list_preview_environments,
             commands::system::list_test_sessions,
             commands::system::list_scan_findings,
             commands::system::list_admin_decisions,
+            commands::self_update::self_update_status,
+            commands::self_update::self_update_pull,
+            commands::self_update::self_update_pending,
             commands::demo::open_url,
             commands::dev_server::get_dev_server_status,
             commands::dev_server::start_dev_server,
@@ -221,6 +272,11 @@ pub fn run() {
             commands::cr_preview::stop_cr_preview,
             commands::cr_preview::launch_cr_app,
             commands::cr_preview::get_cr_preview_log,
+            commands::cr_preview::list_local_branches,
+            commands::cr_preview::start_branch_preview,
+            commands::cr_preview::list_branch_previews,
+            commands::cr_preview::stop_branch_preview,
+            commands::cr_preview::get_branch_preview_log,
             commands::materials::list_material_folders,
             commands::materials::create_material_folder,
             commands::materials::rename_material_folder,
@@ -244,6 +300,8 @@ pub fn run() {
             commands::security::list_security_audits,
             commands::deploy::list_deployments,
             commands::deploy::generate_deploy_script,
+            commands::deploy::update_deploy_script,
+            commands::deploy::delete_deployment,
             commands::deploy::confirm_deploy,
             commands::prototype::list_prototype_prompts,
             commands::prototype::generate_prototype_prompt,
@@ -254,7 +312,9 @@ pub fn run() {
             commands::artifacts::update_delivery_artifact_meta,
             commands::artifacts::delete_delivery_artifact,
             commands::artifacts::delivery_artifact_data_url,
+            commands::artifacts::reveal_delivery_artifact,
             commands::scan::run_proactive_scan,
+            commands::run_config::ai_generate_run_config,
             commands::grading::get_cr_grade,
             commands::grading::list_auto_pass_policy,
             commands::grading::get_auto_pass_enabled,

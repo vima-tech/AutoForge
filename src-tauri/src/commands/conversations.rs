@@ -835,36 +835,51 @@ pub async fn clear_conversation_messages(
     }
 
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    let attachment_paths = purge_conversation_messages(&mut tx, &conversation_id).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
+    remove_attachment_files(attachment_paths).await;
+    Ok(())
+}
+
+/// 清空一个会议室的全部消息/已读/附件记录及关联任务记录（在调用方的事务内执行）。
+/// 返回被删除附件的相对路径，供提交后异步清理磁盘文件。归档与清空共用此逻辑。
+pub(crate) async fn purge_conversation_messages(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+) -> Result<Vec<(String,)>, String> {
     let attachment_paths: Vec<(String,)> =
         sqlx::query_as("SELECT rel_path FROM conversation_attachments WHERE conversation_id=?")
-            .bind(&conversation_id)
-            .fetch_all(&mut *tx)
+            .bind(conversation_id)
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
 
-    delete_conversation_task_records(&mut tx, &conversation_id).await?;
+    delete_conversation_task_records(tx, conversation_id).await?;
 
     sqlx::query("DELETE FROM messages WHERE conversation_id=?")
-        .bind(&conversation_id)
-        .execute(&mut *tx)
+        .bind(conversation_id)
+        .execute(&mut **tx)
         .await
         .map_err(|e| e.to_string())?;
 
     sqlx::query("DELETE FROM conversation_reads WHERE conversation_id=?")
-        .bind(&conversation_id)
-        .execute(&mut *tx)
+        .bind(conversation_id)
+        .execute(&mut **tx)
         .await
         .map_err(|e| e.to_string())?;
 
     sqlx::query("DELETE FROM conversation_attachments WHERE conversation_id=?")
-        .bind(&conversation_id)
-        .execute(&mut *tx)
+        .bind(conversation_id)
+        .execute(&mut **tx)
         .await
         .map_err(|e| e.to_string())?;
 
-    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(attachment_paths)
+}
 
+/// 提交事务后，按相对路径删除磁盘上的附件文件（路径越界则跳过）。
+pub(crate) async fn remove_attachment_files(attachment_paths: Vec<(String,)>) {
     let base = PathBuf::from(crate::state::attachments_base());
     for (rel_path,) in attachment_paths {
         let rel = Path::new(&rel_path);
@@ -872,8 +887,6 @@ pub async fn clear_conversation_messages(
             let _ = tokio::fs::remove_file(base.join(rel)).await;
         }
     }
-
-    Ok(())
 }
 
 async fn delete_conversation_task_records(
@@ -1208,13 +1221,21 @@ pub async fn agent_reply(
         image_paths.len(),
         t0.elapsed()
     );
-    let reply_text =
-        crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, system_prompt, &image_paths)
-            .await
-            .unwrap_or_else(|e| {
-                warn!("[cmd] agent_reply: agent LLM error: {}", e);
-                format!("[系统错误: {}]", e)
-            });
+    // 构建该 Agent 的工具集：内置工具(capabilities 白名单) + 勾选了它的 MCP server 工具。
+    let registry = crate::agents::tools::build_registry_for_agent(&state.db, &agent).await;
+    let reply_text = crate::agents::llm::run_agent_text_with_tools(
+        &state.db,
+        &agent,
+        &prompt,
+        system_prompt,
+        &image_paths,
+        &registry,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        warn!("[cmd] agent_reply: agent LLM error: {}", e);
+        format!("[系统错误: {}]", e)
+    });
     info!(
         "[cmd] agent_reply: claude CLI returned in {:?}",
         t0.elapsed()

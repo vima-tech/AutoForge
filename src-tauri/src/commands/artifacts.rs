@@ -176,7 +176,18 @@ pub async fn delivery_artifact_data_url(
             .map_err(|e| e.to_string())?;
     let (project_id, rel_path, mime) = row.ok_or("产物不存在")?;
     let repo = repo_path(&state.db, &project_id).await?;
-    let bytes = tokio::fs::read(PathBuf::from(&repo).join(&rel_path))
+    let full = PathBuf::from(&repo).join(&rel_path);
+    // Cap inline data URLs so a large artifact can't balloon memory / freeze the webview.
+    const MAX_DATA_URL_BYTES: u64 = 16 * 1024 * 1024;
+    if tokio::fs::metadata(&full)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0)
+        > MAX_DATA_URL_BYTES
+    {
+        return Err("产物超过 16 MB，无法内联预览/下载".to_string());
+    }
+    let bytes = tokio::fs::read(&full)
         .await
         .map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -186,4 +197,39 @@ pub async fn delivery_artifact_data_url(
         &mime
     };
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+/// Reveal the artifact in the OS file manager (highlight the file in its folder),
+/// instead of downloading it. Falls back to opening the containing folder.
+#[tauri::command]
+pub async fn reveal_delivery_artifact(
+    id: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT project_id, rel_path FROM delivery_artifacts WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let (project_id, rel_path) = row.ok_or("产物不存在")?;
+    let repo = repo_path(&state.db, &project_id).await?;
+    let full = PathBuf::from(&repo).join(&rel_path);
+    if !tokio::fs::try_exists(&full).await.unwrap_or(false) {
+        return Err("产物文件不存在".to_string());
+    }
+    let full_str = full.to_string_lossy().to_string();
+    // Highlight the file inside its folder; if that fails, open the parent folder.
+    if app.opener().reveal_item_in_dir(&full_str).is_err() {
+        let dir = full
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .ok_or("无法定位产物所在文件夹")?;
+        app.opener()
+            .open_path(dir, None::<&str>)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

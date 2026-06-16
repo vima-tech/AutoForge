@@ -23,6 +23,9 @@ tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono", "json", "migrate", "macros"] }
+# Innate 自成长知识层：以 in-process SDK 依赖嵌入（lib 名 innate_core）。
+# 0.1.11 起 rusqlite 对齐 libsqlite3-sys 0.30，与 sqlx 共用一份 sqlite，无 links 冲突。
+innate = "0.1.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -42,7 +45,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-stream = "0.1"
 futures = "0.3"
+async-trait = "0.1"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "hostname"] }
+rmcp = { version = "1.7.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 [profile.dev]
 incremental = true

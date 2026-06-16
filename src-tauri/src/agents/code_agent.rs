@@ -47,11 +47,9 @@ pub fn build_prompt(
         ));
     }
 
-    if let Some(spec) = read_factory_spec("coding-spec.md") {
-        prompt.push_str(&format!("\n## 编码规范\n{}\n", spec));
-    }
-    if let Some(spec) = read_factory_spec("testing-spec.md") {
-        prompt.push_str(&format!("\n## 测试规范\n{}\n", spec));
+    let specs = read_project_specs(repo_path);
+    if !specs.trim().is_empty() {
+        prompt.push_str(&format!("\n## 项目规范（.autoforge/specs）\n{}\n", specs));
     }
     if let Some(context) = read_project_file(repo_path, "CLAUDE.md") {
         prompt.push_str(&format!("\n## 目标项目 CLAUDE.md\n{}\n", context));
@@ -238,14 +236,33 @@ fn render_spec_brief(spec: &crate::agents::analysis::IssueAnalysisSpec) -> Strin
     s
 }
 
-fn read_factory_spec(name: &str) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let root = if cwd.file_name().and_then(|v| v.to_str()) == Some("src-tauri") {
-        cwd.parent()?.to_path_buf()
-    } else {
-        cwd
+/// Read all per-project specs from `<repo>/.autoforge/specs/*.md` — the single
+/// source of truth for the target project's standards. Returns concatenated
+/// markdown (each file under a `### <file>` header), capped per file. Empty when
+/// the dir is absent/empty. Sync sibling of `analysis::read_autoforge_specs`.
+fn read_project_specs(repo_path: &str) -> String {
+    let dir = std::path::Path::new(repo_path).join(".autoforge").join("specs");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return String::new();
     };
-    std::fs::read_to_string(root.join("specs").join(name)).ok()
+
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".md"))
+        .collect();
+    names.sort();
+
+    let mut parts: Vec<String> = Vec::new();
+    for name in names {
+        if let Ok(content) = std::fs::read_to_string(dir.join(&name)) {
+            let trimmed: String = content.chars().take(6000).collect();
+            if !trimmed.trim().is_empty() {
+                parts.push(format!("### {}\n{}", name, trimmed));
+            }
+        }
+    }
+    parts.join("\n\n")
 }
 
 fn read_project_file(repo_path: &str, name: &str) -> Option<String> {
@@ -270,6 +287,13 @@ pub async fn run(
         .arg("--disallowedTools")
         .arg("Bash(git *)")
         .current_dir(worktree_path)
+        // Defense-in-depth: `--disallowedTools "Bash(git *)"` only blocks the
+        // direct `git ` form; the agent could still shell out via `sh -c`,
+        // scripts, etc. Disabling all git transport protocols neutralizes any
+        // remote git operation (push/fetch/clone) no matter how it is invoked,
+        // while local commits/builds/tests in the worktree keep working.
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -69,6 +69,15 @@ async fn handle_issue(
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Reject when no token is configured so an empty secret can never authorize
+    // (an empty `ws.token` would otherwise accept the literal "Bearer ").
+    if ws.token.is_empty() {
+        warn!("[webhook] rejected: no token configured");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        );
+    }
     let expected = format!("Bearer {}", ws.token);
     if !constant_time_eq(auth.as_bytes(), expected.as_bytes()) {
         warn!("[webhook] unauthorized request");

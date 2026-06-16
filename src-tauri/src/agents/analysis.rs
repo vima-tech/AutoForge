@@ -423,6 +423,40 @@ pub fn check_safety(text: &str) -> bool {
 
 /// Read key files from a local repository to build a project context string
 /// that enriches the analysis prompt. Gracefully degrades if any read fails.
+/// Read all per-project specs from `.autoforge/specs/*.md` — the single source
+/// of truth for a project's standards (managed in 项目管理, written by specs.rs).
+/// Returns concatenated markdown (each file under a `### <file>` header), capped
+/// per file to keep prompts bounded. Empty string when the dir is absent/empty.
+pub async fn read_autoforge_specs(repo_path: &str) -> String {
+    use tokio::fs;
+
+    let dir = std::path::Path::new(repo_path).join(".autoforge").join("specs");
+    let Ok(mut rd) = fs::read_dir(&dir).await else {
+        return String::new();
+    };
+
+    // Collect .md filenames first so output is deterministic (dir order is not).
+    let mut names: Vec<String> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.to_ascii_lowercase().ends_with(".md") {
+            names.push(name);
+        }
+    }
+    names.sort();
+
+    let mut parts: Vec<String> = Vec::new();
+    for name in names {
+        if let Ok(content) = fs::read_to_string(dir.join(&name)).await {
+            let trimmed: String = content.chars().take(6000).collect();
+            if !trimmed.trim().is_empty() {
+                parts.push(format!("### {}\n{}", name, trimmed));
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
 pub async fn build_project_context(repo_path: &str) -> String {
     use tokio::fs;
 
@@ -438,6 +472,20 @@ pub async fn build_project_context(repo_path: &str) -> String {
                 break;
             }
         }
+    }
+
+    // CLAUDE.md — project-level AI guidance / locked constraints
+    if let Ok(content) = fs::read_to_string(format!("{}/CLAUDE.md", repo_path)).await {
+        let trimmed: String = content.chars().take(4000).collect();
+        if !trimmed.trim().is_empty() {
+            parts.push(format!("## CLAUDE.md\n{}", trimmed));
+        }
+    }
+
+    // 项目规范（.autoforge/specs/*.md）—— 唯一规范来源，约束 scope 与 constraints
+    let specs = read_autoforge_specs(repo_path).await;
+    if !specs.trim().is_empty() {
+        parts.push(format!("## 项目规范（.autoforge/specs）\n{}", specs));
     }
 
     // Primary manifest/config file

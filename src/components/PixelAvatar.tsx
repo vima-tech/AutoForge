@@ -37,7 +37,9 @@ function seedToColors(seed: string): [string, string] {
   const hue = (h >>> 0) % 360;
   return [
     `hsl(${hue},68%,62%)`,
-    `hsla(${hue},68%,62%,0.15)`,
+    // Fully opaque dark tint of the same hue — no transparency, so the avatar
+    // renders cleanly when overlaid on other surfaces.
+    `hsl(${hue},34%,16%)`,
   ];
 }
 

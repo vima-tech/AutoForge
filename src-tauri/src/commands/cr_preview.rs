@@ -10,10 +10,11 @@
 //! When the project has no preview config the status is `no_config` / kind `none`,
 //! and the frontend collapses the preview area (fallback C).
 
+use crate::core::git::GitProxy;
 use crate::models::change_request::ChangeRequest;
 use crate::models::project::Project;
 use crate::models::worktree::WorktreeSession;
-use crate::state::{AppState, DevServerHandle};
+use crate::state::{worktrees_base, AppState, DevServerHandle};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -27,30 +28,14 @@ struct ProjectPreviewConfig {
 }
 
 /// `dev:` block of the project's `config_yaml`. All fields optional so legacy
-/// configs (`dev: { command, url }`) keep parsing; `kind` defaults to `web`.
-/// `{port}` placeholders in `command`/`url` are substituted per-CR.
+/// configs keep parsing; `kind` defaults to `web`. A legacy `url:` is simply
+/// ignored — preview always targets `http://localhost:{port}`.
+/// `{port}` placeholders in `command` are substituted per-CR.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DevSpec {
     kind: Option<String>,
     command: Option<String>,
-    url: Option<String>,
     app_command: Option<String>,
-}
-
-impl DevSpec {
-    fn has_command(&self) -> bool {
-        self.command.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false)
-    }
-    fn kind_str(&self) -> String {
-        match self.kind.as_deref() {
-            Some("tauri") => "tauri".to_string(),
-            _ => "web".to_string(),
-        }
-    }
-    fn can_launch_app(&self) -> bool {
-        self.kind_str() == "tauri"
-            && self.app_command.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false)
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -62,11 +47,147 @@ pub struct CrPreviewStatus {
     pub status: String,
     pub url: Option<String>,
     pub can_launch_app: bool,
+    /// True for `tauri` projects: the iframe only renders the web frontend, so
+    /// `invoke()` IPC is unavailable and data-backed screens stay empty. The real
+    /// preview is the native desktop window (`launch_cr_app`).
+    pub frontend_only: bool,
+    /// True when `kind` was inferred from the project's files (no explicit
+    /// `dev.kind` in config_yaml) — used by the UI to hint the auto-detection.
+    pub auto_detected: bool,
 }
 
-fn parse_dev_spec(config_yaml: Option<&str>) -> Option<DevSpec> {
+/// Parse the raw `dev:` block without requiring a command — detection can fill the
+/// command in later, so we keep partial/empty specs around.
+fn parse_dev_spec_raw(config_yaml: Option<&str>) -> Option<DevSpec> {
     let cfg: ProjectPreviewConfig = serde_yaml::from_str(config_yaml?).ok()?;
-    cfg.dev.filter(DevSpec::has_command)
+    cfg.dev
+}
+
+/// What we can infer about a project's framework by sniffing its files.
+#[derive(Debug, Clone, Default)]
+struct Detected {
+    is_tauri: bool,
+    /// npm script name for the frontend dev server (iframe target).
+    dev_script: Option<String>,
+    /// npm script name that launches the native Tauri window.
+    tauri_script: Option<String>,
+}
+
+/// Detect the project framework from files in `dir` (a repo root or CR worktree).
+/// Recognises Tauri via `src-tauri/{tauri.conf.json,Cargo.toml}` and reads
+/// `package.json` scripts to find the frontend-dev and tauri-dev commands so a
+/// preview works even when `config_yaml` omits them.
+fn detect_framework(dir: &str) -> Detected {
+    let base = std::path::Path::new(dir);
+    let mut d = Detected {
+        is_tauri: base.join("src-tauri/tauri.conf.json").exists()
+            || base.join("src-tauri/Cargo.toml").exists(),
+        ..Default::default()
+    };
+
+    if let Ok(pkg) = std::fs::read_to_string(base.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&pkg) {
+            if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
+                // A script that drives `tauri dev` launches the native window.
+                for (name, val) in scripts {
+                    let v = val.as_str().unwrap_or("");
+                    if v.contains("tauri") && v.contains("dev") {
+                        d.tauri_script = Some(name.clone());
+                        d.is_tauri = true;
+                        break;
+                    }
+                }
+                // Frontend dev server: prefer a literal `dev` script, else the first
+                // non-tauri script that runs vite/dev.
+                if scripts.contains_key("dev") {
+                    d.dev_script = Some("dev".to_string());
+                } else {
+                    for (name, val) in scripts {
+                        let v = val.as_str().unwrap_or("");
+                        if (v.contains("vite") || v.contains("dev")) && !v.contains("tauri") {
+                            d.dev_script = Some(name.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    d
+}
+
+/// A fully-resolved preview spec: explicit `config_yaml` values win, and anything
+/// missing is filled from framework detection (`dir`). Returns `None` only when
+/// preview is impossible (no command and nothing detectable) or explicitly off.
+#[derive(Debug, Clone)]
+struct EffectiveSpec {
+    kind: String,
+    command: String,
+    /// URL template (may contain `{port}`).
+    url: String,
+    app_command: Option<String>,
+    can_launch_app: bool,
+    frontend_only: bool,
+    auto_detected: bool,
+}
+
+fn effective_spec(config_yaml: Option<&str>, dir: &str) -> Option<EffectiveSpec> {
+    let explicit = parse_dev_spec_raw(config_yaml);
+    let det = detect_framework(dir);
+
+    let explicit_kind = explicit.as_ref().and_then(|s| s.kind.as_deref());
+    // Explicit kind always wins; `none` disables preview. When unset, fall back to
+    // detection — this is what stops a Tauri project from being shown as plain web.
+    let (kind, auto_detected) = match explicit_kind {
+        Some("tauri") => ("tauri".to_string(), false),
+        Some("web") => ("web".to_string(), false),
+        Some("none") => return None,
+        _ => (
+            if det.is_tauri { "tauri".to_string() } else { "web".to_string() },
+            det.is_tauri,
+        ),
+    };
+
+    let command = explicit
+        .as_ref()
+        .and_then(|s| s.command.clone())
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))?;
+
+    // Preview URL is fixed to localhost on the auto-allocated port (no longer configurable).
+    let url = "http://localhost:{port}".to_string();
+
+    let app_command = explicit
+        .as_ref()
+        .and_then(|s| s.app_command.clone())
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| {
+            if kind == "tauri" {
+                det.tauri_script.clone().map(|s| format!("npm run {s}"))
+            } else {
+                None
+            }
+        });
+
+    let can_launch_app = kind == "tauri" && app_command.is_some();
+    let frontend_only = kind == "tauri";
+    Some(EffectiveSpec {
+        kind,
+        command,
+        url,
+        app_command,
+        can_launch_app,
+        frontend_only,
+        auto_detected,
+    })
+}
+
+/// Pick the directory to sniff for framework detection: the CR's worktree (its
+/// actual code) when present, else the project's main repo.
+fn detect_dir<'a>(project: &'a Project, session: Option<&'a WorktreeSession>) -> &'a str {
+    session
+        .map(|s| s.worktree_path.as_str())
+        .unwrap_or(project.repo_path.as_str())
 }
 
 /// Deterministic per-session port in [19000, 23000) so re-opening a CR reuses the
@@ -149,7 +270,11 @@ async fn load_ctx(
     .bind(cr_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    // 合并后 worktree 目录已被清理，但 DB 行可能仍在；目录不存在则视作无会话，
+    // 这样 get_cr_preview 报 no_session（前端隐藏「本次改动」启动行），
+    // 框架探测也回落到主仓库（detect_dir）。
+    .filter(|s| std::path::Path::new(&s.worktree_path).exists());
     Ok((project, session))
 }
 
@@ -160,17 +285,21 @@ pub async fn get_cr_preview(
 ) -> Result<CrPreviewStatus, String> {
     let (project, session) = load_ctx(&state.db, &cr_id).await?;
 
-    let Some(spec) = parse_dev_spec(project.config_yaml.as_deref()) else {
+    let Some(spec) = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), detect_dir(&project, session.as_ref())) else {
         return Ok(CrPreviewStatus {
             cr_id,
             kind: "none".to_string(),
             status: "no_config".to_string(),
             url: None,
             can_launch_app: false,
+            frontend_only: false,
+            auto_detected: false,
         });
     };
-    let kind = spec.kind_str();
-    let can_launch_app = spec.can_launch_app();
+    let kind = spec.kind.clone();
+    let can_launch_app = spec.can_launch_app;
+    let frontend_only = spec.frontend_only;
+    let auto_detected = spec.auto_detected;
     let key = format!("cr:{cr_id}");
 
     // If a server is already tracked for this CR, report its live status.
@@ -194,6 +323,8 @@ pub async fn get_cr_preview(
                 status: if reachable { "running" } else { "starting" }.to_string(),
                 url: Some(url),
                 can_launch_app,
+                frontend_only,
+                auto_detected,
             });
         }
         state.dev_servers.lock().await.remove(&key);
@@ -203,6 +334,8 @@ pub async fn get_cr_preview(
             status: "stopped".to_string(),
             url: Some(url),
             can_launch_app,
+            frontend_only,
+            auto_detected,
         });
     }
 
@@ -212,6 +345,8 @@ pub async fn get_cr_preview(
         status: if session.is_some() { "idle" } else { "no_session" }.to_string(),
         url: None,
         can_launch_app,
+        frontend_only,
+        auto_detected,
     })
 }
 
@@ -222,16 +357,16 @@ pub async fn start_cr_preview(
 ) -> Result<CrPreviewStatus, String> {
     let (project, session) = load_ctx(&state.db, &cr_id).await?;
     let session = session.ok_or_else(|| "该变更尚无 worktree 会话（实现未开始或已清理）".to_string())?;
-    let spec = parse_dev_spec(project.config_yaml.as_deref())
-        .ok_or_else(|| "未配置预览启动命令（config_yaml 缺少 dev.command）".to_string())?;
+    let spec = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &session.worktree_path)
+        .ok_or_else(|| "未配置预览启动命令（config_yaml 缺少 dev.command，且未能自动识别框架）".to_string())?;
 
     // Auto-allocate a free port (avoids colliding with other CR previews or a fixed
     // dev port like Vite's 1420); inject it into the command + align the URL.
     let port = crate::commands::dev_server::free_port_from(derive_port(&session.id));
-    let cmd_t = spec.command.clone().unwrap_or_default();
+    let cmd_t = spec.command.clone();
     let command = crate::commands::dev_server::inject_port(&cmd_t, port);
     let url = {
-        let u = spec.url.clone().unwrap_or_default();
+        let u = spec.url.clone();
         if u.contains("{port}") {
             apply_port(&u, port)
         } else if u.trim().is_empty() || command != cmd_t {
@@ -240,8 +375,10 @@ pub async fn start_cr_preview(
             u
         }
     };
-    let kind = spec.kind_str();
-    let can_launch_app = spec.can_launch_app();
+    let kind = spec.kind.clone();
+    let can_launch_app = spec.can_launch_app;
+    let frontend_only = spec.frontend_only;
+    let auto_detected = spec.auto_detected;
     let key = format!("cr:{cr_id}");
 
     // Kill any existing server for this CR before respawning.
@@ -249,7 +386,7 @@ pub async fn start_cr_preview(
         let mut servers = state.dev_servers.lock().await;
         if let Some(old) = servers.remove(&key) {
             if let Some(child) = old.child.lock().await.as_mut() {
-                let _ = child.kill().await;
+                crate::commands::dev_server::kill_child_group(child).await;
             }
         }
     }
@@ -262,6 +399,9 @@ pub async fn start_cr_preview(
         .env("PORT", port.to_string())
         .stdout(out)
         .stderr(err)
+        // Own process group so the whole preview tree (sh → vite → node …) can be
+        // torn down together instead of orphaning grandchildren.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("启动失败: {e}"))?;
 
@@ -289,6 +429,8 @@ pub async fn start_cr_preview(
         status: "starting".to_string(),
         url: Some(url),
         can_launch_app,
+        frontend_only,
+        auto_detected,
     })
 }
 
@@ -298,7 +440,7 @@ pub async fn stop_cr_preview(cr_id: String, state: State<'_, AppState>) -> Resul
     for key in [format!("cr:{cr_id}"), format!("cr:app:{cr_id}")] {
         if let Some(handle) = servers.remove(&key) {
             if let Some(child) = handle.child.lock().await.as_mut() {
-                let _ = child.kill().await;
+                crate::commands::dev_server::kill_child_group(child).await;
             }
         }
     }
@@ -312,19 +454,19 @@ pub async fn stop_cr_preview(cr_id: String, state: State<'_, AppState>) -> Resul
 pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let (project, session) = load_ctx(&state.db, &cr_id).await?;
     let session = session.ok_or_else(|| "无 worktree 会话".to_string())?;
-    let spec = parse_dev_spec(project.config_yaml.as_deref())
+    let spec = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &session.worktree_path)
         .ok_or_else(|| "未配置预览".to_string())?;
     let app_cmd = spec
         .app_command
         .filter(|c| !c.trim().is_empty())
-        .ok_or_else(|| "未配置桌面应用启动命令（dev.app_command）".to_string())?;
+        .ok_or_else(|| "未配置桌面应用启动命令（dev.app_command），且未能自动识别 tauri dev 脚本".to_string())?;
 
     let key = format!("cr:app:{cr_id}");
     {
         let mut servers = state.dev_servers.lock().await;
         if let Some(old) = servers.remove(&key) {
             if let Some(child) = old.child.lock().await.as_mut() {
-                let _ = child.kill().await;
+                crate::commands::dev_server::kill_child_group(child).await;
             }
         }
     }
@@ -334,8 +476,12 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         .arg("-lc")
         .arg(&app_cmd)
         .current_dir(&session.worktree_path)
+        // 隔离 DB，避免与主 AutoForge 共享生产库导致迁移不一致 panic。
+        .envs(isolated_app_env(&session.worktree_path))
         .stdout(out)
         .stderr(err)
+        // Own process group so the launched app tree can be torn down together.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("启动失败: {e}"))?;
 
@@ -347,6 +493,305 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         },
     );
     Ok(())
+}
+
+// ── 分支启动（左侧「启动项目」选分支）────────────────────────────────────────
+//
+// 在项目本地分支上启动预览：每个 (project, branch) 用一个**独立 worktree**（detached
+// 到分支 tip，避免与主仓库/其它 worktree 的「已检出」冲突），并把主仓库的
+// `node_modules` 软链进去，免去重复安装。支持多分支并行（state.dev_servers 以
+// `branch:<project>:<branch>` 为键）。web → dev server；tauri → 启动桌面应用。
+
+async fn load_project(db: &crate::db::Db, project_id: &str) -> Result<Project, String> {
+    sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub is_current: bool,
+    pub is_main: bool,
+    pub is_dev: bool,
+}
+
+/// 列出项目本地分支（含当前/main/dev 标记），供左侧下拉选择。
+#[tauri::command]
+pub async fn list_local_branches(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<BranchInfo>, String> {
+    let project = load_project(&state.db, &project_id).await?;
+    let git = GitProxy::new(&project.repo_path);
+    let current = git
+        .run_str(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let (_code, out, err) = git
+        .run(&["branch", "--format=%(refname:short)"])
+        .await
+        .map_err(|e| e.to_string())?;
+    if out.trim().is_empty() && !err.trim().is_empty() {
+        return Err(format!("读取分支失败: {err}"));
+    }
+    let branches = out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.contains("HEAD detached") && !l.contains("(no branch)"))
+        .map(|name| BranchInfo {
+            name: name.to_string(),
+            is_current: name == current,
+            is_main: name == project.branch_main,
+            is_dev: name == project.branch_dev,
+        })
+        .collect();
+    Ok(branches)
+}
+
+#[derive(Debug, Serialize)]
+pub struct BranchPreviewStatus {
+    pub branch: String,
+    /// "web" | "tauri"
+    pub kind: String,
+    /// "starting" | "running"
+    pub status: String,
+    pub url: Option<String>,
+    pub can_launch_app: bool,
+}
+
+fn sanitize_branch(b: &str) -> String {
+    b.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect()
+}
+
+fn branch_wt_path(project_id: &str, branch: &str) -> String {
+    format!("{}/branch/{}/{}", worktrees_base(), project_id, sanitize_branch(branch))
+}
+
+fn branch_log_key(project_id: &str, branch: &str) -> String {
+    format!("branch-{}-{}", project_id, sanitize_branch(branch))
+}
+
+/// 给预览用的 Tauri 应用一套**隔离的 XDG 目录**，使其 `app_data_dir()` 落到 worktree 内的
+/// 独立路径，用自己的 SQLite DB 跑自己的迁移——而不是共享主 AutoForge 的生产库。
+/// 否则：分支的迁移集与生产库已应用的迁移不一致会直接 panic（migration X missing），
+/// 且多实例并发写同一 SQLite 也不安全。Linux 上 `app_data_dir` 走 XDG_DATA_HOME，
+/// 故无需改被启动应用的代码即可隔离。
+fn isolated_app_env(worktree: &str) -> Vec<(String, String)> {
+    let home = format!("{worktree}/.preview-home");
+    let mut envs = Vec::new();
+    for (key, sub) in [
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+    ] {
+        let dir = format!("{home}/{sub}");
+        let _ = std::fs::create_dir_all(&dir);
+        envs.push((key.to_string(), dir));
+    }
+    envs
+}
+
+/// Ensure a reusable detached worktree at `branch`'s tip, with `node_modules`
+/// symlinked from the main repo so the dev server can start without installing.
+async fn ensure_branch_worktree(repo_path: &str, branch: &str, wt_path: &str) -> Result<(), String> {
+    // 已存在则复用（决策：stop 不删 worktree，便于快速重启）。
+    if std::path::Path::new(wt_path).join(".git").exists() {
+        return Ok(());
+    }
+    if let Some(parent) = std::path::Path::new(wt_path).parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let git = GitProxy::new(repo_path);
+    let _ = git.run(&["worktree", "prune"]).await;
+    // `--detach`：检出到分支 tip 但不占用分支引用，避免「branch already checked out」。
+    let (code, _out, err) = git
+        .run(&["worktree", "add", "--detach", wt_path, branch])
+        .await
+        .map_err(|e| e.to_string())?;
+    if code != 0 {
+        return Err(format!("git worktree add 失败: {err}"));
+    }
+    // 软链 node_modules（gitignore 不在 worktree 内），免重复安装。
+    #[cfg(unix)]
+    {
+        let src = std::path::Path::new(repo_path).join("node_modules");
+        let dst = std::path::Path::new(wt_path).join("node_modules");
+        if src.exists() && !dst.exists() {
+            let _ = std::os::unix::fs::symlink(&src, &dst);
+        }
+    }
+    Ok(())
+}
+
+/// 启动指定分支的预览（web dev server 或 tauri 桌面应用），随机空闲端口避冲突。
+#[tauri::command]
+pub async fn start_branch_preview(
+    project_id: String,
+    branch: String,
+    state: State<'_, AppState>,
+) -> Result<BranchPreviewStatus, String> {
+    let project = load_project(&state.db, &project_id).await?;
+    let wt_path = branch_wt_path(&project_id, &branch);
+    ensure_branch_worktree(&project.repo_path, &branch, &wt_path).await?;
+
+    let spec = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &wt_path)
+        .ok_or_else(|| "未配置预览启动命令（config_yaml 缺少 dev.command，且未能自动识别框架）".to_string())?;
+    let kind = spec.kind.clone();
+    let can_launch_app = spec.can_launch_app;
+
+    let key = format!("branch:{project_id}:{branch}");
+    let port = crate::commands::dev_server::free_port_from(derive_port(&key));
+    // tauri → 启动桌面应用（app_command）；web → dev server。
+    let raw_cmd = if kind == "tauri" {
+        spec.app_command
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| spec.command.clone())
+    } else {
+        spec.command.clone()
+    };
+    let command = crate::commands::dev_server::inject_port(&raw_cmd, port);
+    // tauri 应用无 iframe URL；web 用本地端口 URL。
+    let url = if kind == "tauri" {
+        String::new()
+    } else {
+        format!("http://localhost:{port}")
+    };
+
+    {
+        let mut servers = state.dev_servers.lock().await;
+        if let Some(old) = servers.remove(&key) {
+            if let Some(child) = old.child.lock().await.as_mut() {
+                crate::commands::dev_server::kill_child_group(child).await;
+            }
+        }
+    }
+
+    let (out, err) = log_stdio(
+        &preview_log_path(&branch_log_key(&project_id, &branch)),
+        &command,
+        &wt_path,
+    )?;
+    let child = Command::new("sh")
+        .arg("-lc")
+        .arg(&command)
+        .current_dir(&wt_path)
+        .env("PORT", port.to_string())
+        .envs(isolated_app_env(&wt_path))
+        .stdout(out)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("启动失败: {e}"))?;
+
+    state.dev_servers.lock().await.insert(
+        key,
+        DevServerHandle {
+            child: Arc::new(Mutex::new(Some(child))),
+            url: url.clone(),
+        },
+    );
+
+    Ok(BranchPreviewStatus {
+        branch,
+        kind,
+        status: "starting".to_string(),
+        url: if url.is_empty() { None } else { Some(url) },
+        can_launch_app,
+    })
+}
+
+/// 列出当前项目所有正在运行的分支预览（已退出的句柄顺带清理）。
+#[tauri::command]
+pub async fn list_branch_previews(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<BranchPreviewStatus>, String> {
+    let project = load_project(&state.db, &project_id).await?;
+    let kind = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &project.repo_path)
+        .map(|s| s.kind)
+        .unwrap_or_else(|| "web".to_string());
+    let prefix = format!("branch:{project_id}:");
+
+    let entries: Vec<(String, Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+        let servers = state.dev_servers.lock().await;
+        servers
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, h)| (k.clone(), h.child.clone(), h.url.clone()))
+            .collect()
+    };
+
+    let mut out = Vec::new();
+    let mut dead = Vec::new();
+    for (key, child_arc, url) in entries {
+        let running = {
+            let mut g = child_arc.lock().await;
+            match g.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(None)),
+                None => false,
+            }
+        };
+        if !running {
+            dead.push(key);
+            continue;
+        }
+        let branch = key.strip_prefix(&prefix).unwrap_or("").to_string();
+        let is_app = url.is_empty();
+        let status = if is_app || url_reachable(&url).await {
+            "running"
+        } else {
+            "starting"
+        };
+        out.push(BranchPreviewStatus {
+            branch,
+            kind: kind.clone(),
+            status: status.to_string(),
+            url: if url.is_empty() { None } else { Some(url) },
+            can_launch_app: is_app,
+        });
+    }
+    if !dead.is_empty() {
+        let mut servers = state.dev_servers.lock().await;
+        for k in dead {
+            servers.remove(&k);
+        }
+    }
+    out.sort_by(|a, b| a.branch.cmp(&b.branch));
+    Ok(out)
+}
+
+/// 停止某分支预览（仅杀进程，保留 worktree 以便快速重启）。
+#[tauri::command]
+pub async fn stop_branch_preview(
+    project_id: String,
+    branch: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let key = format!("branch:{project_id}:{branch}");
+    let mut servers = state.dev_servers.lock().await;
+    if let Some(handle) = servers.remove(&key) {
+        if let Some(child) = handle.child.lock().await.as_mut() {
+            crate::commands::dev_server::kill_child_group(child).await;
+        }
+    }
+    Ok(())
+}
+
+/// 某分支预览的启动日志尾部。
+#[tauri::command]
+pub async fn get_branch_preview_log(project_id: String, branch: String) -> Result<String, String> {
+    match std::fs::read_to_string(preview_log_path(&branch_log_key(&project_id, &branch))) {
+        Ok(s) if s.len() > 16000 => Ok(s[s.len() - 16000..].to_string()),
+        Ok(s) => Ok(s),
+        Err(_) => Ok(String::new()),
+    }
 }
 
 #[cfg(test)]
@@ -367,18 +812,79 @@ mod tests {
         assert_eq!(apply_port("no placeholder", 19000), "no placeholder");
     }
 
-    #[test]
-    fn kind_defaults_to_web() {
-        let spec = DevSpec { command: Some("x".into()), ..Default::default() };
-        assert_eq!(spec.kind_str(), "web");
-        assert!(!spec.can_launch_app());
+    // A throwaway dir that exists but holds no framework markers, so detection is
+    // inert and we can test the pure config-driven resolution path.
+    fn empty_dir() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("af-cr-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Build a temp project dir with the given `tauri.conf.json` presence and
+    /// `package.json` scripts, returning its path (caller cleans up).
+    fn make_project(tag: &str, is_tauri: bool, scripts: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("af-cr-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        if is_tauri {
+            std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+            std::fs::write(root.join("src-tauri/tauri.conf.json"), "{}").unwrap();
+        }
+        std::fs::write(
+            root.join("package.json"),
+            format!("{{\"scripts\":{{{scripts}}}}}"),
+        )
+        .unwrap();
+        root
     }
 
     #[test]
-    fn tauri_launch_requires_app_command() {
-        let mut spec = DevSpec { kind: Some("tauri".into()), command: Some("x".into()), ..Default::default() };
-        assert!(!spec.can_launch_app());
-        spec.app_command = Some("npm run tauri:dev".into());
-        assert!(spec.can_launch_app());
+    fn kind_defaults_to_web_without_config_or_markers() {
+        let dir = empty_dir();
+        // No config, no detectable framework → no command → no preview.
+        assert!(effective_spec(None, dir.to_str().unwrap()).is_none());
+        // Explicit web command, inert dir → plain web preview, no native launch.
+        let yaml = "dev:\n  command: \"npm run dev\"\n  url: \"http://localhost:{port}\"\n";
+        let spec = effective_spec(Some(yaml), dir.to_str().unwrap()).unwrap();
+        assert_eq!(spec.kind, "web");
+        assert!(!spec.frontend_only);
+        assert!(!spec.can_launch_app);
+        assert!(!spec.auto_detected);
+    }
+
+    #[test]
+    fn detects_tauri_and_infers_app_command() {
+        let root = make_project(
+            "tauri",
+            true,
+            "\"dev\":\"vite\",\"tauri:dev\":\"tauri dev\"",
+        );
+        let det = detect_framework(root.to_str().unwrap());
+        assert!(det.is_tauri);
+        assert_eq!(det.dev_script.as_deref(), Some("dev"));
+        assert_eq!(det.tauri_script.as_deref(), Some("tauri:dev"));
+
+        // No explicit kind in config → detection promotes it to tauri + infers
+        // the native launch command, so the iframe is flagged frontend-only.
+        let spec = effective_spec(None, root.to_str().unwrap()).unwrap();
+        assert_eq!(spec.kind, "tauri");
+        assert_eq!(spec.command, "npm run dev");
+        assert_eq!(spec.app_command.as_deref(), Some("npm run tauri:dev"));
+        assert!(spec.can_launch_app);
+        assert!(spec.frontend_only);
+        assert!(spec.auto_detected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_kind_wins_over_detection() {
+        let root = make_project("forceweb", true, "\"dev\":\"vite\"");
+        // A tauri repo, but the user pinned kind: web → respect it (not auto).
+        let yaml = "dev:\n  kind: \"web\"\n  command: \"npm run dev\"\n";
+        let spec = effective_spec(Some(yaml), root.to_str().unwrap()).unwrap();
+        assert_eq!(spec.kind, "web");
+        assert!(!spec.frontend_only);
+        assert!(!spec.auto_detected);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

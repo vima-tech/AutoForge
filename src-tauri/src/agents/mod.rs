@@ -4,3 +4,4 @@ pub mod grader;
 pub mod llm;
 pub mod local_claude;
 pub mod roles;
+pub mod tools;

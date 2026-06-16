@@ -30,10 +30,12 @@ function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface LlmConfig {
-  id: string; name: string; provider: string; model: string;
+  id: string; name: string; model: string;
   endpoint: string; api_key: string; ctx_window: string;
-  temperature: number; enabled: boolean; created_at: string;
+  temperature: number; enabled: boolean; api_spec: ApiSpec; created_at: string;
 }
+/** 接口规范（wire spec）：决定文本生成路由与工具调用格式。目前仅支持两种。 */
+export type ApiSpec = 'openai' | 'anthropic';
 export interface Agent {
   id: string; name: string; name_en: string; role: string;
   color: string; initial: string; llm_id: string | null;
@@ -47,10 +49,11 @@ export interface Agent {
 }
 export interface RoleSlot {
   kind: string; name: string; name_en: string;
-  group: 'orchestration' | 'delivery' | 'pipeline';
+  group: 'orchestration' | 'delivery' | 'pipeline' | 'knowledge';
   binding: 'system_kind' | 'forge_role';
   desc: string; color: string; icon: string;
   builtin_prompt: string;
+  llm_only: boolean;
   holder: Agent | null;
 }
 export interface Project {
@@ -190,9 +193,6 @@ export interface ConcurrencyConfig {
   active_slots: number; max_slots: number; pending_review: number;
   pause_threshold: number; stage: string; queue_strategy: string;
 }
-export interface SpecDocument {
-  name: string; content: string;
-}
 export interface PreviewEnvironment {
   id: string; project_id: string; env_type: string;
   worktree_session_id: string | null; container_id: string | null;
@@ -236,9 +236,6 @@ export const getConcurrencyConfig = () => ipc<ConcurrencyConfig>('get_concurrenc
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
 }>) => ipc<ConcurrencyConfig>('update_concurrency_config', { payload });
-export const readSpec = (name: string) => ipc<SpecDocument>('read_spec', { name });
-export const writeSpec = (name: string, content: string) =>
-  ipc<SpecDocument>('write_spec', { name, content });
 export const listPreviewEnvironments = (projectId?: string, status?: string) =>
   ipc<PreviewEnvironment[]>('list_preview_environments', {
     projectId: projectId ?? null, status: status ?? null,
@@ -249,6 +246,32 @@ export const listScanFindings = (testSessionId?: string) =>
   ipc<ScanFinding[]>('list_scan_findings', { testSessionId: testSessionId ?? null });
 export const listAdminDecisions = (projectId?: string) =>
   ipc<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
+
+// ── Self-update (AutoForge managing its own running repo) ─────────────────────
+export interface SelfUpdateStatus {
+  repo_path: string;
+  branch: string;
+  is_self_managed: boolean;
+  dirty: boolean;
+  behind: number;
+  ahead: number;
+}
+export interface SelfUpdateResult {
+  ok: boolean;
+  pulled: number;
+  message: string;
+  restart_required: boolean;
+}
+export interface SelfUpdatePending {
+  project_id: string | null;
+  behind: number;
+}
+export const selfUpdatePending = () =>
+  ipc<SelfUpdatePending>('self_update_pending');
+export const selfUpdateStatus = (projectId: string) =>
+  ipc<SelfUpdateStatus>('self_update_status', { projectId });
+export const selfUpdatePull = (projectId: string) =>
+  ipc<SelfUpdateResult>('self_update_pull', { projectId });
 
 // ── Projects ─────────────────────────────────────────────────────────────────
 export const listProjects = () => ipc<Project[]>('list_projects');
@@ -275,6 +298,27 @@ export const updateProject = (id: string, payload: Partial<{
   branch_dev: string; branch_main: string; status: string; config_yaml: string;
 }>) => ipc<Project>('update_project', { id, payload });
 export const deleteProject = (id: string) => ipc<void>('delete_project', { id });
+
+/** AI 推断的运行配置草稿（字段对齐 ProjectConfigForm，全部可选）。 */
+export interface RunConfigDraft {
+  dev_kind?: string | null;
+  dev_command?: string | null;
+  app_command?: string | null;
+  test_unit?: string | null;
+  test_unit_timeout?: number | null;
+  test_integration?: string | null;
+  test_integration_timeout?: number | null;
+  quality_lint?: string | null;
+  quality_typing?: string | null;
+  quality_security?: string | null;
+  project_language?: string | null;
+  project_framework?: string | null;
+  preview_build?: string | null;
+  preview_start?: string | null;
+  deploy_command?: string | null;
+}
+export const aiGenerateRunConfig = (projectId: string) =>
+  ipc<RunConfigDraft>('ai_generate_run_config', { projectId });
 
 // ── Issues ───────────────────────────────────────────────────────────────────
 export const listIssues = (projectId?: string) =>
@@ -337,6 +381,41 @@ export const deleteGroupConversation = (conversationId: string) =>
   ipc<void>('delete_group_conversation', { conversationId });
 export const clearConversationMessages = (conversationId: string) =>
   ipc<void>('clear_conversation_messages', { conversationId });
+
+// ── 会议室对话归档（只读快照 + 检索回顾） ─────────────────────────────────────
+export interface ArchivedMessage {
+  from_agent: string | null;
+  author: string;
+  author_en: string;
+  author_color: string;
+  is_me: boolean;
+  is_innate: boolean;
+  content_json: string;
+  created_at: string;
+  excluded_from_context: boolean;
+}
+export interface ConversationArchiveSummary {
+  id: string; conversation_id: string; conv_type: string; title: string;
+  project_id: string | null; project_name: string | null;
+  message_count: number; archived_at: string;
+}
+export interface ConversationArchiveDetail extends ConversationArchiveSummary {
+  payload_json: string;
+}
+export interface ArchiveSearchHit extends ConversationArchiveSummary {
+  match_count: number; snippet: string;
+}
+export const archiveConversation = (conversationId: string) =>
+  ipc<ConversationArchiveSummary>('archive_conversation', { conversationId });
+export const listConversationArchives = () =>
+  ipc<ConversationArchiveSummary[]>('list_conversation_archives');
+export const getConversationArchive = (archiveId: string) =>
+  ipc<ConversationArchiveDetail>('get_conversation_archive', { archiveId });
+export const searchConversationArchives = (query: string) =>
+  ipc<ArchiveSearchHit[]>('search_conversation_archives', { query });
+export const deleteConversationArchive = (archiveId: string) =>
+  ipc<void>('delete_conversation_archive', { archiveId });
+
 export const markConversationRead = (conversationId: string) =>
   ipc<void>('mark_conversation_read', { conversationId });
 export const agentReply = (conversationId: string, agentId: string, windowSize?: number) =>
@@ -349,6 +428,26 @@ export const startConversationTask = (payload: {
 }) => ipc<ConversationTask>('start_conversation_task', { payload });
 export const listConversationTasks = (conversationId: string) =>
   ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
+
+// ── Innate 知识库（会议室命令 + 自成长配置） ─────────────────────────────────
+export const INNATE_SENDER = '__innate__';
+export type ConvCommandName = 'remember' | 'recall' | 'evolve' | 'innate';
+export const runConversationCommand = (payload: {
+  conversation_id: string; command: ConvCommandName; arg: string;
+}) => ipc<Message>('run_conversation_command', { payload });
+export interface KnowledgeSettings { evolve_interval_hours: number; capture_threshold: number; }
+export const getKnowledgeSettings = () =>
+  ipc<KnowledgeSettings>('get_knowledge_settings');
+export const setKnowledgeSettings = (payload: KnowledgeSettings) =>
+  ipc<KnowledgeSettings>('set_knowledge_settings', { payload });
+
+export interface EmbeddingSettings {
+  provider: string; base_url: string; model_id: string; api_key: string; dim: number;
+}
+export const getKnowledgeEmbedding = () =>
+  ipc<EmbeddingSettings>('get_knowledge_embedding');
+export const setKnowledgeEmbedding = (payload: EmbeddingSettings) =>
+  ipc<EmbeddingSettings>('set_knowledge_embedding', { payload });
 export const listProjectFiles = (projectId: string, conversationId?: string) =>
   ipc<ProjectContextFile[]>('list_project_files', { projectId, conversationId: conversationId ?? null });
 export const readProjectFile = (projectId: string, relPath: string) =>
@@ -377,15 +476,49 @@ export const writeWorkspaceFile = (projectId: string, relPath: string, content: 
 // ── Settings — LLM ──────────────────────────────────────────────────────────
 export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');
 export const createLlmConfig = (payload: {
-  name: string; provider: string; model: string;
+  name: string; model: string;
   endpoint: string; api_key: string; ctx_window?: string; temperature?: number;
+  api_spec?: ApiSpec;
 }) => ipc<LlmConfig>('create_llm_config', { payload });
 export const updateLlmConfig = (id: string, payload: Partial<{
-  name: string; provider: string; model: string; endpoint: string;
+  name: string; model: string; endpoint: string;
   api_key: string; ctx_window: string; temperature: number; enabled: boolean;
+  api_spec: ApiSpec;
 }>) => ipc<LlmConfig>('update_llm_config', { id, payload });
+
+// ── Settings — Web 搜索工具 ───────────────────────────────────────────────────
+export interface WebSearchSettings {
+  provider: string; endpoint: string; max_results: number; api_key_set: boolean;
+}
+export const getWebSearchSettings = () =>
+  ipc<WebSearchSettings>('get_web_search_settings');
+export const setWebSearchSettings = (
+  provider: string, endpoint: string, max_results: number, api_key?: string,
+) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key });
+
+// ── Settings — MCP servers ────────────────────────────────────────────────────
+export type McpTransport = 'stdio' | 'http';
+export interface McpServer {
+  id: string; name: string; transport: McpTransport;
+  command: string; args_json: string; env_json: string;
+  url: string; headers_json: string; agent_ids_json: string;
+  enabled: boolean; created_at: string;
+}
+export type McpServerInput = Partial<{
+  name: string; transport: McpTransport;
+  command: string; args_json: string; env_json: string;
+  url: string; headers_json: string; agent_ids_json: string; enabled: boolean;
+}>;
+export const listMcpServers = () => ipc<McpServer[]>('list_mcp_servers');
+export const createMcpServer = (payload: McpServerInput & { name: string }) =>
+  ipc<McpServer>('create_mcp_server', { payload });
+export const updateMcpServer = (id: string, payload: McpServerInput) =>
+  ipc<McpServer>('update_mcp_server', { id, payload });
+export const deleteMcpServer = (id: string) => ipc<void>('delete_mcp_server', { id });
+export const testMcpConnection = (id: string) => ipc<string[]>('test_mcp_connection', { id });
 export const deleteLlmConfig = (id: string) => ipc<void>('delete_llm_config', { id });
-export const testLlmConnection = (id: string) => ipc<string>('test_llm_connection', { id });
+export const testLlmConnection = (id: string, draft?: Partial<LlmConfig>) =>
+  ipc<string>('test_llm_connection', { id, draft: draft && Object.keys(draft).length ? draft : null });
 
 // ── Settings — Agents ────────────────────────────────────────────────────────
 export const listAgents = () => ipc<Agent[]>('list_agents');
@@ -526,6 +659,10 @@ export interface CrPreviewStatus {
   status: 'no_config' | 'no_session' | 'idle' | 'starting' | 'running' | 'stopped';
   url: string | null;
   can_launch_app: boolean;
+  /** tauri 项目：iframe 仅渲染前端，IPC 不可用（接口无数据），真正预览是桌面窗口 */
+  frontend_only: boolean;
+  /** kind 由项目文件自动识别（config_yaml 未显式声明 dev.kind） */
+  auto_detected: boolean;
 }
 export const getCrPreview = (crId: string) =>
   ipc<CrPreviewStatus>('get_cr_preview', { crId });
@@ -537,6 +674,31 @@ export const launchCrApp = (crId: string) =>
   ipc<void>('launch_cr_app', { crId });
 export const getCrPreviewLog = (crId: string) =>
   ipc<string>('get_cr_preview_log', { crId });
+
+// ── 分支启动（左侧「启动项目」选分支，worktree 隔离，多分支并行）─────────────────
+export interface BranchInfo {
+  name: string;
+  is_current: boolean;
+  is_main: boolean;
+  is_dev: boolean;
+}
+export interface BranchPreviewStatus {
+  branch: string;
+  kind: 'web' | 'tauri';
+  status: 'starting' | 'running';
+  url: string | null;
+  can_launch_app: boolean;
+}
+export const listLocalBranches = (projectId: string) =>
+  ipc<BranchInfo[]>('list_local_branches', { projectId });
+export const startBranchPreview = (projectId: string, branch: string) =>
+  ipc<BranchPreviewStatus>('start_branch_preview', { projectId, branch });
+export const listBranchPreviews = (projectId: string) =>
+  ipc<BranchPreviewStatus[]>('list_branch_previews', { projectId });
+export const stopBranchPreview = (projectId: string, branch: string) =>
+  ipc<void>('stop_branch_preview', { projectId, branch });
+export const getBranchPreviewLog = (projectId: string, branch: string) =>
+  ipc<string>('get_branch_preview_log', { projectId, branch });
 
 // ── Specs ─────────────────────────────────────────────────────────────────────
 
@@ -608,6 +770,10 @@ export const generateDeployScript = (projectId: string, targetEnv?: string) =>
   ipc<Deployment>('generate_deploy_script', { projectId, targetEnv: targetEnv ?? null });
 export const confirmDeploy = (deploymentId: string) =>
   ipc<Deployment>('confirm_deploy', { deploymentId });
+export const updateDeployScript = (deploymentId: string, script: string) =>
+  ipc<Deployment>('update_deploy_script', { deploymentId, script });
+export const deleteDeployment = (deploymentId: string) =>
+  ipc<void>('delete_deployment', { deploymentId });
 
 // Node 06 — proactive inspection
 export const runProactiveScan = (projectId: string) =>
@@ -673,3 +839,5 @@ export const deleteDeliveryArtifact = (id: string) =>
   ipc<void>('delete_delivery_artifact', { id });
 export const deliveryArtifactDataUrl = (id: string) =>
   ipc<string>('delivery_artifact_data_url', { id });
+export const revealDeliveryArtifact = (id: string) =>
+  ipc<void>('reveal_delivery_artifact', { id });

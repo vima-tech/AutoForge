@@ -7,7 +7,6 @@ use crate::models::{
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use tauri::State;
 use tracing::{debug, info};
 
@@ -76,12 +75,6 @@ pub struct PipelineStats {
     pub executing_cr_ids: Vec<String>,
     pub project_slots: Vec<ProjectSlotStats>,
     pub project_pipelines: Vec<ProjectPipelineStats>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SpecDocument {
-    pub name: String,
-    pub content: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -476,61 +469,6 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
     });
     info!("[cmd] pipeline_stats done in {:?}", t0.elapsed());
     result
-}
-
-#[tauri::command]
-pub async fn read_spec(name: String) -> Result<SpecDocument, String> {
-    let path = spec_path(&name)?;
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| format!("读取规范失败: {}", e))?;
-
-    Ok(SpecDocument {
-        name: path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or(&name)
-            .to_string(),
-        content,
-    })
-}
-
-#[tauri::command]
-pub async fn write_spec(name: String, content: String) -> Result<SpecDocument, String> {
-    let path = spec_path(&name)?;
-    tokio::fs::write(&path, content.as_bytes())
-        .await
-        .map_err(|e| format!("写入规范失败: {}", e))?;
-
-    Ok(SpecDocument {
-        name: path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or(&name)
-            .to_string(),
-        content,
-    })
-}
-
-fn spec_path(name: &str) -> Result<PathBuf, String> {
-    let allowed = [
-        "analysis-spec.md",
-        "coding-spec.md",
-        "review-spec.md",
-        "testing-spec.md",
-    ];
-    if !allowed.contains(&name) {
-        return Err("未知规范文档".to_string());
-    }
-
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let repo_root = if cwd.file_name().and_then(|v| v.to_str()) == Some("src-tauri") {
-        cwd.parent().unwrap_or(Path::new(".")).to_path_buf()
-    } else {
-        cwd
-    };
-
-    Ok(repo_root.join("specs").join(name))
 }
 
 #[tauri::command]

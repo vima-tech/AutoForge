@@ -95,7 +95,8 @@ elevation:
   shadowSm: "0 1px 2px rgba(0,0,0,.18), 0 1px 1px rgba(0,0,0,.10)"
   shadow: "0 6px 20px rgba(0,0,0,.18)"
   shadowLg: "0 24px 60px rgba(0,0,0,.34)"
-  window: "0 32px 80px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.06)"
+  window: "0 0 0 1px rgba(255,255,255,.10), 0 10px 24px -10px rgba(0,0,0,.55), 0 2px 6px -2px rgba(0,0,0,.40)"
+  windowGutter: "24px"   # 透明留白槽（--win-gutter），让无边框透明窗的 CSS 阴影有处可画；最大化时归 0
 
 components:
   btn:
@@ -280,8 +281,14 @@ AutoForge 是一个「Human-Lite-in-the-Loop」自主软件工厂的 Tauri 桌�
 --shadow-sm  细微浮起（分段控件 on 态、小卡）
 --shadow     下拉/弹层/悬浮卡
 --shadow-lg  模态/大弹层
-窗口         0 32px 80px rgba(0,0,0,.6) + 1px 内描边白
+窗口         hairline 描边环 + 柔和 drop + 贴地 contact（让窗口浮起、边界清晰）
 ```
+
+> **窗口阴影机制**：窗口是无边框透明窗，CSS `box-shadow` 必须有 `.os-window` 四周
+> 24px 的透明留白槽（`--win-gutter`）才能画出来，否则被窗口边缘裁掉、看起来扁平。
+> 留白槽在最大化时归 0。**因此任何全屏 `position:fixed` 遮罩都要 `inset: var(--win-gutter,0)`
+> 并 `border-radius:14px`**，否则会盖住留白槽、让圆角窗口在弹窗打开时变成方角黑矩形。
+> Linux WebKitGTK 对无边框透明窗无原生阴影，故统一走此 CSS 方案以保证三端一致。
 
 深度优先用**表面层级**（bg → bg-3）表达，其次才用阴影。focus 态用 ember 光环
 （`box-shadow: 0 0 0 3px var(--ember-tint)`）而非粗边框。毛玻璃仅用于 titlebar

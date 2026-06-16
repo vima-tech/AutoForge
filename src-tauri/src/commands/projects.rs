@@ -6,22 +6,30 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+/// 用文件真源覆盖 config_yaml，使前端/派生逻辑看到的是 .autoforge/run-config.json 的内容。
+fn overlay_config(mut p: Project) -> Project {
+    p.config_yaml = crate::commands::run_config::effective_config(&p);
+    p
+}
+
 #[tauri::command]
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
-    sqlx::query_as::<_, Project>("SELECT * FROM projects ORDER BY created_at DESC")
+    let projects = sqlx::query_as::<_, Project>("SELECT * FROM projects ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(projects.into_iter().map(overlay_config).collect())
 }
 
 #[tauri::command]
 pub async fn list_active_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
-    sqlx::query_as::<_, Project>(
+    let projects = sqlx::query_as::<_, Project>(
         "SELECT * FROM projects WHERE status = 'active' ORDER BY created_at DESC",
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(projects.into_iter().map(overlay_config).collect())
 }
 
 #[tauri::command]
@@ -29,11 +37,12 @@ pub async fn get_project(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<Option<Project>, String> {
-    sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
+    let project = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(project.map(overlay_config))
 }
 
 #[tauri::command]
@@ -132,6 +141,9 @@ pub async fn clone_project_from_git(
         .env("GIT_ASKPASS", &askpass_path)
         .env("SSH_ASKPASS", &askpass_path)
         .env("GCM_INTERACTIVE", "never")
+        // Restrict transports to a safe whitelist so a hostile URL cannot use
+        // remote helpers like `ext::sh -c ...` to achieve command execution.
+        .env("GIT_ALLOW_PROTOCOL", "http:https:ssh:git:file")
         .env("AUTOFORGE_GIT_USERNAME", username)
         .env("AUTOFORGE_GIT_PASSWORD", password);
     let output = match timeout(Duration::from_secs(600), cmd.output()).await {
@@ -253,11 +265,17 @@ pub async fn update_project(
         .await
         .map_err(|e| e.to_string())?;
 
-    sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
+    let project = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
         .bind(&id)
         .fetch_one(&state.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // 运行配置真源是 .autoforge/run-config.json：保存时落盘（YAML/JSON→规整 JSON）。
+    if let Some(ref cfg) = payload.config_yaml {
+        crate::commands::run_config::write_config_file(&project.repo_path, cfg)?;
+    }
+    Ok(overlay_config(project))
 }
 
 async fn ensure_local_project_dir(
