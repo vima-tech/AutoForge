@@ -219,9 +219,10 @@ function ConvItem({ c, active, agentMap, onSelect }: {
   );
 }
 
-function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
+function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive, collapsed, onToggleCollapse }: {
   convs: Conversation[]; agents: Agent[];
   active: string; onSelect: (id: string) => void; onNew: () => void; onOpenArchive: () => void;
+  collapsed: boolean; onToggleCollapse: () => void;
 }) {
   const [q, setQ] = useState('');
   const chatAgents = useMemo(() => agents.filter(a => a.visible_in_chat && a.enabled), [agents]);
@@ -233,12 +234,16 @@ function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
     () => convs.filter(c => c.conv_type === 'direct' && c.members.some(id => !!agentMap[id])),
     [convs, agentMap],
   );
+  if (collapsed) return null;
   return (
     <div className="list-col">
       <div className="list-head">
         <div className="list-title-row">
           <span className="list-title">会议室</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <button className="icon-btn" title="收起对话列表" onClick={onToggleCollapse}>
+              <Icon name="columns" size={18} />
+            </button>
             <button className="icon-btn" title="归档区 · 检索回顾" onClick={onOpenArchive}>
               <Icon name="inbox" size={18} />
             </button>
@@ -262,9 +267,9 @@ function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
   );
 }
 
-function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMenu, projectId }: {
+function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBubbleContextMenu, projectId }: {
   m: Message; agents: Agent[]; isGroup: boolean;
-  highlighted?: boolean; rowRef?: (el: HTMLDivElement | null) => void;
+  highlighted?: boolean; searchTerm?: string; rowRef?: (el: HTMLDivElement | null) => void;
   onBubbleContextMenu?: (e: React.MouseEvent, message: Message, author: string) => void;
   projectId?: string;
 }) {
@@ -300,7 +305,7 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
           onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
           style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
         >
-          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} highlight={searchTerm} />)}
           {m.excluded_from_context && (
             <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
               <Icon name="eye-off" size={11} />已从 AI 上下文排除
@@ -1392,6 +1397,7 @@ export default function ConversationsPage() {
   const [showContext,    setShowContext]     = useState(false);
   const [showSearch,     setShowSearch]     = useState(false);
   const [showHeadMore,   setShowHeadMore]   = useState(false);
+  const [idCopied,       setIdCopied]       = useState(false);
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
@@ -1408,6 +1414,8 @@ export default function ConversationsPage() {
   const [bubbleMenu,     setBubbleMenu]     = useState<BubbleMenuState | null>(null);
   const [contextAttachments, setContextAttachments] = useState<ConversationAttachment[]>([]);
   const [windowSize,         setWindowSize]         = useState(20);
+  const [listCollapsed,  setListCollapsed]  = useState(() => localStorage.getItem('conv.listCollapsed') === '1');
+  const toggleList = () => setListCollapsed(v => { localStorage.setItem('conv.listCollapsed', v ? '0' : '1'); return !v; });
 
   const scrollRef       = useRef<HTMLDivElement>(null);
   const headerActionsRef= useRef<HTMLDivElement>(null);
@@ -1843,12 +1851,17 @@ export default function ConversationsPage() {
 
   return (
     <>
-      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} />
+      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} collapsed={listCollapsed} onToggleCollapse={toggleList} />
 
       {conv ? (
         <div className="content">
           {/* ── Chat header ── */}
           <div className="chat-head">
+            {listCollapsed && (
+              <button className="icon-btn" title="展开对话列表" onClick={toggleList} style={{ marginRight: 2 }}>
+                <Icon name="columns" size={18} />
+              </button>
+            )}
             {conv.conv_type === 'group'
               ? <div className="av sq" style={{ width: 38, height: 38, background: conv.color, fontSize: 'var(--text-title)' }}>{conv.initial ?? conv.name?.[0] ?? '群'}</div>
               : (() => { const a = agentMap[conv.members[0]]; return a ? <Avatar agent={a} size={38} status={conv.unread > 0 ? 'online' : undefined} /> : null; })()}
@@ -1885,7 +1898,17 @@ export default function ConversationsPage() {
 
               {/* More-actions menu */}
               {showHeadMore && (
-                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 200 }}>
+                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 220 }}>
+                  <div
+                    className="mention-row"
+                    onClick={async () => { await copyText(conv.id); setIdCopied(true); setTimeout(() => setIdCopied(false), 1400); }}
+                  >
+                    <Icon name={idCopied ? 'check' : 'copy'} size={15} style={{ color: idCopied ? 'var(--green)' : 'var(--text-3)' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="nm">{idCopied ? '已复制编号' : '复制会议室编号'}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{conv.id}</div>
+                    </div>
+                  </div>
                   {conv.conv_type === 'group' && (
                     <div className="mention-row" onClick={() => { setEditGroup(conv); setShowHeadMore(false); }}>
                       <Icon name="edit" size={15} style={{ color: 'var(--text-3)' }} />
@@ -2165,6 +2188,7 @@ export default function ConversationsPage() {
                 agents={agents}
                 isGroup={conv.conv_type === 'group'}
                 highlighted={activeSearchId === m.id}
+                searchTerm={showSearch ? searchQuery.trim() : ''}
                 rowRef={el => { messageRefs.current[m.id] = el; }}
                 onBubbleContextMenu={openBubbleMenu}
                 projectId={conv.project_id ?? undefined}
@@ -2196,6 +2220,13 @@ export default function ConversationsPage() {
         </div>
       ) : (
         <div className="content">
+          {listCollapsed && (
+            <div className="chat-head">
+              <button className="icon-btn" title="展开对话列表" onClick={toggleList}>
+                <Icon name="columns" size={18} />
+              </button>
+            </div>
+          )}
           <div className="empty"><Icon name="chat" /><div>选择一个会议室开始</div></div>
         </div>
       )}

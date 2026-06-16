@@ -44,6 +44,8 @@ pub async fn create_llm_config(
     let ctx_window = payload.ctx_window.unwrap_or_else(|| "200K".to_string());
     let temperature = payload.temperature.unwrap_or(0.3);
     let api_spec = normalize_api_spec(payload.api_spec.as_deref());
+    // 密钥静态加密落库（见 core::secrets）。
+    let api_key = crate::core::secrets::encrypt_field(&payload.api_key)?;
 
     sqlx::query(
         "INSERT INTO llm_configs (id, name, model, endpoint, api_key, ctx_window, temperature, api_spec)
@@ -53,7 +55,7 @@ pub async fn create_llm_config(
     .bind(&payload.name)
     .bind(&payload.model)
     .bind(&payload.endpoint)
-    .bind(&payload.api_key)
+    .bind(&api_key)
     .bind(&ctx_window)
     .bind(temperature)
     .bind(api_spec)
@@ -92,7 +94,7 @@ pub async fn update_llm_config(
     }
     if let Some(ref v) = payload.api_key {
         sets.push("api_key=?");
-        values.push(v.clone());
+        values.push(crate::core::secrets::encrypt_field(v)?);
     }
     if let Some(ref v) = payload.ctx_window {
         sets.push("ctx_window=?");
@@ -167,6 +169,9 @@ pub async fn test_llm_connection(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("LLM 配置不存在: {}", id))?;
+
+    // 落库值为密文，解密后再用；草稿值是前台明文，会在下方覆盖。
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key)?;
 
     // 用前台尚未保存的草稿覆盖落库值，使「填写后立即测试」反映最新输入，
     // 而非已保存的旧数据。
@@ -569,6 +574,8 @@ pub struct SetRoleSlotPayload {
     pub visible_in_chat: Option<bool>,
     pub mentionable: Option<bool>,
     pub memory_enabled: Option<bool>,
+    /// 工具白名单 JSON（约定 `{"tools":[...]}`）；None=不改。
+    pub capabilities_json: Option<String>,
 }
 
 /// 配置某个内置角色：自动确保单一持有 Agent（无则按注册表默认创建），并应用配置。
@@ -687,6 +694,10 @@ pub async fn set_role_slot(
         sets.push("memory_enabled=?".to_string());
         vals.push(AgentUpdateValue::Bool(v));
     }
+    if let Some(ref c) = payload.capabilities_json {
+        sets.push("capabilities_json=?".to_string());
+        vals.push(AgentUpdateValue::Text(c.clone()));
+    }
     if !sets.is_empty() {
         let sql = format!("UPDATE agents SET {} WHERE id=?", sets.join(", "));
         let mut q = sqlx::query(&sql);
@@ -797,6 +808,27 @@ pub async fn set_agent_forge_role(
         .map_err(|e| e.to_string())
 }
 
+// ---- 凭据加密后端状态 ----
+
+/// 当前密钥主密钥所在后端："keychain"（系统钥匙环）或 "file"（0600 文件兜底）。
+/// 供设置页提示用户兜底场景下安全性较弱。
+#[tauri::command]
+pub fn secret_backend_status() -> String {
+    match crate::core::secrets::backend() {
+        crate::core::secrets::SecretBackend::Keychain => "keychain".to_string(),
+        crate::core::secrets::SecretBackend::File => "file".to_string(),
+    }
+}
+
+// ---- 工具：内置工具目录（供前端动态渲染 Agent 能力开关，新增工具自动出现）----
+
+/// 返回内置工具目录的元信息（name/label/needs_project）。前端据此渲染能力开关，
+/// 不必硬编码工具清单——在 `agents::tools::builtin_catalog` 加一个工具即自动出现在 UI。
+#[tauri::command]
+pub fn list_builtin_tools() -> Vec<crate::agents::tools::ToolInfo> {
+    crate::agents::tools::builtin_catalog_meta()
+}
+
 // ---- 工具：Web 搜索配置（存 app_settings，供 agents/tools/web_search 读取）----
 
 /// 回传给前端的 Web 搜索配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
@@ -875,7 +907,8 @@ pub async fn set_web_search_settings(
     )
     .await?;
     if let Some(key) = api_key {
-        write_setting(&state, "web_search.api_key", key.trim()).await?;
+        let enc = crate::core::secrets::encrypt_field(key.trim())?;
+        write_setting(&state, "web_search.api_key", &enc).await?;
     }
     get_web_search_settings(state).await
 }

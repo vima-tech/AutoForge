@@ -25,5 +25,6 @@ pub mod security;
 pub mod self_update;
 pub mod settings;
 pub mod system;
+pub mod trace;
 pub mod widget;
 pub mod workspace;

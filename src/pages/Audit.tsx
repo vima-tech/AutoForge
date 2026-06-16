@@ -5,7 +5,7 @@ import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
 import {
   listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, getCrGrade,
-  retryChangeRequest, deleteChangeRequest,
+  retryChangeRequest, deleteChangeRequest, retryAnalysis,
   openUrl, listIssues, getIssueAnalysis, review1, parseAnalysisSpec,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
@@ -16,7 +16,31 @@ import {
 
 type Sel = { kind: 'issue' | 'cr'; id: string };
 
+// 复制完整需求编号到剪贴板，附带短暂的成功反馈
+function CopyIdButton({ value, title = '复制编号' }: { value: string; title?: string }) {
+  const [copied, setCopied] = useState(false);
+  const doCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch { /* 剪贴板不可用时静默忽略 */ }
+  };
+  return (
+    <button
+      className="icon-btn btn-sm"
+      style={{ width: 24, height: 24, padding: 0 }}
+      onClick={doCopy}
+      title={copied ? '已复制' : title}
+    >
+      <Icon name={copied ? 'check' : 'copy'} size={13} style={copied ? { color: 'var(--green)' } : undefined} />
+    </button>
+  );
+}
+
 const STATUS_LABEL: Record<string, string> = {
+  analysis_failed: '分析失败',
   pending_review_1: '待需求审核',
   pending_execution: '待执行',
   executing: 'AI 执行中',
@@ -28,6 +52,7 @@ const STATUS_LABEL: Record<string, string> = {
   rejected: '已拒绝',
 };
 const STATUS_COLOR: Record<string, string> = {
+  analysis_failed: 'red',
   pending_review_1: 'amber',
   pending_execution: 'amber',
   executing: 'blue',
@@ -610,13 +635,15 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
   );
 }
 
-function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide }: {
+function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide, onRetryAnalysis }: {
   issue: Issue; analysis: IssueAnalysis | null; analysisLoading: boolean;
   submitting: boolean; decided: string | null;
   advice: string; setAdvice: (v: string) => void;
   onDecide: (decision: 'approved' | 'rejected') => void;
+  onRetryAnalysis: () => void;
 }) {
   const canReview = issue.status === 'pending_review_1' && !decided;
+  const analysisFailed = issue.status === 'analysis_failed';
   const spec = parseAnalysisSpec(analysis?.analysis_json);
   return (
     <>
@@ -624,8 +651,9 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{issue.id.slice(0, 10)}</span>
+            <CopyIdButton value={issue.id} title="复制需求编号" />
             <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>{issue.title}</span>
-            <span className="chip amber">审核 1 · 需求审核</span>
+            <span className={'chip ' + (analysisFailed ? 'red' : 'amber')}>{analysisFailed ? '分析失败' : '审核 1 · 需求审核'}</span>
           </div>
           <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8 }}>
             <span className={'chip ' + (SEV_COLOR[issue.category] || 'blue')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.category}</span>
@@ -644,7 +672,9 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
                   <button className="btn btn-danger" onClick={() => onDecide('rejected')} disabled={submitting}><Icon name="x" size={15} />拒绝</button>
                   <button className="btn btn-primary" onClick={() => onDecide('approved')} disabled={submitting}><Icon name="check" size={15} />批准 · 进入编码</button>
                 </>
-              : <span className="chip" style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>{STATUS_LABEL[issue.status] ?? issue.status}</span>}
+              : analysisFailed
+                ? <button className="btn btn-primary" onClick={onRetryAnalysis} disabled={submitting}><Icon name="refresh" size={15} />重新分析</button>
+                : <span className="chip" style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>{STATUS_LABEL[issue.status] ?? issue.status}</span>}
         </div>
       </div>
 
@@ -652,6 +682,12 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
         <div className="report" style={{ maxWidth: 760 }}>
           <h2><Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />需求描述</h2>
           <p style={{ whiteSpace: 'pre-line' }}>{issue.description || '（无描述）'}</p>
+
+          {analysisFailed && (
+            <div className="chip red" style={{ display: 'block', padding: '12px 14px', margin: '12px 0', lineHeight: 'var(--leading-normal)' }}>
+              <strong>自动分析失败</strong> · 可能是 LLM 超时、限流或未配置可用模型。已保留原始错误（见下方分析摘要），可点击右上角「重新分析」重试。
+            </div>
+          )}
 
           {analysisLoading ? (
             <div className="empty-compact" style={{ padding: '20px 0' }}>加载分析…</div>
@@ -738,6 +774,8 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const [decided, setDecided] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [crLoading, setCrLoading] = useState(false);
+  // 任务进度心跳：cr_id → 最近一次阶段说明，用于在编码/合并期间显示「活着」的进度。
+  const [crProgress, setCrProgress] = useState<Record<string, { phase: string; note?: string }>>({});
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
   const [intakeOpen, setIntakeOpen] = useState(false);
   const [logModal, setLogModal] = useState<{ title: string; sig: string; load: () => Promise<string> } | null>(null);
@@ -804,7 +842,8 @@ export default function AuditPage({ target, onTargetConsumed }: {
       listIssues(projectId),
     ]);
     setCrs(allCrs);
-    setPendingIssues(allIssues.filter(i => i.status === 'pending_review_1'));
+    // 审核 1 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
+    setPendingIssues(allIssues.filter(i => i.status === 'pending_review_1' || i.status === 'analysis_failed'));
     setIssueTitles(Object.fromEntries(allIssues.map(i => [i.id, i.title])));
     setIssuesById(Object.fromEntries(allIssues.map(i => [i.id, i])));
     setLoadedProjectId(projectId);
@@ -926,7 +965,15 @@ export default function AuditPage({ target, onTargetConsumed }: {
       }, 500);
     };
     let unlisten: (() => void) | undefined;
-    listen('AutoForge://event', debounced).then(fn => { unlisten = fn; });
+    listen<{ type?: string; cr_id?: string; phase?: string; note?: string }>('AutoForge://event', e => {
+      const ev = e.payload;
+      // 进度心跳：即时更新（不防抖），让用户在长任务期间看到阶段流动。
+      if (ev?.type === 'task_progress' && ev.cr_id) {
+        setCrProgress(prev => ({ ...prev, [ev.cr_id as string]: { phase: ev.phase || '', note: ev.note } }));
+        return;
+      }
+      debounced();
+    }).then(fn => { unlisten = fn; });
     return () => { if (timer) clearTimeout(timer); unlisten?.(); };
   }, [activeProject, loadList, loadProjectReviewCounts]);
 
@@ -969,6 +1016,20 @@ export default function AuditPage({ target, onTargetConsumed }: {
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
       showError('删除失败：' + String(e));
+    } finally { setSubmitting(false); }
+  };
+
+  // 分析失败闭环：一键重新分析（回到分析队列，常用于超时/限流后的恢复）。
+  const doRetryAnalysis = async () => {
+    if (!activeIssueId || submitting) return;
+    setSubmitting(true);
+    try {
+      await retryAnalysis(activeIssueId);
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      showError('重新分析失败：' + String(e));
     } finally { setSubmitting(false); }
   };
 
@@ -1160,6 +1221,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
               issue={selectedIssue} analysis={issueAnalysis} analysisLoading={analysisLoading}
               submitting={submitting} decided={decided}
               advice={advice} setAdvice={setAdvice} onDecide={doReview1}
+              onRetryAnalysis={doRetryAnalysis}
             />
           ) : cr ? (
             <>
@@ -1168,6 +1230,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{cr.id.slice(0, 10)}</span>
+                    <CopyIdButton value={cr.id} title="复制变更编号" />
                     <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>{issueTitles[cr.issue_id] || 'Change Request'}</span>
                     {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
                     {grade && <span className={'chip ' + (grade.tier === 'T3' ? 'red' : grade.tier === 'T2' ? 'amber' : grade.tier === 'T1' ? 'blue' : 'green')} title={grade.rationale}>风险 {grade.tier} · {grade.change_class}</span>}
@@ -1175,6 +1238,11 @@ export default function AuditPage({ target, onTargetConsumed }: {
                   <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2 }}>
                     {STATUS_LABEL[cr.status] ?? cr.status} · {new Date(cr.updated_at).toLocaleString('zh')}
                   </div>
+                  {(cr.status === 'executing' || cr.status === 'pending_merge') && crProgress[cr.id]?.note && (
+                    <div style={{ fontSize: 'var(--text-label)', color: 'var(--ember)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span className="dot amber" /> {crProgress[cr.id].note}
+                    </div>
+                  )}
                 </div>
                 <div className="audit-decide">
                   {FAILED_STATUSES.includes(cr.status)

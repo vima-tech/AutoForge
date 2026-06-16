@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use super::{Tool, ToolSpec};
+use super::{BuiltinTool, Tool, ToolContext, ToolInfo, ToolSpec};
 use crate::db::Db;
+use std::sync::Arc;
 
 const SETTINGS_PROVIDER: &str = "web_search.provider";
 const SETTINGS_API_KEY: &str = "web_search.api_key";
@@ -38,7 +39,10 @@ impl WebSearchConfig {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        let api_key = get_setting(db, SETTINGS_API_KEY).await.unwrap_or_default();
+        let api_key = crate::core::secrets::decrypt(
+            &get_setting(db, SETTINGS_API_KEY).await.unwrap_or_default(),
+        )
+        .unwrap_or_default();
         let endpoint = get_setting(db, SETTINGS_ENDPOINT).await.unwrap_or_default();
         let max_results = get_setting(db, SETTINGS_MAX_RESULTS)
             .await
@@ -70,6 +74,21 @@ async fn get_setting(db: &Db, key: &str) -> Option<String> {
         .await
         .ok()
         .flatten()
+}
+
+/// web_search 工厂：不依赖项目上下文，任何场景下只要配置了 Provider 即可装配。
+pub struct WebSearchFactory;
+
+#[async_trait]
+impl BuiltinTool for WebSearchFactory {
+    fn info(&self) -> ToolInfo {
+        ToolInfo { name: "web_search", label: "联网搜索", needs_project: false }
+    }
+    async fn build(&self, db: &Db, _ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
+        let cfg = WebSearchConfig::load(db).await;
+        cfg.is_enabled()
+            .then(|| Arc::new(WebSearchTool::new(cfg)) as Arc<dyn Tool>)
+    }
 }
 
 /// 内置 Web 搜索工具。仅在 [`WebSearchConfig::is_enabled`] 时注册进注册表。

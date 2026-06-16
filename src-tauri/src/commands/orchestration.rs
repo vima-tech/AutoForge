@@ -87,7 +87,15 @@ pub async fn start_conversation_task(
 
     let db = state.db.clone();
     let app_for_task = app.clone();
-    tauri::async_runtime::spawn(async move {
+    // trace 关联标签：本次任务的所有 LLM/工具 span 都带上会议室/任务/项目，便于按条件筛选。
+    // task_local 不跨 spawn，故在 spawn 的任务体外层包一层 with_tags。
+    let trace_tags = crate::core::trace::TraceTags {
+        conversation_id: Some(payload.conversation_id.clone()),
+        task_id: Some(task_id.clone()),
+        project_id: conversation.project_id.clone(),
+        ..Default::default()
+    };
+    tauri::async_runtime::spawn(crate::core::trace::with_tags(trace_tags, async move {
         if let Err(e) = execute_conversation_task(
             db.clone(),
             app_for_task.clone(),
@@ -109,7 +117,7 @@ pub async fn start_conversation_task(
             .await;
             emit_task_update(&app_for_task, &payload.conversation_id, &task_id, "failed");
         }
-    });
+    }));
 
     Ok(task)
 }
@@ -206,6 +214,7 @@ async fn execute_conversation_task(
             &snapshot,
             &accumulated,
             &roster,
+            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -255,6 +264,7 @@ async fn execute_conversation_task(
             &snapshot,
             &accumulated,
             &roster,
+            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -474,9 +484,14 @@ async fn ask_planner(
         Some(instruction),
     )
     .await;
-    let raw = crate::agents::llm::run_agent_text(db, planner, &prompt, system_prompt.as_deref(), &[])
-        .await
-        .map_err(|e| e.to_string())?;
+    // planner 也可按需用工具（如先读真实代码再排计划）；未开启工具时自动回退无工具单轮。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
+    let registry = crate::agents::tools::build_registry_for_agent(db, planner, &tool_ctx).await;
+    let raw = crate::agents::llm::run_agent_text_with_tools(
+        db, planner, &prompt, system_prompt.as_deref(), &[], &registry,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     parse_plan_json(&raw)
 }
 
@@ -595,6 +610,7 @@ async fn run_plan_step(
     snapshot: &str,
     accumulated: &str,
     roster: &str,
+    project_id: Option<&str>,
 ) -> Result<(Vec<AgentOutcome>, bool), String> {
     let step_id = Uuid::new_v4().to_string();
     let agent_ids_json = serde_json::to_string(agents).map_err(|e| e.to_string())?;
@@ -626,6 +642,7 @@ async fn run_plan_step(
             snapshot.to_string(),
             accumulated.to_string(),
             roster.to_string(),
+            project_id.map(str::to_string),
         ));
     }
 
@@ -756,6 +773,7 @@ async fn run_agent_for_step(
     snapshot: String,
     accumulated: String,
     roster: String,
+    project_id: Option<String>,
 ) -> Result<AgentOutcome, String> {
     let run_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -776,12 +794,12 @@ async fn run_agent_for_step(
         String::new()
     } else {
         format!(
-            "群聊成员名单（可用 @名字 点名协作，发挥各自专长）：\n{}\n\n",
+            "群聊成员名单（了解在场成员；话题相关时可 @名字 点名协作）：\n{}\n\n",
             roster
         )
     };
     let prompt = format!(
-        "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n如果某个问题更适合其他成员的专长，用 @对方名字 点名邀请其参与（仅 @ 名单中的成员）。",
+        "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n优先自己把问题答完，不必为了协作而刻意 @ 别人；但当某部分确实更适合其他成员的专长、或你想就分歧点邀请其表态时，可以自然地用 @对方名字 点名（仅 @ 名单中的成员，且只 @ 与当前话题真正相关的成员）。不要为了凑发言或客套而 @ 无关成员。",
         roster_section,
         snapshot,
         if accumulated.trim().is_empty() { "无" } else { &accumulated },
@@ -793,25 +811,34 @@ async fn run_agent_for_step(
     } else {
         Some(agent.system_prompt.as_str())
     };
-    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 勾选了它的 MCP server 工具。
-    let registry = crate::agents::tools::build_registry_for_agent(&db, &agent).await;
-    let result =
-        crate::agents::llm::run_agent_text_with_tools(&db, &agent, &prompt, system_prompt, &[], &registry)
+    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 代码扫描(项目仓库) + 勾选的 MCP server 工具。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
+    let registry =
+        crate::agents::tools::build_registry_for_agent(&db, &agent, &tool_ctx).await;
+    // 把「LLM 调用 + 解析 <write-file> + 落盘」包进同一个 trace run：写文件以 tool span
+    // 挂在与本次 Agent 调用相同的 trace 下，链路追踪里即可审计 Agent 写了哪些工作区文件。
+    let (ok, text, text_after_writes, error, write_blocks) =
+        crate::core::trace::scope_run(&db, &agent, async {
+            let result = crate::agents::llm::run_agent_text_with_tools(
+                &db, &agent, &prompt, system_prompt, &[], &registry,
+            )
             .await;
-
-    let (ok, text, error) = match result {
-        Ok(text) => (true, text, None),
-        Err(e) => {
-            let msg = format!("[系统错误: {}]", e);
-            (false, msg.clone(), Some(e.to_string()))
-        }
-    };
-
-    // Parse file writes first (before requirement draft extraction)
-    let (text_after_writes, file_writes) =
-        crate::commands::workspace::parse_agent_file_writes(&text);
-    let write_blocks =
-        crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes).await;
+            let (ok, text, error) = match result {
+                Ok(text) => (true, text, None),
+                Err(e) => {
+                    let msg = format!("[系统错误: {}]", e);
+                    (false, msg, Some(e.to_string()))
+                }
+            };
+            // Parse file writes first (before requirement draft extraction)
+            let (text_after_writes, file_writes) =
+                crate::commands::workspace::parse_agent_file_writes(&text);
+            let write_blocks =
+                crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes)
+                    .await;
+            (ok, text, text_after_writes, error, write_blocks)
+        })
+        .await;
 
     // 检测 LLM 输出中是否嵌入了 requirement_draft artifact JSON
     let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text_after_writes);
@@ -1021,7 +1048,15 @@ async fn run_system_agent_text(
         recall_key,
     )
     .await;
-    match crate::agents::llm::run_agent_text(db, agent, prompt, system_prompt.as_deref(), &[]).await {
+    // 系统角色也可按需用工具（代码扫描/web_search）：注册表按 capabilities 白名单 + 项目绑定装配；
+    // 为空（未开启工具/无项目）时 run_agent_text_with_tools 自动回退到无工具单轮，行为不变。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
+    let registry = crate::agents::tools::build_registry_for_agent(db, agent, &tool_ctx).await;
+    match crate::agents::llm::run_agent_text_with_tools(
+        db, agent, prompt, system_prompt.as_deref(), &[], &registry,
+    )
+    .await
+    {
         Ok(text) => (true, text),
         Err(e) => (false, format!("[系统错误: {}]", e)),
     }

@@ -10,10 +10,11 @@ import AuditPage from './pages/Audit';
 import ProjectsPage from './pages/Projects';
 import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
+import TracePage from './pages/Trace';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
 import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
-type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'settings';
+type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
@@ -309,6 +310,14 @@ export default function App() {
             <span className="rail-label">{theme.mode === 'dark' ? '浅色模式' : '深色模式'}</span>
           </button>
           <button
+            className={'rail-item' + (page === 'trace' ? ' active' : '')}
+            onClick={() => { setPage('trace'); sessionStorage.setItem('AutoForge:page', 'trace'); }}
+            title="LLM 调用链路追踪"
+          >
+            <span className="rail-ic"><Icon name="log" size={23} /></span>
+            <span className="rail-label">链路追踪</span>
+          </button>
+          <button
             className={'rail-item' + (page === 'settings' ? ' active' : '')}
             onClick={() => { setPage('settings'); sessionStorage.setItem('AutoForge:page', 'settings'); }}
             title="设置"
@@ -328,6 +337,7 @@ export default function App() {
         {page === 'projects' && <ProjectsPage />}
         {page === 'delivery' && <DeliveryPage />}
         {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} />}
+        {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
     </div>

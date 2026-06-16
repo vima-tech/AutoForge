@@ -247,6 +247,18 @@ export const listScanFindings = (testSessionId?: string) =>
 export const listAdminDecisions = (projectId?: string) =>
   ipc<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
 
+// 错误历史：后端后台任务失败记录（runner 持久化的 last_error），供设置页排错。
+export interface JobFailure {
+  id: string;
+  job_type: string;
+  status: string;
+  attempt: number;
+  last_error?: string | null;
+  updated_at: string;
+}
+export const listJobFailures = (limit?: number) =>
+  ipc<JobFailure[]>('list_job_failures', { limit: limit ?? null });
+
 // ── Self-update (AutoForge managing its own running repo) ─────────────────────
 export interface SelfUpdateStatus {
   repo_path: string;
@@ -330,6 +342,9 @@ export const submitIssue = (payload: {
   project_id: string; title: string; description?: string;
   category?: string; severity?: string; source_type?: string;
 }) => ipc<Issue>('submit_issue', { payload });
+// 分析失败/卡住时重新触发需求分析（回到分析队列）。
+export const retryAnalysis = (issueId: string) =>
+  ipc<void>('retry_analysis', { issueId });
 
 // ── Change Requests ──────────────────────────────────────────────────────────
 export const listChangeRequests = (projectId?: string, status?: string) =>
@@ -496,6 +511,11 @@ export const setWebSearchSettings = (
   provider: string, endpoint: string, max_results: number, api_key?: string,
 ) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key });
 
+// 凭据加密主密钥后端："keychain"（系统钥匙环）或 "file"（0600 文件兜底，安全性较弱）。
+export type SecretBackend = 'keychain' | 'file';
+export const getSecretBackendStatus = () =>
+  ipc<SecretBackend>('secret_backend_status');
+
 // ── Settings — MCP servers ────────────────────────────────────────────────────
 export type McpTransport = 'stdio' | 'http';
 export interface McpServer {
@@ -548,7 +568,42 @@ export const setRoleSlot = (kind: string, payload: {
   llm_id?: string; prompt_mode?: 'builtin' | 'append' | 'custom';
   supplement?: string; enabled?: boolean;
   visible_in_chat?: boolean; mentionable?: boolean; memory_enabled?: boolean;
+  capabilities_json?: string;
 }) => ipc<RoleSlot[]>('set_role_slot', { kind, payload });
+
+// 内置工具目录：驱动 Agent 能力开关的动态渲染（新增后端工具自动出现，无需改前端）。
+export interface BuiltinToolInfo { name: string; label: string; needs_project: boolean; }
+export const listBuiltinTools = () => ipc<BuiltinToolInfo[]>('list_builtin_tools');
+
+// ── LLM Trace（调用链路追踪）────────────────────────────────────────────────
+export interface LlmTraceSummary {
+  trace_id: string;
+  agent_id: string | null; agent_role: string | null; agent_name: string | null;
+  project_id: string | null; issue_id: string | null; conversation_id: string | null; task_id: string | null;
+  status: string; error: string | null;
+  input: string | null; output: string | null;
+  total_tokens: number | null; latency_ms: number | null;
+  span_count: number; created_at: string;
+}
+export interface LlmTrace {
+  id: string; trace_id: string; parent_id: string | null; seq: number;
+  kind: string; name: string | null;
+  agent_id: string | null; agent_role: string | null; agent_name: string | null;
+  project_id: string | null; issue_id: string | null; conversation_id: string | null; task_id: string | null;
+  provider: string | null; model: string | null; system_prompt: string | null;
+  status: string; error: string | null; input: string | null; output: string | null;
+  prompt_tokens: number | null; completion_tokens: number | null; total_tokens: number | null;
+  latency_ms: number | null; metadata_json: string | null;
+  started_at: string | null; ended_at: string | null; created_at: string;
+}
+export interface TraceFilter {
+  issue_id?: string; conversation_id?: string; agent_name?: string; agent_role?: string;
+  agent_id?: string; project_id?: string; status?: string; kind?: string; limit?: number;
+}
+export const listLlmTraces = (filter: TraceFilter = {}) => ipc<LlmTraceSummary[]>('list_llm_traces', { filter });
+export const getLlmTrace = (traceId: string) => ipc<LlmTrace[]>('get_llm_trace', { traceId });
+export const listTraceAgentNames = () => ipc<string[]>('list_trace_agent_names');
+export const clearLlmTraces = (traceId?: string) => ipc<void>('clear_llm_traces', { traceId: traceId ?? null });
 
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
 

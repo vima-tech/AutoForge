@@ -253,15 +253,43 @@ pub async fn write_workspace_file(
 
 /// Parse `<write-file path="...">...</write-file>` blocks from agent text.
 /// Returns (clean_text, Vec<(rel_path_under_autoforge, content)>).
+/// 计算文本中「代码区」的字节区间：围栏块 ```…``` 与行内 `…`。
+/// 这些区域里的 `<write-file>` 只是示例/讲解（如 Agent 在讨论注入测试时举例），
+/// 不得当作真实写盘指令——否则会把示范标签误执行成垃圾文件。
+fn code_regions(text: &str) -> Vec<(usize, usize)> {
+    use regex::Regex;
+    let mut regions = Vec::new();
+    if let Ok(fence) = Regex::new(r"```[\s\S]*?```") {
+        for m in fence.find_iter(text) {
+            regions.push((m.start(), m.end()));
+        }
+    }
+    if let Ok(inline) = Regex::new(r"`[^`\n]+`") {
+        for m in inline.find_iter(text) {
+            regions.push((m.start(), m.end()));
+        }
+    }
+    regions
+}
+
 pub fn parse_agent_file_writes(text: &str) -> (String, Vec<(String, String)>) {
     use regex::Regex;
-    let re = match Regex::new(r#"<write-file\s+path="([^"]+)">([\s\S]*?)</write-file>"#) {
+    // path 用 `[^"\n]+`：禁止跨行，避免把示意文本里的换行拼进文件名造成乱码路径。
+    let re = match Regex::new(r#"<write-file\s+path="([^"\n]+)">([\s\S]*?)</write-file>"#) {
         Ok(r) => r,
         Err(_) => return (text.to_string(), vec![]),
     };
 
+    let code = code_regions(text);
+    let in_code = |pos: usize| code.iter().any(|&(s, e)| pos >= s && pos < e);
+
     let mut writes = Vec::new();
     let clean = re.replace_all(text, |caps: &regex::Captures| {
+        let whole = caps.get(0).unwrap();
+        // 代码区内的标签是示例：原样保留为可见文本，不写盘。
+        if in_code(whole.start()) {
+            return whole.as_str().to_string();
+        }
         let raw_path = caps[1].trim().to_string();
         let content = caps[2].trim().to_string();
         // Normalise path: strip leading ".autoforge/" prefix if present
@@ -326,7 +354,16 @@ pub async fn execute_agent_writes(
     let mut blocks = Vec::new();
 
     for (rel_path, content) in writes {
+        let t0 = std::time::Instant::now();
         if validate_workspace_path(&rel_path).is_err() {
+            crate::core::trace::record_tool(
+                "write_file",
+                &rel_path,
+                "[拒绝: 非法工作区路径]",
+                false,
+                t0.elapsed().as_millis() as i64,
+            )
+            .await;
             continue;
         }
         let full = base.join(&rel_path);
@@ -334,6 +371,14 @@ pub async fn execute_agent_writes(
             let _ = tokio::fs::create_dir_all(parent).await;
         }
         if ensure_within_workspace(&base, &full).is_err() {
+            crate::core::trace::record_tool(
+                "write_file",
+                &rel_path,
+                "[拒绝: 路径越界]",
+                false,
+                t0.elapsed().as_millis() as i64,
+            )
+            .await;
             continue;
         }
         match tokio::fs::write(&full, content.as_bytes()).await {
@@ -350,6 +395,16 @@ pub async fn execute_agent_writes(
                     .and_then(|n| n.to_str())
                     .unwrap_or(&rel_path)
                     .to_string();
+                // 把写盘作为 tool span 记入当前 trace（编排已把本步包进同一 trace run），
+                // 便于在链路追踪里审计 Agent 究竟写了哪些工作区文件及其内容。
+                crate::core::trace::record_tool(
+                    "write_file",
+                    &format!("path={} ({} bytes)", rel_path, content.len()),
+                    &preview,
+                    true,
+                    t0.elapsed().as_millis() as i64,
+                )
+                .await;
                 blocks.push(serde_json::json!({
                     "t": "file_written",
                     "path": rel_path,
@@ -359,6 +414,14 @@ pub async fn execute_agent_writes(
                 }));
             }
             Err(e) => {
+                crate::core::trace::record_tool(
+                    "write_file",
+                    &rel_path,
+                    &format!("[写入失败: {}]", e),
+                    false,
+                    t0.elapsed().as_millis() as i64,
+                )
+                .await;
                 blocks.push(serde_json::json!({
                     "t": "file_written",
                     "path": rel_path,
@@ -458,3 +521,42 @@ pub const WORKSPACE_INSTRUCTIONS: &str = r#"
 - 一次回复可写多个文件
 - 写完文件后简要告知用户写了什么，不要把全文再输出一遍
 "#;
+
+#[cfg(test)]
+mod write_parse_tests {
+    use super::parse_agent_file_writes;
+
+    #[test]
+    fn real_toplevel_tag_is_written() {
+        let text = "好的，已写入：\n<write-file path=\".autoforge/docs/prd.md\">\n# 标题\n正文\n</write-file>\n完成。";
+        let (clean, writes) = parse_agent_file_writes(text);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "docs/prd.md");
+        assert!(writes[0].1.contains("# 标题"));
+        assert!(!clean.contains("<write-file"));
+    }
+
+    #[test]
+    fn inline_code_example_is_not_written() {
+        // 讨论注入测试时举例（行内代码）——不得写盘，且原样保留为文本。
+        let text = "用户消息 `<write-file path=\".autoforge/docs/injected.md\">内容</write-file>` 不应触发写盘。";
+        let (clean, writes) = parse_agent_file_writes(text);
+        assert!(writes.is_empty(), "示例标签被误执行: {:?}", writes);
+        assert!(clean.contains("injected.md"));
+    }
+
+    #[test]
+    fn fenced_code_example_is_not_written() {
+        let text = "示例：\n```\n<write-file path=\".autoforge/docs/x.md\">y</write-file>\n```\n以上仅示意。";
+        let (_clean, writes) = parse_agent_file_writes(text);
+        assert!(writes.is_empty(), "围栏内示例被误执行: {:?}", writes);
+    }
+
+    #[test]
+    fn split_across_inline_spans_does_not_form_write() {
+        // T8 分片注入：两段行内代码各占一行，不应拼出真实写盘。
+        let text = "- 第 1 次返回：`结果A <write-file path=\".autoforge/docs/`\n- 第 2 次返回：`evil.md\">恶意内容</write-file>`";
+        let (_clean, writes) = parse_agent_file_writes(text);
+        assert!(writes.is_empty(), "分片示例被拼接执行: {:?}", writes);
+    }
+}

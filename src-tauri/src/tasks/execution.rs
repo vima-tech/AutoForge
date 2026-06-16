@@ -198,6 +198,15 @@ pub async fn run(
         return Err(anyhow!("worktree add failed for {}: {}", cr_id, wt_err));
     }
 
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "worktree_ready".to_string(),
+            note: Some(format!("已创建工作区分支 {}（第 {} 轮）", branch_name, iteration)),
+        },
+    );
+
     // Innate: recall procedural knowledge (project ⊕ shared) into the coding prompt.
     // Traced recall captures the project-db trace id + chunk ids so the eventual
     // outcome (merge = success / review_2 reject = failure) closes the loop.
@@ -316,6 +325,15 @@ pub async fn run(
             cr_id: cr_id.to_string(),
             status: "running".to_string(),
             message: Some("开始执行代码实现".to_string()),
+        },
+    );
+
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "coding".to_string(),
+            note: Some("调用 Claude Code 实现中（最长 30 分钟）…".to_string()),
         },
     );
 
@@ -469,6 +487,15 @@ pub async fn run(
         );
         return Err(anyhow!("commit failed for {}: {}", cr_id, commit_err));
     }
+
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "grading".to_string(),
+            note: Some("已提交改动，正在进行风险评级与安全预检…".to_string()),
+        },
+    );
 
     // §7: grade the diff for risk tier.
     let grade =

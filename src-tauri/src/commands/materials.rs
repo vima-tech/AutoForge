@@ -238,6 +238,12 @@ fn now_str() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// 将文件/目录移入系统回收站（而非永久删除），便于误删恢复。
+/// 失败时返回错误而不静默回退到永久删除——宁可保留文件，也不绕过回收站。
+fn move_path_to_trash(path: &Path) -> Result<(), String> {
+    trash::delete(path).map_err(|e| format!("移入回收站失败：{}", e))
+}
+
 /// Ensure `.autoforge/docs/` exists on disk and sync its contents into the DB.
 /// Files directly in `.autoforge/docs/` get `folder_id = NULL`.
 /// Sub-directories become top-level `material_folders` (`parent_id = NULL`).
@@ -710,77 +716,52 @@ pub async fn delete_material_folder(
     };
 
     let folder_path = folder_path_from_docs(&folder.project_id, Some(&id), &state).await?;
-    // Files in deleted folder are moved to docs root (folder_id = NULL, disk = .autoforge/docs/)
-    let root_path = project_docs_dir(&folder.project_id, &state).await?;
 
-    let file_ids: Vec<(String,)> = sqlx::query_as(
+    // 子树内的所有文件记录：用于回收非 repo（app 数据目录）物料 + 级联清理 DB。
+    let files: Vec<MaterialFile> = sqlx::query_as::<_, MaterialFile>(
         "WITH RECURSIVE folder_tree(id) AS (
            SELECT id FROM material_folders WHERE id = ?
            UNION ALL
            SELECT mf.id FROM material_folders mf
            JOIN folder_tree ft ON mf.parent_id = ft.id
          )
-         SELECT id FROM material_files WHERE folder_id IN (SELECT id FROM folder_tree)",
+         SELECT * FROM material_files WHERE folder_id IN (SELECT id FROM folder_tree)",
     )
     .bind(&id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    for (file_id,) in file_ids {
-        let file = sqlx::query_as::<_, MaterialFile>("SELECT * FROM material_files WHERE id = ?")
-            .bind(&file_id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut rel_path = file.rel_path.clone();
-        let mut stored_name = file.stored_name.clone();
-        if let Some(root_path) = root_path.as_deref() {
-            std::fs::create_dir_all(root_path).map_err(|e| e.to_string())?;
-            let src = material_disk_path(&file);
-            if src.exists() {
-                let dest = unique_child_path(root_path, &file.original_name);
-                if src != dest {
-                    match std::fs::rename(&src, &dest) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
-                            if !is_repo_material(&file) {
-                                let _ = std::fs::remove_file(&src);
-                            }
-                        }
-                    }
-                }
-                let disk_path = std::fs::canonicalize(&dest).unwrap_or(dest.clone());
-                rel_path = format!("{}{}", REPO_MATERIAL_PREFIX, disk_path.to_string_lossy());
-                stored_name = dest
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or(&file.original_name)
-                    .to_string();
-            }
-        }
-
-        sqlx::query(
-            "UPDATE material_files
-             SET folder_id = NULL, stored_name = ?, rel_path = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(&stored_name)
-        .bind(&rel_path)
-        .bind(now_str())
-        .bind(&file.id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    if let Some(path) = folder_path {
+    // 1) 整个文件夹目录连同内容一并移入系统回收站（覆盖目录内所有 repo 物料）。
+    if let Some(path) = folder_path.as_ref() {
         if path.exists() {
-            std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+            move_path_to_trash(path)?;
         }
     }
+
+    // 2) 目录未覆盖到的文件（非 repo / app 数据目录物料）逐个移入回收站。
+    //    repo 物料已随上面的目录被回收，此处 disk 不再存在会自动跳过。
+    for file in &files {
+        let disk = material_disk_path(file);
+        if disk.exists() {
+            move_path_to_trash(&disk)?;
+        }
+    }
+
+    // 3) 级联删除 DB 记录：先删子树内文件，再删子树内文件夹（含所有子文件夹）。
+    sqlx::query(
+        "WITH RECURSIVE folder_tree(id) AS (
+           SELECT id FROM material_folders WHERE id = ?
+           UNION ALL
+           SELECT mf.id FROM material_folders mf
+           JOIN folder_tree ft ON mf.parent_id = ft.id
+         )
+         DELETE FROM material_files WHERE folder_id IN (SELECT id FROM folder_tree)",
+    )
+    .bind(&id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     sqlx::query(
         "WITH RECURSIVE folder_tree(id) AS (
@@ -789,21 +770,12 @@ pub async fn delete_material_folder(
            SELECT mf.id FROM material_folders mf
            JOIN folder_tree ft ON mf.parent_id = ft.id
          )
-         UPDATE material_files
-         SET folder_id = NULL, updated_at = ?
-         WHERE folder_id IN (SELECT id FROM folder_tree)",
+         DELETE FROM material_folders WHERE id IN (SELECT id FROM folder_tree)",
     )
     .bind(&id)
-    .bind(now_str())
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
-
-    sqlx::query("DELETE FROM material_folders WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1255,11 +1227,11 @@ pub async fn delete_material_file(id: String, state: State<'_, AppState>) -> Res
         .map_err(|e| e.to_string())?;
 
     if let Some(f) = file {
-        if !is_repo_material(&f) {
-            let full_path = material_disk_path(&f);
-            if full_path.exists() {
-                let _ = std::fs::remove_file(&full_path);
-            }
+        // 移入系统回收站（repo 与非 repo 物料统一处理）。repo 物料若仅删 DB 记录而留盘，
+        // 下次同步会被重新扫入；移入回收站才能真正从 .autoforge/docs 移除且可恢复。
+        let full_path = material_disk_path(&f);
+        if full_path.exists() {
+            move_path_to_trash(&full_path)?;
         }
         sqlx::query("DELETE FROM material_files WHERE id = ?")
             .bind(&id)

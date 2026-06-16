@@ -826,8 +826,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
       {confirmDelFolder && (
         <ConfirmModal
           msg={`确认删除文件夹「${confirmDelFolder.name}」？`}
-          sub="文件夹内的文件将移至根目录。"
-          okLabel="删除"
+          sub="文件夹及其中所有文件将移入系统回收站，可从回收站恢复。"
+          okLabel="移入回收站"
           onOk={() => execDeleteFolder(confirmDelFolder)}
           onCancel={() => setConfirmDelFolder(null)}
         />
@@ -836,8 +836,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
       {confirmDelFile && (
         <ConfirmModal
           msg={`确认删除「${confirmDelFile.original_name}」？`}
-          sub="此操作不可撤销。"
-          okLabel="删除"
+          sub="文件将移入系统回收站，可从回收站恢复。"
+          okLabel="移入回收站"
           onOk={() => execDeleteFile(confirmDelFile)}
           onCancel={() => setConfirmDelFile(null)}
         />

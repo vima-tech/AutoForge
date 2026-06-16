@@ -70,15 +70,70 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
         None
     };
 
-    // Run analysis (uses the analysis Agent's bound custom LLM; CLI only as fallback)
-    let result = crate::agents::analysis::analyze(
-        db,
-        &issue.title,
-        &issue.description,
-        project_context.as_deref(),
+    // Run analysis (uses the analysis Agent's bound custom LLM; CLI only as fallback).
+    // Distinguish a *genuine failure* (LLM transport error or an empty response)
+    // from a real low-score result. A failure used to be silently swallowed by
+    // `unwrap_or_default()`, parking the issue at pending_review_1 with a blank,
+    // misleading 0.5/0.5 analysis. Instead we now surface it: park the issue at
+    // `analysis_failed` so 审核1 shows the raw error + a "重新分析" entry point.
+    let trace_tags = crate::core::trace::TraceTags {
+        issue_id: Some(issue_id.to_string()),
+        project_id: Some(issue.project_id.clone()),
+        ..Default::default()
+    };
+    let result = match crate::core::trace::with_tags(
+        trace_tags,
+        crate::agents::analysis::analyze(
+            db,
+            &issue.title,
+            &issue.description,
+            project_context.as_deref(),
+            Some(issue.project_id.as_str()),
+        ),
     )
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) if !r.raw_output.trim().is_empty() => r,
+        outcome => {
+            let err = match outcome {
+                Err(e) => e.to_string(),
+                _ => "分析模型返回为空（可能是超时、限流或未配置可用的 LLM）".to_string(),
+            };
+            error!("analysis failed for issue {}: {}", issue_id, err);
+            // Persist the failure so the audit page can show the raw error and
+            // offer a retry, rather than a fabricated default analysis.
+            let analysis_id = Uuid::new_v4().to_string();
+            let _ = sqlx::query(
+                "INSERT OR REPLACE INTO issue_analyses
+                 (id, issue_id, authenticity_score, feasibility_score, priority_suggestion,
+                  category_suggestion, severity_suggestion, affected_modules, analysis_summary,
+                  raw_llm_output, analysis_json)
+                 VALUES (?, ?, 0, 0, 5, '', 'medium', '[]', ?, ?, '{}')",
+            )
+            .bind(&analysis_id)
+            .bind(&issue.id)
+            .bind(format!("自动分析失败：{}", err))
+            .bind(&err)
+            .execute(db)
+            .await;
+            sqlx::query(
+                "UPDATE issues SET status='analysis_failed', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(&issue.id)
+            .execute(db)
+            .await?;
+            crate::core::notify::dispatch(db, "analysis_failed", "需求分析失败", &issue.title).await;
+            // Reuse AnalysisCompleted so the frontend reloads the issue list and
+            // shows the analysis_failed status (no need for a new event variant).
+            event::emit(
+                app,
+                event::AppEvent::AnalysisCompleted {
+                    issue_id: issue.id.clone(),
+                },
+            );
+            return Err(anyhow!("analysis failed for issue {}: {}", issue_id, err));
+        }
+    };
 
     // Persist analysis
     let analysis_id = Uuid::new_v4().to_string();

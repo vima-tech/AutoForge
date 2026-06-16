@@ -143,6 +143,44 @@ struct Finding {
     detail: String,
 }
 
+/// Pre-merge deterministic security gate (design §4.3 — shift-left).
+///
+/// Runs ONLY the cheap, zero-dependency heuristic pass over the CR's worktree
+/// diff *before* it lands on dev. Returns `Some(reason)` — a human-readable
+/// markdown block — when a high/critical finding (hardcoded secret, `rm -rf /`,
+/// `os.system`, `shell=True`, …) must block the merge; `None` to allow.
+///
+/// The deep LLM audit deliberately stays in the post-merge `run()` (Node 07):
+/// the gate must be fast, deterministic and free so it never stalls or bills the
+/// pipeline, while the LLM pass keeps providing the richer record + learning loop
+/// on what actually merged.
+pub(crate) async fn pre_merge_gate(db: &Db, repo_path: &str, cr_id: &str) -> Option<String> {
+    let diff = load_diff(db, repo_path, cr_id).await;
+    if diff.trim().is_empty() {
+        return None;
+    }
+    let findings = heuristic_scan(&diff);
+    let severity = max_severity(&findings);
+    if !matches!(severity.as_str(), "high" | "critical") {
+        return None;
+    }
+    let detail = findings
+        .iter()
+        .filter(|f| matches!(f.severity.as_str(), "high" | "critical"))
+        .map(|f| format!("- **[{}]** {} — `{}`", f.severity, f.title, f.detail))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "## 安全门拦截合并\n\n合并前安全扫描发现 {} 项高危问题（最高 **{}**），已阻断合并以防风险代码进入 dev。请在代码中修复后重新执行；如为误报，可调整改动或人工删除该需求。\n\n{}\n",
+        findings
+            .iter()
+            .filter(|f| matches!(f.severity.as_str(), "high" | "critical"))
+            .count(),
+        severity,
+        detail
+    ))
+}
+
 /// Returns the merged diff for the change request's latest worktree branch.
 async fn load_diff(db: &Db, repo_path: &str, cr_id: &str) -> String {
     let session: Option<crate::models::worktree::WorktreeSession> = sqlx::query_as(

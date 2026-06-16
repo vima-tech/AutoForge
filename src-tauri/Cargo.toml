@@ -48,6 +48,13 @@ futures = "0.3"
 async-trait = "0.1"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "hostname"] }
 rmcp = { version = "1.7.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# 凭据静态加密：信封加密（主密钥进系统钥匙环，密钥密文落 SQLite）。
+# keyring v3 须显式选后端；crypto-rust 用纯 Rust AES，避免引入 openssl 系统依赖。
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+aes-gcm = "0.10"
+rand = "0.8"
+# 物料库删除走系统回收站（freedesktop XDG Trash / macOS Trash / Windows 回收站），便于误删恢复。
+trash = "5"
 
 [profile.dev]
 incremental = true

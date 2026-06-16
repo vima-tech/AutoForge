@@ -621,6 +621,36 @@ pub async fn list_scan_findings(
     }
 }
 
+/// One failed background job, for the Settings 错误历史 panel. Surfaces the
+/// `last_error` the runner already persists so failures are inspectable in-app
+/// instead of only in stderr logs.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct JobFailure {
+    pub id: String,
+    pub job_type: String,
+    pub status: String,
+    pub attempt: i64,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+/// Recent failed jobs (most recent first). Capped to avoid unbounded payloads.
+#[tauri::command]
+pub async fn list_job_failures(
+    limit: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<JobFailure>, String> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    sqlx::query_as::<_, JobFailure>(
+        "SELECT id, job_type, status, attempt, last_error, updated_at
+         FROM job_executions WHERE status='failed' ORDER BY updated_at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn list_admin_decisions(
     project_id: Option<String>,

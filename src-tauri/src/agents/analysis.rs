@@ -558,6 +558,7 @@ pub async fn analyze(
     title: &str,
     description: &str,
     project_context: Option<&str>,
+    project_id: Option<&str>,
 ) -> Result<AnalysisResult> {
     let prompt = match project_context.filter(|c| !c.trim().is_empty()) {
         Some(ctx) => format!(
@@ -580,7 +581,11 @@ pub async fn analyze(
                 &agent.prompt_mode,
                 &agent.system_prompt,
             );
-            crate::agents::llm::run_agent_text(db, &agent, &prompt, Some(&sys), &[]).await?
+            // 走工具循环：分析 Agent 可按需读取/检索项目真实源码（绑定项目时），
+            // 让评估基于实际代码而非仅需求文本。未开启工具/无项目时自动回退单轮。
+            let ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
+            let registry = crate::agents::tools::build_registry_for_agent(db, &agent, &ctx).await;
+            crate::agents::llm::run_agent_text_with_tools(db, &agent, &prompt, Some(&sys), &[], &registry).await?
         }
         None => local_claude::run_text(&prompt, Some(SYSTEM_PROMPT)).await?,
     };

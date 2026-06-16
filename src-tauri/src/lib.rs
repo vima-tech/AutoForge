@@ -38,8 +38,23 @@ pub fn run() {
             state::init_materials_base(materials);
             state::init_kb_base(kb);
 
+            // 凭据加密：注入主密钥兜底文件路径并预热（确定 keychain/file 后端），
+            // 必须在任何加解密与迁移之前。
+            let master_key_file = data_dir.join("master.key").to_string_lossy().to_string();
+            core::secrets::init_secrets(master_key_file);
+            core::secrets::warm_up();
+
             let db = tauri::async_runtime::block_on(async {
                 db::init(&db_path).await.expect("db init failed")
+            });
+
+            // 一次性把库内残留明文密钥就地加密（幂等，失败不阻断启动）。
+            tauri::async_runtime::block_on(async {
+                match core::secrets::migrate_plaintext_secrets(&db).await {
+                    Ok(n) if n > 0 => println!("[secrets] 已加密迁移 {} 个明文密钥字段", n),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[secrets] 明文密钥迁移失败: {}", e),
+                }
             });
             let (max_slots, pause_threshold, queue_strategy) =
                 tauri::async_runtime::block_on(commands::system::load_concurrency_settings(&db))
@@ -178,6 +193,7 @@ pub fn run() {
             commands::issues::get_issue,
             commands::issues::get_issue_analysis,
             commands::issues::submit_issue,
+            commands::issues::retry_analysis,
             commands::intake::get_intake_config,
             commands::intake::update_intake_config,
             commands::intake::get_webhook_status,
@@ -237,6 +253,12 @@ pub fn run() {
             commands::settings::test_llm_connection,
             commands::settings::get_web_search_settings,
             commands::settings::set_web_search_settings,
+            commands::settings::list_builtin_tools,
+            commands::trace::list_llm_traces,
+            commands::trace::get_llm_trace,
+            commands::trace::list_trace_agent_names,
+            commands::trace::clear_llm_traces,
+            commands::settings::secret_backend_status,
             commands::mcp::list_mcp_servers,
             commands::mcp::create_mcp_server,
             commands::mcp::update_mcp_server,
@@ -259,6 +281,7 @@ pub fn run() {
             commands::system::list_test_sessions,
             commands::system::list_scan_findings,
             commands::system::list_admin_decisions,
+            commands::system::list_job_failures,
             commands::self_update::self_update_status,
             commands::self_update::self_update_pull,
             commands::self_update::self_update_pending,

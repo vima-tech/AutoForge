@@ -40,8 +40,9 @@ impl McpConnection {
                 let mut cmd = tokio::process::Command::new(server.command.trim());
                 let args: Vec<String> = serde_json::from_str(&server.args_json).unwrap_or_default();
                 cmd.args(&args);
+                let env_json = crate::core::secrets::decrypt(&server.env_json).unwrap_or_default();
                 let env: std::collections::BTreeMap<String, String> =
-                    serde_json::from_str(&server.env_json).unwrap_or_default();
+                    serde_json::from_str(&env_json).unwrap_or_default();
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
@@ -56,8 +57,10 @@ impl McpConnection {
                     return Err(anyhow!("http MCP server 未配置 url"));
                 }
                 let mut config = StreamableHttpClientTransportConfig::with_uri(server.url.trim());
+                let headers_json =
+                    crate::core::secrets::decrypt(&server.headers_json).unwrap_or_default();
                 let headers: std::collections::BTreeMap<String, String> =
-                    serde_json::from_str(&server.headers_json).unwrap_or_default();
+                    serde_json::from_str(&headers_json).unwrap_or_default();
                 for (k, v) in headers {
                     if let (Ok(name), Ok(val)) = (
                         reqwest::header::HeaderName::from_bytes(k.as_bytes()),

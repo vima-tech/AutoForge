@@ -157,6 +157,15 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .await?
             .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
 
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "testing".to_string(),
+            note: Some("合并前测试门校验中…".to_string()),
+        },
+    );
+
     // Quality gate: run configured tests on the un-merged worktree branch
     // FIRST. A failing gate must block the merge (spec: testing.md).
     let passed = crate::tasks::testing::run_and_gate(db, tx, app, cr_id).await?;
@@ -185,6 +194,44 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         return Ok(());
     }
 
+    // Shift-left security gate: a fast, deterministic heuristic scan of the CR
+    // diff runs BEFORE the merge. High/critical findings (secrets, rm -rf /,
+    // os.system, shell=True, …) block the merge so risky code never reaches dev.
+    // Reuses `merge_failed` so the existing audit recovery UI (retry/delete)
+    // surfaces it; the report makes clear it is a security block, not a conflict.
+    if let Some(reason) =
+        crate::tasks::security_audit::pre_merge_gate(db, &project.repo_path, cr_id).await
+    {
+        info!("pre-merge security gate blocked cr {}", cr_id);
+        let _ = sqlx::query("UPDATE worktree_sessions SET report_content=? WHERE id=?")
+            .bind(&reason)
+            .bind(&session.id)
+            .execute(db)
+            .await;
+        sqlx::query(
+            "UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(cr_id)
+        .execute(db)
+        .await?;
+        sqlx::query(
+            "UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(&cr.issue_id)
+        .execute(db)
+        .await?;
+        crate::core::notify::dispatch(db, "security_high", "安全门拦截合并", cr_id).await;
+        event::emit(
+            app,
+            event::AppEvent::WorktreeUpdate {
+                cr_id: cr_id.to_string(),
+                status: "merge_failed".to_string(),
+                message: Some("合并前安全扫描发现高危问题，已阻断合并".to_string()),
+            },
+        );
+        return Ok(());
+    }
+
     let git = GitProxy::new(&project.repo_path);
 
     // Detect whether dev is the branch currently checked out in the project's
@@ -198,6 +245,15 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .map(|(_, out, _)| out.trim().to_string())
         .unwrap_or_default();
     let dev_is_live = !live_branch.is_empty() && live_branch == project.branch_dev;
+
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "merging".to_string(),
+            note: Some(format!("正在合并到 {}…", project.branch_dev)),
+        },
+    );
 
     if let Err((merge_code, merge_err)) =
         land_on_dev(&git, &project, &session, cr_id, dev_is_live).await

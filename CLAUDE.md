@@ -400,7 +400,7 @@ AutoForge 的长期方向是把 Rust 后端从 Tauri 桌面壳中**解耦为可�
 3. **合并唯一入口**：`review_2` command 的 `approved` 分支是唯一触发 merge 的路径
 4. **工作区写入限制**：`workspace.rs` 强制验证写路径必须在 `.autoforge/docs/` 或 `.autoforge/specs/` 内，禁止路径越界（`..` 等）
 5. **附件安全**：白名单 MIME 类型，最大 10 MB，存储时 UUID 化文件名
-6. **API Key 存储**：LLM API Key 存入 SQLite（后续迁移到 Tauri keychain plugin）
+6. **API Key 存储**：所有密钥（LLM `api_key`、MCP `env_json`/`headers_json`、`web_search.api_key`）经 `core/secrets.rs` 信封加密落库——主密钥存系统钥匙环（`keyring` crate，无钥匙环时退化为 app 数据目录下 0600 文件），各密钥用 AES-256-GCM 加密为 `enc:v1:` 密文存 SQLite。写入走 `secrets::encrypt_field`，读取走 `secrets::decrypt`（非密文原样透传，兼容旧明文）；启动时 `migrate_plaintext_secrets` 幂等搬迁残留明文。直接打开 .db 看不到明文密钥
 
 <!-- autoforge:specs:start -->
 ## AutoForge 项目规格

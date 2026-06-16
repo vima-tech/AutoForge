@@ -18,6 +18,7 @@ const ART_NODE_OPTS = [
   { value: 'security', label: '安全' }, { value: 'deploy', label: '部署' },
   { value: 'general', label: '通用' },
 ];
+const ART_NODE_LABEL: Record<string, string> = Object.fromEntries(ART_NODE_OPTS.map(o => [o.value, o.label]));
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -522,7 +523,7 @@ export default function Delivery() {
               : artifacts.map(a => (
                 <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                    <span className="chip">{a.node}</span>
+                    <span className="chip">{ART_NODE_LABEL[a.node] || a.node}</span>
                     <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.original_name}</span>
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{fmtSize(a.size_bytes)}</span>
                   </div>

@@ -9,7 +9,7 @@ import {
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
   getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
-  listPreviewEnvironments, listTestSessions, listAdminDecisions,
+  listPreviewEnvironments, listTestSessions, listAdminDecisions, listJobFailures,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
@@ -17,6 +17,8 @@ import {
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   getWebSearchSettings, setWebSearchSettings,
+  listBuiltinTools, type BuiltinToolInfo,
+  getSecretBackendStatus, type SecretBackend,
   listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
   type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
@@ -24,11 +26,22 @@ import {
   type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
   type WebSearchSettings,
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
+  type JobFailure,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
-  return <button className={'switch' + (on ? ' on' : '')} onClick={onToggle}><i /></button>;
+  // type=button 避免默认 submit 行为；stopPropagation/preventDefault 杜绝 WebKitGTK 下
+  // <button> 内嵌 <label> 时父级 label 二次激活导致的“点了没反应/瞬间回弹”。
+  return (
+    <button
+      type="button"
+      className={'switch' + (on ? ' on' : '')}
+      onClick={e => { e.preventDefault(); e.stopPropagation(); onToggle(); }}
+    >
+      <i />
+    </button>
+  );
 }
 
 function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
@@ -104,9 +117,11 @@ function LLMSettings() {
   const [saving, setSaving] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [secretBackend, setSecretBackend] = useState<SecretBackend | null>(null);
 
   useEffect(() => {
     listLlmConfigs().then(cs => { setConfigs(cs); setLoading(false); }).catch(() => setLoading(false));
+    getSecretBackendStatus().then(setSecretBackend).catch(() => {});
   }, []);
 
   const setDraft = (id: string, field: string, val: unknown) =>
@@ -164,6 +179,15 @@ function LLMSettings() {
       {confirmDel && <ConfirmModal msg="确认删除此 LLM 配置？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
       <div className="set-h">LLM 配置</div>
       <div className="set-desc">管理多个大模型连接。每个 Agent 可指派不同的 LLM。</div>
+      {secretBackend && (
+        <div className="chip" style={{ marginBottom: 12 }}
+          title={secretBackend === 'keychain'
+            ? 'API Key 经 AES-256-GCM 加密落库，主密钥保存在系统钥匙环'
+            : '未检测到系统钥匙环：主密钥退化保存为 0600 本地文件，安全性弱于钥匙环'}>
+          <Icon name={secretBackend === 'keychain' ? 'shield' : 'alert'} size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
+          {secretBackend === 'keychain' ? '密钥加密：系统钥匙环' : '密钥加密：文件兜底（无钥匙环）'}
+        </div>
+      )}
       {configs.map(c => {
         const d = drafts[c.id] ?? {};
         const v = (f: keyof LlmConfig) => (d as Record<string, unknown>)[f] !== undefined ? (d as Record<string, unknown>)[f] as string : c[f] as string;
@@ -241,20 +265,37 @@ const AGENT_TEMPLATES: { label: string; prompt: string }[] = [
   { label: '分析', prompt: '你是分析师。基于事实拆解问题，给出选项、取舍与明确建议，必要时量化，并标注假设与不确定性。' },
 ];
 
-// capabilities_json 工具白名单读写：约定 {"tools":["web_search",...]}。
-function agentHasTool(capJson: string | undefined, tool: string): boolean {
+// capabilities_json 工具白名单：规范形状为 {"tools":[...]}（后端 allowed_tools_from_capabilities
+// 也只读 .tools）。但历史数据里它存的是扁平语义标签数组（如 ["planning","routing"]），
+// 这类数组从未被工具系统消费。下方读取时一律归一，写入时统一输出 {"tools":[...]}——
+// 这样首次切换即把旧数组迁移成对象形状，开关才真正生效。
+// 注意：旧实现 `obj.tools=[...]` 若 obj 是数组，JSON.stringify(数组) 会丢弃该属性 → 改动丢失（点了没反应）。
+function capTools(capJson: string | undefined): string[] {
   try {
-    const arr = (JSON.parse(capJson || '{}') as { tools?: unknown }).tools;
-    return Array.isArray(arr) && arr.includes(tool);
-  } catch { return false; }
+    const v = JSON.parse(capJson || '{}') as unknown;
+    if (Array.isArray(v)) return []; // 旧版扁平标签数组：不含任何工具
+    const arr = (v as { tools?: unknown })?.tools;
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
+  } catch { return []; }
+}
+function agentHasTool(capJson: string | undefined, tool: string): boolean {
+  return capTools(capJson).includes(tool);
 }
 function toggleAgentTool(capJson: string | undefined, tool: string, on: boolean): string {
-  let obj: Record<string, unknown> = {};
-  try { obj = (JSON.parse(capJson || '{}') as Record<string, unknown>) || {}; } catch { obj = {}; }
-  const set = new Set<string>(Array.isArray(obj.tools) ? (obj.tools as string[]) : []);
+  const set = new Set<string>(capTools(capJson));
   if (on) set.add(tool); else set.delete(tool);
-  obj.tools = [...set];
-  return JSON.stringify(obj);
+  return JSON.stringify({ tools: [...set] });
+}
+
+// 内置工具目录：进程内缓存一次，所有能力开关从后端目录动态渲染——后端新增工具自动出现。
+let _builtinToolsCache: BuiltinToolInfo[] | null = null;
+function useBuiltinTools(): BuiltinToolInfo[] {
+  const [tools, setTools] = useState<BuiltinToolInfo[]>(_builtinToolsCache ?? []);
+  useEffect(() => {
+    if (_builtinToolsCache) return;
+    listBuiltinTools().then(t => { _builtinToolsCache = t; setTools(t); }).catch(() => {});
+  }, []);
+  return tools;
 }
 
 function ToolsSettings() {
@@ -458,7 +499,12 @@ function McpServers() {
                     {agents.map(a => {
                       const on = scoped.includes(a.id);
                       return (
-                        <button key={a.id} className={'chip ' + (on ? 'ember' : '')} style={{ cursor: 'pointer', border: on ? undefined : '1px solid var(--border-strong)' }}
+                        <button key={a.id} className={'chip ' + (on ? 'ember' : '')} style={{
+                            cursor: 'pointer',
+                            background: on ? 'var(--ember-tint-strong)' : 'var(--bg-3)',
+                            border: on ? '1px solid var(--ember-soft)' : '1px solid var(--border-strong)',
+                            color: on ? 'var(--ember)' : 'var(--text-2)',
+                          }}
                           onClick={() => toggleAgent(s, d, a.id)}>
                           {on ? '✓ ' : ''}{a.name}
                         </button>
@@ -487,6 +533,7 @@ function McpServers() {
 }
 
 function CustomAgents({ onChanged }: { onChanged: () => void }) {
+  const builtinTools = useBuiltinTools();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hideIds, setHideIds] = useState<Set<string>>(new Set());
   const [llmNames, setLlmNames] = useState<LlmRef[]>([]);
@@ -601,14 +648,17 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                     <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
                       {(() => {
                         const cap = d.capabilities_json !== undefined ? String(d.capabilities_json ?? '') : a.capabilities_json;
-                        const on = agentHasTool(cap, 'web_search');
-                        return (
-                          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
-                            <Switch on={on} onToggle={() => setDraft(a.id, 'capabilities_json', toggleAgentTool(cap, 'web_search', !on))} />联网搜索 web_search
-                          </label>
-                        );
+                        return builtinTools.map(t => {
+                          const on = agentHasTool(cap, t.name);
+                          return (
+                            <label key={t.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}
+                              title={t.needs_project ? '需对话/任务绑定项目才生效' : undefined}>
+                              <Switch on={on} onToggle={() => setDraft(a.id, 'capabilities_json', toggleAgentTool(cap, t.name, !on))} />{t.label} {t.name}
+                            </label>
+                          );
+                        });
                       })()}
-                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>需在「工具 & MCP」中先配置搜索 Provider；仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
+                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>工具在任何调用该 Agent LLM 的场景下都可用，由 LLM 自行决定是否调用（agent loop）。标注「需项目」的工具仅在关联了项目时装配；联网搜索需先在「工具 & MCP」配置 Provider。均仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
                     </div>
                   </div>
                   <div className="field full">
@@ -664,10 +714,34 @@ function RoleSlotCard({ slot, llms, onApply }: {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(false);
   const dirty = supplement !== (h?.system_prompt ?? '');
+  const builtinTools = useBuiltinTools();
 
   const apply = async (payload: Parameters<typeof setRoleSlot>[1]) => {
     setBusy(true);
     try { await onApply(slot.kind, payload); } finally { setBusy(false); }
+  };
+
+  // 工具能力开关（所有系统角色通用，含 llm_only 角色）。开关从后端内置工具目录动态渲染。
+  // 运行时由后端按 capabilities 白名单 + 上下文决定是否真正加载；未开启则与原行为一致。
+  const toolCaps = () => {
+    const cap = h?.capabilities_json;
+    return (
+      <div className="field full">
+        <label>工具能力</label>
+        <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
+          {builtinTools.map(t => {
+            const on = agentHasTool(cap, t.name);
+            return (
+              <label key={t.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}
+                title={t.needs_project ? '需对话/任务绑定项目才生效' : undefined}>
+                <Switch on={on} onToggle={() => apply({ capabilities_json: toggleAgentTool(cap, t.name, !on) })} />{t.label} {t.name}
+              </label>
+            );
+          })}
+        </div>
+        <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>工具在任何调用该角色 LLM 的场景下都可用，由 LLM 自行决定是否调用（agent loop）。标注「需项目」的工具仅在关联了项目时装配；联网搜索需先在「工具 &amp; MCP」配置 Provider。均仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
+      </div>
+    );
   };
 
   const llmState = llmBindingState(h?.llm_id, llms);
@@ -714,6 +788,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             <Switch on={Boolean(h?.enabled)} onToggle={() => apply({ enabled: !(h?.enabled) })} />启用
           </label>
         </div>
+        {toolCaps()}
       </div>
       )}
       {open && !slot.llm_only && (
@@ -759,6 +834,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             </label>
           </div>
         </div>
+        {toolCaps()}
       </div>
       )}
     </div>
@@ -1158,6 +1234,7 @@ function AboutSettings() {
   const [authLoading, setAuthLoading] = useState(true);
   const [previews, setPreviews] = useState<PreviewEnvironment[]>([]);
   const [tests, setTests] = useState<TestSession[]>([]);
+  const [failures, setFailures] = useState<JobFailure[]>([]);
 
   const loadHealth = () => {
     setHealthLoading(true);
@@ -1173,12 +1250,14 @@ function AboutSettings() {
       .then(ok => setAuth(ok))
       .catch(() => setAuth(null))
       .finally(() => setAuthLoading(false));
+    listJobFailures(30).then(setFailures).catch(() => setFailures([]));
   };
 
   useEffect(() => {
     loadHealth();
     listPreviewEnvironments().then(setPreviews).catch(() => setPreviews([]));
     listTestSessions().then(setTests).catch(() => setTests([]));
+    listJobFailures(30).then(setFailures).catch(() => setFailures([]));
   }, []);
 
   const dbVal   = healthLoading ? '…' : health?.db_ok ? 'OK' : healthError ? '错误' : '—';
@@ -1224,11 +1303,26 @@ function AboutSettings() {
           {previews.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无预览环境</div>}
         </div>
       </div>
-      <div className="panel">
+      <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-head"><div className="panel-title"><Icon name="flask" size={16} style={{ color: 'var(--green)' }} />测试会话</div><span className="sec-kicker">{tests.length}</span></div>
         <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 8 }}>
           {tests.slice(0, 8).map(t => <div key={t.id} style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>{t.status} · {t.summary || t.id}</div>)}
           {tests.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无测试会话</div>}
+        </div>
+      </div>
+      <div className="panel">
+        <div className="panel-head"><div className="panel-title"><Icon name="alert" size={16} style={{ color: 'var(--red)' }} />错误历史</div><span className="sec-kicker">{failures.length}</span></div>
+        <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 10 }}>
+          {failures.slice(0, 20).map(f => (
+            <div key={f.id} style={{ display: 'grid', gap: 3, paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}>{f.job_type}</span>
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>第 {f.attempt} 次 · {new Date(f.updated_at).toLocaleString('zh')}</span>
+              </div>
+              {f.last_error && <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 'var(--leading-snug)' }}>{f.last_error.slice(0, 400)}</div>}
+            </div>
+          ))}
+          {failures.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无失败任务</div>}
         </div>
       </div>
     </div>

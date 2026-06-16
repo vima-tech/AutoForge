@@ -16,6 +16,15 @@ pub enum AppEvent {
         status: String,
         message: Option<String>,
     },
+    /// Fine-grained progress heartbeat for a long-running CR task. Unlike
+    /// `WorktreeUpdate` (which marks coarse status transitions), this reports the
+    /// current phase within a stage so the UI shows life during the multi-minute
+    /// claude CLI run instead of an opaque "executing".
+    TaskProgress {
+        cr_id: String,
+        phase: String,
+        note: Option<String>,
+    },
     PreviewUpdate {
         cr_id: String,
         preview_id: String,

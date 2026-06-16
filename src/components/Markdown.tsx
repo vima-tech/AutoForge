@@ -1,5 +1,19 @@
 import React from 'react';
 import { AGENTS } from '../data/mock';
+import { tokenize } from './Block';
+import { highlightHtml } from './highlight';
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Highlight code into an HTML string, reusing the same tokenizer/classes as the
+// standalone `code` block so embedded fences look identical.
+function highlightCode(code: string): string {
+  return tokenize(code)
+    .map(tk => (tk.c ? `<span class="${tk.c}">${escapeHtml(tk.t)}</span>` : escapeHtml(tk.t)))
+    .join('');
+}
 
 function renderInline(text: string): string {
   let s = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -17,16 +31,35 @@ function renderInline(text: string): string {
 interface Block {
   tag: string;
   html: string;
+  cls?: string;
 }
 
-export default function Markdown({ md }: { md: string }) {
+export default function Markdown({ md, highlight }: { md: string; highlight?: string }) {
   const lines = md.split('\n');
   const blocks: Block[] = [];
   let i = 0;
 
   while (i < lines.length) {
     const ln = lines[i];
-    if (/^#{1,6}\s/.test(ln)) {
+    const fence = ln.match(/^(\s*)(```+|~~~+)\s*([^\s`~]*)/);
+    if (fence) {
+      // Fenced code block: ``` or ~~~ (optional language), closed by a matching
+      // fence of the same character. An unterminated fence runs to the end.
+      const marker = fence[2][0];          // ` or ~
+      const lang = (fence[3] || '').trim();
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length) {
+        const cl = lines[i].match(/^\s*(```+|~~~+)\s*$/);
+        if (cl && cl[1][0] === marker) { i++; break; }
+        codeLines.push(lines[i]);
+        i++;
+      }
+      const inner =
+        `<div class="codeblock-head"><span class="lang">${escapeHtml(lang || 'code')}</span></div>` +
+        `<pre><code>${highlightCode(codeLines.join('\n'))}</code></pre>`;
+      blocks.push({ tag: 'div', cls: 'codeblock', html: inner });
+    } else if (/^#{1,6}\s/.test(ln)) {
       const lvl = Math.min(ln.match(/^#+/)![0].length, 6);
       blocks.push({ tag: 'h' + lvl, html: renderInline(ln.replace(/^#+\s/, '')) });
       i++;
@@ -85,7 +118,7 @@ export default function Markdown({ md }: { md: string }) {
       i++;
     } else {
       const buf: string[] = [];
-      const stop = (l: string) => l.trim() === '' || /^[#>\-*]|^\d+\.|\|/.test(l);
+      const stop = (l: string) => l.trim() === '' || /^[#>\-*]|^\d+\.|\||^\s*(```|~~~)/.test(l);
       while (i < lines.length && !stop(lines[i])) {
         buf.push(renderInline(lines[i]));
         i++;
@@ -104,7 +137,8 @@ export default function Markdown({ md }: { md: string }) {
           ? React.createElement('hr', { key: k })
           : React.createElement(b.tag, {
               key: k,
-              dangerouslySetInnerHTML: { __html: b.html },
+              ...(b.cls ? { className: b.cls } : {}),
+              dangerouslySetInnerHTML: { __html: highlightHtml(b.html, highlight) },
             })
       )}
     </>

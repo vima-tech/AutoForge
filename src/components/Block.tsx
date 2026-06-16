@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import Icon from './Icon';
 import Markdown from './Markdown';
+import { highlightText } from './highlight';
 import type { BlockType } from '../data/mock';
 import { attachmentDataUrl, openAttachment, submitFromArtifact, writeWorkspaceFile } from '../services';
 
@@ -8,7 +9,7 @@ const KW = new Set(['const','let','var','function','return','import','export','f
 
 interface Token { c: string | null; t: string }
 
-function tokenize(code: string): Token[] {
+export function tokenize(code: string): Token[] {
   const tokens: Token[] = [];
   const re = /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d+\.?\d*\b)|([A-Za-z_$][\w$]*)|(\s+)|([^\sA-Za-z0-9_$"'\/]+|\/)/g;
   let m: RegExpExecArray | null;
@@ -26,7 +27,7 @@ function tokenize(code: string): Token[] {
   return tokens;
 }
 
-function CodeBlock({ lang, code, projectId }: { lang: string; code: string; projectId?: string }) {
+function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: string; projectId?: string; highlight?: string }) {
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
@@ -70,14 +71,14 @@ function CodeBlock({ lang, code, projectId }: { lang: string; code: string; proj
           </button>
         </div>
       </div>
-      <pre><code>{tokens.map((tk, i) => tk.c ? <span key={i} className={tk.c}>{tk.t}</span> : tk.t)}</code></pre>
+      <pre><code>{tokens.map((tk, i) => tk.c ? <span key={i} className={tk.c}>{highlightText(tk.t, highlight)}</span> : <React.Fragment key={i}>{highlightText(tk.t, highlight)}</React.Fragment>)}</code></pre>
     </div>
   );
 }
 
 // ── ArtifactBlock ─────────────────────────────────────────────────────────────
 
-function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string }) {
+function ArtifactBlock({ b, projectId, highlight }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string; highlight?: string }) {
   const [submitted, setSubmitted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitErr, setSubmitErr] = useState('');
@@ -134,7 +135,7 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
         <div className="artifact-ic"><Icon name={isDraft ? 'inbox' : 'zap'} size={17} /></div>
         <div style={{ minWidth: 0 }}>
           <div className="artifact-kind">{isDraft ? '需求草稿' : b.kind}</div>
-          <div className="artifact-title">{b.title}</div>
+          <div className="artifact-title">{highlightText(b.title, highlight)}</div>
         </div>
       </div>
       <div style={{ padding: '4px 14px' }}>
@@ -145,7 +146,7 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
           </div>
         ))}
       </div>
-      <div className="artifact-body">{b.body}</div>
+      <div className="artifact-body">{highlightText(b.body, highlight)}</div>
       <div className="artifact-foot">
         {isDraft ? (
           submitted ? (
@@ -180,7 +181,14 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
 
 // ── FileWrittenBlock ──────────────────────────────────────────────────────────
 
-function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> }) {
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function FileWrittenBlock({ b, highlight }: { b: Extract<BlockType, { t: 'file_written' }>; highlight?: string }) {
   const [expanded, setExpanded] = useState(false);
   return (
     <div style={{
@@ -196,13 +204,13 @@ function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> 
           .autoforge/{b.path}
         </span>
         <span style={{ fontSize: 'var(--text-caption)', color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }}>
-          {b.error ? '写入失败' : `${(b.size_bytes / 1024).toFixed(1)} KB 已写入`}
+          {b.error ? '写入失败' : `${formatBytes(b.size_bytes)} 已写入`}
         </span>
         <Icon name={expanded ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
       {expanded && b.preview && (
         <pre style={{ margin: 0, padding: '0 12px 10px', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: '1px solid var(--border)' }}>
-          {b.preview}{b.size_bytes > 200 ? ' …' : ''}
+          {highlightText(b.preview, highlight)}{b.size_bytes > 200 ? ' …' : ''}
         </pre>
       )}
     </div>
@@ -211,7 +219,7 @@ function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> 
 
 // ── Main Block ────────────────────────────────────────────────────────────────
 
-export default function Block({ b, projectId }: { b: BlockType; projectId?: string }) {
+export default function Block({ b, projectId, highlight }: { b: BlockType; projectId?: string; highlight?: string }) {
   const [previewUrl, setPreviewUrl] = useState('');
   const [attachmentError, setAttachmentError] = useState('');
 
@@ -233,15 +241,15 @@ export default function Block({ b, projectId }: { b: BlockType; projectId?: stri
     openAttachment(id).catch(e => setAttachmentError(String(e)));
   };
 
-  if (b.t === 'md') return <Markdown md={b.md} />;
-  if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} projectId={projectId} />;
+  if (b.t === 'md') return <Markdown md={b.md} highlight={highlight} />;
+  if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} projectId={projectId} highlight={highlight} />;
   if (b.t === 'typing') return <div className="typing"><i /><i /><i /></div>;
   if (b.t === 'file') return (
     <div className="att">
       <div className="att-ic" style={{ background: b.color }}><Icon name="file" size={19} /></div>
       <div style={{ minWidth: 0 }}>
-        <div className="att-name">{b.name}</div>
-        <div className="att-meta">{b.meta}</div>
+        <div className="att-name">{highlightText(b.name, highlight)}</div>
+        <div className="att-meta">{highlightText(b.meta, highlight)}</div>
         {attachmentError && <div className="att-error">{attachmentError}</div>}
       </div>
       <button className="icon-btn" style={{ marginLeft: 'auto' }} disabled={!b.id} title="打开附件" onClick={() => openStoredAttachment(b.id)}>
@@ -254,7 +262,7 @@ export default function Block({ b, projectId }: { b: BlockType; projectId?: stri
       {previewUrl
         ? <img src={previewUrl} alt={b.label} />
         : <div className="ph" style={{ background: `linear-gradient(135deg, ${b.color}, ${b.color}99)` }}><Icon name="image" size={30} /></div>}
-      <div className="cap">{b.label}　{b.meta}</div>
+      <div className="cap">{highlightText(b.label, highlight)}　{highlightText(b.meta, highlight)}</div>
       {attachmentError && <button className="att-img-error" title={attachmentError}><Icon name="alert" size={14} /></button>}
       {b.id && (
         <button className="att-img-open icon-btn" title="打开附件" onClick={() => openStoredAttachment(b.id)}>
@@ -263,7 +271,7 @@ export default function Block({ b, projectId }: { b: BlockType; projectId?: stri
       )}
     </div>
   );
-  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} />;
-  if (b.t === 'file_written') return <FileWrittenBlock b={b} />;
+  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} highlight={highlight} />;
+  if (b.t === 'file_written') return <FileWrittenBlock b={b} highlight={highlight} />;
   return null;
 }

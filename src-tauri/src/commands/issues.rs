@@ -1,5 +1,6 @@
 use crate::intake::{gateway, IntakePayload};
 use crate::models::issue::{CreateIssue, Issue, IssueAnalysis};
+use crate::models::job::JobPayload;
 use crate::state::AppState;
 use tauri::{AppHandle, State};
 
@@ -61,4 +62,40 @@ pub async fn submit_issue(
         source_ref: payload.source_ref,
     };
     gateway::receive(&state.db, &state.job_tx, &app, intake).await
+}
+
+/// Re-run requirement analysis for an issue whose analysis failed (or is stuck at
+/// review 1). Resets the issue to `pending_analysis` and re-enqueues the analysis
+/// job. Re-enqueuing reuses the existing idempotency row (incrementing its attempt
+/// counter) and still re-dispatches the work, so a transient LLM failure recovers
+/// in one click instead of leaving the issue on a dead-end.
+#[tauri::command]
+pub async fn retry_analysis(
+    issue_id: String,
+    _app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let updated = sqlx::query(
+        "UPDATE issues SET status='pending_analysis', updated_at=datetime('now')
+         WHERE id=? AND status IN ('analysis_failed', 'pending_review_1')",
+    )
+    .bind(&issue_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err("仅「分析失败」或「待审核 1」状态的需求可重新分析".to_string());
+    }
+    crate::tasks::runner::enqueue(
+        &state.db,
+        &state.job_tx,
+        "analysis",
+        &format!("analysis:{}", issue_id),
+        JobPayload::Analysis {
+            issue_id: issue_id.clone(),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
