@@ -1,6 +1,7 @@
 use crate::models::agent::{Agent, CreateAgent, UpdateAgent};
 use crate::models::llm_config::{CreateLlmConfig, LlmConfig, UpdateLlmConfig};
 use crate::state::AppState;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tauri::State;
 use uuid::Uuid;
@@ -14,6 +15,15 @@ use uuid::Uuid;
 fn mask_key(mut cfg: LlmConfig) -> LlmConfig {
     cfg.api_key = String::new();
     cfg
+}
+
+/// 归一化接口规范，目前仅支持 openai、anthropic 两种 HTTP wire 格式，其余一律回退 openai。
+/// api_spec 是接口规范的唯一真源（provider 字段已移除）。
+fn normalize_api_spec(explicit: Option<&str>) -> &'static str {
+    match explicit.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("anthropic") => "anthropic",
+        _ => "openai",
+    }
 }
 
 #[tauri::command]
@@ -33,19 +43,20 @@ pub async fn create_llm_config(
     let id = Uuid::new_v4().to_string();
     let ctx_window = payload.ctx_window.unwrap_or_else(|| "200K".to_string());
     let temperature = payload.temperature.unwrap_or(0.3);
+    let api_spec = normalize_api_spec(payload.api_spec.as_deref());
 
     sqlx::query(
-        "INSERT INTO llm_configs (id, name, provider, model, endpoint, api_key, ctx_window, temperature)
+        "INSERT INTO llm_configs (id, name, model, endpoint, api_key, ctx_window, temperature, api_spec)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(&payload.name)
-    .bind(&payload.provider)
     .bind(&payload.model)
     .bind(&payload.endpoint)
     .bind(&payload.api_key)
     .bind(&ctx_window)
     .bind(temperature)
+    .bind(api_spec)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -71,10 +82,6 @@ pub async fn update_llm_config(
         sets.push("name=?");
         values.push(v.clone());
     }
-    if let Some(ref v) = payload.provider {
-        sets.push("provider=?");
-        values.push(v.clone());
-    }
     if let Some(ref v) = payload.model {
         sets.push("model=?");
         values.push(v.clone());
@@ -98,6 +105,10 @@ pub async fn update_llm_config(
     if let Some(v) = payload.enabled {
         sets.push("enabled=?");
         values.push(if v { "1" } else { "0" }.to_string());
+    }
+    if let Some(ref v) = payload.api_spec {
+        sets.push("api_spec=?");
+        values.push(normalize_api_spec(Some(v)).to_string());
     }
 
     if sets.is_empty() {
@@ -163,9 +174,6 @@ pub async fn test_llm_connection(
         if let Some(v) = d.name {
             cfg.name = v;
         }
-        if let Some(v) = d.provider {
-            cfg.provider = v;
-        }
         if let Some(v) = d.model {
             cfg.model = v;
         }
@@ -184,6 +192,9 @@ pub async fn test_llm_connection(
         if let Some(v) = d.enabled {
             cfg.enabled = v;
         }
+        if let Some(v) = d.api_spec {
+            cfg.api_spec = v;
+        }
     }
 
     let client = reqwest::Client::builder()
@@ -192,16 +203,10 @@ pub async fn test_llm_connection(
         .map_err(|e| e.to_string())?;
 
     let started = Instant::now();
-    let provider = cfg.provider.to_ascii_lowercase();
+    let api_spec = cfg.api_spec.to_ascii_lowercase();
     let endpoint = cfg.endpoint.trim_end_matches('/');
 
-    let response = if provider.contains("ollama") {
-        client
-            .get(join_endpoint(endpoint, "/api/tags"))
-            .send()
-            .await
-            .map_err(|e| format!("连接失败: {}", e))?
-    } else if provider.contains("anthropic") {
+    let response = if api_spec == "anthropic" {
         // Anthropic native API — distinct /v1/messages format
         client
             .post(join_endpoint(endpoint, "/v1/messages"))
@@ -790,4 +795,87 @@ pub async fn set_agent_forge_role(
         .fetch_all(&state.db)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ---- 工具：Web 搜索配置（存 app_settings，供 agents/tools/web_search 读取）----
+
+/// 回传给前端的 Web 搜索配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchSettings {
+    pub provider: String,
+    pub endpoint: String,
+    pub max_results: u32,
+    pub api_key_set: bool,
+}
+
+async fn read_setting(state: &AppState, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key=?")
+        .bind(key)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn write_setting(state: &AppState, key: &str, value: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_web_search_settings(
+    state: State<'_, AppState>,
+) -> Result<WebSearchSettings, String> {
+    let provider = read_setting(&state, "web_search.provider")
+        .await
+        .unwrap_or_default();
+    let endpoint = read_setting(&state, "web_search.endpoint")
+        .await
+        .unwrap_or_default();
+    let max_results = read_setting(&state, "web_search.max_results")
+        .await
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(5);
+    let api_key_set = read_setting(&state, "web_search.api_key")
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    Ok(WebSearchSettings {
+        provider,
+        endpoint,
+        max_results,
+        api_key_set,
+    })
+}
+
+/// 保存 Web 搜索配置。`api_key` 为 None 时不改动已存的 key（与 LLM 配置一致的语义）。
+#[tauri::command]
+pub async fn set_web_search_settings(
+    provider: String,
+    endpoint: String,
+    max_results: u32,
+    api_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<WebSearchSettings, String> {
+    write_setting(&state, "web_search.provider", provider.trim()).await?;
+    write_setting(&state, "web_search.endpoint", endpoint.trim()).await?;
+    write_setting(
+        &state,
+        "web_search.max_results",
+        &max_results.clamp(1, 10).to_string(),
+    )
+    .await?;
+    if let Some(key) = api_key {
+        write_setting(&state, "web_search.api_key", key.trim()).await?;
+    }
+    get_web_search_settings(state).await
 }

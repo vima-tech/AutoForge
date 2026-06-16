@@ -102,7 +102,7 @@ pub async fn run_and_gate(
     .execute(db)
     .await?;
 
-    let checks = configured_checks(project.config_yaml.as_deref());
+    let checks = configured_checks(crate::commands::run_config::effective_config(&project).as_deref());
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
         results.push(run_check(&test_path, name, command, timeout).await);

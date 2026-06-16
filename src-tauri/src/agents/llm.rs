@@ -1,10 +1,14 @@
+use crate::agents::tools::ToolRegistry;
 use crate::models::agent::Agent;
 use crate::models::llm_config::LlmConfig;
 use anyhow::{anyhow, Result};
 use reqwest::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// 工具循环最大轮数，防止模型无限调用工具。每轮 = 一次模型调用 + 一批工具执行。
+const MAX_TOOL_ITERS: usize = 6;
 
 pub async fn run_agent_text(
     db: &crate::db::Db,
@@ -32,29 +36,67 @@ pub async fn run_agent_text(
         return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
     }
 
-    let provider = cfg.provider.to_ascii_lowercase();
-    if provider.contains("claude-cli") {
-        return crate::agents::local_claude::run_text_with_model_and_images(
-            prompt,
-            system_prompt,
-            image_paths,
-            Some(&cfg.model),
-        )
-        .await;
-    }
-
     if !image_paths.is_empty() {
         return Err(anyhow!(
             "当前 LLM 适配器暂不支持图片输入，请改用 Claude CLI 或移除图片附件"
         ));
     }
 
-    if provider.contains("ollama") {
-        run_ollama(&cfg, prompt, system_prompt).await
-    } else if provider.contains("anthropic") {
-        run_anthropic(&cfg, prompt, system_prompt).await
+    // 接口规范唯一真源：仅 openai、anthropic 两种 wire 格式，其余按 openai 处理。
+    match cfg.api_spec.to_ascii_lowercase().as_str() {
+        "anthropic" => run_anthropic(&cfg, prompt, system_prompt).await,
+        _ => run_openai_compatible(&cfg, prompt, system_prompt).await,
+    }
+}
+
+/// 带工具调用循环的文本生成。`registry` 应已按 Agent 白名单收窄（见
+/// `tools::ToolRegistry::filtered`）。当满足以下任一条件时退化为无工具单轮
+/// （直接委托 [`run_agent_text`]）：Agent 未绑定 LLM / 绑定 Claude CLI / 带图片输入 /
+/// 工具集为空 / api_spec 不支持工具（仅 openai、anthropic 支持）。
+///
+/// 退化策略：工具循环中途任何错误（含端点不支持 tools 字段）都会回退到无工具单轮，
+/// 保证「带工具反而答不出」不会比原来更糟。
+pub async fn run_agent_text_with_tools(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+    registry: &ToolRegistry,
+) -> Result<String> {
+    // 无工具 / 带图片 / 无自定义 LLM → 老路径，保持既有行为。
+    if registry.is_empty() || !image_paths.is_empty() || agent.llm_id.is_none() {
+        return run_agent_text(db, agent, prompt, system_prompt, image_paths).await;
+    }
+
+    let llm_id = agent.llm_id.as_ref().unwrap();
+    let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    if !cfg.enabled {
+        return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
+    }
+
+    let spec = cfg.api_spec.to_ascii_lowercase();
+    // 仅 openai、anthropic 两种 wire 格式；未知按 openai 处理，与 run_agent_text 一致。
+    let loop_result = if spec == "anthropic" {
+        run_anthropic_tool_loop(&cfg, prompt, system_prompt, registry).await
     } else {
-        run_openai_compatible(&cfg, prompt, system_prompt).await
+        run_openai_tool_loop(&cfg, prompt, system_prompt, registry).await
+    };
+
+    match loop_result {
+        Ok(text) => Ok(text),
+        Err(e) => {
+            // 端点可能不支持 tools 字段等 → 优雅降级为无工具单轮。
+            eprintln!(
+                "[tools] 工具循环失败，回退无工具单轮（agent={}, spec={}): {}",
+                agent.name, spec, e
+            );
+            run_agent_text(db, agent, prompt, system_prompt, image_paths).await
+        }
     }
 }
 
@@ -85,17 +127,12 @@ pub async fn run_system_role_text(
         ));
     };
 
-    let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+    // 校验绑定的 LLM 配置存在即可（api_spec 仅 openai/anthropic，无需额外规范校验）。
+    sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
         .bind(llm_id)
         .fetch_optional(db)
         .await?
         .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
-    if cfg.provider.to_ascii_lowercase().contains("claude-cli") {
-        return Err(anyhow!(
-            "系统角色 Agent「{}」当前绑定 Claude CLI，请改用非 Claude CLI 的 LLM 配置",
-            agent.name
-        ));
-    }
 
     // 缺省召回键回退到 prompt；交给共享组装器处理 prompt_mode 组合 + 记忆召回。
     let key = recall_query.filter(|q| !q.trim().is_empty()).or(Some(prompt));
@@ -218,30 +255,193 @@ async fn run_anthropic(
         .ok_or_else(|| anyhow!("Anthropic 响应缺少 content[].text"))
 }
 
-async fn run_ollama(cfg: &LlmConfig, prompt: &str, system_prompt: Option<&str>) -> Result<String> {
+/// OpenAI 兼容工具调用循环：声明 tools → 解析 message.tool_calls → 执行 → 以
+/// role=tool 消息回灌 → 续轮，直到模型不再调用工具或达到轮数上限。
+async fn run_openai_tool_loop(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    registry: &ToolRegistry,
+) -> Result<String> {
     let client = http_client()?;
-    let mut messages = Vec::new();
+    let tools = openai_tools(registry);
+    let mut messages: Vec<Value> = Vec::new();
     if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
-        messages.push(serde_json::json!({ "role": "system", "content": system }));
+        messages.push(json!({ "role": "system", "content": system }));
     }
-    messages.push(serde_json::json!({ "role": "user", "content": prompt }));
+    messages.push(json!({ "role": "user", "content": prompt }));
 
-    let value = send_json(client.post(join_endpoint(&cfg.endpoint, "/api/chat")).json(
-        &serde_json::json!({
+    for _ in 0..MAX_TOOL_ITERS {
+        let mut req = client
+            .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+            .json(&json!({
+                "model": cfg.model,
+                "messages": messages,
+                "temperature": cfg.temperature,
+                "tools": tools,
+                "tool_choice": "auto"
+            }));
+        if !cfg.api_key.trim().is_empty() {
+            req = req.bearer_auth(&cfg.api_key);
+        }
+
+        let body = send_json(req).await?;
+        let msg = body
+            .pointer("/choices/0/message")
+            .cloned()
+            .ok_or_else(|| anyhow!("OpenAI-compatible 响应缺少 choices[0].message"))?;
+
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if tool_calls.is_empty() {
+            return msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("OpenAI-compatible 响应缺少最终 content"));
+        }
+
+        // 助手回合（含 tool_calls）必须原样回灌，否则下一轮无法对应工具结果。
+        messages.push(msg.clone());
+        for call in &tool_calls {
+            let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let fname = call
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args_str = call
+                .pointer("/function/arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let args = serde_json::from_str::<Value>(args_str).unwrap_or_else(|_| json!({}));
+            let outcome = registry.invoke(fname, args).await;
+            if !outcome.ok {
+                eprintln!("[tools] 工具 `{}` 返回失败/被拦截：{}", fname, outcome.content);
+            }
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": outcome.content
+            }));
+        }
+    }
+    Err(anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+}
+
+/// Anthropic 工具调用循环：声明 tools → 解析 content[].type=tool_use → 执行 →
+/// 以 user/tool_result 块回灌 → 续轮，直到 stop_reason≠tool_use 或达到轮数上限。
+async fn run_anthropic_tool_loop(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    registry: &ToolRegistry,
+) -> Result<String> {
+    let client = http_client()?;
+    let tools = anthropic_tools(registry);
+    let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": prompt })];
+
+    for _ in 0..MAX_TOOL_ITERS {
+        let mut body = json!({
             "model": cfg.model,
             "messages": messages,
-            "stream": false,
-            "options": { "temperature": cfg.temperature }
-        }),
-    ))
-    .await?;
+            "max_tokens": 4096,
+            "temperature": cfg.temperature,
+            "tools": tools
+        });
+        if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+            body["system"] = Value::String(system.to_string());
+        }
 
-    value
-        .pointer("/message/content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("Ollama 响应缺少 message.content"))
+        let value = send_json(
+            client
+                .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )
+        .await?;
+
+        let content = value
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let stop = value.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("");
+        let has_tool_use = content
+            .iter()
+            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"));
+
+        if stop != "tool_use" || !has_tool_use {
+            let text = content
+                .iter()
+                .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(text)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow!("Anthropic 响应缺少最终 text"));
+        }
+
+        // 助手回合（含 tool_use 块）原样回灌。
+        messages.push(json!({ "role": "assistant", "content": content.clone() }));
+        let mut results = Vec::new();
+        for block in content
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+        {
+            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            let outcome = registry.invoke(name, input).await;
+            if !outcome.ok {
+                eprintln!("[tools] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+            }
+            results.push(json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": outcome.content
+            }));
+        }
+        messages.push(json!({ "role": "user", "content": results }));
+    }
+    Err(anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+}
+
+fn openai_tools(registry: &ToolRegistry) -> Vec<Value> {
+    registry
+        .specs()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": s.name,
+                    "description": s.description,
+                    "parameters": s.parameters
+                }
+            })
+        })
+        .collect()
+}
+
+fn anthropic_tools(registry: &ToolRegistry) -> Vec<Value> {
+    registry
+        .specs()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "input_schema": s.parameters
+            })
+        })
+        .collect()
 }
 
 async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {

@@ -11,7 +11,7 @@ import ProjectsPage from './pages/Projects';
 import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
-import { THEME_STORAGE_KEY, oppositeMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
+import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
 type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'settings';
 
@@ -19,18 +19,7 @@ const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 const win = () => getCurrentWindow();
 
 // ---- Traffic light buttons ----
-function TrafficLights() {
-  const [maximized, setMaximized] = useState(false);
-
-  useEffect(() => {
-    if (!isTauri) return;
-    win().isMaximized().then(setMaximized);
-    let unlisten: (() => void) | undefined;
-    win().onResized(() => win().isMaximized().then(setMaximized))
-         .then(fn => { unlisten = fn; });
-    return () => unlisten?.();
-  }, []);
-
+function TrafficLights({ maximized, setMaximized }: { maximized: boolean; setMaximized: (v: boolean) => void }) {
   // stopPropagation on mousedown prevents startDragging from firing
   const stopDrag = (e: React.MouseEvent) => e.stopPropagation();
 
@@ -117,6 +106,8 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
+  // Window maximize state drives the .os-window shadow gutter (collapse it when maximized).
+  const [maximized, setMaximized] = useState(false);
   // Cross-page jump target: Dashboard → Audit (a requirement to open in 功能审计).
   const [auditTarget, setAuditTarget] = useState<{ projectId: string; issueId: string } | null>(null);
   const goToAudit = useCallback((target: { projectId: string; issueId: string }) => {
@@ -158,6 +149,11 @@ export default function App() {
     localStorage.setItem(THEME_STORAGE_KEY, themeIdOf(theme));
   }, [theme]);
 
+  // Apply persisted nav-rail expand behavior on startup (Settings updates it live).
+  useEffect(() => {
+    applyRailMode(parseRailMode(localStorage.getItem(RAIL_STORAGE_KEY)));
+  }, []);
+
   // Auth check intentionally removed: spawning the claude Electron subprocess
   // at any point while WebKitGTK is active delivers SIGTRAP to our process,
   // triggering a NeedDebuggerBreak trap that permanently freezes IPC.
@@ -169,6 +165,16 @@ export default function App() {
     window.addEventListener('AutoForge:badges-refresh', onCustom);
     return () => window.removeEventListener('AutoForge:badges-refresh', onCustom);
   }, [refreshBadges]);
+
+  // Track maximize state so the window shadow gutter collapses when maximized.
+  useEffect(() => {
+    if (!isTauri) return;
+    win().isMaximized().then(setMaximized);
+    let unlisten: (() => void) | undefined;
+    win().onResized(() => win().isMaximized().then(setMaximized))
+         .then(fn => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
 
   // Single consolidated listener for all AutoForge://event traffic.
   // Three separate listen() calls were previously registered here — each event
@@ -255,10 +261,10 @@ export default function App() {
   const navBadge = (id: Page) => id === 'chat' ? badges.chat : id === 'audit' ? badges.audit : 0;
 
   return (
-    <div className="os-window">
+    <div className={'os-window' + (maximized ? ' maximized' : '')}>
       {/* Custom titlebar — onMouseDown triggers window drag */}
       <div className="os-titlebar" onMouseDown={handleTitlebarMouseDown}>
-        <TrafficLights />
+        <TrafficLights maximized={maximized} setMaximized={setMaximized} />
         <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
         <div className="tb-right">
           <span className={'chip ' + (health?.stage === 'paused' ? 'red' : health?.stage === 'throttled' ? 'amber' : 'green')} style={{ padding: '3px 9px' }}>
@@ -271,8 +277,10 @@ export default function App() {
 
       <div className="os-body">
         <div className="rail">
+          <div className="rail-inner">
           <div className="rail-logo" title="AutoForge">
-            <ForgeLogo size={38} />
+            <span className="rail-ic"><ForgeLogo size={32} /></span>
+            <span className="rail-label rail-wordmark">AUTO<b>FORGE</b></span>
           </div>
           {NAV.map(n => {
             const badge = navBadge(n.id);
@@ -283,8 +291,11 @@ export default function App() {
               onClick={() => { setPage(n.id); sessionStorage.setItem('AutoForge:page', n.id); }}
               title={n.name}
             >
-              <Icon name={n.ic} size={23} />
-              {badge > 0 && page !== n.id && <span className="rail-badge">{badge}</span>}
+              <span className="rail-ic">
+                <Icon name={n.ic} size={23} />
+                {badge > 0 && page !== n.id && <span className="rail-badge">{badge}</span>}
+              </span>
+              <span className="rail-label">{n.name}</span>
             </button>
             );
           })}
@@ -294,17 +305,21 @@ export default function App() {
             title={theme.mode === 'dark' ? '切换浅色' : '切换深色'}
             onClick={() => setTheme(t => ({ ...t, mode: oppositeMode(t.mode) }))}
           >
-            <Icon name={theme.mode === 'dark' ? 'sun' : 'moon'} size={22} />
+            <span className="rail-ic"><Icon name={theme.mode === 'dark' ? 'sun' : 'moon'} size={23} /></span>
+            <span className="rail-label">{theme.mode === 'dark' ? '浅色模式' : '深色模式'}</span>
           </button>
           <button
             className={'rail-item' + (page === 'settings' ? ' active' : '')}
             onClick={() => { setPage('settings'); sessionStorage.setItem('AutoForge:page', 'settings'); }}
             title="设置"
           >
-            <Icon name="settings" size={23} />
+            <span className="rail-ic"><Icon name="settings" size={23} /></span>
+            <span className="rail-label">设置</span>
           </button>
-          <div style={{ marginTop: 6 }}>
-            <MeAvatar size={38} />
+          <div className="rail-item rail-me">
+            <span className="rail-ic"><MeAvatar size={34} /></span>
+            <span className="rail-label">我的账户</span>
+          </div>
           </div>
         </div>
 

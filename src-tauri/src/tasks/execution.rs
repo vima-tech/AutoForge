@@ -242,7 +242,7 @@ pub async fn run(
             .or(cr.admin_suggestions_1.as_deref()),
         iteration as u32,
         &project.repo_path,
-        project.config_yaml.as_deref(),
+        crate::commands::run_config::effective_config(&project).as_deref(),
     );
 
     sqlx::query(

@@ -1,17 +1,17 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
-import { parseProjectConfig } from '../components/ProjectDialogs';
+import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
 import {
   listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, getCrGrade,
   retryChangeRequest, deleteChangeRequest,
-  openUrl, listIssues, getIssueAnalysis, review1,
-  getDevServerStatus, startDevServer, stopDevServer, getDevServerLog, parseAnalysisSpec,
+  openUrl, listIssues, getIssueAnalysis, review1, parseAnalysisSpec,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
+  listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
-  type CrPreviewStatus, type DevServerStatus, type Issue, type IssueAnalysis,
-  type IssueAnalysisSpec,
+  type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
+  type BranchInfo, type BranchPreviewStatus,
 } from '../services';
 
 type Sel = { kind: 'issue' | 'cr'; id: string };
@@ -127,163 +127,169 @@ function ResizeHandle({ onDrag }: { onDrag: (dx: number) => void }) {
   return <div className={`resize-handle${active ? ' active' : ''}`} onMouseDown={onMouseDown} />;
 }
 
-// ── PreviewSection ────────────────────────────────────────────────────────────
+// ── LiveLogModal ───────────────────────────────────────────────────────────────
 
-interface PreviewControl {
-  status: CrPreviewStatus['status'];
-  kind: CrPreviewStatus['kind'];
-  canLaunchApp: boolean;
-  /** tauri：iframe 仅前端，IPC 不可用 —— 提示用户改用桌面窗口预览 */
-  frontendOnly: boolean;
-  autoDetected: boolean;
-  onStart: () => void;
-  onStop: () => void;
-  onLaunch: () => void;
-  onShowLog: () => void;
+// 去除 ANSI/OSC 转义序列（cargo/tauri 输出含大量颜色码），并折叠进度条的 \r 覆盖。
+function stripAnsi(s: string): string {
+  return s
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+}
+function logLineTone(line: string): string {
+  const t = line.trimStart();
+  // 日志头部：命令、cwd/PATH 注释、分隔线 —— 作次要信息淡化
+  if (t.startsWith('$ ') || t.startsWith('# ') || /^[-=]{6,}\s*$/.test(t)) return 'cmd';
+  const l = line.toLowerCase();
+  if (/(error|panic|fatal|failed|✗|\bcannot\b|exception|traceback|\berr\b)/.test(l)) return 'err';
+  if (/(warn|warning|deprecated)/.test(l)) return 'warn';
+  if (/(compiling|building|finished|running|ready|✓|local:|listening|started|success|\bdone\b)/.test(l)) return 'ok';
+  return '';
+}
+function parseLogLines(raw: string): { text: string; tone: string }[] {
+  const arr = stripAnsi(raw).split('\n').map(seg => {
+    const text = seg.includes('\r') ? seg.slice(seg.lastIndexOf('\r') + 1) : seg;
+    return { text, tone: logLineTone(text) };
+  });
+  // 去掉末尾多余空行，避免一长串空白尾巴
+  while (arr.length > 1 && arr[arr.length - 1].text === '') arr.pop();
+  return arr;
 }
 
-function LogModal({ title, text, onClose }: { title: string; text: string; onClose: () => void }) {
+// 实时日志窗口：定时拉取、按行高亮、跟随底部自动滚动（用户上滚则暂停跟随）。
+function LiveLogModal({ title, load, onClose }: {
+  title: string; load: () => Promise<string>; onClose: () => void;
+}) {
+  const [raw, setRaw] = useState('');
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const followRef = useRef(true);
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  // 仅挂载时启动轮询（组件按 sig key 重挂载切换目标），避免父组件 re-render 重置定时器
+  useEffect(() => {
+    let alive = true;
+    const tick = () => { loadRef.current().then(t => { if (alive) setRaw(t); }).catch(() => {}); };
+    tick();
+    const id = window.setInterval(tick, 1200);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeRef.current(); };
+    window.addEventListener('keydown', onKey);
+    return () => { alive = false; window.clearInterval(id); window.removeEventListener('keydown', onKey); };
+  }, []);
+
+  const lines = useMemo(() => parseLogLines(raw), [raw]);
+
+  // 跟随底部：内容更新后若仍处于跟随态则滚到底
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (el && followRef.current) el.scrollTop = el.scrollHeight;
+  }, [lines]);
+
+  const onScroll = () => {
+    const el = bodyRef.current;
+    if (el) followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  };
+
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
-      <div style={{ width: 760, maxWidth: 'calc(100vw - 32px)', maxHeight: 'min(80vh, 640px)', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 16, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
-        <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
+      <div style={{ width: 820, maxWidth: 'calc(100vw - 32px)', height: 'min(78vh, 640px)', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 16, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className="dot green" style={{ flexShrink: 0 }} />
           <span className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">{title}</span></span>
+          <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)' }}>
+            {raw ? `${lines.length} 行 · ` : ''}实时跟随
+          </span>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
-        <pre style={{ flex: 1, margin: 0, overflow: 'auto', padding: '14px 18px', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-normal)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-          {text || '（暂无日志输出 —— 进程可能尚未启动，或启动命令本身未产生输出）'}
-        </pre>
-      </div>
-    </div>
-  );
-}
-
-// 以固定 16:9 逻辑视口（默认 1280×720 桌面分辨率）渲染页面，再整体等比缩放
-// 填满可用空间。这样窄预览栏里也能看到真实桌面布局，而非被压扁的响应式版本。
-function ScaledViewport({ url, title, baseW = 1280, baseH = 720 }: {
-  url: string; title: string; baseW?: number; baseH?: number;
-}) {
-  const stageRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(1);
-  useEffect(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    const fit = () => {
-      const r = el.getBoundingClientRect();
-      setScale(Math.min(r.width / baseW, r.height / baseH) || 1);
-    };
-    fit();
-    const ro = new ResizeObserver(fit);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [baseW, baseH]);
-  return (
-    <div className="prev-stage" ref={stageRef}>
-      <div className="prev-viewport" style={{ width: baseW, height: baseH, transform: `scale(${scale})` }}>
-        <iframe src={url} title={title} className="prev-iframe" />
-      </div>
-    </div>
-  );
-}
-
-function PreviewSection({ label, tag, tagClass, url, control }: {
-  label: string; tag: string; tagClass: string; url: string | null;
-  control?: PreviewControl;
-}) {
-  const [reloadKey, setReloadKey] = useState(0);
-  const starting = control?.status === 'starting';
-
-  return (
-    <div className="prev-section">
-      <div className="prev-bar">
-        <span className={`prev-tag ${tagClass}`}>{tag}</span>
-        <span className="url">{url ?? (starting ? '启动中…' : control ? '未运行' : '未配置')}</span>
-        {/* tauri：随时可打开原生桌面窗口（iframe 只能显示 web 前端，逃生口 D） */}
-        {control?.canLaunchApp && (
-          <button className="icon-btn" style={{ width: 24, height: 24 }}
-            title="打开桌面应用窗口" onClick={control.onLaunch}>
-            <Icon name="box" size={12} />
-          </button>
-        )}
-        {url && (
-          <>
-            <button className="icon-btn" style={{ width: 24, height: 24 }}
-              title="在浏览器打开" onClick={() => openUrl(url).catch(() => {})}>
-              <Icon name="external" size={12} />
-            </button>
-            <button className="icon-btn" style={{ width: 24, height: 24 }}
-              title="刷新" onClick={() => setReloadKey(k => k + 1)}>
-              <Icon name="refresh" size={12} />
-            </button>
-          </>
-        )}
-        {control && url && (
-          <button className="icon-btn" style={{ width: 24, height: 24 }}
-            title="停止预览" onClick={control.onStop}>
-            <Icon name="x" size={12} />
-          </button>
-        )}
-      </div>
-      {url ? (
-        <div className="prev-body">
-          {control?.frontendOnly && (
-            <div className="prev-warn">
-              <Icon name="alert" size={13} />
-              <span>Tauri 应用：此处仅渲染前端，<b>IPC 接口不可用</b>（数据为空）。请打开桌面窗口查看真实效果。</span>
-              {control.canLaunchApp && (
-                <button className="btn btn-sm" style={{ marginLeft: 'auto', flex: 'none' }} onClick={control.onLaunch}>
-                  <Icon name="box" size={12} />桌面窗口
-                </button>
-              )}
-            </div>
-          )}
-          <ScaledViewport key={reloadKey} url={url} title={label} />
+        <div ref={bodyRef} onScroll={onScroll} className="log-body scroll">
+          {lines.length <= 1 && !raw
+            ? <div className="log-empty">（暂无日志输出 —— 进程可能尚未启动，或启动命令本身未产生输出）</div>
+            : lines.map((l, i) => (
+                <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
+                  <span className="log-gut">{i + 1}</span>
+                  <span className="log-code">{l.text || ' '}</span>
+                </div>
+              ))}
         </div>
-      ) : control ? (
-        <PreviewPlaceholder control={control} />
-      ) : (
-        <div className="prev-empty">未配置预览环境</div>
-      )}
+      </div>
     </div>
   );
 }
 
-function PreviewPlaceholder({ control }: { control: PreviewControl }) {
-  if (control.status === 'starting') {
-    return (
-      <div className="prev-empty" style={{ flexDirection: 'column', gap: 12 }}>
-        <span className="dot amber" />
-        <span>正在 worktree 中启动预览服务…</span>
-      </div>
-    );
-  }
-  if (control.status === 'no_session') {
-    return <div className="prev-empty">实现尚未开始，暂无可预览的 worktree</div>;
-  }
-  // idle | stopped
-  const tauri = control.kind === 'tauri';
+// ── BranchLauncher（页头：启动项目 + 运行中分支）────────────────────────────────
+
+function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog }: {
+  branches: BranchInfo[]; branchPreviews: BranchPreviewStatus[];
+  onStart: (b: string) => void; onStop: (b: string) => void; onShowLog: (b: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: PointerEvent) => {
+      if (e.target instanceof Node && ref.current?.contains(e.target)) return;
+      setOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [open]);
+
   return (
-    <div className="prev-empty" style={{ flexDirection: 'column', gap: 12 }}>
-      {control.status === 'stopped' && (
-        <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>预览进程已退出，请查看日志排查</span>
+    <div className="audit-launch" ref={ref}>
+      {branchPreviews.length > 0 && (
+        <div className="audit-launch-runs">
+          {branchPreviews.map(p => (
+            <div key={p.branch} className="run-pill">
+              <span className={'dot ' + (p.status === 'running' ? 'green' : 'amber')} style={{ flexShrink: 0 }} />
+              <span className="run-pill-name" title={p.branch}>{p.branch}</span>
+              {p.kind === 'tauri'
+                ? <span className="chip ember" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }}>APP</span>
+                : p.url && (
+                  <button className="icon-btn run-pill-btn" title="在浏览器打开" onClick={() => openUrl(p.url!).catch(() => {})}>
+                    <Icon name="external" size={13} />
+                  </button>
+                )}
+              <button className="icon-btn run-pill-btn" title="查看启动日志" onClick={() => onShowLog(p.branch)}>
+                <Icon name="log" size={13} />
+              </button>
+              <button className="icon-btn run-pill-btn" title="停止" onClick={() => onStop(p.branch)}>
+                <Icon name="x" size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
       )}
-      <span>
-        {tauri
-          ? '检测到 Tauri 应用：桌面窗口可访问完整 IPC 接口（数据正常）；iframe 仅供前端布局预览，接口为空。'
-          : '在 worktree 中启动 dev server'}
-      </span>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
-        {tauri && control.canLaunchApp && (
-          <button className="btn" onClick={control.onLaunch}>
-            <Icon name="box" size={14} />打开桌面窗口
-          </button>
+      <div style={{ position: 'relative', flexShrink: 0 }}>
+        <button className="btn btn-sm" onClick={() => setOpen(o => !o)} title="选择分支启动（main 即线上版本）">
+          <Icon name="play" size={14} />启动项目
+          <Icon name="chevDown" size={13} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: open ? 'rotate(180deg)' : 'none' }} />
+        </button>
+        {open && (
+          <div className="mention-pop" style={{ right: 0, left: 'auto', top: 'calc(100% + 6px)', bottom: 'auto', minWidth: 220, marginBottom: 0 }}>
+            {branches.length === 0 && (
+              <div className="empty-compact" style={{ padding: '8px 10px' }}>无本地分支或未配置启动命令</div>
+            )}
+            {branches.map(b => {
+              const running = branchPreviews.some(p => p.branch === b.name);
+              return (
+                <div key={b.name} className="mention-row" onClick={() => { onStart(b.name); setOpen(false); }}>
+                  <Icon name="merge" size={14} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div className="nm" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.name}</span>
+                      {b.is_main && <span className="chip ember" style={{ padding: '0 5px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>线上</span>}
+                      {b.is_dev && <span className="chip blue" style={{ padding: '0 5px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>dev</span>}
+                    </div>
+                  </div>
+                  {running && <span className="dot green" style={{ flexShrink: 0 }} />}
+                </div>
+              );
+            })}
+          </div>
         )}
-        <button className="btn btn-ghost" onClick={control.onStart}>
-          <Icon name="play" size={14} />{tauri ? 'iframe 前端预览' : '启动预览'}
-        </button>
-        <button className="btn btn-ghost" onClick={control.onShowLog}>
-          <Icon name="file" size={14} />查看日志
-        </button>
       </div>
     </div>
   );
@@ -292,14 +298,12 @@ function PreviewPlaceholder({ control }: { control: PreviewControl }) {
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
-  onSelectCr, onSelectIssue, devStatus, onStartServer, onStopServer, onShowDevLog, onOpenIntake,
+  onSelectCr, onSelectIssue, onOpenIntake,
   width }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
   issueTitles: Record<string, string>; sel: Sel | null;
   onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void;
-  devStatus: DevServerStatus | null; onStartServer: () => void; onStopServer: () => void;
-  onShowDevLog: () => void;
   onOpenIntake: () => void;
   width: number;
 }) {
@@ -359,44 +363,6 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           </div>
           )}
         </div>
-
-        {devStatus?.status === 'running' ? (
-          <button className="btn" style={{ justifyContent: 'flex-start', width: '100%', gap: 6 }}
-            onClick={() => openUrl(devStatus.url!).catch(() => {})}>
-            <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--green)', flexShrink: 0, display: 'inline-block' }} />
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
-              {devStatus.url}
-            </span>
-            <button className="icon-btn" style={{ width: 22, height: 22, flexShrink: 0 }} title="停止服务"
-              onClick={e => { e.stopPropagation(); onStopServer(); }}>
-              <Icon name="x" size={11} />
-            </button>
-            <Icon name="external" size={13} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
-          </button>
-        ) : devStatus?.status === 'starting' ? (
-          <button className="btn" disabled style={{ justifyContent: 'center', width: '100%', gap: 6 }}>
-            <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--amber)', flexShrink: 0, display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' }} />
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
-              {devStatus.url ?? '启动中…'}
-            </span>
-          </button>
-        ) : devStatus?.status === 'idle' || devStatus?.status === 'stopped' ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-            <button className="btn" style={{ justifyContent: 'center', width: '100%' }} onClick={onStartServer}>
-              <Icon name="play" size={15} />启动项目
-            </button>
-            {devStatus?.status === 'stopped' && (
-              <button className="btn btn-ghost btn-sm" style={{ justifyContent: 'center', width: '100%', color: 'var(--red)' }} onClick={onShowDevLog}>
-                <Icon name="alert" size={13} />进程已退出 · 查看日志
-              </button>
-            )}
-          </div>
-        ) : activeProject ? (
-          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', textAlign: 'center', padding: '6px 8px', cursor: 'default' }}>
-            未配置启动命令
-          </div>
-        ) : null}
-
       </div>
 
       <div className="list-group-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -419,11 +385,9 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             <div className="req-item-top">
               <span className="req-id">{issue.id.slice(0, 8)}</span>
               <span className="chip amber" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>审核 1</span>
+              <span className="req-time">{new Date(issue.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
             </div>
-            <div className="req-title" style={{ fontSize: 'var(--text-control)' }}>{issue.title}</div>
-            <div className="req-foot">
-              <span style={{ marginLeft: 'auto' }}>{new Date(issue.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
-            </div>
+            <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
           </div>
         ))}
 
@@ -445,11 +409,9 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                   <div className="req-item-top">
                     <span className="req-id">{r.id.slice(0, 8)}</span>
                     <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
+                    <span className="req-time">{new Date(r.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
                   </div>
-                  <div className="req-title" style={{ fontSize: 'var(--text-control)' }}>{issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}</div>
-                  <div className="req-foot">
-                    <span style={{ marginLeft: 'auto' }}>{new Date(r.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
-                  </div>
+                  <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}>{issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}</div>
                 </div>
               </React.Fragment>
             );
@@ -766,7 +728,8 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [session, setSession] = useState<WorktreeSession | null>(null);
   const [crPreview, setCrPreview] = useState<CrPreviewStatus | null>(null);
-  const [devStatus, setDevStatus] = useState<DevServerStatus | null>(null);
+  const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [branchPreviews, setBranchPreviews] = useState<BranchPreviewStatus[]>([]);
   const [diff, setDiff] = useState('');
   const [grade, setGrade] = useState<CrGrade | null>(null);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
@@ -777,23 +740,20 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const [crLoading, setCrLoading] = useState(false);
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
   const [intakeOpen, setIntakeOpen] = useState(false);
-  const [logModal, setLogModal] = useState<{ title: string; text: string } | null>(null);
-  const [previewMax, setPreviewMax] = useState(false);
-  useEffect(() => {
-    if (!previewMax) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPreviewMax(false); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [previewMax]);
+  const [logModal, setLogModal] = useState<{ title: string; sig: string; load: () => Promise<string> } | null>(null);
+  const [toast, setToast] = useState<ToastData | null>(null);
+  // 统一系统内提示框：替代浏览器原生 alert()
+  const showError = useCallback((msg: string) => setToast({ msg, tone: 'error' }), []);
 
-  // Column widths
+  // Column widths（左侧列表；右侧 audit-right 已移除）
   const [listWidth, setListWidth] = useState(300);
-  const [rightWidth, setRightWidth] = useState(420);
 
   // Advice textarea ref for auto-focus
   const adviceRef = useRef<HTMLTextAreaElement>(null);
   // Monotonic token to discard stale CR-detail responses (handles same-id refetches after a revision)
   const loadReqRef = useRef(0);
+  // web 预览：startCrPreview 后服务还在 starting，置位以便就绪时自动打开浏览器
+  const autoOpenRef = useRef(false);
 
   const activeCr = sel?.kind === 'cr' ? sel.id : '';
   const activeIssueId = sel?.kind === 'issue' ? sel.id : '';
@@ -816,20 +776,27 @@ export default function AuditPage({ target, onTargetConsumed }: {
 
   useEffect(() => { loadProjects(); loadProjectReviewCounts(); }, [loadProjects, loadProjectReviewCounts]);
 
-  // Load dev server status when active project changes
+  // 切项目：加载本地分支 + 当前运行中的分支预览
   useEffect(() => {
-    if (!activeProject) { setDevStatus(null); return; }
-    getDevServerStatus(activeProject.id).then(setDevStatus).catch(() => setDevStatus(null));
+    if (!activeProject) { setBranches([]); setBranchPreviews([]); return; }
+    const pid = activeProject.id;
+    listLocalBranches(pid).then(b => { if (activeProject?.id === pid) setBranches(b); }).catch(() => setBranches([]));
+    listBranchPreviews(pid).then(b => { if (activeProject?.id === pid) setBranchPreviews(b); }).catch(() => setBranchPreviews([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject]);
 
-  // Poll while server is starting
+  // 只要有分支预览在跑就持续轮询：既等 starting→running，也及时发现进程退出
+  //（用户手动关掉 Tauri 预览窗口 → tauri dev 进程结束 → 后端 try_wait 判定已停止 → 这里同步移除）。
+  // 依赖布尔量而非数组，避免每次拉取都重建定时器；列表清空后自动停轮询。
+  const hasBranchPreviews = branchPreviews.length > 0;
   useEffect(() => {
-    if (!activeProject || devStatus?.status !== 'starting') return;
+    if (!activeProject || !hasBranchPreviews) return;
+    const pid = activeProject.id;
     const id = setInterval(() => {
-      getDevServerStatus(activeProject.id).then(setDevStatus).catch(() => {});
-    }, 2000);
+      listBranchPreviews(pid).then(b => { if (activeProject?.id === pid) setBranchPreviews(b); }).catch(() => {});
+    }, 2500);
     return () => clearInterval(id);
-  }, [devStatus?.status, activeProject]);
+  }, [hasBranchPreviews, activeProject]);
 
   const loadList = useCallback(async (projectId: string) => {
     const [allCrs, allIssues] = await Promise.all([
@@ -895,6 +862,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
     setAdvice('');
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
+    autoOpenRef.current = false;  // 切换 CR 时取消上一条未完成的自动打开
     setTimeout(() => adviceRef.current?.focus(), 120);
 
     (async () => {
@@ -920,7 +888,15 @@ export default function AuditPage({ target, onTargetConsumed }: {
     const crId = activeCr;
     if (!crId) return;
     const id = setInterval(() => {
-      getCrPreview(crId).then(p => { if (loadReqRef.current && activeCr === crId) setCrPreview(p); }).catch(() => {});
+      getCrPreview(crId).then(p => {
+        if (!loadReqRef.current || activeCr !== crId) return;
+        setCrPreview(p);
+        // web 预览就绪：若用户点的是「启动并打开浏览器」，此刻自动打开
+        if (p.status === 'running' && p.url && autoOpenRef.current) {
+          autoOpenRef.current = false;
+          openUrl(p.url).catch(() => {});
+        }
+      }).catch(() => {});
     }, 2000);
     return () => clearInterval(id);
   }, [crPreview?.status, activeCr]);
@@ -976,7 +952,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
       await loadProjectReviewCounts();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
-      alert('重新执行失败：' + String(e));
+      showError('重新执行失败：' + String(e));
     } finally { setSubmitting(false); }
   };
 
@@ -992,7 +968,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
       await loadProjectReviewCounts();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
-      alert('删除失败：' + String(e));
+      showError('删除失败：' + String(e));
     } finally { setSubmitting(false); }
   };
 
@@ -1023,26 +999,51 @@ export default function AuditPage({ target, onTargetConsumed }: {
     }
   };
 
-  const doStartServer = useCallback(async () => {
+  // 启动选定分支（worktree 隔离，多分支可并行）；web 就绪后自动开浏览器
+  const doStartBranch = useCallback(async (branch: string) => {
+    if (!activeProject) return;
+    const pid = activeProject.id;
+    try {
+      const st = await startBranchPreview(pid, branch);
+      setBranchPreviews(prev => [...prev.filter(p => p.branch !== branch), st].sort((a, b) => a.branch.localeCompare(b.branch)));
+      // 启动即打开实时日志窗口，便于观察编译/启动进度
+      setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch) });
+      if (st.kind === 'web' && st.url) {
+        // 轮询直到可达再开浏览器，避免打开尚未就绪的空白页
+        const open = async (tries: number) => {
+          const list = await listBranchPreviews(pid).catch(() => []);
+          const cur = list.find(p => p.branch === branch);
+          if (cur?.status === 'running' && cur.url) { openUrl(cur.url).catch(() => {}); return; }
+          if (tries > 0) setTimeout(() => open(tries - 1), 1500);
+        };
+        open(20);
+      }
+    } catch (e) { showError('启动失败：' + String(e)); }
+  }, [activeProject, showError]);
+
+  const doStopBranch = useCallback(async (branch: string) => {
     if (!activeProject) return;
     try {
-      const status = await startDevServer(activeProject.id);
-      setDevStatus(status);
-    } catch (e) { alert('启动失败：' + String(e)); }
-  }, [activeProject]);
+      await stopBranchPreview(activeProject.id, branch);
+      setBranchPreviews(prev => prev.filter(p => p.branch !== branch));
+    } catch (e) { showError('停止失败：' + String(e)); }
+  }, [activeProject, showError]);
 
-  const doStopServer = useCallback(async () => {
+  const showBranchLog = useCallback((branch: string) => {
     if (!activeProject) return;
-    try {
-      await stopDevServer(activeProject.id);
-      setDevStatus(s => s ? { ...s, status: 'stopped' } : null);
-    } catch (e) { alert('停止失败：' + String(e)); }
+    const pid = activeProject.id;
+    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch) });
   }, [activeProject]);
 
+  // web 项目：在 worktree 启动 dev server，就绪后自动打开浏览器（starting 时交给轮询补打开）
   const doStartCrPreview = useCallback(async () => {
     if (!activeCr) return;
-    try { setCrPreview(await startCrPreview(activeCr)); }
-    catch (e) { alert('启动预览失败：' + String(e)); }
+    try {
+      const st = await startCrPreview(activeCr);
+      setCrPreview(st);
+      if (st.status === 'running' && st.url) openUrl(st.url).catch(() => {});
+      else if (st.status === 'starting') autoOpenRef.current = true;
+    } catch (e) { showError('启动预览失败：' + String(e)); }
   }, [activeCr]);
 
   const doStopCrPreview = useCallback(async () => {
@@ -1050,66 +1051,94 @@ export default function AuditPage({ target, onTargetConsumed }: {
     try {
       await stopCrPreview(activeCr);
       setCrPreview(p => p ? { ...p, status: 'stopped', url: null } : null);
-    } catch (e) { alert('停止失败：' + String(e)); }
+    } catch (e) { showError('停止失败：' + String(e)); }
   }, [activeCr]);
 
   const doLaunchCrApp = useCallback(async () => {
     if (!activeCr) return;
     try { await launchCrApp(activeCr); }
-    catch (e) { alert('启动桌面应用失败：' + String(e)); }
-  }, [activeCr]);
+    catch (e) { showError('启动桌面应用失败：' + String(e)); }
+  }, [activeCr, showError]);
 
-  const showDevLog = useCallback(async () => {
-    if (!activeProject) return;
-    const text = await getDevServerLog(activeProject.id).catch(e => '读取日志失败：' + String(e));
-    setLogModal({ title: `启动日志 · ${activeProject.name}`, text });
-  }, [activeProject]);
-
-  const showCrPreviewLog = useCallback(async () => {
+  const showCrPreviewLog = useCallback(() => {
     if (!activeCr) return;
-    const text = await getCrPreviewLog(activeCr).catch(e => '读取日志失败：' + String(e));
-    setLogModal({ title: '预览日志 · 本次改动', text });
+    const id = activeCr;
+    setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}`, load: () => getCrPreviewLog(id) });
   }, [activeCr]);
 
   const cr = crs.find(c => c.id === activeCr);
-  const prodUrl = parseProjectConfig(activeProject?.config_yaml ?? null).prodUrl || null;
-  // 是否支持可视化预览：项目配了 dev 命令（kind 非 none）才显示预览区，否则让出空间给管理员建议
-  const canPreview = !!crPreview && crPreview.kind !== 'none';
+  // 「本次改动」预览：worktree 存在才可启动（合并后 no_session → 隐藏预览按钮）
+  const showCrPreview = !!crPreview && crPreview.kind !== 'none' && crPreview.status !== 'no_session';
   const selectedIssue = activeIssueId ? pendingIssues.find(i => i.id === activeIssueId) : undefined;
   const report = session?.report_content ? parseReport(session.report_content) : null;
   const hunks = diff ? parseDiff(diff) : [];
   const canRevise = cr?.status === 'pending_review_2' && !decided;
 
-  // 预览双栏（生产 main vs 本次改动）。inline 纵向堆叠；最大化时横向并排。
-  const renderPreviewFrames = (horizontal: boolean) => (
-    <div className={`prev-frames${horizontal ? ' horizontal' : ''}`}>
-      <PreviewSection label="生产 main" tag="生产 main" tagClass="prod" url={prodUrl} />
-      <PreviewSection
-        label={`本次改动 ${cr?.id.slice(0, 8) ?? ''}`}
-        tag={`本次改动 ${cr?.id.slice(0, 8) ?? ''}`}
-        tagClass="cr"
-        url={crPreview?.status === 'running' ? crPreview.url : null}
-        control={{
-          status: crPreview!.status,
-          kind: crPreview!.kind,
-          canLaunchApp: crPreview!.can_launch_app,
-          frontendOnly: crPreview!.frontend_only,
-          autoDetected: crPreview!.auto_detected,
-          onStart: doStartCrPreview,
-          onStop: doStopCrPreview,
-          onLaunch: doLaunchCrApp,
-          onShowLog: showCrPreviewLog,
-        }}
-      />
-    </div>
-  );
+  // 「本次改动」预览的启动动作：web → 起 dev server 并自动开浏览器；tauri → 直接启动桌面程序
+  const renderCrLaunch = () => {
+    if (!crPreview || crPreview.kind === 'none') return null;
+    const { kind, status, url, can_launch_app } = crPreview;
+    if (status === 'no_session') return null;
+    if (status === 'starting') {
+      return (
+        <button className="btn btn-sm" disabled>
+          <span className="dot amber" style={{ marginRight: 4 }} />启动中…
+        </button>
+      );
+    }
+    if (kind === 'tauri') {
+      // tauri：直接启动桌面程序（可访问完整 IPC），无需 iframe
+      return (
+        <>
+          <button className="btn btn-sm" disabled={!can_launch_app} onClick={doLaunchCrApp}>
+            <Icon name="box" size={14} />启动 Tauri 程序
+          </button>
+          <button className="btn btn-sm btn-ghost" onClick={showCrPreviewLog} title="查看启动日志">
+            <Icon name="log" size={14} />
+          </button>
+        </>
+      );
+    }
+    // web：运行中显示「打开浏览器 / 停止」，否则「启动并打开浏览器」
+    if (status === 'running' && url) {
+      return (
+        <>
+          <button className="btn btn-sm" onClick={() => openUrl(url).catch(() => {})}>
+            <Icon name="external" size={14} />打开浏览器
+          </button>
+          <button className="btn btn-sm btn-ghost" onClick={doStopCrPreview} title="停止预览服务">
+            <Icon name="x" size={14} />
+          </button>
+          <button className="btn btn-sm btn-ghost" onClick={showCrPreviewLog} title="查看启动日志">
+            <Icon name="log" size={14} />
+          </button>
+        </>
+      );
+    }
+    return (
+      <>
+        <button className="btn btn-sm" onClick={doStartCrPreview}>
+          <Icon name="play" size={14} />启动并打开浏览器
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={showCrPreviewLog} title="查看启动日志">
+          <Icon name="log" size={14} />
+        </button>
+      </>
+    );
+  };
 
   return (
     <div className="audit-page">
-      <div className="audit-top" style={{ height: 56 }}>
+      <div className="audit-top audit-head-main" style={{ height: 56 }}>
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">AUDIT</span><span className="cn">· 功能审计</span>
         </div>
+        {activeProject && (
+          <BranchLauncher
+            branches={branches} branchPreviews={branchPreviews}
+            onStart={doStartBranch} onStop={doStopBranch} onShowLog={showBranchLog}
+          />
+        )}
       </div>
 
       <div className="audit-workspace">
@@ -1120,7 +1149,6 @@ export default function AuditPage({ target, onTargetConsumed }: {
           projectReviewCounts={projectReviewCounts} crs={crs} pendingIssues={pendingIssues} issueTitles={issueTitles} sel={sel}
           onSelectCr={id => { setSel({ kind: 'cr', id }); setDecided(null); }}
           onSelectIssue={id => { setSel({ kind: 'issue', id }); setDecided(null); }}
-          devStatus={devStatus} onStartServer={doStartServer} onStopServer={doStopServer} onShowDevLog={showDevLog}
           onOpenIntake={() => setIntakeOpen(true)}
           width={listWidth}
         />
@@ -1182,6 +1210,11 @@ export default function AuditPage({ target, onTargetConsumed }: {
                       <button className={tab === 'report' ? 'on' : ''} onClick={() => setTab('report')}>实现报告</button>
                       <button className={tab === 'diff' ? 'on' : ''} onClick={() => setTab('diff')}>代码 Diff</button>
                     </div>
+                    {tab === 'report' && issuesById[cr.issue_id] && (
+                      <button className="btn btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setOrigReqOpen(o => !o)}>
+                        <Icon name={origReqOpen ? 'eye-off' : 'eye'} size={13} />{origReqOpen ? '收起' : '查看'}需求原文
+                      </button>
+                    )}
                     {tab === 'diff' && (
                       <div className="seg" style={{ marginLeft: 'auto' }}>
                         <button className={diffMode === 'unified' ? 'on' : ''} onClick={() => setDiffMode('unified')}>
@@ -1196,25 +1229,18 @@ export default function AuditPage({ target, onTargetConsumed }: {
                   <div className="diff-viewport scroll">
                     {tab === 'report' ? (
                       <div className="report">
-                        {(() => {
+                        {origReqOpen && (() => {
                           const oi = issuesById[cr.issue_id];
                           if (!oi) return null;
                           return (
-                            <div style={{ marginBottom: 14 }}>
-                              <button className="btn btn-sm" onClick={() => setOrigReqOpen(o => !o)}>
-                                <Icon name={origReqOpen ? 'eye-off' : 'eye'} size={13} />{origReqOpen ? '收起' : '查看'}需求原文
-                              </button>
-                              {origReqOpen && (
-                                <div className="panel" style={{ marginTop: 8, padding: '12px 14px' }}>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-                                    <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>{oi.title}</span>
-                                    <span className={'chip ' + (SEV_COLOR[oi.category] || 'blue')} style={{ fontSize: 'var(--text-micro)' }}>{oi.category}</span>
-                                    <span className={'chip ' + (SEV_COLOR[oi.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{oi.severity}</span>
-                                    <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{oi.source_type} · {new Date(oi.created_at).toLocaleString('zh')}</span>
-                                  </div>
-                                  <p style={{ margin: 0, whiteSpace: 'pre-line', fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' }}>{oi.description || '（无描述）'}</p>
-                                </div>
-                              )}
+                            <div className="panel" style={{ marginBottom: 12, padding: '12px 14px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+                                <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>{oi.title}</span>
+                                <span className={'chip ' + (SEV_COLOR[oi.category] || 'blue')} style={{ fontSize: 'var(--text-micro)' }}>{oi.category}</span>
+                                <span className={'chip ' + (SEV_COLOR[oi.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{oi.severity}</span>
+                                <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{oi.source_type} · {new Date(oi.created_at).toLocaleString('zh')}</span>
+                              </div>
+                              <p style={{ margin: 0, whiteSpace: 'pre-line', fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' }}>{oi.description || '（无描述）'}</p>
                             </div>
                           );
                         })()}
@@ -1292,60 +1318,34 @@ export default function AuditPage({ target, onTargetConsumed }: {
                       </div>
                     )}
                   </div>
-                </div>
 
-              {/* 1. 第二个拖拽分割线 */}
-              <ResizeHandle onDrag={dx => setRightWidth(w => Math.max(200, Math.min(700, w - dx)))} />
-
-              {/* 右栏：预览 + 建议 */}
-              <div className="audit-right" style={{ width: rightWidth }}>
-                {canPreview && (
-                  <>
-                    <div className="prev-head">
-                      <Icon name="eye" size={16} style={{ color: 'var(--ember)' }} />
-                      <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>实时预览对比</span>
-                      <span className={`prev-tag ${crPreview!.kind === 'tauri' ? 'cr' : 'prod'}`} style={{ marginLeft: 'auto' }}>
-                        {crPreview!.kind === 'tauri' ? 'TAURI' : 'WEB'}
-                      </span>
-                      {crPreview!.auto_detected && (
-                        <span className="prev-auto" title="预览类型由项目文件自动识别（config_yaml 未声明 dev.kind）">自动识别</span>
-                      )}
-                      <button className="icon-btn" style={{ width: 26, height: 26 }}
-                        title="最大化预览（整窗查看）" onClick={() => setPreviewMax(true)}>
-                        <Icon name="maximize" size={14} />
-                      </button>
-                    </div>
-                    {renderPreviewFrames(false)}
-                  </>
-                )}
-
-                {/* 2. 管理员建议 + 修改按钮，Enter 发送；无预览时占满右栏 */}
-                <div className={`advice-wrap${canPreview ? '' : ' advice-expanded'}`}>
-                  <div className="advice-label">管理员建议 → Claude Code</div>
-                  {!canPreview && (
-                    <div className="advice-hint">
-                      <Icon name="code" size={13} />
-                      <span>该变更无可视化预览（后端 / 逻辑类改动），请基于代码 Diff 与测试结果审核。</span>
-                    </div>
-                  )}
-                  <div className="advice-input">
-                    <textarea
-                      ref={adviceRef}
-                      value={advice}
-                      onChange={e => setAdvice(e.target.value)}
-                      onKeyDown={onAdviceKeyDown}
-                      placeholder={canRevise ? '输入修改意见，Enter 发送，Shift+Enter 换行…' : '输入备注（只读状态不会提交）…'}
-                    />
-                    {canRevise && (
-                      <div className="advice-input-foot">
-                        <button className="btn" style={{ padding: '5px 12px', fontSize: 'var(--text-label)' }} onClick={() => doReview('revision')} disabled={submitting}>
+                  {/* 底部悬浮 dock：左 = 本次改动预览启动；右 = 管理员建议 + 修改 */}
+                  <div className="audit-dock">
+                    {showCrPreview && (
+                      <div className="dock-preview">
+                        <span className="dock-label">本次改动预览</span>
+                        <div className="dock-preview-actions">{renderCrLaunch()}</div>
+                      </div>
+                    )}
+                    <div className="dock-advice">
+                      <span className="dock-label">管理员建议 → Claude Code</span>
+                      <div className="dock-advice-row">
+                        <textarea
+                          ref={adviceRef}
+                          value={advice}
+                          onChange={e => setAdvice(e.target.value)}
+                          onKeyDown={onAdviceKeyDown}
+                          placeholder={canRevise ? '输入修改意见，Enter 发送，Shift+Enter 换行…' : '输入备注（只读状态不会提交）…'}
+                        />
+                        <button className="btn btn-sm" onClick={() => doReview('revision')}
+                          disabled={!canRevise || submitting}
+                          title={canRevise ? '提交修改意见，退回重新执行' : '仅「待代码审核」状态可提交修改'}>
                           <Icon name="refresh" size={14} />修改
                         </button>
                       </div>
-                    )}
+                    </div>
                   </div>
                 </div>
-              </div>
               </div>
             </>
           ) : (
@@ -1355,7 +1355,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
       </div>
 
       {intakeOpen && activeProject && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
           <div style={{ width: 720, maxHeight: 'min(800px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
             <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}>
@@ -1372,30 +1372,10 @@ export default function AuditPage({ target, onTargetConsumed }: {
       )}
 
       {logModal && (
-        <LogModal title={logModal.title} text={logModal.text} onClose={() => setLogModal(null)} />
+        <LiveLogModal key={logModal.sig} title={logModal.title} load={logModal.load} onClose={() => setLogModal(null)} />
       )}
 
-      {previewMax && canPreview && (
-        <div className="prev-max" onClick={() => setPreviewMax(false)}>
-          <div className="prev-max-card" onClick={e => e.stopPropagation()}>
-            <div className="prev-head">
-              <Icon name="eye" size={16} style={{ color: 'var(--ember)' }} />
-              <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>实时预览对比 · 整窗查看</span>
-              <span className={`prev-tag ${crPreview!.kind === 'tauri' ? 'cr' : 'prod'}`} style={{ marginLeft: 'auto' }}>
-                {crPreview!.kind === 'tauri' ? 'TAURI' : 'WEB'}
-              </span>
-              {crPreview!.auto_detected && (
-                <span className="prev-auto" title="预览类型由项目文件自动识别（config_yaml 未声明 dev.kind）">自动识别</span>
-              )}
-              <button className="icon-btn" style={{ width: 26, height: 26 }}
-                title="退出最大化" onClick={() => setPreviewMax(false)}>
-                <Icon name="minimize" size={14} />
-              </button>
-            </div>
-            {renderPreviewFrames(true)}
-          </div>
-        </div>
-      )}
+      <Toast data={toast} onClose={() => setToast(null)} />
     </div>
   );
 }

@@ -25,6 +25,17 @@ pub async fn run_proactive(
             .await?
             .ok_or_else(|| anyhow!("project {} not found", project_id))?;
 
+    // No configured check commands → there is nothing meaningful to inspect.
+    // Bail out *before* creating a session so we don't litter the history with
+    // empty "巡检跳过" records; callers surface this as a prompt instead.
+    let checks = configured_checks(crate::commands::run_config::effective_config(&project).as_deref());
+    if checks.is_empty() {
+        return Err(anyhow!(
+            "项目「{}」未配置任何检查命令，无需巡检。请先在「项目管理 → 配置」中填写 test/quality 检查命令。",
+            project.name
+        ));
+    }
+
     let session_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO test_sessions
@@ -37,7 +48,6 @@ pub async fn run_proactive(
     .execute(db)
     .await?;
 
-    let checks = configured_checks(project.config_yaml.as_deref());
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
         results.push(run_check(&project.repo_path, name, command, timeout).await);
@@ -45,9 +55,7 @@ pub async fn run_proactive(
 
     let failed: Vec<_> = results.iter().filter(|r| !r.ok).collect();
     let status = if failed.is_empty() { "passed" } else { "failed" };
-    let summary = if results.is_empty() {
-        "未配置检查命令，巡检跳过".to_string()
-    } else if failed.is_empty() {
+    let summary = if failed.is_empty() {
         format!("巡检通过：{} 项检查全部正常", results.len())
     } else {
         format!("巡检发现 {} / {} 项检查失败", failed.len(), results.len())

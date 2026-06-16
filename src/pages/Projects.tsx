@@ -11,10 +11,15 @@ import {
   openMaterialFile, aiOrganizeMaterials, backupMaterialFiles,
   getMaterialBackupConfig, updateMaterialBackupConfig,
   listProjectSpecs, upsertProjectSpec, deleteProjectSpec, aiGenerateSpecs,
+  aiGenerateRunConfig,
   type MaterialFolder, type MaterialFile, type MaterialBackupConfig,
   type MaterialSearchResult,
-  type ProjectSpec, type SpecCategory,
+  type ProjectSpec, type SpecCategory, type RunConfigDraft,
 } from '../services';
+import {
+  parseProjectConfigForm, buildProjectConfig,
+  type ProjectConfigForm, type SensitiveFieldRow, type MaskRule,
+} from '../utils/projectConfig';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -120,7 +125,7 @@ function BackupConfigModal({ config, onSave, onClose }: {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 480, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '22px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-body)' }}><span className="en">BACKUP</span><span className="cn"> · 云存储备份</span></div>
@@ -314,7 +319,7 @@ function MoveFileModal({ file, folders, onMove, onClose }: {
   onMove: (folderId: string | null) => void; onClose: () => void;
 }) {
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 360, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '20px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ fontWeight: 600, marginBottom: 14 }}>移动到文件夹</div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 300, overflowY: 'auto' }}>
@@ -775,7 +780,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
       {/* rename folder modal */}
       {renamingFolder && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
           <div style={{ width: 340, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '20px 24px' }} onClick={e => e.stopPropagation()}>
             <div style={{ fontWeight: 600, marginBottom: 12 }}>重命名文件夹</div>
             <div className="field" style={{ marginBottom: 12 }}>
@@ -793,7 +798,7 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
 
       {/* create subfolder modal */}
       {creatingFolder !== null && creatingFolder.parentId !== null && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
           <div style={{ width: 340, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '20px 24px' }} onClick={e => e.stopPropagation()}>
             <div style={{ fontWeight: 600, marginBottom: 12 }}>新建子文件夹</div>
             <div className="field" style={{ marginBottom: 12 }}>
@@ -909,7 +914,7 @@ function SpecEditModal({ spec, category, projectId, onSave, onClose }: {
   const catMeta = SPEC_CATEGORIES.find(c => c.id === category)!;
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
       <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '22px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-control)' }}>
@@ -1090,6 +1095,178 @@ function SpecPanel({ projectId }: { projectId: string }) {
 }
 
 
+// ── ConfigPanel（运行配置）────────────────────────────────────────────────────
+
+const MASK_RULE_OPTS: { value: MaskRule; label: string }[] = [
+  { value: 'mask', label: '掩码 (首字符 + ****)' },
+  { value: 'hash', label: '哈希 (不可逆随机)' },
+  { value: 'drop', label: '清空 (置 NULL)' },
+];
+
+function CfgField({ label, hint, value, onChange, placeholder, mono = true, full = false }: {
+  label: string; hint?: string; value: string;
+  onChange: (v: string) => void; placeholder?: string; mono?: boolean; full?: boolean;
+}) {
+  return (
+    <div className={`field${full ? ' full' : ''}`}>
+      <label>{label}</label>
+      <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+        style={mono ? { fontFamily: 'var(--font-mono)' } : undefined} />
+      {hint && <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 4, lineHeight: 'var(--leading-normal)' }}>{hint}</div>}
+    </div>
+  );
+}
+
+function CfgSection({ title, desc, children }: { title: string; desc?: string; children: React.ReactNode }) {
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <div style={{ fontSize: 'var(--text-caption)', letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600, marginBottom: 3, fontFamily: 'var(--font-mono)' }}>{title}</div>
+      {desc && <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 10, lineHeight: 'var(--leading-normal)' }}>{desc}</div>}
+      {children}
+    </div>
+  );
+}
+
+function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => void | Promise<void> }) {
+  const [form, setForm] = useState<ProjectConfigForm>(() => parseProjectConfigForm(project.config_yaml));
+  const [saving, setSaving] = useState(false);
+  const [aiWorking, setAiWorking] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  const set = (patch: Partial<ProjectConfigForm>) => setForm(f => ({ ...f, ...patch }));
+  const flash = (m: string) => { setMessage(m); setTimeout(() => setMessage(''), 5000); };
+
+  // AI 推断填表：仅覆盖 AI 给出非空值的字段，保留人工已填内容（脱敏字段不由 AI 生成）。
+  const applyDraft = (d: RunConfigDraft) => {
+    const pick = (v: string | null | undefined, cur: string) => (v == null || v === '' ? cur : v);
+    const num = (v: number | null | undefined, cur: string) => (v == null ? cur : String(v));
+    setForm(f => ({
+      ...f,
+      devKind: d.dev_kind === 'tauri' ? 'tauri' : d.dev_kind === 'web' ? 'web' : f.devKind,
+      devCommand: pick(d.dev_command, f.devCommand),
+      appCommand: pick(d.app_command, f.appCommand),
+      testUnit: pick(d.test_unit, f.testUnit),
+      testUnitTimeout: num(d.test_unit_timeout, f.testUnitTimeout),
+      testIntegration: pick(d.test_integration, f.testIntegration),
+      testIntegrationTimeout: num(d.test_integration_timeout, f.testIntegrationTimeout),
+      qualityLint: pick(d.quality_lint, f.qualityLint),
+      qualityTyping: pick(d.quality_typing, f.qualityTyping),
+      qualitySecurity: pick(d.quality_security, f.qualitySecurity),
+      projectLanguage: pick(d.project_language, f.projectLanguage),
+      projectFramework: pick(d.project_framework, f.projectFramework),
+      previewBuild: pick(d.preview_build, f.previewBuild),
+      previewStart: pick(d.preview_start, f.previewStart),
+      deployCommand: pick(d.deploy_command, f.deployCommand),
+    }));
+  };
+
+  const aiGenerate = async () => {
+    setAiWorking(true); setError('');
+    try {
+      applyDraft(await aiGenerateRunConfig(project.id));
+      flash('已根据仓库推断填入，请检查后点「保存配置」');
+    } catch (e) { setError(String(e)); }
+    finally { setAiWorking(false); }
+  };
+  const setRow = (i: number, patch: Partial<SensitiveFieldRow>) =>
+    setForm(f => ({ ...f, sensitiveFields: f.sensitiveFields.map((r, idx) => idx === i ? { ...r, ...patch } : r) }));
+  const addRow = () => setForm(f => ({ ...f, sensitiveFields: [...f.sensitiveFields, { table: '', fields: '', rule: 'mask' }] }));
+  const delRow = (i: number) => setForm(f => ({ ...f, sensitiveFields: f.sensitiveFields.filter((_, idx) => idx !== i) }));
+
+  const save = async () => {
+    setSaving(true); setError('');
+    try {
+      const json = buildProjectConfig(form, project.config_yaml);
+      await updateProject(project.id, { config_yaml: json ?? '' });
+      flash('运行配置已保存');
+      await onSaved();
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
+      {/* action bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 20px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
+        <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>预览 / 测试 / 巡检 / 部署 / 脱敏均读取此处配置</div>
+        <div style={{ flex: 1 }} />
+        {message && <span style={{ fontSize: 'var(--text-label)', color: 'var(--green)', maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
+        <button className="btn btn-sm" onClick={aiGenerate} disabled={aiWorking || saving} title="读取仓库构建文件，AI 推断并填入运行配置">
+          <Icon name="brain" size={13} style={aiWorking ? { animation: 'spin 1s linear infinite' } : undefined} />
+          {aiWorking ? 'AI 推断中…' : 'AI 一键生成'}
+        </button>
+        <button className="btn btn-sm btn-primary" onClick={save} disabled={saving || aiWorking}>
+          <Icon name="check" size={13} />{saving ? '保存中…' : '保存配置'}
+        </button>
+      </div>
+
+      {error && (
+        <div style={{ padding: '6px 20px', color: 'var(--red)', fontSize: 'var(--text-label)', background: 'rgba(219,90,64,.06)', flexShrink: 0 }}>{error}</div>
+      )}
+
+      <div style={{ flex: 1, overflowY: 'auto', padding: '18px 22px' }}>
+        <CfgSection title="审计预览环境" desc="变更审核时拉起预览实例所需。预览固定加载 http://localhost:{port}，命令中的 {port} 会按变更替换为独立端口。">
+          <div className="field" style={{ marginBottom: 10 }}>
+            <label>应用类型</label>
+            <div className="seg" style={{ alignSelf: 'flex-start' }}>
+              <button type="button" className={form.devKind !== 'tauri' ? 'on' : ''} onClick={() => set({ devKind: 'web' })}>Web 应用</button>
+              <button type="button" className={form.devKind === 'tauri' ? 'on' : ''} onClick={() => set({ devKind: 'tauri' })}>Tauri 桌面</button>
+            </div>
+          </div>
+          <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
+            <CfgField full label={form.devKind === 'tauri' ? '前端预览启动命令' : '启动命令'} value={form.devCommand} onChange={v => set({ devCommand: v })} placeholder="npm run dev -- --port {port}" />
+            {form.devKind === 'tauri' && (
+              <CfgField full label="桌面应用启动命令（可选，逃生口）" value={form.appCommand} onChange={v => set({ appCommand: v })} placeholder="npm run tauri:dev" />
+            )}
+          </div>
+        </CfgSection>
+
+        <CfgSection title="测试套件" desc="主动巡检与合并前自动测试依次执行；任一失败将阻断合并 / 建为需求。">
+          <div className="cfg-fields" style={{ gridTemplateColumns: '3fr 1fr' }}>
+            <CfgField label="单元测试命令" value={form.testUnit} onChange={v => set({ testUnit: v })} placeholder="npm test" />
+            <CfgField mono={false} label="超时(秒)" value={form.testUnitTimeout} onChange={v => set({ testUnitTimeout: v })} placeholder="120" />
+            <CfgField label="集成测试命令" value={form.testIntegration} onChange={v => set({ testIntegration: v })} placeholder="npm run test:integration" />
+            <CfgField mono={false} label="超时(秒)" value={form.testIntegrationTimeout} onChange={v => set({ testIntegrationTimeout: v })} placeholder="300" />
+          </div>
+        </CfgSection>
+
+        <CfgSection title="质量检查" desc="同样纳入巡检 / 测试套件，固定 120s 超时。">
+          <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr 1fr' }}>
+            <CfgField label="Lint" value={form.qualityLint} onChange={v => set({ qualityLint: v })} placeholder="eslint ." />
+            <CfgField label="类型检查" value={form.qualityTyping} onChange={v => set({ qualityTyping: v })} placeholder="tsc --noEmit" />
+            <CfgField label="安全扫描" value={form.qualitySecurity} onChange={v => set({ qualitySecurity: v })} placeholder="npm audit" />
+          </div>
+        </CfgSection>
+
+        <CfgSection title="部署" desc="生成部署脚本时使用；技术栈用于提示 LLM 润色，preview/deploy 命令决定脚本主体。">
+          <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
+            <CfgField mono={false} label="语言" value={form.projectLanguage} onChange={v => set({ projectLanguage: v })} placeholder="typescript" />
+            <CfgField mono={false} label="框架" value={form.projectFramework} onChange={v => set({ projectFramework: v })} placeholder="react" />
+            <CfgField full label="构建命令 (preview.build)" value={form.previewBuild} onChange={v => set({ previewBuild: v })} placeholder="npm run build" />
+            <CfgField full label="启动命令 (preview.start)" value={form.previewStart} onChange={v => set({ previewStart: v })} placeholder="npm run start" />
+            <CfgField full label="部署命令 (deploy.command，优先于上面两条)" value={form.deployCommand} onChange={v => set({ deployCommand: v })} placeholder="./scripts/deploy.sh" />
+          </div>
+        </CfgSection>
+
+        <CfgSection title="预览数据脱敏" desc="预览环境克隆数据库后，对敏感字段执行脱敏（仅 SQLite）。">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {form.sensitiveFields.map((r, i) => (
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr 1.4fr auto', gap: 8, alignItems: 'center' }}>
+                <input value={r.table} onChange={e => setRow(i, { table: e.target.value })} placeholder="表名 users" style={{ fontFamily: 'var(--font-mono)' }} />
+                <input value={r.fields} onChange={e => setRow(i, { fields: e.target.value })} placeholder="字段，逗号分隔 email, phone" style={{ fontFamily: 'var(--font-mono)' }} />
+                <Select value={r.rule} onChange={v => setRow(i, { rule: v as MaskRule })} options={MASK_RULE_OPTS} />
+                <button className="btn btn-sm btn-danger" onClick={() => delRow(i)} title="删除该行"><Icon name="trash" size={13} /></button>
+              </div>
+            ))}
+            <button className="btn btn-sm" style={{ alignSelf: 'flex-start' }} onClick={addRow}><Icon name="plus" size={12} />添加脱敏字段</button>
+          </div>
+        </CfgSection>
+      </div>
+    </div>
+  );
+}
+
 // ── ProjectInfoTab ────────────────────────────────────────────────────────────
 
 function ProjectInfoTab({ project }: { project: Project }) {
@@ -1160,7 +1337,7 @@ function ProjectNavItem({ project, active, onClick }: {
 
 // ── ProjectsPage ──────────────────────────────────────────────────────────────
 
-type Tab = 'info' | 'materials' | 'intake' | 'spec';
+type Tab = 'info' | 'materials' | 'intake' | 'spec' | 'config';
 
 export default function ProjectsPage() {
   const [projects, setProjects]         = useState<Project[]>([]);
@@ -1233,7 +1410,7 @@ export default function ProjectsPage() {
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">PROJECTS</span><span className="cn">· 项目管理</span>
         </div>
-        <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
+        <button className="btn btn-primary btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setShowCreate(true)}>
           <Icon name="plus" size={14} />新建项目
         </button>
       </div>
@@ -1299,7 +1476,7 @@ export default function ProjectsPage() {
 
                 {/* tabs */}
                 <div style={{ display: 'flex', gap: 2, borderBottom: '1px solid var(--border)' }}>
-                  {([['info', '基本信息', 'sliders'], ['materials', '物料库', 'folder'], ['intake', '需求入口', 'inbox'], ['spec', '规格', 'layers']] as const).map(([id, label, ic]) => (
+                  {([['info', '基本信息', 'sliders'], ['materials', '物料库', 'folder'], ['intake', '需求入口', 'inbox'], ['spec', '规格', 'layers'], ['config', '运行配置', 'cpu']] as const).map(([id, label, ic]) => (
                     <button
                       key={id}
                       onClick={() => setActiveTab(id as Tab)}
@@ -1323,6 +1500,7 @@ export default function ProjectsPage() {
                 {activeTab === 'materials' && <MaterialsPanel key={selectedProject.id} projectId={selectedProject.id} />}
                 {activeTab === 'intake'    && <IntakePanel key={selectedProject.id} projectId={selectedProject.id} />}
                 {activeTab === 'spec'      && <SpecPanel key={selectedProject.id} projectId={selectedProject.id} />}
+                {activeTab === 'config'    && <ConfigPanel key={selectedProject.id} project={selectedProject} onSaved={load} />}
               </div>
             </>
           ) : (

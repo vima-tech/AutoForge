@@ -7,12 +7,15 @@ import {
   listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
-  clearConversationMessages, toggleMessageContext, startConversationTask,
+  toggleMessageContext, startConversationTask,
+  archiveConversation, listConversationArchives, getConversationArchive,
+  searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
   listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
   runConversationCommand, INNATE_SENDER,
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
+  type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
 } from '../services';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
@@ -29,6 +32,10 @@ interface PendingAttachment {
   file: File;
   mode: 'file' | 'image';
 }
+
+// 群聊 @快捷指令：`@所有人` 展开为全部可点名成员，让大家一起讨论并尽快达成一致。
+const ALL_MENTION_ID = '__all__';
+type MentionItem = { kind: 'all' } | { kind: 'agent'; agent: Agent };
 
 // Innate 知识库斜杠命令：在私聊/群聊里手动触发记忆存储、召回、进化与状态查看。
 interface SlashCommand { name: ConvCommandName; usage: string; desc: string; icon: string; }
@@ -212,9 +219,9 @@ function ConvItem({ c, active, agentMap, onSelect }: {
   );
 }
 
-function ConvList({ convs, agents, active, onSelect, onNew }: {
+function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
   convs: Conversation[]; agents: Agent[];
-  active: string; onSelect: (id: string) => void; onNew: () => void;
+  active: string; onSelect: (id: string) => void; onNew: () => void; onOpenArchive: () => void;
 }) {
   const [q, setQ] = useState('');
   const chatAgents = useMemo(() => agents.filter(a => a.visible_in_chat && a.enabled), [agents]);
@@ -231,9 +238,14 @@ function ConvList({ convs, agents, active, onSelect, onNew }: {
       <div className="list-head">
         <div className="list-title-row">
           <span className="list-title">会议室</span>
-          <button className="icon-btn" title="新建群聊" onClick={onNew} style={{ color: 'var(--ember)' }}>
-            <Icon name="plus" size={20} />
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <button className="icon-btn" title="归档区 · 检索回顾" onClick={onOpenArchive}>
+              <Icon name="inbox" size={18} />
+            </button>
+            <button className="icon-btn" title="新建群聊" onClick={onNew} style={{ color: 'var(--ember)' }}>
+              <Icon name="plus" size={20} />
+            </button>
+          </div>
         </div>
         <div className="search">
           <Icon name="search" size={15} />
@@ -335,6 +347,13 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
       : [],
     [isG, conv.members, agentMap],
   );
+  // 下拉候选：成员超过 1 人时，置顶一个「@所有人」选项。
+  const mentionItems = useMemo<MentionItem[]>(() => {
+    const list: MentionItem[] = [];
+    if (members.length > 1) list.push({ kind: 'all' });
+    for (const a of members) list.push({ kind: 'agent', agent: a });
+    return list;
+  }, [members]);
   const filteredContextAttachments = useMemo(() => {
     const q = attachmentQuery.trim().toLowerCase();
     if (!q) return contextAttachments;
@@ -505,7 +524,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     syncEditor();
   };
 
-  const pickMention = (a: Agent) => {
+  const insertMentionTag = (className: string, agentId: string, label: string) => {
     const editor = editorRef.current;
     const sel = window.getSelection();
     if (!editor || !sel || sel.rangeCount === 0) return;
@@ -523,10 +542,10 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     }
 
     const tag = document.createElement('span');
-    tag.className = 'mention-tag';
+    tag.className = className;
     tag.contentEditable = 'false';
-    tag.dataset.agentId = a.id;
-    tag.textContent = '@' + a.name;
+    tag.dataset.agentId = agentId;
+    tag.textContent = label;
     const spacer = document.createTextNode('\u00a0');
     range.insertNode(spacer);
     range.insertNode(tag);
@@ -534,6 +553,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     setShowMention(false);
     setText(editorText());
     editor.focus();
+  };
+
+  const pickMention = (a: Agent) => insertMentionTag('mention-tag', a.id, '@' + a.name);
+  const pickAll = () => insertMentionTag('mention-tag mention-all', ALL_MENTION_ID, '@\u6240\u6709\u4eba');
+  const pickMentionItem = (item: MentionItem | undefined) => {
+    if (!item) return;
+    if (item.kind === 'all') pickAll();
+    else pickMention(item.agent);
   };
 
   const pickSlashCommand = (c: SlashCommand) => {
@@ -600,7 +627,9 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     const ids = Array.from(editor.querySelectorAll<HTMLElement>('.mention-tag'))
       .map(node => node.dataset.agentId)
       .filter((id): id is string => !!id);
-    return Array.from(new Set(ids));
+    // `@所有人` 展开为当前全部可点名成员。
+    const expanded = ids.flatMap(id => (id === ALL_MENTION_ID ? members.map(m => m.id) : [id]));
+    return Array.from(new Set(expanded));
   };
 
   const deleteAdjacentInlineTag = () => {
@@ -658,10 +687,10 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
   };
 
   const onKey = (e: React.KeyboardEvent) => {
-    if (showMention && members.length > 0) {
-      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMention(members[mentionSel]); return; }
-      if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel(s => (s + 1) % members.length); return; }
-      if (e.key === 'ArrowUp')   { e.preventDefault(); setMentionSel(s => (s - 1 + members.length) % members.length); return; }
+    if (showMention && mentionItems.length > 0) {
+      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMentionItem(mentionItems[mentionSel]); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel(s => (s + 1) % mentionItems.length); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); setMentionSel(s => (s - 1 + mentionItems.length) % mentionItems.length); return; }
     }
     if (showAttachmentPicker) {
       if ((e.key === 'Enter' || e.key === 'Tab') && visibleContextAttachments.length > 0) {
@@ -816,15 +845,22 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
             ))}
           </div>
         )}
-        {showMention && members.length > 0 && (
+        {showMention && mentionItems.length > 0 && (
           <div className="mention-pop">
             <div className="mention-pop-label">@ 指定 Agent 回答</div>
-            {members.map((a, i) => (
-              <div key={a.id} className={'mention-row' + (i === mentionSel ? ' mention-active' : '')}
+            {mentionItems.map((item, i) => item.kind === 'all' ? (
+              <div key="__all__" className={'mention-row' + (i === mentionSel ? ' mention-active' : '')}
                 onMouseDown={e => e.preventDefault()}
-                onMouseEnter={() => setMentionSel(i)} onClick={() => pickMention(a)}>
-                <Avatar agent={a} size={30} />
-                <div><div className="nm">{a.name}</div><div className="rl">{a.role}</div></div>
+                onMouseEnter={() => setMentionSel(i)} onClick={() => pickAll()}>
+                <div className="mention-all-ic"><Icon name="users" size={16} /></div>
+                <div><div className="nm">所有人</div><div className="rl">全员一起讨论，互相分析、@ 彼此尽快达成一致</div></div>
+              </div>
+            ) : (
+              <div key={item.agent.id} className={'mention-row' + (i === mentionSel ? ' mention-active' : '')}
+                onMouseDown={e => e.preventDefault()}
+                onMouseEnter={() => setMentionSel(i)} onClick={() => pickMention(item.agent)}>
+                <Avatar agent={item.agent} size={30} />
+                <div><div className="nm">{item.agent.name}</div><div className="rl">{item.agent.role}</div></div>
               </div>
             ))}
           </div>
@@ -904,7 +940,7 @@ function NewGroupModal({ agents, projects, onClose, onCreate }: {
   }, [projOpen]);
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }}>
       <div style={{ width: 440, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center' }}>
           <div>
@@ -1026,7 +1062,7 @@ function EditGroupModal({ conversation, projects, onClose, onSave }: {
   }, [projOpen]);
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 200 }}>
       <div style={{ width: 440, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center' }}>
           <div>
@@ -1113,11 +1149,224 @@ function EditGroupModal({ conversation, projects, onClose, onSave }: {
   );
 }
 
-function ConfirmModal({ msg, okLabel, onOk, onCancel }: {
-  msg: string; okLabel: string; onOk: () => void; onCancel: () => void;
+// 只读归档消息行：用快照里去规范化的发言人信息渲染，不依赖 live agents，无右键菜单/编辑。
+function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
+  m: ArchivedMessage; agents: Agent[]; isGroup: boolean; projectId?: string;
+}) {
+  const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
+  const liveAgent = !m.is_me && !m.is_innate && m.from_agent ? agentMap[m.from_agent] : null;
+  const pseudo: Message = {
+    id: '', conversation_id: '', from_agent: m.from_agent,
+    content_json: m.content_json, created_at: m.created_at,
+    excluded_from_context: m.excluded_from_context,
+  };
+  const blocks = visibleMessageBlocks(pseudo);
+  const quote = messageQuote(pseudo);
+  return (
+    <div className={'msg' + (m.is_me ? ' me' : '')}>
+      {m.is_me
+        ? <MeAvatar size={36} />
+        : m.is_innate
+          ? <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Innate 知识库"><Icon name="brain" size={20} /></div>
+          : liveAgent
+            ? <Avatar agent={liveAgent} size={36} />
+            : <div className="av" style={{ width: 36, height: 36, background: m.author_color || 'var(--bg-3)', color: 'var(--text)', fontSize: 'var(--text-body)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{m.author.slice(0, 1)}</div>}
+      <div className="msg-body">
+        {!m.is_me && (
+          <div className="msg-meta">
+            <span className="msg-author" style={{ color: m.is_innate ? 'var(--ember)' : (m.author_color || 'var(--text)') }}>{m.author}</span>
+            {m.is_innate
+              ? <span className="chip ember" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>KNOWLEDGE</span>
+              : isGroup && m.author_en && <span className="chip" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>{m.author_en}</span>}
+            <span className="msg-time" title={fmtFull(m.created_at)}>{fmtMsgTime(m.created_at)}</span>
+          </div>
+        )}
+        <div className="bubble" style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
+        </div>
+        {quote && (
+          <div className="bubble-quote" title={`${quote.author}: ${quote.text}`}>
+            <span className="quote-author">{quote.author}</span>
+            <span className="quote-text">{quote.text}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// 归档区：左侧检索/列表，右侧只读回顾选中归档的完整对话快照。
+function ArchiveBrowser({ agents, projects, onClose }: {
+  agents: Agent[]; projects: Project[]; onClose: () => void;
+}) {
+  const [q, setQ] = useState('');
+  const [summaries, setSummaries] = useState<ConversationArchiveSummary[]>([]);
+  const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ArchivedMessage[]>([]);
+  const [selectedMeta, setSelectedMeta] = useState<ConversationArchiveSummary | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<ConversationArchiveSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const refreshList = useCallback(async () => {
+    try { setSummaries(await listConversationArchives()); }
+    catch (e) { setErr(String(e)); }
+  }, []);
+
+  useEffect(() => { refreshList(); }, [refreshList]);
+
+  useEffect(() => {
+    const term = q.trim();
+    if (!term) { setHits([]); return; }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try { const r = await searchConversationArchives(term); if (!cancelled) setHits(r); }
+      catch (e) { if (!cancelled) setErr(String(e)); }
+    }, 180);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [q]);
+
+  const openArchive = async (s: ConversationArchiveSummary) => {
+    setSelectedId(s.id);
+    setSelectedMeta(s);
+    setLoading(true);
+    setErr('');
+    try {
+      const detail = await getConversationArchive(s.id);
+      const parsed: ArchivedMessage[] = JSON.parse(detail.payload_json);
+      setMessages(parsed);
+    } catch (e) {
+      setErr(String(e));
+      setMessages([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const removeArchive = async (id: string) => {
+    try {
+      await deleteConversationArchive(id);
+      if (selectedId === id) { setSelectedId(null); setMessages([]); setSelectedMeta(null); }
+      setConfirmDelete(null);
+      await refreshList();
+    } catch (e) { setErr(String(e)); setConfirmDelete(null); }
+  };
+
+  const searching = q.trim().length > 0;
+  const rows: (ConversationArchiveSummary & { match_count?: number; snippet?: string })[] =
+    searching ? hits : summaries;
+  const projectName = (s: ConversationArchiveSummary) =>
+    s.project_name ?? (s.project_id ? projects.find(p => p.id === s.project_id)?.name : undefined);
+  const isGroupMeta = (selectedMeta?.conv_type ?? 'group') === 'group';
+
+  return (
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
+      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-strong)', borderRadius: 14, width: 'min(980px, 92vw)', height: 'min(680px, 88vh)', display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '13px 16px', borderBottom: '1px solid var(--border)' }}>
+          <Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 'var(--text-section)', fontWeight: 700 }}>归档区</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>READ-ONLY · 只读快照检索与回顾</div>
+          </div>
+          <button className="icon-btn" title="关闭" onClick={onClose}><Icon name="x" size={16} /></button>
+        </div>
+        {err && <div style={{ padding: '6px 16px', color: 'var(--red)', fontSize: 'var(--text-label)' }}>{err}</div>}
+        <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+          {/* 左：检索 + 列表 */}
+          <div style={{ width: 320, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--bg-1)' }}>
+            <div style={{ padding: 12 }}>
+              <div className="search">
+                <Icon name="search" size={15} />
+                <input placeholder="搜索归档内容或标题…" value={q} onChange={e => setQ(e.target.value)} autoFocus />
+              </div>
+            </div>
+            <div className="scroll" style={{ flex: 1, overflowY: 'auto', padding: '0 8px 10px' }}>
+              {rows.length === 0 ? (
+                <div className="empty" style={{ padding: '28px 12px', textAlign: 'center', color: 'var(--text-3)', fontSize: 'var(--text-label)' }}>
+                  {searching ? '没有匹配的归档' : '暂无归档对话'}
+                </div>
+              ) : rows.map(s => (
+                <div
+                  key={s.id}
+                  className={'mention-row' + (selectedId === s.id ? ' mention-active' : '')}
+                  style={{ alignItems: 'flex-start', flexDirection: 'column', gap: 4, padding: '9px 10px' }}
+                  onClick={() => openArchive(s)}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%' }}>
+                    <Icon name="package" size={13} style={{ color: 'var(--ember)', flexShrink: 0 }} />
+                    <span className="nm" style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
+                    <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', flexShrink: 0 }}>{s.message_count}条</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+                    <span className="chip" style={{ padding: '0 6px', fontSize: 'var(--text-micro)' }}>{s.conv_type === 'group' ? '群聊' : '单聊'}</span>
+                    {projectName(s) && <span style={{ color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 2 }}><Icon name="folder" size={9} />{projectName(s)}</span>}
+                    <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)' }}>{fmtListTime(s.archived_at)}</span>
+                  </div>
+                  {searching && typeof s.match_count === 'number' && (
+                    <div style={{ width: '100%', fontSize: 'var(--text-caption)', color: 'var(--text-2)' }}>
+                      <span className="chip ember" style={{ padding: '0 6px', fontSize: 'var(--text-micro)' }}>命中 {s.match_count}</span>
+                      {s.snippet && <span style={{ marginLeft: 6, color: 'var(--text-3)' }}>{s.snippet}</span>}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+          {/* 右：只读回顾 */}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, background: 'var(--bg)' }}>
+            {selectedMeta ? (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 16px', borderBottom: '1px solid var(--border)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <Icon name="key" size={13} style={{ color: 'var(--text-3)' }} />
+                      <span style={{ fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{selectedMeta.title}</span>
+                      <span className="chip" style={{ padding: '0 6px', fontSize: 'var(--text-micro)' }}>只读</span>
+                    </div>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
+                      {selectedMeta.message_count} 条 · 归档于 {fmtFull(selectedMeta.archived_at)}
+                    </div>
+                  </div>
+                  <button className="btn btn-sm btn-danger" onClick={() => setConfirmDelete(selectedMeta)} title="彻底删除此归档">
+                    <Icon name="trash" size={14} /> 彻底删除
+                  </button>
+                </div>
+                <div className="msgs scroll" style={{ flex: 1 }}>
+                  {loading
+                    ? <div className="empty" style={{ color: 'var(--text-3)', padding: 30 }}>加载中…</div>
+                    : messages.map((m, i) => (
+                        <ArchiveMessageRow key={i} m={m} agents={agents} isGroup={isGroupMeta} projectId={selectedMeta.project_id ?? undefined} />
+                      ))}
+                </div>
+              </>
+            ) : (
+              <div className="empty" style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10, color: 'var(--text-3)' }}>
+                <Icon name="inbox" size={34} style={{ color: 'var(--text-faint)' }} />
+                <div style={{ fontSize: 'var(--text-label)' }}>从左侧选择一个归档，只读回顾完整对话</div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      {confirmDelete && (
+        <ConfirmModal
+          zIndex={260}
+          msg={`确认彻底删除归档「${confirmDelete.title}」（${confirmDelete.message_count} 条）？删除后该归档快照不可恢复。`}
+          okLabel="彻底删除"
+          onOk={() => removeArchive(confirmDelete.id)}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConfirmModal({ msg, okLabel, onOk, onCancel, zIndex = 220 }: {
+  msg: string; okLabel: string; onOk: () => void; onCancel: () => void; zIndex?: number;
 }) {
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 380, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
@@ -1150,7 +1399,8 @@ export default function ConversationsPage() {
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
-  const [confirmClear,   setConfirmClear]   = useState<string | null>(null);
+  const [confirmArchive, setConfirmArchive] = useState<string | null>(null);
+  const [showArchive,    setShowArchive]    = useState(false);
   const [memberError,    setMemberError]    = useState('');
   const [sending,        setSending]        = useState(false);
   const [loadError,      setLoadError]      = useState('');
@@ -1566,26 +1816,26 @@ export default function ConversationsPage() {
     }
   };
 
-  const clearConversation = async () => {
-    if (!confirmClear) return;
-    const id = confirmClear;
+  const archiveAndClearConversation = async () => {
+    if (!confirmArchive) return;
+    const id = confirmArchive;
     setLoadError('');
     try {
-      await clearConversationMessages(id);
+      await archiveConversation(id);
       const remaining = await listConversations();
       setConvs(remaining);
       setMsgs([]);
       setContextAttachments([]);
       setQuoteDraft(null);
       setBubbleMenu(null);
-      setConfirmClear(null);
+      setConfirmArchive(null);
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
       if (!remaining.some(c => c.id === id)) {
         setActive(remaining[0]?.id ?? '');
       }
     } catch (e) {
       setLoadError(String(e));
-      setConfirmClear(null);
+      setConfirmArchive(null);
     }
   };
 
@@ -1593,7 +1843,7 @@ export default function ConversationsPage() {
 
   return (
     <>
-      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} />
+      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} />
 
       {conv ? (
         <div className="content">
@@ -1642,13 +1892,17 @@ export default function ConversationsPage() {
                       <div style={{ flex: 1, minWidth: 0 }}><div className="nm">编辑会议室</div></div>
                     </div>
                   )}
+                  <div className="mention-row" onClick={() => { setShowArchive(true); setShowHeadMore(false); }}>
+                    <Icon name="inbox" size={15} style={{ color: 'var(--text-3)' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}><div className="nm">归档区 · 检索回顾</div></div>
+                  </div>
                   <div
                     className="mention-row"
-                    style={visibleMsgCount === 0 ? { opacity: 0.45, pointerEvents: 'none' } : { color: 'var(--red)' }}
-                    onClick={() => { if (visibleMsgCount === 0) return; setConfirmClear(conv.id); setShowHeadMore(false); }}
+                    style={visibleMsgCount === 0 ? { opacity: 0.45, pointerEvents: 'none' } : undefined}
+                    onClick={() => { if (visibleMsgCount === 0) return; setConfirmArchive(conv.id); setShowHeadMore(false); }}
                   >
-                    <Icon name="trash" size={15} style={{ color: 'var(--red)' }} />
-                    <div style={{ flex: 1, minWidth: 0 }}><div className="nm" style={{ color: 'var(--red)' }}>清空会议室内容</div></div>
+                    <Icon name="package" size={15} style={{ color: 'var(--ember)' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}><div className="nm">归档会议室内容</div></div>
                   </div>
                 </div>
               )}
@@ -1971,13 +2225,16 @@ export default function ConversationsPage() {
           onCancel={() => setConfirmDissolve(null)}
         />
       )}
-      {confirmClear && (
+      {confirmArchive && (
         <ConfirmModal
-          msg="确认清空当前会议室内容？消息、已读状态和附件记录会被删除；单聊清空后将从左侧列表消失。"
-          okLabel="确认清空"
-          onOk={clearConversation}
-          onCancel={() => setConfirmClear(null)}
+          msg="确认归档当前会议室内容？当前消息将存为只读归档（可在「归档区」检索回顾），随后会议室会被清空、可继续使用；单聊归档后将从左侧列表消失。"
+          okLabel="确认归档"
+          onOk={archiveAndClearConversation}
+          onCancel={() => setConfirmArchive(null)}
         />
+      )}
+      {showArchive && (
+        <ArchiveBrowser agents={agents} projects={projects} onClose={() => setShowArchive(false)} />
       )}
     </>
   );

@@ -3,12 +3,12 @@ import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
 import Select from '../components/Select';
-import { THEME_PALETTES, type ThemeMode, type ThemeSelection } from '../theme';
+import { THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode, type ThemeMode, type ThemeSelection, type RailMode } from '../theme';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
-  getSystemHealth, updateConcurrencyConfig, readSpec, writeSpec,
+  getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
   listPreviewEnvironments, listTestSessions, listAdminDecisions,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
@@ -16,9 +16,13 @@ import {
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
+  getWebSearchSettings, setWebSearchSettings,
+  listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
+  type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
   type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
+  type WebSearchSettings,
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
 } from '../services';
 
@@ -29,7 +33,7 @@ function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
 
 function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
   return createPortal(
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 360, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 20px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>{msg}</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
@@ -42,12 +46,16 @@ function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; 
   );
 }
 
-const llmColor = (provider: string) => {
-  const p = provider.toLowerCase();
+const llmColor = (apiSpec: string) => {
+  const p = (apiSpec || '').toLowerCase();
   if (p.includes('anthropic')) return '#8b7ad8';
   if (p.includes('openai')) return '#4f8ed1';
   if (p.includes('ollama')) return '#4f9d6b';
   return '#e8772e';
+};
+
+const API_SPEC_LABEL: Record<string, string> = {
+  openai: 'OpenAI 兼容', anthropic: 'Anthropic',
 };
 
 type LlmRef = { id: string; name: string; enabled: boolean };
@@ -142,7 +150,7 @@ function LLMSettings() {
 
   const addNew = async () => {
     const c = await createLlmConfig({
-      name: '新 LLM 配置', provider: 'Anthropic',
+      name: '新 LLM 配置', api_spec: 'anthropic',
       model: 'claude-sonnet-4-20250514', endpoint: 'https://api.anthropic.com', api_key: '',
     });
     setConfigs(cs => [...cs, c]);
@@ -162,10 +170,10 @@ function LLMSettings() {
         return (
           <div className="cfg-card" key={c.id} style={exp === c.id ? { borderColor: 'var(--ember-tint-strong)' } : {}}>
             <div className="cfg-top" onClick={() => setExp(exp === c.id ? null : c.id)} style={{ cursor: 'pointer' }}>
-              <div className="cfg-logo" style={{ background: llmColor(String(v('provider'))) }}><Icon name="brain" size={20} /></div>
+              <div className="cfg-logo" style={{ background: llmColor(v('api_spec')) }}><Icon name="brain" size={20} /></div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="cfg-name">{v('name')}</div>
-                <div className="cfg-sub">{v('provider')} · {v('model')}</div>
+                <div className="cfg-sub">{API_SPEC_LABEL[v('api_spec')] ?? v('api_spec')} · {v('model')}</div>
               </div>
               <span className={'chip ' + (c.enabled ? 'green' : '')}>{c.enabled ? '● 已启用' : '未启用'}</span>
               <Icon name={exp === c.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', marginLeft: 4 }} />
@@ -173,9 +181,12 @@ function LLMSettings() {
             {exp === c.id && (
               <div className="cfg-fields rise">
                 <div className="field full"><label>名称</label><input value={v('name')} onChange={e => setDraft(c.id, 'name', e.target.value)} /></div>
-                <div className="field"><label>Provider</label>
-                  <Select value={v('provider')} onChange={val => setDraft(c.id, 'provider', val)}
-                    options={['Anthropic', 'OpenAI', 'Ollama', 'Azure', '自定义'].map(v => ({ value: v, label: v }))} />
+                <div className="field"><label>接口规范 · 工具调用格式</label>
+                  <Select value={v('api_spec') || 'openai'} onChange={val => setDraft(c.id, 'api_spec', val)}
+                    options={[
+                      { value: 'openai', label: 'OpenAI 兼容' },
+                      { value: 'anthropic', label: 'Anthropic' },
+                    ]} />
                 </div>
                 <div className="field"><label>Model</label><input className="mono" value={v('model')} onChange={e => setDraft(c.id, 'model', e.target.value)} /></div>
                 <div className="field full"><label>API Endpoint</label><input className="mono" value={v('endpoint')} onChange={e => setDraft(c.id, 'endpoint', e.target.value)} /></div>
@@ -229,6 +240,251 @@ const AGENT_TEMPLATES: { label: string; prompt: string }[] = [
   { label: '文案', prompt: '你是产品文案专家。用简洁、准确、有说服力的中文表达，匹配目标受众与场景，避免空话套话。' },
   { label: '分析', prompt: '你是分析师。基于事实拆解问题，给出选项、取舍与明确建议，必要时量化，并标注假设与不确定性。' },
 ];
+
+// capabilities_json 工具白名单读写：约定 {"tools":["web_search",...]}。
+function agentHasTool(capJson: string | undefined, tool: string): boolean {
+  try {
+    const arr = (JSON.parse(capJson || '{}') as { tools?: unknown }).tools;
+    return Array.isArray(arr) && arr.includes(tool);
+  } catch { return false; }
+}
+function toggleAgentTool(capJson: string | undefined, tool: string, on: boolean): string {
+  let obj: Record<string, unknown> = {};
+  try { obj = (JSON.parse(capJson || '{}') as Record<string, unknown>) || {}; } catch { obj = {}; }
+  const set = new Set<string>(Array.isArray(obj.tools) ? (obj.tools as string[]) : []);
+  if (on) set.add(tool); else set.delete(tool);
+  obj.tools = [...set];
+  return JSON.stringify(obj);
+}
+
+function ToolsSettings() {
+  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false });
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
+
+  const enabled =
+    (ws.provider === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
+    (ws.provider === 'searxng' && ws.endpoint.trim().length > 0);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await setWebSearchSettings(ws.provider, ws.endpoint, ws.max_results, apiKey.trim() || undefined);
+      setWs(r); setApiKey(''); setStatus('已保存');
+    } catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">工具 & MCP</div>
+      <div className="set-desc">为 Agent 启用外部工具。工具结果视为不可信外部输入，回灌上下文前自动过安全过滤。仅 OpenAI 兼容 / Anthropic 接口规范的 LLM 支持工具调用。</div>
+
+      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-top" style={{ gap: 10 }}>
+          <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="search" size={15} /></div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>TOOL</span>
+            </div>
+            <div className="cfg-sub">检索互联网并把标题/链接/摘要回灌给 Agent</div>
+          </div>
+          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
+        </div>
+
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field"><label>搜索 Provider</label>
+            <Select value={ws.provider || 'off'} onChange={val => setWs(w => ({ ...w, provider: val === 'off' ? '' : val }))}
+              options={[
+                { value: 'off', label: '关闭' },
+                { value: 'tavily', label: 'Tavily（需 API Key）' },
+                { value: 'searxng', label: 'SearXNG（自托管，无需 Key）' },
+              ]} />
+          </div>
+          <div className="field"><label>返回结果数</label>
+            <input type="number" min="1" max="10" value={ws.max_results}
+              onChange={e => setWs(w => ({ ...w, max_results: Math.max(1, Math.min(10, Number(e.target.value) || 5)) }))} />
+          </div>
+          {ws.provider === 'searxng' && (
+            <div className="field full"><label>SearXNG Endpoint</label>
+              <input type="text" className="mono" value={ws.endpoint} placeholder="https://searx.example.com"
+                onChange={e => setWs(w => ({ ...w, endpoint: e.target.value }))} />
+            </div>
+          )}
+          {ws.provider === 'tavily' && (
+            <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Tavily API Key</label>
+              <input type="password" className="mono" value={apiKey}
+                placeholder={ws.api_key_set ? '已设置（留空则不修改）' : 'tvly-...'}
+                onChange={e => setApiKey(e.target.value)} />
+            </div>
+          )}
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存工具配置</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+          <div className="field full">
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+              启用后，在「角色 Agent / 自定义 Agent」的能力中勾选 web_search 的 Agent 才会实际调用此工具。
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <McpServers />
+    </div>
+  );
+}
+
+function McpServers() {
+  const [servers, setServers] = useState<McpServer[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [exp, setExp] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, McpServerInput>>({});
+  const [test, setTest] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+
+  const reload = () => Promise.all([listMcpServers(), listAgents()])
+    .then(([s, a]) => { setServers(s); setAgents(a); })
+    .catch(() => {});
+  useEffect(() => { reload(); }, []);
+
+  const setDraft = (id: string, field: keyof McpServerInput, val: unknown) =>
+    setDrafts(d => ({ ...d, [id]: { ...d[id], [field]: val } }));
+
+  const val = <K extends keyof McpServer>(s: McpServer, d: McpServerInput, f: K): McpServer[K] =>
+    (d[f as keyof McpServerInput] as McpServer[K] | undefined) ?? s[f];
+
+  const scopedAgents = (s: McpServer, d: McpServerInput): string[] => {
+    try { return JSON.parse(String(val(s, d, 'agent_ids_json') ?? '[]')); } catch { return []; }
+  };
+  const toggleAgent = (s: McpServer, d: McpServerInput, agentId: string) => {
+    const cur = new Set(scopedAgents(s, d));
+    if (cur.has(agentId)) cur.delete(agentId); else cur.add(agentId);
+    setDraft(s.id, 'agent_ids_json', JSON.stringify([...cur]));
+  };
+
+  const save = async (id: string) => {
+    const d = drafts[id] ?? {};
+    if (Object.keys(d).length === 0) { setExp(null); return; }
+    setBusy(id);
+    try {
+      const updated = await updateMcpServer(id, d);
+      setServers(ss => ss.map(s => s.id === id ? updated : s));
+      setDrafts(x => { const n = { ...x }; delete n[id]; return n; });
+    } catch (e) { setTest(t => ({ ...t, [id]: '保存失败: ' + String(e) })); }
+    finally { setBusy(null); }
+  };
+  const addNew = async () => {
+    const s = await createMcpServer({ name: '新 MCP Server', transport: 'stdio' });
+    setServers(ss => [...ss, s]); setExp(s.id);
+  };
+  const doDelete = async (id: string) => {
+    await deleteMcpServer(id);
+    setServers(ss => ss.filter(s => s.id !== id));
+    setConfirmDel(null);
+  };
+  const runTest = async (id: string) => {
+    setBusy(id); setTest(t => ({ ...t, [id]: '连接中…' }));
+    try {
+      const tools = await testMcpConnection(id);
+      setTest(t => ({ ...t, [id]: tools.length ? `✓ 发现 ${tools.length} 个工具：${tools.join(', ')}` : '✓ 已连接，但无工具' }));
+    } catch (e) { setTest(t => ({ ...t, [id]: '✗ ' + String(e) })); }
+    finally { setBusy(null); }
+  };
+
+  return (
+    <div style={{ marginTop: 22 }}>
+      {confirmDel && <ConfirmModal msg="确认删除此 MCP Server？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
+      <div className="set-h" style={{ fontSize: 'var(--text-section)' }}>MCP Servers</div>
+      <div className="set-desc">接入外部 MCP 工具生态。每个 server 勾选适用的 Agent —— 仅被勾选的 Agent 会加载其工具。MCP 工具结果同样过安全过滤。</div>
+
+      {servers.map(s => {
+        const d = drafts[s.id] ?? {};
+        const transport = String(val(s, d, 'transport') ?? 'stdio') as McpTransport;
+        const scoped = scopedAgents(s, d);
+        const en = Boolean(d.enabled ?? s.enabled);
+        return (
+          <div className="cfg-card" key={s.id} style={{ padding: exp === s.id ? '13px 16px' : '8px 12px', marginBottom: 6, ...(exp === s.id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+            <div className="cfg-top" onClick={() => setExp(exp === s.id ? null : s.id)} style={{ cursor: 'pointer', gap: 10 }}>
+              <div className="cfg-logo" style={{ background: 'var(--blue, #4f8ed1)', width: 28, height: 28 }}><Icon name="zap" size={15} /></div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{String(val(s, d, 'name') ?? '')}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{transport.toUpperCase()}</span>
+                </div>
+                <div className="cfg-sub">{scoped.length ? `适用 ${scoped.length} 个 Agent` : '未勾选任何 Agent'}</div>
+              </div>
+              <span className={'chip ' + (en ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{en ? '已启用' : '未启用'}</span>
+              <Icon name={exp === s.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
+            </div>
+            {exp === s.id && (
+              <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+                <div className="field"><label>名称</label>
+                  <input value={String(val(s, d, 'name') ?? '')} onChange={e => setDraft(s.id, 'name', e.target.value)} />
+                </div>
+                <div className="field"><label>传输方式</label>
+                  <Select value={transport} onChange={v => setDraft(s.id, 'transport', v)}
+                    options={[{ value: 'stdio', label: 'stdio（本地子进程）' }, { value: 'http', label: 'HTTP（远程 streamable）' }]} />
+                </div>
+                {transport === 'stdio' ? (<>
+                  <div className="field full"><label>启动命令 command</label>
+                    <input className="mono" value={String(val(s, d, 'command') ?? '')} placeholder="npx / uvx / node …"
+                      onChange={e => setDraft(s.id, 'command', e.target.value)} />
+                  </div>
+                  <div className="field full"><label>参数 args（JSON 数组）</label>
+                    <input className="mono" value={String(val(s, d, 'args_json') ?? '[]')} placeholder='["-y","@modelcontextprotocol/server-filesystem","/path"]'
+                      onChange={e => setDraft(s.id, 'args_json', e.target.value)} />
+                  </div>
+                  <div className="field full"><label>环境变量 env（JSON 对象，密钥留空则不改）</label>
+                    <input className="mono" value={String(val(s, d, 'env_json') ?? '{}')} placeholder='{"API_KEY":""}'
+                      onChange={e => setDraft(s.id, 'env_json', e.target.value)} />
+                  </div>
+                </>) : (<>
+                  <div className="field full"><label>服务 URL</label>
+                    <input className="mono" value={String(val(s, d, 'url') ?? '')} placeholder="https://host/mcp"
+                      onChange={e => setDraft(s.id, 'url', e.target.value)} />
+                  </div>
+                  <div className="field full"><label>请求头 headers（JSON 对象，密钥留空则不改）</label>
+                    <input className="mono" value={String(val(s, d, 'headers_json') ?? '{}')} placeholder='{"Authorization":"Bearer "}'
+                      onChange={e => setDraft(s.id, 'headers_json', e.target.value)} />
+                  </div>
+                </>)}
+                <div className="field full"><label>适用 Agent（勾选后该 Agent 加载本 server 的工具）</label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '6px 0' }}>
+                    {agents.length === 0 && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>暂无 Agent</span>}
+                    {agents.map(a => {
+                      const on = scoped.includes(a.id);
+                      return (
+                        <button key={a.id} className={'chip ' + (on ? 'ember' : '')} style={{ cursor: 'pointer', border: on ? undefined : '1px solid var(--border-strong)' }}
+                          onClick={() => toggleAgent(s, d, a.id)}>
+                          {on ? '✓ ' : ''}{a.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingTop: 4 }}>
+                  <Switch on={en} onToggle={() => setDraft(s.id, 'enabled', !en)} />
+                  <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>启用此 server</span>
+                  <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(s.id)}><Icon name="trash" size={13} />删除</button>
+                  <button className="btn btn-sm" disabled={busy === s.id} onClick={() => runTest(s.id)}><Icon name="zap" size={13} />测试连接</button>
+                  <button className="btn btn-sm btn-primary" disabled={busy === s.id} onClick={() => save(s.id)}><Icon name="check" size={13} />保存</button>
+                </div>
+                {test[s.id] && (
+                  <div className="field full"><span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{test[s.id]}</span></div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div className="cfg-card add" onClick={addNew} style={{ padding: 12, marginBottom: 0 }}><Icon name="plus" size={16} />新增 MCP Server</div>
+    </div>
+  );
+}
 
 function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -338,6 +594,21 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                       <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
                         <Switch on={Boolean(d.visible_in_chat ?? a.visible_in_chat)} onToggle={() => setDraft(a.id, 'visible_in_chat', !(d.visible_in_chat ?? a.visible_in_chat))} />可私聊
                       </label>
+                    </div>
+                  </div>
+                  <div className="field full">
+                    <label>工具能力</label>
+                    <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
+                      {(() => {
+                        const cap = d.capabilities_json !== undefined ? String(d.capabilities_json ?? '') : a.capabilities_json;
+                        const on = agentHasTool(cap, 'web_search');
+                        return (
+                          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+                            <Switch on={on} onToggle={() => setDraft(a.id, 'capabilities_json', toggleAgentTool(cap, 'web_search', !on))} />联网搜索 web_search
+                          </label>
+                        );
+                      })()}
+                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>需在「工具 & MCP」中先配置搜索 Provider；仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
                     </div>
                   </div>
                   <div className="field full">
@@ -733,46 +1004,6 @@ function KnowledgeSettings() {
   );
 }
 
-const SPEC_FILES = ['analysis-spec.md', 'coding-spec.md', 'review-spec.md', 'testing-spec.md'];
-
-function SpecsSettings() {
-  const [name, setName] = useState(SPEC_FILES[0]);
-  const [content, setContent] = useState('');
-  const [status, setStatus] = useState('');
-
-  useEffect(() => {
-    readSpec(name).then(doc => { setContent(doc.content); setStatus(''); }).catch(e => setStatus(String(e)));
-  }, [name]);
-
-  const save = async () => {
-    const doc = await writeSpec(name, content);
-    setContent(doc.content);
-    setStatus('已保存');
-  };
-
-  return (
-    <div className="set-inner rise">
-      <div className="set-h">规范文档</div>
-      <div className="set-desc">这些文档会注入 Agent prompt，直接约束分析、编码和测试行为。</div>
-      <div className="cfg-card">
-        <div className="cfg-fields">
-          <div className="field full"><label>文档</label>
-            <Select value={name} onChange={setName}
-              options={SPEC_FILES.map(f => ({ value: f, label: f }))} />
-          </div>
-          <div className="field full"><label>内容</label>
-            <textarea className="mono" rows={18} value={content} onChange={e => setContent(e.target.value)} />
-          </div>
-          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-            <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存文档</button>
-            {status && <span style={{ fontSize: 'var(--text-label)', color: status === '已保存' ? 'var(--green-soft)' : 'var(--red)' }}>{status}</span>}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ThemeSettings({
   theme,
   onThemeChange,
@@ -783,10 +1014,29 @@ function ThemeSettings({
   const setMode = (mode: ThemeMode) => onThemeChange(t => ({ ...t, mode }));
   const selected = THEME_PALETTES.find(p => p.id === theme.palette) ?? THEME_PALETTES[0];
 
+  const [railMode, setRailMode] = useState<RailMode>(() => parseRailMode(localStorage.getItem(RAIL_STORAGE_KEY)));
+  useEffect(() => {
+    localStorage.setItem(RAIL_STORAGE_KEY, railMode);
+    applyRailMode(railMode);
+  }, [railMode]);
+
   return (
     <div className="set-inner set-inner-wide rise">
       <div className="set-h">主题设置</div>
       <div className="set-desc">当前明暗主题已归入 Forge Ember。选择任一主题族后，可在深色和浅色两种风格间切换。</div>
+
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head"><div className="panel-title"><Icon name="columns" size={16} />导航栏</div></div>
+        <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>悬停展开导航栏</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+              开启后鼠标悬停可展开标签；关闭则锁定为收起状态，悬停不再触发展开。
+            </div>
+          </div>
+          <Switch on={railMode === 'hover'} onToggle={() => setRailMode(m => (m === 'hover' ? 'locked' : 'hover'))} />
+        </div>
+      </div>
 
       <div className="theme-toolbar">
         <div>
@@ -904,6 +1154,8 @@ function AboutSettings() {
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [healthError, setHealthError] = useState(false);
   const [healthLoading, setHealthLoading] = useState(true);
+  const [auth, setAuth] = useState<boolean | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [previews, setPreviews] = useState<PreviewEnvironment[]>([]);
   const [tests, setTests] = useState<TestSession[]>([]);
 
@@ -914,6 +1166,13 @@ function AboutSettings() {
       .then(h => { setHealth(h); setHealthError(false); })
       .catch(() => { setHealth(null); setHealthError(true); })
       .finally(() => setHealthLoading(false));
+    // system_health 永远返回 claude_auth=true（避开启动期 SIGTRAP），
+    // 真实登录态需走专用的 check_claude_auth 命令（进程组隔离后可安全调用）。
+    setAuthLoading(true);
+    checkClaudeAuth()
+      .then(ok => setAuth(ok))
+      .catch(() => setAuth(null))
+      .finally(() => setAuthLoading(false));
   };
 
   useEffect(() => {
@@ -924,8 +1183,11 @@ function AboutSettings() {
 
   const dbVal   = healthLoading ? '…' : health?.db_ok ? 'OK' : healthError ? '错误' : '—';
   const dbColor = healthLoading ? 'var(--text-3)' : health?.db_ok ? 'var(--green)' : healthError ? 'var(--red)' : 'var(--text-3)';
-  const authVal   = healthLoading ? '…' : health ? (health.claude_auth ? 'OK' : '未登录') : '—';
-  const authColor = healthLoading ? 'var(--text-3)' : (health?.claude_auth) ? 'var(--green)' : health ? 'var(--red)' : 'var(--text-3)';
+  const authVal   = authLoading ? '…' : auth === null ? '—' : auth ? 'OK' : '未登录';
+  const authColor = authLoading ? 'var(--text-3)' : auth === null ? 'var(--text-3)' : auth ? 'var(--green)' : 'var(--red)';
+  const stageVal  = healthLoading ? '…'
+    : health ? (health.stage === 'paused' ? '已暂停' : health.stage === 'throttled' ? '降速' : '正常')
+    : '—';
 
   return (
     <div className="set-inner rise">
@@ -933,20 +1195,25 @@ function AboutSettings() {
       <div className="set-desc" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span>运行健康、Claude 认证和后台运行态概览。</span>
         {healthError && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)' }}>状态获取失败</span>}
-        <button className="btn" style={{ marginLeft: 'auto', fontSize: 'var(--text-label)', padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading}>
-          {healthLoading ? '加载中…' : '刷新'}
+        <button className="btn" style={{ marginLeft: 'auto', fontSize: 'var(--text-label)', padding: '2px 10px' }} onClick={loadHealth} disabled={healthLoading || authLoading}>
+          {(healthLoading || authLoading) ? '加载中…' : '刷新'}
         </button>
       </div>
       <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', marginBottom: 16 }}>
         {[
-          { label: '数据库',     val: dbVal,                         color: dbColor },
-          { label: 'Claude Auth', val: authVal,                      color: authColor },
-          { label: '版本',       val: health?.version ?? (healthLoading ? '…' : '—'), color: 'var(--blue)' },
-          { label: '阶段',       val: health?.stage    ?? (healthLoading ? '…' : '—'), color: 'var(--ember)' },
+          { label: '数据库',      val: dbVal,    color: dbColor,        ic: 'layers' },
+          { label: 'Claude Auth', val: authVal,  color: authColor,      ic: 'shield' },
+          { label: '版本',        val: health?.version ?? (healthLoading ? '…' : '—'), color: 'var(--blue)', ic: 'package' },
+          { label: '阶段',        val: stageVal, color: 'var(--ember)', ic: 'zap' },
         ].map(x => (
           <div className="stat" key={x.label}>
-            <div className="stat-val" style={{ color: x.color }}>{x.val}</div>
-            <div className="stat-label">{x.label}</div>
+            <div className="stat-ic" style={{ background: `color-mix(in oklab, ${x.color} 16%, transparent)`, color: x.color }}>
+              <Icon name={x.ic} size={18} />
+            </div>
+            <div className="stat-main">
+              <div className="stat-label">{x.label}</div>
+              <div className="stat-val" style={{ color: x.color, fontSize: 'var(--text-section)' }}>{x.val}</div>
+            </div>
           </div>
         ))}
       </div>
@@ -1300,7 +1567,7 @@ function SelfUpdateSettings() {
       </div>
 
       {confirm && createPortal(
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
           <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 400, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
             <p style={{ margin: '0 0 14px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>
               将拉取 origin/{st?.branch || 'dev'} 的 {st?.behind ?? 0} 个新提交到本地。
@@ -1323,17 +1590,21 @@ function SelfUpdateSettings() {
 }
 
 const SET_ITEMS = [
-  { id: 'theme',       name: '主题设置',     ic: 'palette' },
+  // —— AI 核心：搭建智能体的地基（模型 → 能力 → 角色 → 记忆）——
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-  { id: 'roles',       name: '角色 Agent',         ic: 'bot' },
-  { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
-  { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+  { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
+  { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
   { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
+  // —— 运行与流控 ——
+  { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
+  // —— 集成与通知 ——
   { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
   { id: 'notify',      name: '通知通道',     ic: 'bell' },
-  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
-  { id: 'specs',       name: '规范文档',     ic: 'file' },
+  // —— 系统 ——
+  { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+  { id: 'theme',       name: '主题设置',     ic: 'palette' },
   { id: 'about',       name: '关于 AutoForge', ic: 'box' },
 ];
 
@@ -1377,6 +1648,7 @@ export default function SettingsPage({
         <div className="set-body scroll">
           {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
           {sec === 'llm'         && <LLMSettings />}
+          {sec === 'tools'       && <ToolsSettings />}
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
@@ -1385,9 +1657,8 @@ export default function SettingsPage({
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
-          {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','roles','concurrency','selfupdate','knowledge','security','webhook','notify','gating','specs','about'].includes(sec) && (
+          {!['theme','llm','tools','roles','concurrency','selfupdate','knowledge','security','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

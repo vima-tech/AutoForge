@@ -170,6 +170,15 @@ preview:
         assert!(statements_from_yaml("project:\n  name: x\n").is_empty());
     }
 
+    /// 运行配置真源是 `.autoforge/run-config.json`（JSON）。JSON 是合法 YAML，
+    /// 所以 serde_yaml 消费者必须能直接解析 JSON 形态的配置。
+    #[test]
+    fn parses_json_run_config() {
+        let json = r#"{"preview":{"sensitive_fields":[{"table":"users","fields":["phone","email"],"rule":"mask"}]}}"#;
+        let stmts = statements_from_yaml(json);
+        assert_eq!(stmts.len(), 2);
+    }
+
     /// Real runtime test: build a SQLite db, apply masking via the sqlite3 CLI,
     /// and verify the stored value was actually masked. Skips if sqlite3 absent.
     #[tokio::test]

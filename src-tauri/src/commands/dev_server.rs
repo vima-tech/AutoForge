@@ -14,8 +14,11 @@ struct ProjectDevConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct DevConfig {
     command: String,
-    url: String,
 }
+
+/// Preview always loads the dev server at localhost on the auto-allocated port;
+/// the URL is no longer project-configurable (`{port}` is substituted per-run).
+const DEFAULT_DEV_URL: &str = "http://localhost:{port}";
 
 #[derive(Debug, Serialize)]
 pub struct DevServerStatus {
@@ -92,12 +95,72 @@ pub(crate) fn inject_port(command: &str, port: u16) -> String {
     }
 }
 
+/// Whether a literal command string references the `PORT` env var (`$PORT` / `${PORT}`).
+pub(crate) fn command_uses_port_env(command: &str) -> bool {
+    command.contains("$PORT") || command.contains("${PORT")
+}
+
+/// Extract the npm-style script name a command runs, if any:
+/// `npm run X`, `pnpm run X`, `pnpm X`, `yarn X`, `bun run X` → `Some("X")`.
+/// Returns `None` for direct binaries (`vite`, `python …`, `tauri dev`, …).
+fn npm_script_name(command: &str) -> Option<String> {
+    let mut toks = command.split_whitespace();
+    let runner = toks.next()?;
+    match runner {
+        "npm" | "bun" => {
+            // require an explicit `run`
+            if toks.next()? != "run" {
+                return None;
+            }
+            toks.next().map(|s| s.to_string())
+        }
+        "pnpm" | "yarn" => {
+            let next = toks.next()?;
+            if next == "run" {
+                toks.next().map(|s| s.to_string())
+            } else {
+                Some(next.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the command (resolved through its package.json script body, if it's an
+/// npm-style script invocation) consumes the `PORT` env var we export. Such commands
+/// — e.g. a `tauri:dev` script whose frontend port is `${PORT:-1420}` — run on our
+/// allocated port even though `inject_port` leaves their text untouched, so the
+/// configured URL must be realigned to match. `repo_path` resolves the script body.
+pub(crate) fn command_consumes_port(command: &str, repo_path: &str) -> bool {
+    if command_uses_port_env(command) {
+        return true;
+    }
+    let Some(script) = npm_script_name(command) else {
+        return false;
+    };
+    let pkg = std::path::Path::new(repo_path).join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&pkg) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    json.get("scripts")
+        .and_then(|s| s.get(&script))
+        .and_then(|v| v.as_str())
+        .map(command_uses_port_env)
+        .unwrap_or(false)
+}
+
 /// Resolve the URL to poll, aligned to the actually-used `port`.
-fn resolve_url(template: &str, command_changed: bool, port: u16) -> String {
+/// `port_applied` is true when the server actually listens on `port` — either
+/// because we injected a `--port` flag or because the command reads `$PORT`.
+fn resolve_url(template: &str, port_applied: bool, port: u16) -> String {
     if template.contains("{port}") {
         apply_port(template, port)
-    } else if template.trim().is_empty() || command_changed {
-        // auto-injected a port → the configured URL's port no longer applies
+    } else if template.trim().is_empty() || port_applied {
+        // the running server uses our allocated port → the configured URL's
+        // hardcoded port (e.g. 1420) no longer applies
         format!("http://localhost:{port}")
     } else {
         template.to_string()
@@ -163,13 +226,13 @@ pub async fn get_dev_server_status(
 
     let dev = project
         .as_ref()
-        .and_then(|p| parse_dev_config(p.config_yaml.as_deref()));
+        .and_then(|p| parse_dev_config(crate::commands::run_config::effective_config(p).as_deref()));
 
     let base = derive_port(&project_id);
     Ok(DevServerStatus {
         project_id,
         status: if dev.is_some() { "idle" } else { "no_config" }.to_string(),
-        url: dev.map(|c| apply_port(&c.url, base)),
+        url: dev.map(|_| apply_port(DEFAULT_DEV_URL, base)),
     })
 }
 
@@ -185,15 +248,20 @@ pub async fn start_dev_server(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    let dev = parse_dev_config(project.config_yaml.as_deref())
-        .ok_or_else(|| "未配置启动命令 (config_yaml 中缺少 dev.command / dev.url)".to_string())?;
+    let dev = parse_dev_config(crate::commands::run_config::effective_config(&project).as_deref())
+        .ok_or_else(|| "未配置启动命令 (config_yaml 中缺少 dev.command)".to_string())?;
 
     // Auto-allocate a free port so the preview never collides with an already-running
     // instance (e.g. the target project pins Vite to 1420). The port is injected into
     // the command (and exported as PORT) and the URL is aligned to it.
     let port = free_port_from(derive_port(&project_id));
     let command = inject_port(&dev.command, port);
-    let url = resolve_url(&dev.url, command != dev.command, port);
+    // The URL must follow the port when we either rewrote the command or the
+    // command (directly or via its package.json script) reads the PORT env we
+    // export (e.g. a `tauri:dev` script whose devUrl is `${PORT:-1420}`).
+    let port_applied =
+        command != dev.command || command_consumes_port(&dev.command, &project.repo_path);
+    let url = resolve_url(DEFAULT_DEV_URL, port_applied, port);
 
     // Kill any existing process for this project
     {
@@ -338,6 +406,51 @@ mod tests {
         // user kept an explicit URL and we didn't touch the command → respect it
         assert_eq!(resolve_url("http://localhost:3000", false, 5200), "http://localhost:3000");
         assert_eq!(resolve_url("", false, 5200), "http://localhost:5200");
+    }
+
+    #[test]
+    fn port_env_commands_realign_url() {
+        // A `tauri dev` script whose frontend port is `${PORT:-1420}`: text is left
+        // untouched by inject_port, but it runs on our allocated port, so the URL must
+        // be realigned instead of showing the stale 1420.
+        let raw = "tauri dev --config '{\"build\":{\"devUrl\":\"http://localhost:${PORT:-1420}\"}}'";
+        assert!(command_uses_port_env(raw));
+        assert!(!command_uses_port_env("npm run tauri:dev"));
+        // when the command consumes PORT, the stale configured URL is replaced
+        assert_eq!(resolve_url("http://127.0.0.1:1420", true, 22164), "http://localhost:22164");
+    }
+
+    #[test]
+    fn parses_npm_style_script_names() {
+        assert_eq!(npm_script_name("npm run tauri:dev").as_deref(), Some("tauri:dev"));
+        assert_eq!(npm_script_name("bun run dev").as_deref(), Some("dev"));
+        assert_eq!(npm_script_name("pnpm run dev").as_deref(), Some("dev"));
+        assert_eq!(npm_script_name("pnpm dev").as_deref(), Some("dev"));
+        assert_eq!(npm_script_name("yarn dev").as_deref(), Some("dev"));
+        assert_eq!(npm_script_name("yarn run dev").as_deref(), Some("dev"));
+        assert_eq!(npm_script_name("vite"), None);
+        assert_eq!(npm_script_name("python -m http.server"), None);
+        assert_eq!(npm_script_name("npm install"), None);
+    }
+
+    #[test]
+    fn resolves_port_env_through_package_json() {
+        let dir = std::env::temp_dir().join(format!("autoforge-devsrv-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg = dir.join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{"scripts":{"tauri:dev":"tauri dev --config \"{\\\"build\\\":{\\\"devUrl\\\":\\\"http://localhost:${PORT:-1420}\\\"}}\"","dev":"vite"}}"#,
+        )
+        .unwrap();
+        let repo = dir.to_str().unwrap();
+        // script body references ${PORT} → port is applied
+        assert!(command_consumes_port("npm run tauri:dev", repo));
+        // plain vite script does not → URL stays as configured
+        assert!(!command_consumes_port("npm run dev", repo));
+        // missing package.json / unknown script → false, not a panic
+        assert!(!command_consumes_port("npm run tauri:dev", "/nonexistent/path/xyz"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

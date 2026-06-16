@@ -228,6 +228,33 @@ Claude Code 在 worktree 内执行时额外禁止 git 工具：`--disallowedTool
 
 ---
 
+## 🧭 长期愿景：后端独立化 + MCP（开发约束 — 必读）
+
+AutoForge 的长期方向是把 Rust 后端从 Tauri 桌面壳中**解耦为可独立运行的服务**，并接入 **MCP 协议**（让 Agent 消费外部工具生态，从"工具"升级为"平台"）。当前**不主动重构**，但**后续所有开发必须保持现有架构缝隙，不得加深 Tauri 耦合**，否则会让未来拆分成本指数级上升。
+
+### 现状（为什么现在拆分成本低）
+
+耦合"浅但宽"，且集中在**传输/壳**层面，不碰业务语义：
+
+- ✅ `agents/llm.rs`（LLM 核心）、`db.rs`、`core/concurrency.rs`、`core/git.rs` 是**纯 Rust**，零 Tauri 引用。
+- ✅ `state.rs` 的 `AppState` 只装 `db / job_tx / concurrency / dev_servers`，**不含任何 Tauri 类型**；路径全局走 `OnceLock`。
+- ✅ `AppEvent`（`core/event.rs`）是可序列化 enum，本身与 Tauri 无关；只有 `emit()` 一句调 `app.emit`。
+- ⚠️ 唯一"宽"的耦合：`AppHandle` 被当事件 sink 一路透传进 `runner → tasks/* → orchestration` 的几乎每个函数签名，仅为了调 `event::emit`。
+- ⚠️ 业务逻辑多写在 `#[tauri::command]` 函数体内（inline sqlx），尚未下沉到独立 service 层。
+
+### 开发铁律（新增/修改代码时遵守）
+
+1. **业务逻辑不得依赖 Tauri 类型。** `tasks/`、`agents/`、`core/`、`models/`、新增的 service 函数里**禁止**出现 `AppHandle`、`State<'_, _>`、`Window`、`Manager`、`tauri::*`（事件发射除外，见第 2 条）。需要 DB/并发等依赖时，从 `AppState` 的纯字段取或显式传参。
+2. **事件发射只走 `event::emit(app, AppEvent)` 这一个出口**，不要在业务代码里直接 `app.emit(...)` 或新增第二种广播方式。这样未来把 `AppHandle` 换成 `trait EventSink` 时只需改一处。新增事件一律加到 `AppEvent` enum，不要传裸 JSON。
+3. **`#[tauri::command]` 保持薄包装。** 命令函数体内尽量只做"取 state → 调普通 async fn → 返回"，把实际逻辑写成不带 Tauri 类型的独立 async fn（放对应 `commands/<module>.rs` 或更下层）。**不要**在命令体里堆积大段业务/sqlx 逻辑。
+4. **异步任务用 `tokio::spawn`**（或现有 `tasks/runner.rs` 的入队机制），**不要**在业务层新增对 `tauri::async_runtime` 的直接依赖。
+5. **路径/全局配置走 `state.rs` 的 `OnceLock` 初始化器**（`init_*_base`），不要从 Tauri `AppHandle`/`PathResolver` 现取，以便非 Tauri 入口也能初始化。
+6. **MCP 相关代码放 Rust 后端，不放前端。** MCP（rmcp）跑在 tokio 上，与后端独立化正交——可在当前 Tauri 进程内先落地，但同样遵守第 1–4 条（MCP client/server 不得引用 Tauri 类型）。MCP 工具结果视为**不可信外部输入**，回灌上下文前过 `has_obvious_injection()`；MVP 阶段只允许**只读/无副作用**工具，写类工具默认禁用并走白名单。
+
+> 一句话：**Tauri 是薄壳不是地基**——把它当成"可替换的传输 + 事件 + 运行时适配层"，业务逻辑始终保持对它无感知。每次提交前自检：我新写的非命令代码里出现 `tauri::` 了吗？如果是事件以外的用途，就是在加深耦合，应改为参数传纯依赖。
+
+---
+
 ## 会议室系统
 
 ### 对话类型

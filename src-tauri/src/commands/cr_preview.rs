@@ -10,10 +10,11 @@
 //! When the project has no preview config the status is `no_config` / kind `none`,
 //! and the frontend collapses the preview area (fallback C).
 
+use crate::core::git::GitProxy;
 use crate::models::change_request::ChangeRequest;
 use crate::models::project::Project;
 use crate::models::worktree::WorktreeSession;
-use crate::state::{AppState, DevServerHandle};
+use crate::state::{worktrees_base, AppState, DevServerHandle};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -27,13 +28,13 @@ struct ProjectPreviewConfig {
 }
 
 /// `dev:` block of the project's `config_yaml`. All fields optional so legacy
-/// configs (`dev: { command, url }`) keep parsing; `kind` defaults to `web`.
-/// `{port}` placeholders in `command`/`url` are substituted per-CR.
+/// configs keep parsing; `kind` defaults to `web`. A legacy `url:` is simply
+/// ignored — preview always targets `http://localhost:{port}`.
+/// `{port}` placeholders in `command` are substituted per-CR.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DevSpec {
     kind: Option<String>,
     command: Option<String>,
-    url: Option<String>,
     app_command: Option<String>,
 }
 
@@ -153,11 +154,8 @@ fn effective_spec(config_yaml: Option<&str>, dir: &str) -> Option<EffectiveSpec>
         .filter(|c| !c.trim().is_empty())
         .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))?;
 
-    let url = explicit
-        .as_ref()
-        .and_then(|s| s.url.clone())
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| "http://localhost:{port}".to_string());
+    // Preview URL is fixed to localhost on the auto-allocated port (no longer configurable).
+    let url = "http://localhost:{port}".to_string();
 
     let app_command = explicit
         .as_ref()
@@ -272,7 +270,11 @@ async fn load_ctx(
     .bind(cr_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    // 合并后 worktree 目录已被清理，但 DB 行可能仍在；目录不存在则视作无会话，
+    // 这样 get_cr_preview 报 no_session（前端隐藏「本次改动」启动行），
+    // 框架探测也回落到主仓库（detect_dir）。
+    .filter(|s| std::path::Path::new(&s.worktree_path).exists());
     Ok((project, session))
 }
 
@@ -283,7 +285,7 @@ pub async fn get_cr_preview(
 ) -> Result<CrPreviewStatus, String> {
     let (project, session) = load_ctx(&state.db, &cr_id).await?;
 
-    let Some(spec) = effective_spec(project.config_yaml.as_deref(), detect_dir(&project, session.as_ref())) else {
+    let Some(spec) = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), detect_dir(&project, session.as_ref())) else {
         return Ok(CrPreviewStatus {
             cr_id,
             kind: "none".to_string(),
@@ -355,7 +357,7 @@ pub async fn start_cr_preview(
 ) -> Result<CrPreviewStatus, String> {
     let (project, session) = load_ctx(&state.db, &cr_id).await?;
     let session = session.ok_or_else(|| "该变更尚无 worktree 会话（实现未开始或已清理）".to_string())?;
-    let spec = effective_spec(project.config_yaml.as_deref(), &session.worktree_path)
+    let spec = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &session.worktree_path)
         .ok_or_else(|| "未配置预览启动命令（config_yaml 缺少 dev.command，且未能自动识别框架）".to_string())?;
 
     // Auto-allocate a free port (avoids colliding with other CR previews or a fixed
@@ -452,7 +454,7 @@ pub async fn stop_cr_preview(cr_id: String, state: State<'_, AppState>) -> Resul
 pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let (project, session) = load_ctx(&state.db, &cr_id).await?;
     let session = session.ok_or_else(|| "无 worktree 会话".to_string())?;
-    let spec = effective_spec(project.config_yaml.as_deref(), &session.worktree_path)
+    let spec = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &session.worktree_path)
         .ok_or_else(|| "未配置预览".to_string())?;
     let app_cmd = spec
         .app_command
@@ -474,6 +476,8 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         .arg("-lc")
         .arg(&app_cmd)
         .current_dir(&session.worktree_path)
+        // 隔离 DB，避免与主 AutoForge 共享生产库导致迁移不一致 panic。
+        .envs(isolated_app_env(&session.worktree_path))
         .stdout(out)
         .stderr(err)
         // Own process group so the launched app tree can be torn down together.
@@ -489,6 +493,305 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         },
     );
     Ok(())
+}
+
+// ── 分支启动（左侧「启动项目」选分支）────────────────────────────────────────
+//
+// 在项目本地分支上启动预览：每个 (project, branch) 用一个**独立 worktree**（detached
+// 到分支 tip，避免与主仓库/其它 worktree 的「已检出」冲突），并把主仓库的
+// `node_modules` 软链进去，免去重复安装。支持多分支并行（state.dev_servers 以
+// `branch:<project>:<branch>` 为键）。web → dev server；tauri → 启动桌面应用。
+
+async fn load_project(db: &crate::db::Db, project_id: &str) -> Result<Project, String> {
+    sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub is_current: bool,
+    pub is_main: bool,
+    pub is_dev: bool,
+}
+
+/// 列出项目本地分支（含当前/main/dev 标记），供左侧下拉选择。
+#[tauri::command]
+pub async fn list_local_branches(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<BranchInfo>, String> {
+    let project = load_project(&state.db, &project_id).await?;
+    let git = GitProxy::new(&project.repo_path);
+    let current = git
+        .run_str(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let (_code, out, err) = git
+        .run(&["branch", "--format=%(refname:short)"])
+        .await
+        .map_err(|e| e.to_string())?;
+    if out.trim().is_empty() && !err.trim().is_empty() {
+        return Err(format!("读取分支失败: {err}"));
+    }
+    let branches = out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.contains("HEAD detached") && !l.contains("(no branch)"))
+        .map(|name| BranchInfo {
+            name: name.to_string(),
+            is_current: name == current,
+            is_main: name == project.branch_main,
+            is_dev: name == project.branch_dev,
+        })
+        .collect();
+    Ok(branches)
+}
+
+#[derive(Debug, Serialize)]
+pub struct BranchPreviewStatus {
+    pub branch: String,
+    /// "web" | "tauri"
+    pub kind: String,
+    /// "starting" | "running"
+    pub status: String,
+    pub url: Option<String>,
+    pub can_launch_app: bool,
+}
+
+fn sanitize_branch(b: &str) -> String {
+    b.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect()
+}
+
+fn branch_wt_path(project_id: &str, branch: &str) -> String {
+    format!("{}/branch/{}/{}", worktrees_base(), project_id, sanitize_branch(branch))
+}
+
+fn branch_log_key(project_id: &str, branch: &str) -> String {
+    format!("branch-{}-{}", project_id, sanitize_branch(branch))
+}
+
+/// 给预览用的 Tauri 应用一套**隔离的 XDG 目录**，使其 `app_data_dir()` 落到 worktree 内的
+/// 独立路径，用自己的 SQLite DB 跑自己的迁移——而不是共享主 AutoForge 的生产库。
+/// 否则：分支的迁移集与生产库已应用的迁移不一致会直接 panic（migration X missing），
+/// 且多实例并发写同一 SQLite 也不安全。Linux 上 `app_data_dir` 走 XDG_DATA_HOME，
+/// 故无需改被启动应用的代码即可隔离。
+fn isolated_app_env(worktree: &str) -> Vec<(String, String)> {
+    let home = format!("{worktree}/.preview-home");
+    let mut envs = Vec::new();
+    for (key, sub) in [
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+    ] {
+        let dir = format!("{home}/{sub}");
+        let _ = std::fs::create_dir_all(&dir);
+        envs.push((key.to_string(), dir));
+    }
+    envs
+}
+
+/// Ensure a reusable detached worktree at `branch`'s tip, with `node_modules`
+/// symlinked from the main repo so the dev server can start without installing.
+async fn ensure_branch_worktree(repo_path: &str, branch: &str, wt_path: &str) -> Result<(), String> {
+    // 已存在则复用（决策：stop 不删 worktree，便于快速重启）。
+    if std::path::Path::new(wt_path).join(".git").exists() {
+        return Ok(());
+    }
+    if let Some(parent) = std::path::Path::new(wt_path).parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let git = GitProxy::new(repo_path);
+    let _ = git.run(&["worktree", "prune"]).await;
+    // `--detach`：检出到分支 tip 但不占用分支引用，避免「branch already checked out」。
+    let (code, _out, err) = git
+        .run(&["worktree", "add", "--detach", wt_path, branch])
+        .await
+        .map_err(|e| e.to_string())?;
+    if code != 0 {
+        return Err(format!("git worktree add 失败: {err}"));
+    }
+    // 软链 node_modules（gitignore 不在 worktree 内），免重复安装。
+    #[cfg(unix)]
+    {
+        let src = std::path::Path::new(repo_path).join("node_modules");
+        let dst = std::path::Path::new(wt_path).join("node_modules");
+        if src.exists() && !dst.exists() {
+            let _ = std::os::unix::fs::symlink(&src, &dst);
+        }
+    }
+    Ok(())
+}
+
+/// 启动指定分支的预览（web dev server 或 tauri 桌面应用），随机空闲端口避冲突。
+#[tauri::command]
+pub async fn start_branch_preview(
+    project_id: String,
+    branch: String,
+    state: State<'_, AppState>,
+) -> Result<BranchPreviewStatus, String> {
+    let project = load_project(&state.db, &project_id).await?;
+    let wt_path = branch_wt_path(&project_id, &branch);
+    ensure_branch_worktree(&project.repo_path, &branch, &wt_path).await?;
+
+    let spec = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &wt_path)
+        .ok_or_else(|| "未配置预览启动命令（config_yaml 缺少 dev.command，且未能自动识别框架）".to_string())?;
+    let kind = spec.kind.clone();
+    let can_launch_app = spec.can_launch_app;
+
+    let key = format!("branch:{project_id}:{branch}");
+    let port = crate::commands::dev_server::free_port_from(derive_port(&key));
+    // tauri → 启动桌面应用（app_command）；web → dev server。
+    let raw_cmd = if kind == "tauri" {
+        spec.app_command
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| spec.command.clone())
+    } else {
+        spec.command.clone()
+    };
+    let command = crate::commands::dev_server::inject_port(&raw_cmd, port);
+    // tauri 应用无 iframe URL；web 用本地端口 URL。
+    let url = if kind == "tauri" {
+        String::new()
+    } else {
+        format!("http://localhost:{port}")
+    };
+
+    {
+        let mut servers = state.dev_servers.lock().await;
+        if let Some(old) = servers.remove(&key) {
+            if let Some(child) = old.child.lock().await.as_mut() {
+                crate::commands::dev_server::kill_child_group(child).await;
+            }
+        }
+    }
+
+    let (out, err) = log_stdio(
+        &preview_log_path(&branch_log_key(&project_id, &branch)),
+        &command,
+        &wt_path,
+    )?;
+    let child = Command::new("sh")
+        .arg("-lc")
+        .arg(&command)
+        .current_dir(&wt_path)
+        .env("PORT", port.to_string())
+        .envs(isolated_app_env(&wt_path))
+        .stdout(out)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("启动失败: {e}"))?;
+
+    state.dev_servers.lock().await.insert(
+        key,
+        DevServerHandle {
+            child: Arc::new(Mutex::new(Some(child))),
+            url: url.clone(),
+        },
+    );
+
+    Ok(BranchPreviewStatus {
+        branch,
+        kind,
+        status: "starting".to_string(),
+        url: if url.is_empty() { None } else { Some(url) },
+        can_launch_app,
+    })
+}
+
+/// 列出当前项目所有正在运行的分支预览（已退出的句柄顺带清理）。
+#[tauri::command]
+pub async fn list_branch_previews(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<BranchPreviewStatus>, String> {
+    let project = load_project(&state.db, &project_id).await?;
+    let kind = effective_spec(crate::commands::run_config::effective_config(&project).as_deref(), &project.repo_path)
+        .map(|s| s.kind)
+        .unwrap_or_else(|| "web".to_string());
+    let prefix = format!("branch:{project_id}:");
+
+    let entries: Vec<(String, Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+        let servers = state.dev_servers.lock().await;
+        servers
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, h)| (k.clone(), h.child.clone(), h.url.clone()))
+            .collect()
+    };
+
+    let mut out = Vec::new();
+    let mut dead = Vec::new();
+    for (key, child_arc, url) in entries {
+        let running = {
+            let mut g = child_arc.lock().await;
+            match g.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(None)),
+                None => false,
+            }
+        };
+        if !running {
+            dead.push(key);
+            continue;
+        }
+        let branch = key.strip_prefix(&prefix).unwrap_or("").to_string();
+        let is_app = url.is_empty();
+        let status = if is_app || url_reachable(&url).await {
+            "running"
+        } else {
+            "starting"
+        };
+        out.push(BranchPreviewStatus {
+            branch,
+            kind: kind.clone(),
+            status: status.to_string(),
+            url: if url.is_empty() { None } else { Some(url) },
+            can_launch_app: is_app,
+        });
+    }
+    if !dead.is_empty() {
+        let mut servers = state.dev_servers.lock().await;
+        for k in dead {
+            servers.remove(&k);
+        }
+    }
+    out.sort_by(|a, b| a.branch.cmp(&b.branch));
+    Ok(out)
+}
+
+/// 停止某分支预览（仅杀进程，保留 worktree 以便快速重启）。
+#[tauri::command]
+pub async fn stop_branch_preview(
+    project_id: String,
+    branch: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let key = format!("branch:{project_id}:{branch}");
+    let mut servers = state.dev_servers.lock().await;
+    if let Some(handle) = servers.remove(&key) {
+        if let Some(child) = handle.child.lock().await.as_mut() {
+            crate::commands::dev_server::kill_child_group(child).await;
+        }
+    }
+    Ok(())
+}
+
+/// 某分支预览的启动日志尾部。
+#[tauri::command]
+pub async fn get_branch_preview_log(project_id: String, branch: String) -> Result<String, String> {
+    match std::fs::read_to_string(preview_log_path(&branch_log_key(&project_id, &branch))) {
+        Ok(s) if s.len() > 16000 => Ok(s[s.len() - 16000..].to_string()),
+        Ok(s) => Ok(s),
+        Err(_) => Ok(String::new()),
+    }
 }
 
 #[cfg(test)]

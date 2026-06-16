@@ -21,6 +21,7 @@ export default function Select({ value, onChange, options, placeholder = '请选
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<PopPos | null>(null);
   const triggerRef = useRef<HTMLDivElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
 
   const selected = options.find(o => o.value === value);
 
@@ -41,12 +42,17 @@ export default function Select({ value, onChange, options, placeholder = '请选
   useEffect(() => {
     if (!open) { setPos(null); return; }
     calcPos();
-    const close = () => setOpen(false);
-    window.addEventListener('scroll', close, true);
-    window.addEventListener('resize', close);
+    const onScroll = (e: Event) => {
+      // 在弹层内部滚动时不关闭，否则下拉项超过 max-height 后无法滚动浏览
+      if (popRef.current && e.target instanceof Node && popRef.current.contains(e.target)) return;
+      setOpen(false);
+    };
+    const onResize = () => setOpen(false);
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onResize);
     return () => {
-      window.removeEventListener('scroll', close, true);
-      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onResize);
     };
   }, [open]);
 
@@ -86,6 +92,7 @@ export default function Select({ value, onChange, options, placeholder = '请选
 
       {open && pos && createPortal(
         <div
+          ref={popRef}
           className={`csel-pop${pos.flipUp ? ' flip' : ''}`}
           role="listbox"
           style={{ position: 'fixed', top: pos.top, left: pos.left, width: pos.width }}

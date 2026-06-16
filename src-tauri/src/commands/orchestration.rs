@@ -381,6 +381,14 @@ async fn build_plan(
 
     let needs_planner = mentioned.is_empty() || asks_for_sequence(instruction);
     if !needs_planner {
+        // `@所有人`：被点名的恰好覆盖全部可调度成员（且不止一人）。让全员并发就同一话题
+        // 表态，并显式要求互相分析、@ 彼此尽快收敛到一致意见（后续链式 @ 跟进阶段接力）。
+        let is_everyone = mentioned.len() > 1 && mentioned.len() == members.len();
+        let step_instruction = if is_everyone {
+            consensus_instruction(instruction)
+        } else {
+            instruction.to_string()
+        };
         return Ok(ConversationPlan {
             steps: vec![ConversationPlanStep {
                 step_type: if mentioned.len() > 1 {
@@ -390,7 +398,7 @@ async fn build_plan(
                 }
                 .to_string(),
                 agents: mentioned,
-                instruction: instruction.to_string(),
+                instruction: step_instruction,
             }],
         });
     }
@@ -663,6 +671,25 @@ async fn run_plan_step(
     Ok((outcomes, step_failed))
 }
 
+/// Wrap a user topic with `@所有人` collaboration framing: every member states a
+/// clear position, analyzes the others' points, and @-mentions peers to converge
+/// on a shared conclusion quickly. The chained-@mention follow-up phase then lets
+/// the named members respond, so the discussion actually iterates toward consensus.
+fn consensus_instruction(instruction: &str) -> String {
+    // 去掉 composer 注入的 `@所有人` 字面前缀，只保留真正的话题。
+    let topic = instruction.trim().trim_start_matches("@所有人").trim();
+    let topic = if topic.is_empty() { "（见上文对话）" } else { topic };
+    format!(
+        "群聊全员讨论以下话题，目标是尽快达成一致结论：\n{}\n\n请每位成员：\n\
+1. 先基于自身专长给出明确立场和理由；\n\
+2. 认真分析其他成员的发言，明确表示同意 / 反对 / 补充，并说明依据；\n\
+3. 用 @对方名字 点名你想回应或邀请表态的成员，推动观点收敛；\n\
+4. 如果已与他人观点一致，请直接说明并归纳共识，不要为了发言而重复。\n\
+保持简洁、聚焦分歧点，避免空泛附和。",
+        topic
+    )
+}
+
 /// Build a human-readable roster of the schedulable group members, one per line
 /// as `@名字（角色/专长）`, so each agent knows who else is in the room and whom
 /// to @ for a given problem. The `@` prefix matches the mention syntax agents
@@ -766,7 +793,11 @@ async fn run_agent_for_step(
     } else {
         Some(agent.system_prompt.as_str())
     };
-    let result = crate::agents::llm::run_agent_text(&db, &agent, &prompt, system_prompt, &[]).await;
+    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 勾选了它的 MCP server 工具。
+    let registry = crate::agents::tools::build_registry_for_agent(&db, &agent).await;
+    let result =
+        crate::agents::llm::run_agent_text_with_tools(&db, &agent, &prompt, system_prompt, &[], &registry)
+            .await;
 
     let (ok, text, error) = match result {
         Ok(text) => (true, text, None),

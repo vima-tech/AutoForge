@@ -70,8 +70,7 @@ pub async fn generate_deploy_script(
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
     let env = target_env.unwrap_or_else(|| "production".to_string());
-    let cfg: DeployYaml = project
-        .config_yaml
+    let cfg: DeployYaml = crate::commands::run_config::effective_config(&project)
         .as_deref()
         .and_then(|y| serde_yaml::from_str(y).ok())
         .unwrap_or_default();
@@ -100,6 +99,65 @@ pub async fn generate_deploy_script(
         .fetch_one(&state.db)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Edit a not-yet-run deploy script. Only `pending_confirm` deployments are
+/// editable — a script that already ran (or is running) must not be mutated.
+#[tauri::command]
+pub async fn update_deploy_script(
+    deployment_id: String,
+    script: String,
+    state: State<'_, AppState>,
+) -> Result<Deployment, String> {
+    let dep = sqlx::query_as::<_, Deployment>("SELECT * FROM deployments WHERE id=?")
+        .bind(&deployment_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("deployment {} not found", deployment_id))?;
+
+    if dep.status != "pending_confirm" {
+        return Err(format!("部署 {} 状态为 {}，不可编辑", dep.id, dep.status));
+    }
+
+    sqlx::query("UPDATE deployments SET script=? WHERE id=?")
+        .bind(&script)
+        .bind(&deployment_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query_as::<_, Deployment>("SELECT * FROM deployments WHERE id=?")
+        .bind(&deployment_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a deployment record. A running deploy cannot be deleted (let it finish
+/// or fail first) to avoid orphaning an in-flight process.
+#[tauri::command]
+pub async fn delete_deployment(
+    deployment_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let dep = sqlx::query_as::<_, Deployment>("SELECT * FROM deployments WHERE id=?")
+        .bind(&deployment_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("deployment {} not found", deployment_id))?;
+
+    if dep.status == "running" {
+        return Err("部署正在执行中，无法删除".to_string());
+    }
+
+    sqlx::query("DELETE FROM deployments WHERE id=?")
+        .bind(&deployment_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Execute a previously-generated deploy script. This is the gated, irreversible action.

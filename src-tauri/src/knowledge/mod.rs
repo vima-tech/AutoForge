@@ -92,10 +92,10 @@ fn non_empty(s: &str) -> Option<String> {
     if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
-/// Map an AutoForge LLM provider → Innate provider enum (openai | anthropic).
+/// Map an AutoForge LLM `api_spec` → Innate provider enum (openai | anthropic).
 /// `claude-cli` has no HTTP API → `None` (unusable for Innate distillation).
-fn innate_provider(provider: &str) -> Option<&'static str> {
-    let p = provider.to_ascii_lowercase();
+fn innate_provider(api_spec: &str) -> Option<&'static str> {
+    let p = api_spec.to_ascii_lowercase();
     if p.contains("claude-cli") {
         None
     } else if p.contains("anthropic") {
@@ -146,7 +146,7 @@ pub async fn refresh_kb_models(db: &crate::db::Db) {
     };
 
     let distill = resolve_distill_llm(db).await.and_then(|cfg| {
-        let provider = innate_provider(&cfg.provider)?; // None for claude-cli
+        let provider = innate_provider(&cfg.api_spec)?; // None for claude-cli
         Some(InLlmConfig {
             provider: provider.to_string(),
             base_url: non_empty(&cfg.endpoint),
