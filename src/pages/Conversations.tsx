@@ -15,6 +15,7 @@ import {
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
 } from '../services';
 import type { BlockType } from '../data/mock';
+import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -191,7 +192,7 @@ function ConvItem({ c, active, agentMap, onSelect }: {
         <div className="conv-top">
           <span className="conv-name">{t}</span>
           <span className="conv-time">
-            {c.last_time ? new Date(c.last_time).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' }) : ''}
+            {c.last_time ? fmtListTime(c.last_time) : ''}
           </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -277,8 +278,8 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
             {isInnate
               ? <span className="chip ember" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>KNOWLEDGE</span>
               : isGroup && <span className="chip" style={{ padding: '0px 6px', fontSize: 'var(--text-micro)' }}>{a!.name_en}</span>}
-            <span className="msg-time">
-              {new Date(m.created_at).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}
+            <span className="msg-time" title={fmtFull(m.created_at)}>
+              {fmtMsgTime(m.created_at)}
             </span>
           </div>
         )}
@@ -321,6 +322,8 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
   const [mentionSel, setMentionSel] = useState(0);
   const [attachmentSel, setAttachmentSel] = useState(0);
   const composerRef = useRef<HTMLDivElement>(null);
+  const attachmentPopRef = useRef<HTMLDivElement>(null);
+  const attachmentTriggerRef = useRef<HTMLButtonElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -350,7 +353,8 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     if (!showAttachmentPicker) return;
     const closeOnOutside = (e: PointerEvent) => {
       if (!(e.target instanceof Node)) return;
-      if (composerRef.current?.contains(e.target)) return;
+      if (attachmentPopRef.current?.contains(e.target)) return;
+      if (attachmentTriggerRef.current?.contains(e.target)) return;
       setShowAttachmentPicker(false);
       setAttachmentQuery('');
     };
@@ -754,6 +758,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           </button>
         )}
         <button
+          ref={attachmentTriggerRef}
           className="context-attach-trigger"
           title="引用历史附件到会议室上下文"
           disabled={busy}
@@ -825,7 +830,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           </div>
         )}
         {showAttachmentPicker && (
-          <div className="mention-pop attachment-pop">
+          <div ref={attachmentPopRef} className="mention-pop attachment-pop">
             <div className="mention-pop-label"># 引用会议室上下文附件</div>
             {visibleContextAttachments.length > 0 ? (
               visibleContextAttachments.map((a, i) => (
@@ -1137,6 +1142,7 @@ export default function ConversationsPage() {
   const [showMembers,    setShowMembers]    = useState(false);
   const [showContext,    setShowContext]     = useState(false);
   const [showSearch,     setShowSearch]     = useState(false);
+  const [showHeadMore,   setShowHeadMore]   = useState(false);
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
@@ -1280,15 +1286,15 @@ export default function ConversationsPage() {
 
   // 6. Close panels when clicking outside the header actions area.
   useEffect(() => {
-    if (!showMembers && !showContext && !showSearch) return;
+    if (!showMembers && !showContext && !showSearch && !showHeadMore) return;
     const close = (e: PointerEvent) => {
       if (!(e.target instanceof Node)) return;
       if (headerActionsRef.current?.contains(e.target)) return;
-      setShowMembers(false); setShowContext(false); setShowSearch(false); setMemberError('');
+      setShowMembers(false); setShowContext(false); setShowSearch(false); setShowHeadMore(false); setMemberError('');
     };
     document.addEventListener('pointerdown', close);
     return () => document.removeEventListener('pointerdown', close);
-  }, [showMembers, showContext, showSearch]);
+  }, [showMembers, showContext, showSearch, showHeadMore]);
 
   useEffect(() => {
     if (!bubbleMenu) return;
@@ -1611,41 +1617,41 @@ export default function ConversationsPage() {
             </div>
             <div className="chat-head-actions" ref={headerActionsRef} style={{ position: 'relative' }}>
               {conv.conv_type === 'group' && (
-                <button className="member-stack" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); setShowSearch(false); }}
+                <button className="member-stack" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); setShowSearch(false); setShowHeadMore(false); }}
                   style={{ background: 'transparent', border: 0, padding: '0 4px', cursor: 'pointer' }}>
-                  {convMembers.slice(0, 4).map(a => <Avatar key={a.id} agent={a} size={28} />)}
+                  {convMembers.slice(0, 4).map(a => <Avatar key={a.id} agent={a} size={24} />)}
                 </button>
               )}
-              {conv.conv_type === 'group' && (
-                <button className="icon-btn" title="编辑会议室" onClick={() => { setEditGroup(conv); setShowMembers(false); setShowContext(false); setShowSearch(false); }}>
-                  <Icon name="edit" size={17} />
-                </button>
-              )}
-              {conv.conv_type === 'group' && (
-                <button className="icon-btn" title="群成员列表" onClick={() => { setShowMembers(v => !v); setShowContext(false); setShowSearch(false); }}>
-                  <Icon name="users" size={18} />
-                </button>
-              )}
-              <button className="icon-btn" title="会议室上下文与附件" onClick={() => { setShowContext(v => !v); setShowMembers(false); setShowSearch(false); }}>
+              {conv.conv_type === 'group' && <div className="chat-head-sep" />}
+              <button className={`icon-btn${showContext ? ' on' : ''}`} title="会议室上下文与附件" onClick={() => { setShowContext(v => !v); setShowMembers(false); setShowSearch(false); setShowHeadMore(false); }}>
                 <Icon name="layers" size={18} />
               </button>
-              <button className="icon-btn" title="搜索会议室" onClick={() => { setShowSearch(v => !v); setShowMembers(false); setShowContext(false); }}>
+              <button className={`icon-btn${showSearch ? ' on' : ''}`} title="搜索会议室" onClick={() => { setShowSearch(v => !v); setShowMembers(false); setShowContext(false); setShowHeadMore(false); }}>
                 <Icon name="search" size={18} />
               </button>
-              <button
-                className="icon-btn"
-                title="清空会议室内容"
-                disabled={visibleMsgCount === 0}
-                style={{ color: 'var(--red)' }}
-                onClick={() => {
-                  setConfirmClear(conv.id);
-                  setShowMembers(false);
-                  setShowContext(false);
-                  setShowSearch(false);
-                }}
-              >
-                <Icon name="trash" size={17} />
+              <button className={`icon-btn${showHeadMore ? ' on' : ''}`} title="更多操作" onClick={() => { setShowHeadMore(v => !v); setShowMembers(false); setShowContext(false); setShowSearch(false); }}>
+                <Icon name="dots" size={18} />
               </button>
+
+              {/* More-actions menu */}
+              {showHeadMore && (
+                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 200 }}>
+                  {conv.conv_type === 'group' && (
+                    <div className="mention-row" onClick={() => { setEditGroup(conv); setShowHeadMore(false); }}>
+                      <Icon name="edit" size={15} style={{ color: 'var(--text-3)' }} />
+                      <div style={{ flex: 1, minWidth: 0 }}><div className="nm">编辑会议室</div></div>
+                    </div>
+                  )}
+                  <div
+                    className="mention-row"
+                    style={visibleMsgCount === 0 ? { opacity: 0.45, pointerEvents: 'none' } : { color: 'var(--red)' }}
+                    onClick={() => { if (visibleMsgCount === 0) return; setConfirmClear(conv.id); setShowHeadMore(false); }}
+                  >
+                    <Icon name="trash" size={15} style={{ color: 'var(--red)' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}><div className="nm" style={{ color: 'var(--red)' }}>清空会议室内容</div></div>
+                  </div>
+                </div>
+              )}
 
               {/* Members panel */}
               {conv.conv_type === 'group' && showMembers && (
@@ -1882,8 +1888,8 @@ export default function ConversationsPage() {
                           <div className="nm">{sender}</div>
                           <div className="rl">{text || '消息内容为空'}</div>
                         </div>
-                        <span className="chat-search-time">
-                          {new Date(message.created_at).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}
+                        <span className="chat-search-time" title={fmtFull(message.created_at)}>
+                          {fmtMsgTime(message.created_at)}
                         </span>
                       </div>
                     ))}

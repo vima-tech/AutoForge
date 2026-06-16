@@ -19,6 +19,7 @@ pub mod projects;
 pub mod prototype;
 pub mod scan;
 pub mod security;
+pub mod self_update;
 pub mod settings;
 pub mod system;
 pub mod widget;

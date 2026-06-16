@@ -15,9 +15,11 @@ import {
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
+  listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
   type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
+  type Project, type SelfUpdateStatus, type SelfUpdateResult,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -48,9 +50,24 @@ const llmColor = (provider: string) => {
   return '#e8772e';
 };
 
-function formatAgentSub(agent: Agent, llmNames: { id: string; name: string }[]) {
-  const llmName = llmNames.find(l => l.id === agent.llm_id)?.name ?? '未指定 LLM';
-  return `LLM: ${llmName}`;
+type LlmRef = { id: string; name: string; enabled: boolean };
+
+// 角色/Agent 绑定的 LLM 健康状态：未绑定 / 正常 / 已停用 / 配置缺失。
+function llmBindingState(llmId: string | null | undefined, llms: LlmRef[]): 'none' | 'ok' | 'disabled' | 'missing' {
+  if (!llmId) return 'none';
+  const m = llms.find(l => l.id === llmId);
+  if (!m) return 'missing';
+  return m.enabled ? 'ok' : 'disabled';
+}
+
+// 下拉项标签：已停用的 LLM 追加标记，避免误选到不可用配置。
+const llmOptionLabel = (l: LlmRef) => l.enabled ? l.name : `${l.name}（已停用）`;
+
+function formatAgentSub(agent: Agent, llms: LlmRef[]) {
+  if (!agent.llm_id) return 'LLM: 未指定 LLM';
+  const m = llms.find(l => l.id === agent.llm_id);
+  if (!m) return `LLM: ${agent.llm_id}（配置缺失）`;
+  return `LLM: ${m.name}${m.enabled ? '' : '（已停用）'}`;
 }
 
 // 从后端返回的完整错误字符串中提取简短摘要，保留 HTTP 状态码 + 核心 message
@@ -112,7 +129,7 @@ function LLMSettings() {
   const testConn = async (id: string) => {
     setTesting(id);
     setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
-    const result = await testLlmConnection(id).catch(e => String(e));
+    const result = await testLlmConnection(id, drafts[id]).catch(e => String(e));
     setTestResult(r => ({ ...r, [id]: result }));
     setTesting(null);
   };
@@ -216,7 +233,7 @@ const AGENT_TEMPLATES: { label: string; prompt: string }[] = [
 function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hideIds, setHideIds] = useState<Set<string>>(new Set());
-  const [llmNames, setLlmNames] = useState<{ id: string; name: string }[]>([]);
+  const [llmNames, setLlmNames] = useState<LlmRef[]>([]);
   const [exp, setExp] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Partial<Agent>>>({});
   const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
@@ -227,7 +244,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
     Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog()]).then(([ags, llms, cat]) => {
       setAgents(ags);
       setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
-      setLlmNames(llms.map(l => ({ id: l.id, name: l.name })));
+      setLlmNames(llms.map(l => ({ id: l.id, name: l.name, enabled: l.enabled })));
       setLoading(false);
     }).catch(() => setLoading(false));
 
@@ -285,6 +302,13 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                 <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{v('name')}</span></div>
                 <div className="cfg-sub">{formatAgentSub(a, llmNames)}</div>
               </div>
+              {(() => {
+                const st = llmBindingState(a.llm_id, llmNames);
+                if (!a.enabled || st === 'ok' || st === 'none') return null;
+                return <span className="chip red" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }}
+                  title={st === 'disabled' ? '绑定的 LLM 已停用，运行将失败' : '绑定的 LLM 配置已删除，运行将失败'}>
+                  <Icon name="alert" size={11} />{st === 'disabled' ? 'LLM 已停用' : 'LLM 缺失'}</span>;
+              })()}
               <Icon name={exp === a.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
             </div>
             {exp === a.id && (
@@ -297,7 +321,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                     <Select
                       value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
                       onChange={val => setDraft(a.id, 'llm_id', val || null)}
-                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: l.name }))]} />
+                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]} />
                   </div>
                   <div className="field full"><label>职责标签</label>
                     <input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} />
@@ -360,7 +384,7 @@ const PROMPT_MODES: { id: 'builtin' | 'append' | 'custom'; label: string }[] = [
 
 function RoleSlotCard({ slot, llms, onApply }: {
   slot: RoleSlot;
-  llms: { id: string; name: string }[];
+  llms: LlmRef[];
   onApply: (kind: string, payload: Parameters<typeof setRoleSlot>[1]) => Promise<void>;
 }) {
   const h = slot.holder;
@@ -375,11 +399,17 @@ function RoleSlotCard({ slot, llms, onApply }: {
     try { await onApply(slot.kind, payload); } finally { setBusy(false); }
   };
 
+  const llmState = llmBindingState(h?.llm_id, llms);
   const status = !h ? { t: '未配置', c: '' }
     : !h.enabled ? { t: '已停用', c: '' }
     : !h.llm_id ? { t: '缺 LLM', c: 'amber' }
+    : llmState === 'disabled' ? { t: 'LLM 已停用', c: 'red' }
+    : llmState === 'missing' ? { t: 'LLM 缺失', c: 'red' }
     : { t: '已启用', c: 'green' };
-  const llmName = h?.llm_id ? (llms.find(l => l.id === h.llm_id)?.name ?? h.llm_id) : '未指定 LLM';
+  const boundLlm = h?.llm_id ? llms.find(l => l.id === h.llm_id) : undefined;
+  const llmName = h?.llm_id
+    ? (boundLlm ? `${boundLlm.name}${boundLlm.enabled ? '' : '（已停用）'}` : `${h.llm_id}（缺失）`)
+    : '未指定 LLM';
   const modeLabel = PROMPT_MODES.find(m => m.id === mode)?.label ?? '内置';
 
   return (
@@ -404,7 +434,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
       {open && slot.llm_only && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field full"><label>使用的 LLM</label>
-          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定（Innate 回退启发式蒸馏）—' }, ...llms.map(l => ({ value: l.id, label: l.name }))]}
+          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定（Innate 回退启发式蒸馏）—' }, ...llms.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]}
             onChange={val => apply({ llm_id: val, enabled: true })} />
           <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>仅支持有 HTTP API 的 LLM（OpenAI 兼容 / Anthropic）；Claude CLI 无法用于 Innate。Innate 已内置进程内，配置即时生效、不写任何全局文件。</span>
         </div>
@@ -418,7 +448,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
       {open && !slot.llm_only && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field"><label>使用的 LLM</label>
-          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定 —' }, ...llms.map(l => ({ value: l.id, label: l.name }))]}
+          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定 —' }, ...llms.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]}
             onChange={val => apply({ llm_id: val, enabled: true })} />
         </div>
         <div className="field"><label>提示词</label>
@@ -539,14 +569,14 @@ function EmbeddingConfigCard() {
 
 function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   const [slots, setSlots] = useState<RoleSlot[]>([]);
-  const [llms, setLlms] = useState<{ id: string; name: string }[]>([]);
+  const [llms, setLlms] = useState<LlmRef[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({}); // 默认收起
 
   useEffect(() => {
     Promise.all([listRoleCatalog(), listLlmConfigs()]).then(([s, l]) => {
-      setSlots(s); setLlms(l.map(x => ({ id: x.id, name: x.name }))); setLoading(false);
+      setSlots(s); setLlms(l.map(x => ({ id: x.id, name: x.name, enabled: x.enabled }))); setLoading(false);
     }).catch(e => { setErr(String(e)); setLoading(false); });
   }, []);
 
@@ -564,8 +594,8 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
         const rows = slots.filter(s => s.group === g.id);
         if (rows.length === 0) return null;
         const open = !!openGroups[g.id];
-        // 完整配置 = 有持有 Agent + 已启用 + 已绑定 LLM（缺一即不计入）
-        const active = rows.filter(r => r.holder?.enabled && r.holder?.llm_id).length;
+        // 完整配置 = 有持有 Agent + 已启用 + 绑定的 LLM 本身可用（停用/缺失均不计入）
+        const active = rows.filter(r => r.holder?.enabled && llmBindingState(r.holder?.llm_id, llms) === 'ok').length;
         const complete = active === rows.length;
         return (
           <div className="panel" style={{ marginBottom: 12 }} key={g.id}>
@@ -1184,11 +1214,120 @@ function WebhookSettings() {
   );
 }
 
+// ── 自更新（AutoForge 管理自身仓库时的安全同步）──────────────────────────────
+function SelfUpdateSettings() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [pid, setPid] = useState('');
+  const [st, setSt] = useState<SelfUpdateStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [pulling, setPulling] = useState(false);
+  const [result, setResult] = useState<SelfUpdateResult | null>(null);
+
+  useEffect(() => {
+    listProjects().then(ps => {
+      setProjects(ps);
+      if (ps.length) setPid(ps[0].id);
+    }).catch(() => {});
+  }, []);
+
+  const refresh = async (id: string) => {
+    if (!id) return;
+    setLoading(true); setResult(null); setSt(null);
+    try { setSt(await selfUpdateStatus(id)); }
+    catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { refresh(pid); /* eslint-disable-next-line */ }, [pid]);
+
+  const doPull = async () => {
+    setConfirm(false); setPulling(true); setResult(null);
+    try { setResult(await selfUpdatePull(pid)); }
+    catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
+    finally { setPulling(false); refresh(pid); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">同步更新（自更新）</div>
+      <div className="set-desc">
+        当 AutoForge 用自身作为项目运行时，交付合并会在隔离 worktree 中完成并<strong>推送到 origin/dev</strong>，不改动正在运行的工作区。
+        在此一键拉取最新代码（仅快进，git 自身会拒绝覆盖未提交改动以防丢失）。
+        <br /><strong>注意</strong>：拉取会改动源码，开发模式将<strong>自动重新编译并重启</strong>，请先确认无未保存/未提交的工作。
+      </div>
+      <div className="cfg-card">
+        <div className="cfg-fields">
+          <div className="field full"><label>项目</label>
+            <Select value={pid} onChange={setPid}
+              options={projects.map(p => ({ value: p.id, label: p.name }))} placeholder="选择项目" />
+          </div>
+
+          {loading && <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>加载状态中…</div>}
+
+          {st && (
+            <div className="field full" style={{ gap: 8 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                <span className="chip">{st.branch || '游离 HEAD'}</span>
+                {st.is_self_managed
+                  ? <span className="chip ember">自管理仓库</span>
+                  : <span className="chip">普通项目</span>}
+                {st.behind > 0
+                  ? <span className="chip amber">落后 {st.behind}</span>
+                  : <span className="chip green">已最新</span>}
+                {st.ahead > 0 && <span className="chip blue">领先 {st.ahead}</span>}
+                {st.dirty && <span className="chip red">有未提交改动</span>}
+              </div>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>{st.repo_path}</span>
+            </div>
+          )}
+
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={pulling || loading || !st || st.behind === 0}
+              onClick={() => setConfirm(true)}>
+              <Icon name="refresh" size={14} />{pulling ? '同步中…' : '同步更新'}
+              {st && st.behind > 0 && (
+                <span className="set-nav-badge" style={{ marginLeft: 6 }}>{st.behind}</span>
+              )}
+            </button>
+            {result && (
+              <span style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap',
+                lineHeight: 'var(--leading-normal)', color: result.ok ? 'var(--green-soft)' : 'var(--red)' }}>
+                {result.message}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {confirm && createPortal(
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'grid', placeItems: 'center', zIndex: 9999 }}>
+          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 400, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+            <p style={{ margin: '0 0 14px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>
+              将拉取 origin/{st?.branch || 'dev'} 的 {st?.behind ?? 0} 个新提交到本地。
+            </p>
+            <p style={{ margin: '0 0 20px', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--amber-soft)' }}>
+              ⚠ 源码将被更新，开发模式会<strong>自动重新编译并重启</strong>（运行中状态丢失）。
+              {st?.dirty && ' 当前有未提交改动；若与更新冲突，git 会拒绝拉取以免覆盖你的工作。'}
+              请确认已保存/提交重要工作后再继续。
+            </p>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={() => setConfirm(false)}>取消</button>
+              <button className="btn btn-primary" onClick={doPull}><Icon name="refresh" size={14} />确认同步并接受重启</button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
 const SET_ITEMS = [
   { id: 'theme',       name: '主题设置',     ic: 'palette' },
   { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
   { id: 'roles',       name: '角色 Agent',         ic: 'bot' },
   { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+  { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
   { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
   { id: 'security',    name: '安全与权限',   ic: 'shield' },
   { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
@@ -1207,6 +1346,18 @@ export default function SettingsPage({
 }) {
   const [sec, setSec] = useState('llm');
   const cur = SET_ITEMS.find(i => i.id === sec)!;
+
+  // 待拉取提交数角标：每分钟检查一次自管理仓库落后 origin/dev 的提交数。
+  const [pendingBehind, setPendingBehind] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const tick = () => selfUpdatePending()
+      .then(r => { if (alive) setPendingBehind(r.behind); })
+      .catch(() => {});
+    tick();
+    const t = setInterval(tick, 60_000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
   return (
     <div className="content">
       <div className="audit-top" style={{ height: 56 }}>
@@ -1217,6 +1368,9 @@ export default function SettingsPage({
           {SET_ITEMS.map(it => (
             <div key={it.id} className={'set-nav-item' + (sec === it.id ? ' active' : '')} onClick={() => setSec(it.id)}>
               <Icon name={it.ic} size={18} />{it.name}
+              {it.id === 'selfupdate' && pendingBehind > 0 && (
+                <span className="set-nav-badge" title={`有 ${pendingBehind} 个提交待拉取`}>{pendingBehind}</span>
+              )}
             </div>
           ))}
         </div>
@@ -1225,6 +1379,7 @@ export default function SettingsPage({
           {sec === 'llm'         && <LLMSettings />}
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
+          {sec === 'selfupdate'  && <SelfUpdateSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
@@ -1232,7 +1387,7 @@ export default function SettingsPage({
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'specs'       && <SpecsSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','roles','concurrency','knowledge','security','webhook','notify','gating','specs','about'].includes(sec) && (
+          {!['theme','llm','roles','concurrency','selfupdate','knowledge','security','webhook','notify','gating','specs','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

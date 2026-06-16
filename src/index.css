@@ -932,6 +932,7 @@ button { font-family: inherit; cursor: pointer; }
   transition: background .14s, color .14s;
 }
 .icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+.icon-btn.on { background: var(--ember-tint); color: var(--ember); }
 .icon-btn svg { width: 18px; height: 18px; }
 
 .chip {
@@ -1035,7 +1036,8 @@ button { font-family: inherit; cursor: pointer; }
 .chat-head-info { min-width: 0; }
 .chat-head-title { font-weight: 700; font-size: var(--text-title); display: flex; align-items: center; gap: 8px; }
 .chat-head-sub { font-size: var(--text-label); color: var(--text-3); margin-top: 1px; }
-.chat-head-actions { margin-left: auto; display: flex; gap: 4px; }
+.chat-head-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+.chat-head-sep { width: 1px; align-self: stretch; margin: 6px 4px; background: var(--border); }
 .member-stack { display: flex; }
 .member-stack .av { margin-left: -8px; border: 2px solid var(--bg); }
 .member-stack .av:first-child { margin-left: 0; }
@@ -1500,7 +1502,25 @@ button { font-family: inherit; cursor: pointer; }
 .prev-tag { font-family: var(--font-mono); font-size: var(--text-micro); padding: 2px 7px; border-radius: 6px; font-weight: 700; flex: none; }
 .prev-tag.prod { color: var(--red); background: rgba(219,90,64,.13); }
 .prev-tag.cr { color: var(--ember); background: var(--ember-tint); }
-.prev-iframe { flex: 1; width: 100%; min-height: 0; border: none; background: var(--bg-3); }
+/* 自动识别框架的提示徽标 */
+.prev-auto { font-family: var(--font-mono); font-size: var(--text-micro); letter-spacing: .04em; color: var(--text-3); border: 1px dashed var(--border-strong); border-radius: 6px; padding: 1px 6px; flex: none; }
+/* iframe 区容器：可在视口上方叠加 frontend-only 警示条 */
+.prev-body { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+/* Tauri 前端-only 警示条：iframe 无 IPC、数据为空时提示改用桌面窗口 */
+.prev-warn { display: flex; align-items: center; gap: 8px; flex: none; padding: 6px 10px; font-size: var(--text-caption); line-height: var(--leading-snug); color: var(--amber); background: rgba(224,163,46,.14); border-bottom: 1px solid var(--border); }
+.prev-warn b { color: var(--amber); font-weight: 700; }
+/* 16:9 等比缩放舞台：在 stage 内居中一个固定逻辑分辨率的 viewport，整体 scale 自适应 */
+.prev-stage { flex: 1; min-height: 0; min-width: 0; overflow: hidden; display: grid; place-items: center; background: var(--code-bg); padding: 8px; }
+.prev-viewport { flex: none; transform-origin: center center; border-radius: var(--radius-sm); overflow: hidden; box-shadow: var(--shadow); }
+.prev-iframe { width: 100%; height: 100%; border: none; background: var(--bg-3); display: block; }
+/* 横向并排（最大化整窗对比时） */
+.prev-frames.horizontal { flex-direction: row; }
+.prev-frames.horizontal .prev-section { border-bottom: none; border-right: 1px solid var(--border); }
+.prev-frames.horizontal .prev-section:last-child { border-right: none; }
+/* 最大化整窗预览覆盖层 */
+.prev-max { position: fixed; inset: 0; z-index: 260; background: rgba(0,0,0,.62); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); display: grid; place-items: center; padding: 24px; }
+.prev-max-card { width: 100%; height: 100%; max-width: calc(100vw - 48px); max-height: calc(100vh - 48px); background: var(--bg-2); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); overflow: hidden; display: flex; flex-direction: column; }
+.prev-max-card .prev-frames { flex: 1; min-height: 0; }
 .prev-empty {
   flex: 1; display: flex; align-items: center; justify-content: center;
   color: var(--text-3); font-size: var(--text-body); line-height: var(--leading-normal); text-align: center;
@@ -1540,6 +1560,12 @@ button { font-family: inherit; cursor: pointer; }
 .set-nav-item:hover { background: var(--surface-hover); color: var(--text); }
 .set-nav-item.active { background: var(--ember-tint); color: var(--ember); }
 .set-nav-item svg { width: 18px; height: 18px; }
+.set-nav-badge {
+  margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
+  display: grid; place-items: center; border-radius: 99px;
+  font-family: var(--font-mono); font-size: var(--text-micro); font-weight: 700;
+  color: var(--amber); background: rgba(224,163,46,.14);
+}
 .set-body { flex: 1; overflow-y: auto; }
 .set-inner { max-width: 760px; padding: 28px 36px 50px; }
 

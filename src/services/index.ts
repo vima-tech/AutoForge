@@ -251,6 +251,32 @@ export const listScanFindings = (testSessionId?: string) =>
 export const listAdminDecisions = (projectId?: string) =>
   ipc<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
 
+// ── Self-update (AutoForge managing its own running repo) ─────────────────────
+export interface SelfUpdateStatus {
+  repo_path: string;
+  branch: string;
+  is_self_managed: boolean;
+  dirty: boolean;
+  behind: number;
+  ahead: number;
+}
+export interface SelfUpdateResult {
+  ok: boolean;
+  pulled: number;
+  message: string;
+  restart_required: boolean;
+}
+export interface SelfUpdatePending {
+  project_id: string | null;
+  behind: number;
+}
+export const selfUpdatePending = () =>
+  ipc<SelfUpdatePending>('self_update_pending');
+export const selfUpdateStatus = (projectId: string) =>
+  ipc<SelfUpdateStatus>('self_update_status', { projectId });
+export const selfUpdatePull = (projectId: string) =>
+  ipc<SelfUpdateResult>('self_update_pull', { projectId });
+
 // ── Projects ─────────────────────────────────────────────────────────────────
 export const listProjects = () => ipc<Project[]>('list_projects');
 export const listActiveProjects = () => ipc<Project[]>('list_active_projects');
@@ -406,7 +432,8 @@ export const updateLlmConfig = (id: string, payload: Partial<{
   api_key: string; ctx_window: string; temperature: number; enabled: boolean;
 }>) => ipc<LlmConfig>('update_llm_config', { id, payload });
 export const deleteLlmConfig = (id: string) => ipc<void>('delete_llm_config', { id });
-export const testLlmConnection = (id: string) => ipc<string>('test_llm_connection', { id });
+export const testLlmConnection = (id: string, draft?: Partial<LlmConfig>) =>
+  ipc<string>('test_llm_connection', { id, draft: draft && Object.keys(draft).length ? draft : null });
 
 // ── Settings — Agents ────────────────────────────────────────────────────────
 export const listAgents = () => ipc<Agent[]>('list_agents');

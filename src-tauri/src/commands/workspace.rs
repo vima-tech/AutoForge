@@ -109,38 +109,56 @@ pub async fn list_workspace_files(
     let mut files = Vec::new();
 
     for subfolder in &["docs", "specs"] {
-        let dir = base.join(subfolder);
-        if !dir.exists() {
+        let root = base.join(subfolder);
+        if !root.exists() {
             continue;
         }
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if !path.is_file() { continue; }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') { continue; }
-            let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
+        // Walk recursively so files in nested subfolders (e.g. docs/sub/x.md)
+        // are listed, not just top-level entries. Iterative to avoid async recursion.
+        const MAX_DEPTH: u32 = 8;
+        let mut stack: Vec<(PathBuf, u32)> = vec![(root.clone(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
                 Err(_) => continue,
             };
-            let modified_at = meta.modified()
-                .map(|t| {
-                    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    chrono::DateTime::from_timestamp(secs as i64, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            files.push(WorkspaceFile {
-                rel_path: format!("{}/{}", subfolder, name),
-                name,
-                subfolder: subfolder.to_string(),
-                size_bytes: meta.len(),
-                modified_at,
-            });
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                if entry_name.starts_with('.') { continue; }
+                let meta = match tokio::fs::metadata(&path).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.is_dir() {
+                    if depth < MAX_DEPTH {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                if !meta.is_file() { continue; }
+                // Path relative to the subfolder root (e.g. "sub/x.md"), so files
+                // in different subfolders stay distinguishable in the list.
+                let rel_in_sub = path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| entry_name.clone());
+                let modified_at = meta.modified()
+                    .map(|t| {
+                        let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        chrono::DateTime::from_timestamp(secs as i64, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                files.push(WorkspaceFile {
+                    rel_path: format!("{}/{}", subfolder, rel_in_sub),
+                    name: rel_in_sub,
+                    subfolder: subfolder.to_string(),
+                    size_bytes: meta.len(),
+                    modified_at,
+                });
+            }
         }
     }
 

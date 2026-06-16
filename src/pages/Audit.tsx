@@ -133,6 +133,9 @@ interface PreviewControl {
   status: CrPreviewStatus['status'];
   kind: CrPreviewStatus['kind'];
   canLaunchApp: boolean;
+  /** tauri：iframe 仅前端，IPC 不可用 —— 提示用户改用桌面窗口预览 */
+  frontendOnly: boolean;
+  autoDetected: boolean;
   onStart: () => void;
   onStop: () => void;
   onLaunch: () => void;
@@ -150,6 +153,34 @@ function LogModal({ title, text, onClose }: { title: string; text: string; onClo
         <pre style={{ flex: 1, margin: 0, overflow: 'auto', padding: '14px 18px', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-normal)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
           {text || '（暂无日志输出 —— 进程可能尚未启动，或启动命令本身未产生输出）'}
         </pre>
+      </div>
+    </div>
+  );
+}
+
+// 以固定 16:9 逻辑视口（默认 1280×720 桌面分辨率）渲染页面，再整体等比缩放
+// 填满可用空间。这样窄预览栏里也能看到真实桌面布局，而非被压扁的响应式版本。
+function ScaledViewport({ url, title, baseW = 1280, baseH = 720 }: {
+  url: string; title: string; baseW?: number; baseH?: number;
+}) {
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(1);
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const fit = () => {
+      const r = el.getBoundingClientRect();
+      setScale(Math.min(r.width / baseW, r.height / baseH) || 1);
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [baseW, baseH]);
+  return (
+    <div className="prev-stage" ref={stageRef}>
+      <div className="prev-viewport" style={{ width: baseW, height: baseH, transform: `scale(${scale})` }}>
+        <iframe src={url} title={title} className="prev-iframe" />
       </div>
     </div>
   );
@@ -194,7 +225,20 @@ function PreviewSection({ label, tag, tagClass, url, control }: {
         )}
       </div>
       {url ? (
-        <iframe key={reloadKey} src={url} className="prev-iframe" title={label} />
+        <div className="prev-body">
+          {control?.frontendOnly && (
+            <div className="prev-warn">
+              <Icon name="alert" size={13} />
+              <span>Tauri 应用：此处仅渲染前端，<b>IPC 接口不可用</b>（数据为空）。请打开桌面窗口查看真实效果。</span>
+              {control.canLaunchApp && (
+                <button className="btn btn-sm" style={{ marginLeft: 'auto', flex: 'none' }} onClick={control.onLaunch}>
+                  <Icon name="box" size={12} />桌面窗口
+                </button>
+              )}
+            </div>
+          )}
+          <ScaledViewport key={reloadKey} url={url} title={label} />
+        </div>
       ) : control ? (
         <PreviewPlaceholder control={control} />
       ) : (
@@ -217,15 +261,25 @@ function PreviewPlaceholder({ control }: { control: PreviewControl }) {
     return <div className="prev-empty">实现尚未开始，暂无可预览的 worktree</div>;
   }
   // idle | stopped
+  const tauri = control.kind === 'tauri';
   return (
     <div className="prev-empty" style={{ flexDirection: 'column', gap: 12 }}>
       {control.status === 'stopped' && (
         <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>预览进程已退出，请查看日志排查</span>
       )}
-      <span>{control.kind === 'tauri' ? '在 worktree 中启动前端预览服务' : '在 worktree 中启动 dev server'}</span>
-      <div style={{ display: 'flex', gap: 8 }}>
-        <button className="btn" onClick={control.onStart}>
-          <Icon name="play" size={14} />启动预览
+      <span>
+        {tauri
+          ? '检测到 Tauri 应用：桌面窗口可访问完整 IPC 接口（数据正常）；iframe 仅供前端布局预览，接口为空。'
+          : '在 worktree 中启动 dev server'}
+      </span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+        {tauri && control.canLaunchApp && (
+          <button className="btn" onClick={control.onLaunch}>
+            <Icon name="box" size={14} />打开桌面窗口
+          </button>
+        )}
+        <button className="btn btn-ghost" onClick={control.onStart}>
+          <Icon name="play" size={14} />{tauri ? 'iframe 前端预览' : '启动预览'}
         </button>
         <button className="btn btn-ghost" onClick={control.onShowLog}>
           <Icon name="file" size={14} />查看日志
@@ -470,18 +524,30 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
         </>
       )}
 
-      {sc.affected_files.length > 0 && (
+      {(sc.affected_files.length > 0 || sc.related_files.length > 0) && (
         <>
           <SpecH2 icon="file" color="var(--violet)">影响文件{sc.blast_radius ? <span className="chip" style={{ marginLeft: 8, fontSize: 'var(--text-micro)' }}>{sc.blast_radius}</span> : null}</SpecH2>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {sc.affected_files.map((f, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-                <span className={'chip ' + (CHANGE_CHIP[f.change_type] || '')} style={{ fontSize: 'var(--text-micro)' }}>{f.change_type}</span>
-                <span style={monoPath}>{f.path}</span>
-                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{f.reason}</span>
+          {sc.affected_files.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {sc.affected_files.map((f, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                  <span className={'chip ' + (CHANGE_CHIP[f.change_type] || '')} style={{ fontSize: 'var(--text-micro)' }}>{f.change_type}</span>
+                  <span style={monoPath}>{f.path}</span>
+                  <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{f.reason}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {sc.related_files.length > 0 && (
+            <div style={{ marginTop: sc.affected_files.length > 0 ? 10 : 0 }}>
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', letterSpacing: '.06em', textTransform: 'uppercase', marginBottom: 4 }}>相关文件（需阅读，不一定改动）</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {sc.related_files.map((p, i) => (
+                  <span key={i} className="chip" style={{ ...monoPath, fontSize: 'var(--text-micro)' }}>{p}</span>
+                ))}
               </div>
-            ))}
-          </div>
+            </div>
+          )}
           {sc.entry_points.length > 0 && <p style={{ ...liStyle, marginTop: 8 }}><b>入手点：</b>{sc.entry_points.join('；')}</p>}
           {sc.out_of_scope.length > 0 && <p style={liStyle}><b>不在范围：</b>{sc.out_of_scope.join('；')}</p>}
         </>
@@ -692,6 +758,8 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const [crs, setCrs] = useState<ChangeRequest[]>([]);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
   const [issueTitles, setIssueTitles] = useState<Record<string, string>>({});
+  const [issuesById, setIssuesById] = useState<Record<string, Issue>>({});
+  const [origReqOpen, setOrigReqOpen] = useState(false);
   const [sel, setSel] = useState<Sel | null>(null);
   const [loadedProjectId, setLoadedProjectId] = useState('');
   const [issueAnalysis, setIssueAnalysis] = useState<IssueAnalysis | null>(null);
@@ -710,6 +778,13 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
   const [intakeOpen, setIntakeOpen] = useState(false);
   const [logModal, setLogModal] = useState<{ title: string; text: string } | null>(null);
+  const [previewMax, setPreviewMax] = useState(false);
+  useEffect(() => {
+    if (!previewMax) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPreviewMax(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [previewMax]);
 
   // Column widths
   const [listWidth, setListWidth] = useState(300);
@@ -764,6 +839,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
     setCrs(allCrs);
     setPendingIssues(allIssues.filter(i => i.status === 'pending_review_1'));
     setIssueTitles(Object.fromEntries(allIssues.map(i => [i.id, i.title])));
+    setIssuesById(Object.fromEntries(allIssues.map(i => [i.id, i])));
     setLoadedProjectId(projectId);
   }, []);
 
@@ -1004,6 +1080,30 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const hunks = diff ? parseDiff(diff) : [];
   const canRevise = cr?.status === 'pending_review_2' && !decided;
 
+  // 预览双栏（生产 main vs 本次改动）。inline 纵向堆叠；最大化时横向并排。
+  const renderPreviewFrames = (horizontal: boolean) => (
+    <div className={`prev-frames${horizontal ? ' horizontal' : ''}`}>
+      <PreviewSection label="生产 main" tag="生产 main" tagClass="prod" url={prodUrl} />
+      <PreviewSection
+        label={`本次改动 ${cr?.id.slice(0, 8) ?? ''}`}
+        tag={`本次改动 ${cr?.id.slice(0, 8) ?? ''}`}
+        tagClass="cr"
+        url={crPreview?.status === 'running' ? crPreview.url : null}
+        control={{
+          status: crPreview!.status,
+          kind: crPreview!.kind,
+          canLaunchApp: crPreview!.can_launch_app,
+          frontendOnly: crPreview!.frontend_only,
+          autoDetected: crPreview!.auto_detected,
+          onStart: doStartCrPreview,
+          onStop: doStopCrPreview,
+          onLaunch: doLaunchCrApp,
+          onShowLog: showCrPreviewLog,
+        }}
+      />
+    </div>
+  );
+
   return (
     <div className="audit-page">
       <div className="audit-top" style={{ height: 56 }}>
@@ -1096,6 +1196,28 @@ export default function AuditPage({ target, onTargetConsumed }: {
                   <div className="diff-viewport scroll">
                     {tab === 'report' ? (
                       <div className="report">
+                        {(() => {
+                          const oi = issuesById[cr.issue_id];
+                          if (!oi) return null;
+                          return (
+                            <div style={{ marginBottom: 14 }}>
+                              <button className="btn btn-sm" onClick={() => setOrigReqOpen(o => !o)}>
+                                <Icon name={origReqOpen ? 'eye-off' : 'eye'} size={13} />{origReqOpen ? '收起' : '查看'}需求原文
+                              </button>
+                              {origReqOpen && (
+                                <div className="panel" style={{ marginTop: 8, padding: '12px 14px' }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+                                    <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>{oi.title}</span>
+                                    <span className={'chip ' + (SEV_COLOR[oi.category] || 'blue')} style={{ fontSize: 'var(--text-micro)' }}>{oi.category}</span>
+                                    <span className={'chip ' + (SEV_COLOR[oi.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{oi.severity}</span>
+                                    <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{oi.source_type} · {new Date(oi.created_at).toLocaleString('zh')}</span>
+                                  </div>
+                                  <p style={{ margin: 0, whiteSpace: 'pre-line', fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' }}>{oi.description || '（无描述）'}</p>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                         {FAILED_STATUSES.includes(cr.status) ? (
                           <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--red)', borderRadius: 10, padding: '14px 16px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--red)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
@@ -1185,25 +1307,15 @@ export default function AuditPage({ target, onTargetConsumed }: {
                       <span className={`prev-tag ${crPreview!.kind === 'tauri' ? 'cr' : 'prod'}`} style={{ marginLeft: 'auto' }}>
                         {crPreview!.kind === 'tauri' ? 'TAURI' : 'WEB'}
                       </span>
+                      {crPreview!.auto_detected && (
+                        <span className="prev-auto" title="预览类型由项目文件自动识别（config_yaml 未声明 dev.kind）">自动识别</span>
+                      )}
+                      <button className="icon-btn" style={{ width: 26, height: 26 }}
+                        title="最大化预览（整窗查看）" onClick={() => setPreviewMax(true)}>
+                        <Icon name="maximize" size={14} />
+                      </button>
                     </div>
-                    <div className="prev-frames">
-                      <PreviewSection label="生产 main" tag="生产 main" tagClass="prod" url={prodUrl} />
-                      <PreviewSection
-                        label={`本次改动 ${cr.id.slice(0, 8)}`}
-                        tag={`本次改动 ${cr.id.slice(0, 8)}`}
-                        tagClass="cr"
-                        url={crPreview!.status === 'running' ? crPreview!.url : null}
-                        control={{
-                          status: crPreview!.status,
-                          kind: crPreview!.kind,
-                          canLaunchApp: crPreview!.can_launch_app,
-                          onStart: doStartCrPreview,
-                          onStop: doStopCrPreview,
-                          onLaunch: doLaunchCrApp,
-                          onShowLog: showCrPreviewLog,
-                        }}
-                      />
-                    </div>
+                    {renderPreviewFrames(false)}
                   </>
                 )}
 
@@ -1261,6 +1373,28 @@ export default function AuditPage({ target, onTargetConsumed }: {
 
       {logModal && (
         <LogModal title={logModal.title} text={logModal.text} onClose={() => setLogModal(null)} />
+      )}
+
+      {previewMax && canPreview && (
+        <div className="prev-max" onClick={() => setPreviewMax(false)}>
+          <div className="prev-max-card" onClick={e => e.stopPropagation()}>
+            <div className="prev-head">
+              <Icon name="eye" size={16} style={{ color: 'var(--ember)' }} />
+              <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>实时预览对比 · 整窗查看</span>
+              <span className={`prev-tag ${crPreview!.kind === 'tauri' ? 'cr' : 'prod'}`} style={{ marginLeft: 'auto' }}>
+                {crPreview!.kind === 'tauri' ? 'TAURI' : 'WEB'}
+              </span>
+              {crPreview!.auto_detected && (
+                <span className="prev-auto" title="预览类型由项目文件自动识别（config_yaml 未声明 dev.kind）">自动识别</span>
+              )}
+              <button className="icon-btn" style={{ width: 26, height: 26 }}
+                title="退出最大化" onClick={() => setPreviewMax(false)}>
+                <Icon name="minimize" size={14} />
+              </button>
+            </div>
+            {renderPreviewFrames(true)}
+          </div>
+        </div>
       )}
     </div>
   );

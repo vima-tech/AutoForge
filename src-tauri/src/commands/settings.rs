@@ -145,13 +145,46 @@ pub async fn delete_llm_config(id: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-pub async fn test_llm_connection(id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+pub async fn test_llm_connection(
+    id: String,
+    draft: Option<UpdateLlmConfig>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("LLM 配置不存在: {}", id))?;
+
+    // 用前台尚未保存的草稿覆盖落库值，使「填写后立即测试」反映最新输入，
+    // 而非已保存的旧数据。
+    if let Some(d) = draft {
+        if let Some(v) = d.name {
+            cfg.name = v;
+        }
+        if let Some(v) = d.provider {
+            cfg.provider = v;
+        }
+        if let Some(v) = d.model {
+            cfg.model = v;
+        }
+        if let Some(v) = d.endpoint {
+            cfg.endpoint = v;
+        }
+        if let Some(v) = d.api_key {
+            cfg.api_key = v;
+        }
+        if let Some(v) = d.ctx_window {
+            cfg.ctx_window = v;
+        }
+        if let Some(v) = d.temperature {
+            cfg.temperature = v;
+        }
+        if let Some(v) = d.enabled {
+            cfg.enabled = v;
+        }
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
