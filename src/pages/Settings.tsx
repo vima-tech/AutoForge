@@ -14,9 +14,10 @@ import {
   listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
+  getKnowledgeEmbedding, setKnowledgeEmbedding,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
-  type NotifyChannel, type AutoPassPolicy, type RoleSlot,
+  type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -391,7 +392,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{slot.name_en}</span>
           </div>
           <div className="cfg-sub" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {open ? slot.desc : (h ? `${llmName} · 提示词 ${modeLabel}` : slot.desc)}
+            {open ? slot.desc : (h ? (slot.llm_only ? llmName : `${llmName} · 提示词 ${modeLabel}`) : slot.desc)}
           </div>
         </div>
         {!open && h?.mentionable && <span className="chip" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }} title="可拉入群聊">群</span>}
@@ -400,7 +401,21 @@ function RoleSlotCard({ slot, llms, onApply }: {
         <span className={'chip ' + status.c} style={{ flexShrink: 0 }}>{status.t}</span>
         <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
-      {open && (
+      {open && slot.llm_only && (
+      <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+        <div className="field full"><label>使用的 LLM</label>
+          <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定（Innate 回退启发式蒸馏）—' }, ...llms.map(l => ({ value: l.id, label: l.name }))]}
+            onChange={val => apply({ llm_id: val, enabled: true })} />
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>仅支持有 HTTP API 的 LLM（OpenAI 兼容 / Anthropic）；Claude CLI 无法用于 Innate。Innate 已内置进程内，配置即时生效、不写任何全局文件。</span>
+        </div>
+        <div className="field full">
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
+            <Switch on={Boolean(h?.enabled)} onToggle={() => apply({ enabled: !(h?.enabled) })} />启用
+          </label>
+        </div>
+      </div>
+      )}
+      {open && !slot.llm_only && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field"><label>使用的 LLM</label>
           <Select value={h?.llm_id ?? ''} options={[{ value: '', label: '— 未指定 —' }, ...llms.map(l => ({ value: l.id, label: l.name }))]}
@@ -438,7 +453,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
               <Switch on={Boolean(h?.visible_in_chat)} onToggle={() => apply({ visible_in_chat: !(h?.visible_in_chat) })} />可私聊
             </label>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }} title="开启后该角色会召回本项目历史经验注入提示词，随使用越来越准（需安装 innate CLI）">
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }} title="开启后该角色会召回本项目历史经验注入提示词，随使用越来越准（Innate 已内置，无需外部安装）">
               <Switch on={h ? Boolean(h.memory_enabled) : true} onToggle={() => apply({ memory_enabled: !(h?.memory_enabled ?? true) })} />启用记忆
             </label>
           </div>
@@ -453,7 +468,74 @@ const ROLE_GROUPS: { id: RoleSlot['group']; title: string; icon: string; color: 
   { id: 'orchestration', title: '群聊编排角色', icon: 'bot',     color: 'var(--blue)',  sub: '会议室多 Agent 协作的内置职责' },
   { id: 'delivery',      title: '交付与项目角色', icon: 'package', color: 'var(--green)', sub: '交付流水线与项目工具的 AI 职责' },
   { id: 'pipeline',      title: '需求流水线角色', icon: 'sliders', color: 'var(--ember)', sub: '分析 / 测试阶段' },
+  { id: 'knowledge',     title: '知识层（Innate）', icon: 'brain', color: 'var(--ember)', sub: 'Innate 自成长用的蒸馏 LLM 与 Embedding 模型' },
 ];
+
+// Innate embedding 模型配置卡（recall 语义检索用；非聊天 LLM，独立于 llm_configs）。
+function EmbeddingConfigCard() {
+  const [form, setForm] = useState<EmbeddingSettings>({ provider: 'openai', base_url: '', model_id: '', api_key: '', dim: 1536 });
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getKnowledgeEmbedding().then(setForm).catch(e => setStatus(String(e))); }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try { setForm(await setKnowledgeEmbedding(form)); setStatus('已保存 · 已同步至 Innate'); }
+    catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const configured = form.model_id.trim().length > 0;
+  return (
+    <div className="cfg-card" style={{ padding: open ? '13px 16px' : '8px 12px', marginBottom: 0, ...(open ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+      <div className="cfg-top" onClick={() => setOpen(o => !o)} style={{ cursor: 'pointer', gap: 10 }}>
+        <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="layers" size={15} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="cfg-name cfg-name-line"><span className="cfg-name-text">Embedding 模型</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>Embedding</span>
+          </div>
+          <div className="cfg-sub" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {open ? '语义召回（innate recall）用的向量模型' : (configured ? `${form.model_id} · dim ${form.dim}` : '语义召回向量模型（未配置则用哈希占位）')}
+          </div>
+        </div>
+        <span className={'chip ' + (configured ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{configured ? '已配置' : '未配置'}</span>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+      </div>
+      {open && (
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field"><label>Provider</label>
+            <Select value={form.provider || 'openai'} options={[{ value: 'openai', label: 'openai（兼容）' }]}
+              onChange={val => setForm(f => ({ ...f, provider: val }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>Anthropic 无 embedding API，仅 OpenAI 兼容端点。</span>
+          </div>
+          <div className="field"><label>向量维度 dim</label>
+            <input type="number" min="1" max="8192" value={form.dim}
+              onChange={e => setForm(f => ({ ...f, dim: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>须与模型实际产出一致（如 text-embedding-v4=1024）。</span>
+          </div>
+          <div className="field full"><label>Base URL</label>
+            <input type="text" value={form.base_url} placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
+              onChange={e => setForm(f => ({ ...f, base_url: e.target.value }))} />
+          </div>
+          <div className="field full"><label>Model ID</label>
+            <input type="text" value={form.model_id} placeholder="text-embedding-v4 / text-embedding-3-small"
+              onChange={e => setForm(f => ({ ...f, model_id: e.target.value }))} />
+          </div>
+          <div className="field full"><label>API Key</label>
+            <input type="password" value={form.api_key} placeholder="embedding API Key"
+              onChange={e => setForm(f => ({ ...f, api_key: e.target.value }))} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存 Embedding</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   const [slots, setSlots] = useState<RoleSlot[]>([]);
@@ -500,6 +582,7 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
             {open && (
               <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {rows.map(s => <RoleSlotCard key={s.kind} slot={s} llms={llms} onApply={apply} />)}
+                {g.id === 'knowledge' && <EmbeddingConfigCard />}
               </div>
             )}
           </div>
@@ -596,6 +679,7 @@ function KnowledgeSettings() {
       <div className="set-h">知识库自成长（Innate）</div>
       <div className="set-desc">
         AutoForge 在后台持续把交付经验蒸馏进各项目知识库。捕获达到阈值即自动进化，定时器作为低活跃项目的兜底；会议室里用 <code>/remember</code> <code>/recall</code> <code>/evolve</code> <code>/innate</code> 手动驱动。
+        <br />本页只管<strong>调度</strong>；Innate 用的<strong>蒸馏 LLM 与 Embedding 模型</strong>在「角色 Agent → 知识层（Innate）」配置。
       </div>
       <div className="cfg-card">
         <div className="cfg-fields">

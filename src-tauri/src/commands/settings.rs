@@ -454,12 +454,14 @@ pub struct RoleSlot {
     pub kind: String,
     pub name: String,
     pub name_en: String,
-    pub group: String,   // orchestration | delivery | pipeline
+    pub group: String,   // orchestration | delivery | pipeline | knowledge
     pub binding: String, // system_kind | forge_role
     pub desc: String,
     pub color: String,
     pub icon: String,
     pub builtin_prompt: String,
+    /// 仅绑定 LLM 的角色（知识层）：前端只渲染 LLM 选择器，隐藏 prompt/群聊等开关。
+    pub llm_only: bool,
     pub holder: Option<Agent>,
 }
 
@@ -469,6 +471,7 @@ fn group_str(g: crate::agents::roles::RoleGroup) -> &'static str {
         Orchestration => "orchestration",
         Delivery => "delivery",
         Pipeline => "pipeline",
+        Knowledge => "knowledge",
     }
 }
 
@@ -511,6 +514,7 @@ pub async fn list_role_catalog(state: State<'_, AppState>) -> Result<Vec<RoleSlo
             color: def.color.to_string(),
             icon: def.icon.to_string(),
             builtin_prompt: def.builtin_prompt.to_string(),
+            llm_only: def.llm_only,
             holder,
         });
     }
@@ -662,6 +666,12 @@ pub async fn set_role_slot(
     }
 
     tx.commit().await.map_err(|e| e.to_string())?;
+
+    // 知识层蒸馏 LLM 改动后，刷新 in-process Innate 模型配置（best-effort，不阻断保存）。
+    if kind == "kb_distill" {
+        crate::knowledge::refresh_kb_models(&state.db).await;
+    }
+
     list_role_catalog(state).await
 }
 

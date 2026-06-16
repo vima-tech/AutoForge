@@ -93,6 +93,97 @@ pub async fn set_knowledge_settings(
     Ok(KnowledgeSettings { evolve_interval_hours: interval, capture_threshold: threshold })
 }
 
+// ── Embedding 模型配置 ──────────────────────────────────────────────────────
+//
+// Innate 的 embedding（用于 recall 语义检索）无法用聊天 LLM 表达（需 provider/
+// base_url/model_id/api_key/dim），llm_configs 也无此概念，故以 `knowledge.embedding.*`
+// 前缀键独立存 app_settings，保存时刷新 in-process Innate 的 embedding provider。
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingSettings {
+    /// 目前 Innate 仅支持 OpenAI 兼容的 embedding API。
+    pub provider: String,
+    pub base_url: String,
+    pub model_id: String,
+    pub api_key: String,
+    /// 向量维度，必须与模型实际产出一致（不一致会静默导致相似度错误）。
+    pub dim: u32,
+}
+
+impl Default for EmbeddingSettings {
+    fn default() -> Self {
+        Self {
+            provider: "openai".to_string(),
+            base_url: String::new(),
+            model_id: String::new(),
+            api_key: String::new(),
+            dim: 1536,
+        }
+    }
+}
+
+/// Load embedding settings (shared by the command layer and the Innate sync).
+pub async fn load_embedding_settings(db: &crate::db::Db) -> EmbeddingSettings {
+    let mut s = EmbeddingSettings::default();
+    if let Ok(rows) = sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM app_settings WHERE key IN (
+            'knowledge.embedding.provider', 'knowledge.embedding.base_url',
+            'knowledge.embedding.model_id', 'knowledge.embedding.api_key',
+            'knowledge.embedding.dim')",
+    )
+    .fetch_all(db)
+    .await
+    {
+        for (key, value) in rows {
+            match key.as_str() {
+                "knowledge.embedding.provider" if !value.is_empty() => s.provider = value,
+                "knowledge.embedding.base_url" => s.base_url = value,
+                "knowledge.embedding.model_id" => s.model_id = value,
+                "knowledge.embedding.api_key" => s.api_key = value,
+                "knowledge.embedding.dim" => s.dim = value.parse().unwrap_or(s.dim),
+                _ => {}
+            }
+        }
+    }
+    s
+}
+
+#[tauri::command]
+pub async fn get_knowledge_embedding(
+    state: State<'_, AppState>,
+) -> Result<EmbeddingSettings, String> {
+    Ok(load_embedding_settings(&state.db).await)
+}
+
+#[tauri::command]
+pub async fn set_knowledge_embedding(
+    payload: EmbeddingSettings,
+    state: State<'_, AppState>,
+) -> Result<EmbeddingSettings, String> {
+    let dim = payload.dim.clamp(1, 8192);
+    for (key, value) in [
+        ("knowledge.embedding.provider", payload.provider.trim().to_string()),
+        ("knowledge.embedding.base_url", payload.base_url.trim().to_string()),
+        ("knowledge.embedding.model_id", payload.model_id.trim().to_string()),
+        ("knowledge.embedding.api_key", payload.api_key.trim().to_string()),
+        ("knowledge.embedding.dim", dim.to_string()),
+    ] {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(key)
+        .bind(&value)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    // 刷新 in-process Innate 的 embedding/蒸馏模型配置（下次 recall/evolve 即生效）。
+    crate::knowledge::refresh_kb_models(&state.db).await;
+    Ok(load_embedding_settings(&state.db).await)
+}
+
 // ── /command dispatch ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

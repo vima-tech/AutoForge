@@ -1,23 +1,31 @@
 //! Innate integration — AutoForge self-growth knowledge layer.
 //!
-//! Strategy: shell out to the `innate` CLI (the same integration path Innate's
-//! own SDKs/Daemon use) rather than linking it in-process, which avoids the
-//! rusqlite vs sqlx/libsqlite3-sys SQLite symbol clash. All operations are
-//! best-effort: if the `innate` binary is absent or errors, the pipeline runs
-//! unchanged. Tenancy = per-project db + a shared db (design: shared = the
-//! factory's durable craft; proj = disposable working memory).
+//! Strategy: Innate is embedded **in-process** as the `innate` crate (lib
+//! `innate_core`), not shelled out. We construct the LLM/embedding providers
+//! from AutoForge's own unified config (the `kb_distill` role's LLM + the
+//! embedding settings) and inject them via `KnowledgeBase::open_with`, so Innate
+//! never reads the global `~/.innate/settings.json` and has **zero relationship
+//! with the outside world** (no CLI, no shared global state, no effect on other
+//! agents' Innate MCP). All operations are best-effort: if a provider is
+//! unconfigured Innate degrades gracefully (dummy embedder / heuristic
+//! distiller); errors never break the pipeline. Tenancy = per-project db + a
+//! shared db (shared = the factory's durable craft; proj = working memory).
+//!
+//! Concurrency: `KnowledgeBase` is sync (rusqlite) and its providers do blocking
+//! HTTP (`ureq`), so every operation runs on `tokio::task::spawn_blocking`. Each
+//! call opens its own connection (SQLite WAL handles multi-connection access).
 
 use crate::state::kb_base;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-use tokio::process::Command;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-fn innate_bin() -> String {
-    std::env::var("AUTOFORGE_INNATE_BIN").unwrap_or_else(|_| "innate".to_string())
-}
+use innate_core::embedding::EmbeddingProvider;
+use innate_core::llm::{build_distiller, LlmEmbeddingProvider};
+use innate_core::refine::Distiller;
+use innate_core::settings::{EmbeddingConfig as InEmbeddingConfig, LlmConfig as InLlmConfig};
+use innate_core::{KnowledgeBase, RecallParams, RecallResult, RecordParams};
 
 fn proj_db(project_id: &str) -> PathBuf {
     PathBuf::from(kb_base()).join(format!("proj-{}.db", sanitize(project_id)))
@@ -50,24 +58,286 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-async fn run_innate(db: &PathBuf, args: &[&str], timeout_secs: u64) -> Option<String> {
-    let _ = tokio::fs::create_dir_all(kb_base()).await;
-    let result = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        Command::new(innate_bin())
-            .arg("--db")
-            .arg(db)
-            .args(args)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if result.status.success() {
-        Some(String::from_utf8_lossy(&result.stdout).to_string())
-    } else {
-        None
+// ── In-process model config (Innate providers) ──────────────────────────────
+//
+// The embedding + distill-LLM config that drive Innate's providers. Cached in a
+// global so the per-call knowledge functions stay db-free; refreshed at startup
+// and whenever the user saves the knowledge-layer config (`refresh_kb_models`).
+
+#[derive(Default, Clone)]
+struct KbModels {
+    embedding: Option<InEmbeddingConfig>,
+    distill: Option<InLlmConfig>,
+}
+
+static KB_MODELS: OnceLock<RwLock<KbModels>> = OnceLock::new();
+
+fn kb_models() -> &'static RwLock<KbModels> {
+    KB_MODELS.get_or_init(|| RwLock::new(KbModels::default()))
+}
+
+fn set_kb_models(embedding: Option<InEmbeddingConfig>, distill: Option<InLlmConfig>) {
+    *kb_models().write().unwrap() = KbModels { embedding, distill };
+    // Providers are baked into open `KnowledgeBase` handles at open time, so a
+    // config change invalidates the whole handle cache; dim alerts referenced the
+    // old config and self-correct on the next open.
+    clear_kb_cache();
+    if let Some(a) = DIM_ALERTS.get() {
+        a.write().unwrap().clear();
     }
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+/// Map an AutoForge LLM provider → Innate provider enum (openai | anthropic).
+/// `claude-cli` has no HTTP API → `None` (unusable for Innate distillation).
+fn innate_provider(provider: &str) -> Option<&'static str> {
+    let p = provider.to_ascii_lowercase();
+    if p.contains("claude-cli") {
+        None
+    } else if p.contains("anthropic") {
+        Some("anthropic")
+    } else {
+        Some("openai")
+    }
+}
+
+/// Resolve the `llm_configs` row bound to the `kb_distill` role (None if no
+/// holder / no LLM bound).
+async fn resolve_distill_llm(db: &crate::db::Db) -> Option<crate::models::llm_config::LlmConfig> {
+    let agent = sqlx::query_as::<_, crate::models::agent::Agent>(
+        "SELECT * FROM agents
+         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE '%,kb_distill,%'
+           AND enabled=1
+         ORDER BY created_at LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    let llm_id = agent.llm_id?;
+    sqlx::query_as::<_, crate::models::llm_config::LlmConfig>(
+        "SELECT * FROM llm_configs WHERE id=?",
+    )
+    .bind(&llm_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Rebuild the cached Innate model config from AutoForge's unified config.
+/// Call at startup and after the user saves the embedding / `kb_distill` config.
+pub async fn refresh_kb_models(db: &crate::db::Db) {
+    let emb = crate::commands::knowledge::load_embedding_settings(db).await;
+    let embedding = if emb.model_id.trim().is_empty() {
+        None
+    } else {
+        Some(InEmbeddingConfig {
+            provider: non_empty(&emb.provider).unwrap_or_else(|| "openai".to_string()),
+            base_url: non_empty(&emb.base_url),
+            model_id: emb.model_id.trim().to_string(),
+            api_key: non_empty(&emb.api_key),
+            dim: emb.dim as usize,
+        })
+    };
+
+    let distill = resolve_distill_llm(db).await.and_then(|cfg| {
+        let provider = innate_provider(&cfg.provider)?; // None for claude-cli
+        Some(InLlmConfig {
+            provider: provider.to_string(),
+            base_url: non_empty(&cfg.endpoint),
+            model_id: cfg.model.trim().to_string(),
+            api_key: non_empty(&cfg.api_key),
+        })
+    });
+
+    match &embedding {
+        Some(e) => eprintln!(
+            "[innate] embedding active: model={} dim={} (real provider)",
+            e.model_id, e.dim
+        ),
+        None => eprintln!(
+            "[innate] embedding unconfigured → dummy embedder; recall degrades to heuristic match"
+        ),
+    }
+    set_kb_models(embedding, distill);
+}
+
+// ── Open-handle cache (B-1) ─────────────────────────────────────────────────
+//
+// Opening a `KnowledgeBase` is not free: it opens a SQLite connection, runs
+// schema/migration checks + `init_meta`, and bakes in the embedding/distiller
+// providers. Recall sits on the hot path of *every* system role (and fans out
+// proj ⊕ shared), so re-opening per call is wasteful. We cache one
+// `Arc<Mutex<KnowledgeBase>>` per db path — mirroring the Innate MCP server,
+// which holds a single `Mutex<KnowledgeBase>` for its whole lifetime.
+// `KnowledgeBase` is `Send` but not `Sync` (rusqlite `Connection`), so the
+// `Mutex` both makes the handle shareable across `spawn_blocking` threads and
+// serializes access to a given db — acceptable here: concurrency is bounded and
+// SQLite serializes writers regardless. The cache is dropped on config change
+// (`set_kb_models`), since providers are fixed at open time.
+
+type KbHandle = Arc<Mutex<KnowledgeBase>>;
+static KB_CACHE: OnceLock<RwLock<HashMap<PathBuf, KbHandle>>> = OnceLock::new();
+
+fn kb_cache() -> &'static RwLock<HashMap<PathBuf, KbHandle>> {
+    KB_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn clear_kb_cache() {
+    if let Some(c) = KB_CACHE.get() {
+        c.write().unwrap().clear();
+    }
+}
+
+// ── Embedding-dimension health (B-2) ────────────────────────────────────────
+//
+// Innate already fails closed on a dim change: `open_with` → `init_meta`
+// returns "content_dim mismatch: database uses X, embedding provider uses Y"
+// when the configured embedding's dimension differs from what the db was built
+// with (a silent recall blackout otherwise, since cosine search only scores
+// equal-dim vectors). Our best-effort opens would swallow that into `None`. We
+// detect that specific error, log it once, and stash a per-db alert so `/innate`
+// and the settings health view can show an actionable message instead of
+// quietly returning nothing.
+
+static DIM_ALERTS: OnceLock<RwLock<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn dim_alerts() -> &'static RwLock<HashMap<PathBuf, String>> {
+    DIM_ALERTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Open succeeded → clear any stale dim alert for this db.
+fn note_open_ok(db: &PathBuf) {
+    if let Some(a) = DIM_ALERTS.get() {
+        a.write().unwrap().remove(db);
+    }
+}
+
+/// Open failed → if it's a dimension mismatch, record an actionable alert.
+fn note_open_err(db: &PathBuf, err: &str) {
+    if err.contains("mismatch") && err.contains("dim") {
+        let msg = format!(
+            "向量维度与当前 embedding 配置不一致（{}）。更换 embedding 模型后，旧向量会被静默跳过，\
+             召回质量将下降。请改回原 embedding 模型，或清空并重建该库（{}）。",
+            err,
+            db.display()
+        );
+        eprintln!("[innate] dim-guard: {msg}");
+        dim_alerts().write().unwrap().insert(db.clone(), msg);
+    }
+}
+
+/// Active embedding-dimension alert for a scope, if any (for `/innate` + health).
+pub fn kb_dim_alert(project_id: Option<&str>) -> Option<String> {
+    let db = scope_db(project_id);
+    DIM_ALERTS.get()?.read().unwrap().get(&db).cloned()
+}
+
+/// Get the cached `KnowledgeBase` for `db`, opening (and caching) it with the
+/// current providers if absent. Opening runs on a blocking thread (sync IO).
+async fn cached_kb(db: PathBuf) -> Result<KbHandle, String> {
+    if let Some(h) = kb_cache().read().unwrap().get(&db).cloned() {
+        return Ok(h);
+    }
+    let models = kb_models().read().unwrap().clone();
+    let db_for_open = db.clone();
+    let opened = tokio::task::spawn_blocking(move || -> Result<KnowledgeBase, String> {
+        let embedding = models
+            .embedding
+            .map(|c| Arc::new(LlmEmbeddingProvider::new(c)) as Arc<dyn EmbeddingProvider>);
+        let distiller = models
+            .distill
+            .as_ref()
+            .map(|c| build_distiller(c) as Arc<dyn Distiller>);
+        KnowledgeBase::open_with(&db_for_open, embedding, None, distiller, None, None)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("知识库任务异常：{e}"))?;
+
+    match opened {
+        Ok(kb) => {
+            note_open_ok(&db);
+            let handle: KbHandle = Arc::new(Mutex::new(kb));
+            // Double-checked insert: a racing open may have populated the slot.
+            let mut w = kb_cache().write().unwrap();
+            Ok(w.entry(db).or_insert(handle).clone())
+        }
+        Err(e) => {
+            note_open_err(&db, &e);
+            Err(format!("打开知识库失败：{e}"))
+        }
+    }
+}
+
+/// Run `f` against the cached `KnowledgeBase` at `db` on a blocking thread.
+/// `Err(String)` on open/op failure (for the command layer); [`with_kb`] wraps
+/// this best-effort for pipeline hooks.
+async fn with_kb_result<T, F>(db: PathBuf, f: F) -> Result<T, String>
+where
+    F: FnOnce(&KnowledgeBase) -> innate_core::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = cached_kb(db).await?;
+    tokio::task::spawn_blocking(move || -> Result<T, String> {
+        let kb = handle.lock().unwrap();
+        f(&kb).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("知识库任务异常：{e}"))?
+}
+
+/// Best-effort variant: returns `None` on any error (fire-and-forget safe).
+async fn with_kb<T, F>(db: PathBuf, f: F) -> Option<T>
+where
+    F: FnOnce(&KnowledgeBase) -> innate_core::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    with_kb_result(db, f).await.ok()
+}
+
+/// Run a recall against one db. `trace` persists a usage trace (for the
+/// record/feedback loop); pass `false` for throwaway recalls.
+async fn run_recall(
+    db: PathBuf,
+    query: String,
+    budget: usize,
+    include_sparks: bool,
+    trace: bool,
+) -> Option<RecallResult> {
+    with_kb(db, move |kb| {
+        kb.recall(RecallParams {
+            query: &query,
+            budget,
+            trace,
+            include_sparks,
+            source: "sdk",
+            ..Default::default()
+        })
+    })
+    .await
+}
+
+/// Flatten a `RecallResult` into injectable text + the surfaced chunk ids.
+fn render_recall(rr: &RecallResult) -> (String, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut ids = Vec::new();
+    for item in rr.knowledge.iter().chain(rr.sparks.iter()) {
+        if let Some(c) = item.get("content").and_then(|c| c.as_str()) {
+            if !c.trim().is_empty() {
+                lines.push(format!("- {}", c.trim()));
+            }
+        }
+        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+            ids.push(id.to_string());
+        }
+    }
+    (lines.join("\n"), ids)
 }
 
 /// Recall procedural knowledge for a coding/analysis prompt.
@@ -79,18 +349,14 @@ pub async fn kb_recall(project_id: &str, query: &str) -> String {
         return String::new();
     }
     let mut parts = Vec::new();
-    if let Some(text) = run_innate(
-        &proj_db(project_id),
-        &["recall", &q, "--budget", "3000"],
-        45,
-    )
-    .await
-    {
+    if let Some(rr) = run_recall(proj_db(project_id), q.clone(), 3000, false, false).await {
+        let (text, _) = render_recall(&rr);
         if !text.trim().is_empty() {
             parts.push(format!("### 项目经验\n{}", text.trim()));
         }
     }
-    if let Some(text) = run_innate(&shared_db(), &["recall", &q, "--budget", "2000"], 45).await {
+    if let Some(rr) = run_recall(shared_db(), q, 2000, false, false).await {
+        let (text, _) = render_recall(&rr);
         if !text.trim().is_empty() {
             parts.push(format!("### 通用技能（跨项目）\n{}", text.trim()));
         }
@@ -110,9 +376,9 @@ pub struct Recall {
     pub used_ids: Vec<String>,
 }
 
-/// Recall like [`kb_recall`], but over JSON so we capture the project-db
-/// `trace_id` + chunk ids for a later [`kb_record`]. Still fans out to the
-/// shared db for injection text (its trace is left to the timer/curate sweep).
+/// Recall like [`kb_recall`], but capture the project-db `trace_id` + chunk ids
+/// for a later [`kb_record`]. Still fans out to the shared db for injection text
+/// (its trace is left to the timer/curate sweep).
 pub async fn kb_recall_traced(project_id: &str, query: &str) -> Recall {
     let q: String = query.chars().take(500).collect();
     if q.trim().is_empty() {
@@ -121,61 +387,23 @@ pub async fn kb_recall_traced(project_id: &str, query: &str) -> Recall {
     let mut out = Recall::default();
     let mut parts = Vec::new();
 
-    if let Some(raw) = run_innate(
-        &proj_db(project_id),
-        &["recall", &q, "--budget", "3000", "--format", "json", "--source", "sdk"],
-        45,
-    )
-    .await
-    {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            out.trace_id = v.get("trace_id").and_then(|t| t.as_str()).map(str::to_string);
-            let (text, ids) = render_recall_json(&v);
-            out.used_ids = ids;
-            if !text.trim().is_empty() {
-                parts.push(format!("### 项目经验\n{}", text.trim()));
-            }
+    if let Some(rr) = run_recall(proj_db(project_id), q.clone(), 3000, false, true).await {
+        out.trace_id = Some(rr.trace_id.clone());
+        let (text, ids) = render_recall(&rr);
+        out.used_ids = ids;
+        if !text.trim().is_empty() {
+            parts.push(format!("### 项目经验\n{}", text.trim()));
         }
     }
-
-    if let Some(raw) = run_innate(
-        &shared_db(),
-        &["recall", &q, "--budget", "2000", "--format", "json", "--source", "sdk"],
-        45,
-    )
-    .await
-    {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let (text, _) = render_recall_json(&v);
-            if !text.trim().is_empty() {
-                parts.push(format!("### 通用技能（跨项目）\n{}", text.trim()));
-            }
+    if let Some(rr) = run_recall(shared_db(), q, 2000, false, false).await {
+        let (text, _) = render_recall(&rr);
+        if !text.trim().is_empty() {
+            parts.push(format!("### 通用技能（跨项目）\n{}", text.trim()));
         }
     }
 
     out.text = parts.join("\n\n");
     out
-}
-
-/// Flatten a `recall --format json` payload into injectable text + chunk ids.
-fn render_recall_json(v: &serde_json::Value) -> (String, Vec<String>) {
-    let mut lines = Vec::new();
-    let mut ids = Vec::new();
-    for arr in [v.get("knowledge"), v.get("sparks")].into_iter().flatten() {
-        if let Some(items) = arr.as_array() {
-            for item in items {
-                if let Some(c) = item.get("content").and_then(|c| c.as_str()) {
-                    if !c.trim().is_empty() {
-                        lines.push(format!("- {}", c.trim()));
-                    }
-                }
-                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                    ids.push(id.to_string());
-                }
-            }
-        }
-    }
-    (lines.join("\n"), ids)
 }
 
 /// Close a recall trace with its real-world outcome (the record half of the
@@ -191,24 +419,30 @@ pub async fn kb_record(
     if trace_id.trim().is_empty() {
         return;
     }
-    let used = used_ids.join(",");
-    let mut args: Vec<&str> = vec![
-        "record",
-        trace_id,
-        "--outcome",
-        outcome,
-        "--source",
-        "sdk",
-        // explicit empty `--used` means "known none", which is the correct
-        // signal when the recall surfaced nothing.
-        "--used",
-        &used,
-    ];
-    if let Some(fb) = feedback {
-        args.push("--feedback");
-        args.push(fb);
-    }
-    let _ = run_innate(&proj_db(project_id), &args, 45).await;
+    let trace_id = trace_id.to_string();
+    let used: Vec<String> = used_ids.to_vec();
+    let outcome = outcome.to_string();
+    let feedback = feedback.map(str::to_string);
+    let _ = with_kb(proj_db(project_id), move |kb| {
+        let (feedback_up, feedback_down): (Option<&[String]>, Option<&[String]>) =
+            match feedback.as_deref() {
+                Some("up") => (Some(&used), None),
+                Some("down") => (None, Some(&used)),
+                _ => (None, None),
+            };
+        kb.record(RecordParams {
+            trace_id: &trace_id,
+            outcome: Some(&outcome),
+            // explicit empty `used` means "known none" — correct when the recall
+            // surfaced nothing.
+            used: Some(&used),
+            feedback_up,
+            feedback_down,
+            source: "sdk",
+            ..Default::default()
+        })
+    })
+    .await;
 }
 
 /// Look up the recall trace linked to a change request, write back its outcome
@@ -246,11 +480,9 @@ pub async fn consume_trace_outcome(
 pub async fn kb_add(project_id: &str, content: &str, trigger: &str) {
     let content: String = content.chars().take(4000).collect();
     let trigger: String = trigger.chars().take(300).collect();
-    let ok = run_innate(
-        &proj_db(project_id),
-        &["add", &content, "--kind", "note", "--trigger", &trigger],
-        45,
-    )
+    let ok = with_kb(proj_db(project_id), move |kb| {
+        kb.add(&content, "note", Some(&trigger), None, "agent", None)
+    })
     .await
     .is_some();
     if ok {
@@ -260,12 +492,12 @@ pub async fn kb_add(project_id: &str, content: &str, trigger: &str) {
 
 /// Distil + curate a project's accumulated episodic logs into knowledge.
 pub async fn kb_evolve(project_id: &str) {
-    let _ = run_innate(&proj_db(project_id), &["evolve", "--trigger", "manual"], 120).await;
+    let _ = with_kb(proj_db(project_id), |kb| kb.evolve("manual")).await;
 }
 
 /// Distil + curate the shared (cross-project) craft db.
 pub async fn kb_evolve_shared() {
-    let _ = run_innate(&shared_db(), &["evolve", "--trigger", "scheduled"], 120).await;
+    let _ = with_kb(shared_db(), |kb| kb.evolve("scheduled")).await;
 }
 
 // ── Self-growth: event-threshold auto-evolve ───────────────────────────────
@@ -320,28 +552,7 @@ fn note_capture(project_id: Option<&str>) {
 // ── Command-layer helpers (manual /commands in the meeting room) ────────────
 //
 // These return a human-readable status `Result` (vs. the fire-and-forget
-// pipeline hooks above) so the chat can surface success / "innate unavailable".
-
-async fn run_innate_result(db: &PathBuf, args: &[&str], timeout_secs: u64) -> Result<String, String> {
-    let _ = tokio::fs::create_dir_all(kb_base()).await;
-    let out = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        Command::new(innate_bin()).arg("--db").arg(db).args(args).output(),
-    )
-    .await
-    .map_err(|_| "Innate 调用超时".to_string())?
-    .map_err(|e| format!("无法启动 innate（请确认已安装 innate CLI）：{}", e))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).to_string();
-        Err(if err.trim().is_empty() {
-            format!("innate 退出码 {:?}", out.status.code())
-        } else {
-            err.trim().to_string()
-        })
-    }
-}
+// pipeline hooks above) so the chat can surface success / failure detail.
 
 /// Manually store a knowledge chunk (the `/remember` command).
 pub async fn cmd_remember(
@@ -351,11 +562,9 @@ pub async fn cmd_remember(
 ) -> Result<(), String> {
     let content: String = content.chars().take(4000).collect();
     let trigger: String = trigger.chars().take(300).collect();
-    run_innate_result(
-        &scope_db(project_id),
-        &["add", &content, "--kind", "note", "--trigger", &trigger, "--source", "chat"],
-        45,
-    )
+    with_kb_result(scope_db(project_id), move |kb| {
+        kb.add(&content, "note", Some(&trigger), None, "chat", None)
+    })
     .await?;
     note_capture(project_id);
     Ok(())
@@ -367,32 +576,87 @@ pub async fn cmd_recall(project_id: Option<&str>, query: &str) -> Result<String,
     if q.trim().is_empty() {
         return Err("请在 /recall 后输入要召回的关键词".to_string());
     }
-    run_innate_result(
-        &scope_db(project_id),
-        &["recall", &q, "--budget", "4000", "--include-sparks"],
-        45,
-    )
-    .await
-    .map(|t| t.trim().to_string())
+    let rr = with_kb_result(scope_db(project_id), move |kb| {
+        kb.recall(RecallParams {
+            query: &q,
+            budget: 4000,
+            include_sparks: true,
+            source: "sdk",
+            ..Default::default()
+        })
+    })
+    .await?;
+    let (text, _) = render_recall(&rr);
+    Ok(text.trim().to_string())
 }
 
 /// Manually distil + curate a scope (the `/evolve` command).
 pub async fn cmd_evolve(project_id: Option<&str>) -> Result<String, String> {
-    run_innate_result(&scope_db(project_id), &["evolve", "--trigger", "manual"], 180)
-        .await
-        .map(|t| t.trim().to_string())
+    let report = with_kb_result(scope_db(project_id), |kb| kb.evolve("manual")).await?;
+    Ok(render_value(&report))
 }
 
 /// Knowledge-base health summary for a scope (the `/innate` command).
+/// Prepends an embedding-dimension warning when one is active (and surfaces it
+/// even when the mismatch is what made the open fail).
 pub async fn cmd_inspect(project_id: Option<&str>) -> Result<String, String> {
-    run_innate_result(&scope_db(project_id), &["inspect"], 45)
-        .await
-        .map(|t| t.trim().to_string())
+    match with_kb_result(scope_db(project_id), |kb| kb.inspect()).await {
+        Ok(report) => {
+            let body = render_value(&report);
+            Ok(match kb_dim_alert(project_id) {
+                Some(alert) => format!("⚠️ {alert}\n\n{body}"),
+                None => body,
+            })
+        }
+        // A dim mismatch fails the open; show the actionable warning instead of a
+        // generic error so the user knows exactly what to fix.
+        Err(e) => match kb_dim_alert(project_id) {
+            Some(alert) => Ok(format!("⚠️ {alert}")),
+            None => Err(e),
+        },
+    }
+}
+
+/// Render an Innate JSON report (`evolve` / `inspect`) into readable text.
+fn render_value(v: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
 /// Reset the in-process capture counter for a scope (used after a manual evolve).
 pub fn reset_capture_count(project_id: Option<&str>) {
     if let Some(counts) = CAPTURE_COUNTS.get() {
         counts.lock().unwrap().remove(&scope_key(project_id));
+    }
+}
+
+#[cfg(test)]
+mod sdk_smoke {
+    use innate_core::{KnowledgeBase, RecallParams};
+
+    // Proves the in-process Innate SDK runs inside AutoForge's build (default
+    // dummy embedder + heuristic distiller; no network, no global files).
+    #[test]
+    fn in_process_add_recall_inspect_evolve() {
+        let dir = std::env::temp_dir().join(format!("af-kb-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = dir.join("t.db");
+
+        let kb = KnowledgeBase::open_with(&db, None, None, None, None, None).expect("open_with");
+        let id = kb
+            .add("写数据库查询时用 sqlx 而非 rusqlite", "note", Some("写数据库查询"), None, "manual", None)
+            .expect("add");
+        assert!(!id.is_empty(), "add returns a chunk id");
+
+        let rr = kb
+            .recall(RecallParams { query: "数据库查询", budget: 2000, source: "sdk", ..Default::default() })
+            .expect("recall");
+        assert!(!rr.trace_id.is_empty(), "recall yields a trace id");
+
+        let report = kb.inspect().expect("inspect");
+        assert!(report.is_object() || report.is_array(), "inspect returns json");
+
+        kb.evolve("manual").expect("evolve");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

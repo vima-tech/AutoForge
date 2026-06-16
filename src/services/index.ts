@@ -47,10 +47,11 @@ export interface Agent {
 }
 export interface RoleSlot {
   kind: string; name: string; name_en: string;
-  group: 'orchestration' | 'delivery' | 'pipeline';
+  group: 'orchestration' | 'delivery' | 'pipeline' | 'knowledge';
   binding: 'system_kind' | 'forge_role';
   desc: string; color: string; icon: string;
   builtin_prompt: string;
+  llm_only: boolean;
   holder: Agent | null;
 }
 export interface Project {
@@ -361,6 +362,14 @@ export const getKnowledgeSettings = () =>
   ipc<KnowledgeSettings>('get_knowledge_settings');
 export const setKnowledgeSettings = (payload: KnowledgeSettings) =>
   ipc<KnowledgeSettings>('set_knowledge_settings', { payload });
+
+export interface EmbeddingSettings {
+  provider: string; base_url: string; model_id: string; api_key: string; dim: number;
+}
+export const getKnowledgeEmbedding = () =>
+  ipc<EmbeddingSettings>('get_knowledge_embedding');
+export const setKnowledgeEmbedding = (payload: EmbeddingSettings) =>
+  ipc<EmbeddingSettings>('set_knowledge_embedding', { payload });
 export const listProjectFiles = (projectId: string, conversationId?: string) =>
   ipc<ProjectContextFile[]>('list_project_files', { projectId, conversationId: conversationId ?? null });
 export const readProjectFile = (projectId: string, relPath: string) =>
@@ -538,6 +547,10 @@ export interface CrPreviewStatus {
   status: 'no_config' | 'no_session' | 'idle' | 'starting' | 'running' | 'stopped';
   url: string | null;
   can_launch_app: boolean;
+  /** tauri 项目：iframe 仅渲染前端，IPC 不可用（接口无数据），真正预览是桌面窗口 */
+  frontend_only: boolean;
+  /** kind 由项目文件自动识别（config_yaml 未显式声明 dev.kind） */
+  auto_detected: boolean;
 }
 export const getCrPreview = (crId: string) =>
   ipc<CrPreviewStatus>('get_cr_preview', { crId });

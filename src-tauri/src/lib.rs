@@ -94,6 +94,9 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let settings = commands::knowledge::load_knowledge_settings(&db_for_kb).await;
                 knowledge::set_evolve_threshold(settings.capture_threshold);
+                // 启动时把统一配置（蒸馏 LLM + embedding）载入 in-process Innate，
+                // 确保即使只在 DB 改过配置、未手动保存，Innate 也用上最新模型。
+                knowledge::refresh_kb_models(&db_for_kb).await;
                 loop {
                     let hours = commands::knowledge::load_knowledge_settings(&db_for_kb)
                         .await
@@ -220,6 +223,8 @@ pub fn run() {
             commands::knowledge::run_conversation_command,
             commands::knowledge::get_knowledge_settings,
             commands::knowledge::set_knowledge_settings,
+            commands::knowledge::get_knowledge_embedding,
+            commands::knowledge::set_knowledge_embedding,
             commands::settings::list_llm_configs,
             commands::settings::create_llm_config,
             commands::settings::update_llm_config,
