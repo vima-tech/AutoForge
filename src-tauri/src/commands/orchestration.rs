@@ -806,10 +806,17 @@ async fn run_agent_for_step(
         instruction,
         agent.name
     );
-    let system_prompt = if agent.system_prompt.trim().is_empty() {
-        None
+    // 统一输出规范：自由对话 Agent 的发言需条理清晰、简洁准确。把规范追加到 Agent
+    // 自身系统提示词之后（无自定义提示词时单独使用），不影响有严格输出契约的系统角色。
+    let base_prompt = agent.system_prompt.trim();
+    let system_prompt = if base_prompt.is_empty() {
+        crate::agents::roles::OUTPUT_FORMAT_GUIDE.to_string()
     } else {
-        Some(agent.system_prompt.as_str())
+        format!(
+            "{}\n\n{}",
+            base_prompt,
+            crate::agents::roles::OUTPUT_FORMAT_GUIDE
+        )
     };
     // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 代码扫描(项目仓库) + 勾选的 MCP server 工具。
     let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
@@ -820,7 +827,7 @@ async fn run_agent_for_step(
     let (ok, text, text_after_writes, error, write_blocks) =
         crate::core::trace::scope_run(&db, &agent, async {
             let result = crate::agents::llm::run_agent_text_with_tools(
-                &db, &agent, &prompt, system_prompt, &[], &registry,
+                &db, &agent, &prompt, Some(system_prompt.as_str()), &[], &registry,
             )
             .await;
             let (ok, text, error) = match result {

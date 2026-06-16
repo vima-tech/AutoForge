@@ -136,6 +136,19 @@ function visibleMessageBlocks(m: Message): BlockType[] {
   return parseMessageBlocks(m).filter(b => b.t !== 'quote_ref');
 }
 
+// 判定一条消息是否为「长文档」：含较长的 markdown 正文（或多个标题）。
+// 命中后整条改用「文档流」呈现（中性面板 + 限定阅读行宽 + prose 排版，全文常显），
+// 短消息仍保持对话气泡。仅对 Agent 输出生效——「我」的消息保持气泡右对齐。
+function isLongDoc(blocks: BlockType[]): boolean {
+  const md = blocks
+    .filter((b): b is Extract<BlockType, { t: 'md' }> => b.t === 'md')
+    .map(b => b.md)
+    .join('\n');
+  if (!md) return false;
+  const headings = (md.match(/^#{1,6}\s/gm) || []).length;
+  return md.length >= 600 || headings >= 2;
+}
+
 async function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -280,8 +293,9 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   const author = me ? '我' : isInnate ? 'Innate' : (a?.name ?? 'Agent');
   const blocks = visibleMessageBlocks(m);
   const quote = messageQuote(m);
+  const longDoc = !me && isLongDoc(blocks);
   return (
-    <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
+    <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (longDoc ? ' msg-doc' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
       {me
         ? <MeAvatar size={36} />
         : isInnate
@@ -301,7 +315,7 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
           </div>
         )}
         <div
-          className="bubble"
+          className={'bubble' + (longDoc ? ' doc' : '')}
           onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
           style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
         >
@@ -1167,8 +1181,9 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
   };
   const blocks = visibleMessageBlocks(pseudo);
   const quote = messageQuote(pseudo);
+  const longDoc = !m.is_me && isLongDoc(blocks);
   return (
-    <div className={'msg' + (m.is_me ? ' me' : '')}>
+    <div className={'msg' + (m.is_me ? ' me' : '') + (longDoc ? ' msg-doc' : '')}>
       {m.is_me
         ? <MeAvatar size={36} />
         : m.is_innate
@@ -1186,7 +1201,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
             <span className="msg-time" title={fmtFull(m.created_at)}>{fmtMsgTime(m.created_at)}</span>
           </div>
         )}
-        <div className="bubble" style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
+        <div className={'bubble' + (longDoc ? ' doc' : '')} style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
           {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
         </div>
         {quote && (

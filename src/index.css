@@ -6,6 +6,8 @@
   --font-display: "Archivo", "Noto Sans SC", system-ui, sans-serif;
   --font-sans: "Noto Sans SC", "Archivo", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+  /* 阅读字体：中文衬线（报纸质感），仅用于会议室气泡正文，提升长文阅读舒适度 */
+  --font-reading: "Noto Serif SC", "Noto Sans SC", Georgia, serif;
 
   /* Typography scale
      - display: dashboard hero/page emphasis
@@ -63,6 +65,9 @@
   --rail-expanded: 196px;
   --rail-ic: 46px;
   --list-w: 276px;
+  --measure: 780px;        /* 长文档阅读行宽上限（含内边距），保证舒适的每行字符数 */
+  /* 报纸波点纹理：极淡的网点底纹，随主题自动适配（中性气泡用文本色网点） */
+  --paper-dot: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
 /* Dark (default) */
@@ -1153,7 +1158,7 @@ button { font-family: inherit; cursor: pointer; }
 .chat-error-bar .icon-btn { width: 24px; height: 24px; flex: none; color: currentColor; }
 .day-sep { align-self: center; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-faint); letter-spacing: .1em; padding: 2px 0; }
 
-.msg { display: flex; gap: 11px; max-width: 78%; }
+.msg { display: flex; gap: 11px; max-width: 90%; }
 .msg.me { align-self: flex-end; flex-direction: row-reverse; }
 .msg-body { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .msg.me .msg-body { align-items: flex-end; }
@@ -1166,14 +1171,23 @@ button { font-family: inherit; cursor: pointer; }
 html[data-theme="light"],
 html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .bubble {
-  background: var(--bubble-them); color: var(--bubble-them-text);
-  padding: 11px 14px; border-radius: 4px 15px 15px 15px;
-  font-size: var(--text-body); line-height: var(--leading-bubble); box-shadow: var(--shadow-sm);
+  background:
+    radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 7px 7px,
+    var(--bubble-them);
+  color: var(--bubble-them-text);
+  padding: 12px 15px; border-radius: 4px 15px 15px 15px;
+  font-size: var(--text-body); line-height: var(--leading-relaxed); box-shadow: var(--shadow-sm);
   border: 1px solid var(--border);
   word-wrap: break-word; overflow-wrap: anywhere;
 }
+/* 报纸阅读质感：气泡正文（Markdown 段落/列表/引用/表格文字）用中文衬线，
+   标题保留 display(Archivo)、代码保留 mono、结构化块(artifact/附件)不受影响 */
+.bubble :where(p, li, blockquote, td) { font-family: var(--font-reading); }
 .msg.me .bubble {
-  background: var(--bubble-me); color: var(--bubble-me-text);
+  background:
+    radial-gradient(color-mix(in srgb, var(--bubble-me-text) 8%, transparent) 1px, transparent 1.6px) 0 0 / 7px 7px,
+    var(--bubble-me);
+  color: var(--bubble-me-text);
   border-radius: 15px 4px 15px 15px; border: none;
   box-shadow: 0 3px 12px var(--ember-tint-strong);
 }
@@ -1223,6 +1237,46 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .msg.me .bubble .md-table td { border-color: rgba(0,0,0,.15); }
 .msg.me .bubble .md-table tr:nth-child(even) td { background: rgba(0,0,0,.1); }
 .msg.me .bubble .mention { background: rgba(0,0,0,.13); color: var(--bubble-me-text); }
+.bubble hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+/* 连续的「文件写入记录」之间留 5px 间隔 */
+.file-written + .file-written { margin-top: 5px; }
+
+/* ── 长文档流（.msg-doc / .bubble.doc）─────────────────────────────────────────
+   长 markdown 消息跳出对话气泡：中性面板底 + 限定阅读行宽 + prose 行高，
+   标题层级与段落留白更舒展，全文常显、无需展开。短消息仍用气泡。 */
+.msg.msg-doc { max-width: 100%; }
+.bubble.doc {
+  width: 100%; max-width: var(--measure);
+  background:
+    radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 8px 8px,
+    var(--bg-2);
+  color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 22px 26px; box-shadow: none;
+  line-height: var(--leading-prose);
+}
+.bubble.doc :where(h1,h2,h3,h4,h5,h6) { font-family: var(--font-display); margin: 24px 0 11px; line-height: var(--leading-snug); letter-spacing: -.005em; }
+.bubble.doc > :first-child { margin-top: 0; }
+.bubble.doc h1 { font-size: var(--text-page-title); padding-bottom: 9px; border-bottom: 2px solid var(--border-strong); }
+.bubble.doc h2 { font-size: var(--text-heading); padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.bubble.doc h3 { font-size: var(--text-section); }
+.bubble.doc h3::before { content: ""; display: inline-block; width: 3px; height: .82em; margin-right: 8px; vertical-align: -1px; background: var(--ember); border-radius: 2px; }
+.bubble.doc h4 { font-size: var(--text-title); color: var(--text); }
+.bubble.doc p { margin: 12px 0; }
+.bubble.doc ul, .bubble.doc ol { margin: 12px 0; padding-left: 26px; }
+.bubble.doc li { margin: 6px 0; line-height: var(--leading-relaxed); }
+.bubble.doc li::marker { color: var(--ember); }
+.bubble.doc blockquote {
+  margin: 16px 0; padding: 10px 16px; font-style: italic;
+  border-left: 3px solid var(--ember); border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--ember-tint); color: var(--text-2); line-height: var(--leading-relaxed);
+}
+.bubble.doc blockquote p:first-child { margin-top: 0; }
+.bubble.doc blockquote p:last-child { margin-bottom: 0; }
+.bubble.doc .codeblock, .bubble.doc pre { margin: 16px 0; }
+.bubble.doc .md-table { margin: 16px 0; }
+.bubble.doc hr { margin: 22px 0; }
+
 .bubble-quote {
   display: flex; align-items: center; gap: 6px; max-width: min(460px, 70vw);
   margin: 6px 4px 0; padding: 5px 8px; font-size: var(--text-label); line-height: var(--leading-normal);

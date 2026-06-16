@@ -191,7 +191,7 @@ function formatBytes(n: number): string {
 function FileWrittenBlock({ b, highlight }: { b: Extract<BlockType, { t: 'file_written' }>; highlight?: string }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div style={{
+    <div className="file-written" style={{
       border: `1px solid ${b.error ? 'var(--red)' : 'var(--ember)'}`,
       borderRadius: 10, overflow: 'hidden',
       background: b.error ? 'color-mix(in srgb, var(--red) 8%, transparent)' : 'var(--ember-tint)',

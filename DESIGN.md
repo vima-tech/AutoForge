@@ -53,6 +53,9 @@ typography:
   mono:
     fontFamily: '"JetBrains Mono", ui-monospace, "SFMono-Regular", monospace'
     usage: "代码、kicker/eyebrow、表单标签、chip、窗口标题等机械感文本"
+  reading:
+    fontFamily: '"Noto Serif SC", "Noto Sans SC", Georgia, serif'
+    usage: "仅会议室气泡正文（Markdown 段落/列表/引用/表格文字）——中文衬线营造报纸阅读质感，提升长文舒适度；标题仍用 display，代码仍用 mono"
   scale:
     micro: { fontSize: "10px" }      # 徽标、密集 chrome
     caption: { fontSize: "11px" }    # 元数据
@@ -321,7 +324,8 @@ AutoForge 是一个「Human-Lite-in-the-Loop」自主软件工厂的 Tauri 桌�
 - **Switch `.switch`**：42×24 pill 开关，开态 ember 底。
 - **下拉 / 提及 `.proj-select` + `.mention-pop` + `.mention-row`**：**唯一允许的下拉模式**，统一项目选择、@提及、菜单。
 - **Avatar `.av`** / **Window shell `.os-window/.os-titlebar/.traffic`** / **导航 `.rail/.rail-item`** / **空态 `.empty`**：见 `src/index.css`。
-- **消息块**（会议室）：`md / code / file / image / artifact / quote_ref / file_written`，渲染于 `src/components/Block.tsx`，气泡用 `--bubble-me`（熔岩）/ `--bubble-them`。
+- **消息块**（会议室）：`md / code / file / image / artifact / quote_ref / file_written`，渲染于 `src/components/Block.tsx`，气泡用 `--bubble-me`（熔岩）/ `--bubble-them`。气泡底叠加极淡「报纸波点」网点纹理（`--paper-dot` radial-gradient，7–8px 网格，随主题自适应），正文用 `--font-reading` 中文衬线，宽度上限 `max-width: 90%`。
+- **长文档流**（`.bubble.doc`）：长 Markdown 消息（Agent 发言 ≥600 字符或含 ≥2 标题）跳出气泡，改用中性 `--bg-2` 面板 + 波点纹理 + `--measure`（780px）阅读行宽 + `--leading-prose` 行高，标题分级带分隔线/ember 标记，全文常显无需展开。
 
 动效：入场 `.rise`（translateY 9px，.34s）、`typing` 三点、carousel 滚入。全部尊重
 `prefers-reduced-motion` 与 `[data-motion="off"]`。交互过渡统一 .08–.18s。
