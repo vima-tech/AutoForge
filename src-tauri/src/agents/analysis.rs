@@ -18,6 +18,8 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
     "is_duplicate": <true|false>,
     "duplicate_of": <疑似重复的需求标识，未知则 null>,
     "duplicate_hint": "<疑似重复的简述，否则空字符串>",
+    "needs_changes": <true|false 该需求是否真的需要改动代码>,
+    "no_change_reason": "<needs_changes 为 false 时，一句话说明为何无需改动；否则空字符串>",
     "analysis_summary": "<120字以内摘要>",
     "confidence": <0.0-1.0 本次分析整体置信度>
   },
@@ -74,6 +76,7 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
 - claude_code_brief 是 scope + implementation_plan 的蒸馏，必须自洽、可直接执行。
 - 信息不足时，在 open_questions / assumptions 中说明，并相应降低 confidence，不要臆造。
 - bug 类必须给出 root_cause 与 reproduction_steps；非 bug 类 root_cause 用 null。
+- needs_changes：当需求确实需要改动代码时为 true。若判定为「误报/无需改动」——例如所指为测试夹具或示例数据、功能已实现、纯属提问或咨询、描述的问题在当前代码中不存在——则置 false，并在 no_change_reason 用一句话说明，同时 scope.affected_files 应为空。此时 AutoForge 将默认不建议进入编码执行。
 "#;
 
 // ── 完整结构化分析规格（对齐 schemas/issue_analysis.schema.json v1.0）──────────────
@@ -96,12 +99,17 @@ pub struct Triage {
     pub duplicate_of: Option<String>,
     #[serde(default)]
     pub duplicate_hint: String,
+    #[serde(default = "yes")]
+    pub needs_changes: bool,
+    #[serde(default)]
+    pub no_change_reason: String,
     #[serde(default)]
     pub analysis_summary: String,
     #[serde(default = "half")]
     pub confidence: f64,
 }
 fn half() -> f64 { 0.5 }
+fn yes() -> bool { true }
 fn five() -> i64 { 5 }
 fn cat_default() -> String { "Feature".to_string() }
 fn sev_default() -> String { "medium".to_string() }
@@ -116,6 +124,8 @@ impl Default for Triage {
             is_duplicate: false,
             duplicate_of: None,
             duplicate_hint: String::new(),
+            needs_changes: true,
+            no_change_reason: String::new(),
             analysis_summary: String::new(),
             confidence: 0.5,
         }
@@ -686,6 +696,8 @@ pub fn parse_spec(text: &str) -> Option<IssueAnalysisSpec> {
         is_duplicate: l.is_duplicate.unwrap_or(false),
         duplicate_of: None,
         duplicate_hint: l.duplicate_hint.unwrap_or_default(),
+        needs_changes: true,
+        no_change_reason: String::new(),
         analysis_summary: l.analysis_summary.unwrap_or_default(),
         confidence: 0.5,
     };

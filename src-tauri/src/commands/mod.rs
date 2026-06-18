@@ -14,6 +14,7 @@ pub mod issues;
 pub mod knowledge;
 pub mod materials;
 pub mod mcp;
+pub mod notifications;
 pub mod notify;
 pub mod specs;
 pub mod orchestration;

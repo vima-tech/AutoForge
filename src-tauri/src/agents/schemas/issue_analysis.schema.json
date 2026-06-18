@@ -39,6 +39,8 @@
         "is_duplicate": { "type": "boolean", "description": "是否疑似与既有需求重复（保守判断）。" },
         "duplicate_of": { "type": ["string", "null"], "description": "疑似重复的目标 issue id，未知则为 null。" },
         "duplicate_hint": { "type": "string", "description": "疑似重复的简述，否则为空字符串。" },
+        "needs_changes": { "type": "boolean", "description": "该需求是否真的需要改动代码。误报/已实现/纯提问/问题不存在等情况置 false，此时 AutoForge 默认不建议进入编码执行。缺省视为 true。" },
+        "no_change_reason": { "type": "string", "description": "needs_changes 为 false 时，一句话说明为何无需改动；否则为空字符串。" },
         "analysis_summary": { "type": "string", "maxLength": 120, "description": "一句话摘要（≤120 字）。" },
         "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "本次分析整体置信度；低置信时应在 open_questions 中列出待确认项。" }
       }

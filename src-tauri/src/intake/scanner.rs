@@ -275,6 +275,133 @@ pub async fn scan_npm_audit(project_id: &str, repo_path: &str) -> Vec<IntakePayl
         .collect()
 }
 
+/// 运行 pip-audit（Python 依赖漏洞）。需仓库含 requirements.txt 或 pyproject.toml。
+pub async fn scan_pip_audit(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    if !Path::new(repo_path).join("requirements.txt").exists()
+        && !Path::new(repo_path).join("pyproject.toml").exists()
+    {
+        return vec![];
+    }
+
+    // pip-audit 输出 JSON：{"dependencies":[{"name","version","vulns":[{"id","description","fix_versions"}]}]}
+    let output = crate::core::platform::shell("pip-audit -f json")
+        .current_dir(repo_path)
+        .output()
+        .await;
+    let stdout = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(e) => {
+            warn!("[scanner] pip-audit failed: {}", e);
+            return vec![];
+        }
+    };
+    let val: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    // 兼容两种顶层形态：{"dependencies":[...]} 或直接数组。
+    let deps = val
+        .get("dependencies")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .or_else(|| val.as_array().cloned())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for dep in deps {
+        let pkg = dep.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let version = dep.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        let vulns = match dep.get("vulns").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for vuln in vulns {
+            if out.len() >= 50 {
+                return out;
+            }
+            let id = vuln.get("id").and_then(|i| i.as_str()).unwrap_or("UNKNOWN");
+            let desc = vuln
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let fix = vuln
+                .get("fix_versions")
+                .and_then(|f| f.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            out.push(IntakePayload {
+                project_id: project_id.to_string(),
+                title: format!("[安全] pip {}: {}", pkg, id),
+                description: Some(format!(
+                    "Advisory: {}\nPackage: {} {}\nFix: {}\n\n{}",
+                    id, pkg, version, fix, desc
+                )),
+                category: Some("Debt".to_string()),
+                // pip-audit 默认不给 CVSS 评级，统一标 medium，交由分析阶段定级。
+                severity: Some("medium".to_string()),
+                source_type: "security_audit".to_string(),
+                source_ref: Some(format!("pip:{}", id)),
+            });
+        }
+    }
+    out
+}
+
+/// 运行 govulncheck（Go 依赖/调用链漏洞）。需仓库含 go.mod。
+pub async fn scan_govulncheck(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    if !Path::new(repo_path).join("go.mod").exists() {
+        return vec![];
+    }
+
+    // govulncheck -json 输出**串联的 JSON 对象流**（非单一数组），用流式反序列化逐个读，
+    // 收集含 "osv" 字段的漏洞条目。
+    let output = crate::core::platform::shell("govulncheck -json ./...")
+        .current_dir(repo_path)
+        .output()
+        .await;
+    let stdout = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(e) => {
+            warn!("[scanner] govulncheck failed: {}", e);
+            return vec![];
+        }
+    };
+
+    let mut out = Vec::new();
+    let stream = serde_json::Deserializer::from_str(&stdout).into_iter::<serde_json::Value>();
+    for item in stream.flatten() {
+        let Some(osv) = item.get("osv") else { continue };
+        if out.len() >= 50 {
+            break;
+        }
+        let id = osv.get("id").and_then(|i| i.as_str()).unwrap_or("UNKNOWN");
+        let summary = osv
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .or_else(|| osv.get("details").and_then(|d| d.as_str()))
+            .unwrap_or("");
+        out.push(IntakePayload {
+            project_id: project_id.to_string(),
+            title: format!(
+                "[安全] go {}: {}",
+                id,
+                summary.chars().take(80).collect::<String>()
+            ),
+            description: Some(format!("Advisory: {}\n\n{}", id, summary)),
+            category: Some("Debt".to_string()),
+            severity: Some("high".to_string()),
+            source_type: "security_audit".to_string(),
+            source_ref: Some(format!("go:{}", id)),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

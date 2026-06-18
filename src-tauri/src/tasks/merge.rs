@@ -259,6 +259,28 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .unwrap_or_default();
     let dev_is_live = !live_branch.is_empty() && live_branch == project.branch_dev;
 
+    // Snapshot the CR's full diff BEFORE the merge moves the base branch and
+    // before the worktree is torn down. Diffing the worktree against the base
+    // *after* the merge would compare against a branch that already contains
+    // these changes (empty/garbage result), so capture it here while the base
+    // branch still predates the merge. This is what lets the audit page show
+    // the code changes of an already-merged requirement (worktree long gone).
+    if let Some(diff) = crate::commands::change_requests::compute_worktree_diff(
+        &session.worktree_path,
+        &session.branch_name,
+        &cr.target_branch,
+    )
+    .await
+    {
+        if !diff.is_empty() {
+            let _ = sqlx::query("UPDATE worktree_sessions SET diff_content=? WHERE id=?")
+                .bind(&diff)
+                .bind(&session.id)
+                .execute(db)
+                .await;
+        }
+    }
+
     event::emit(
         app,
         event::AppEvent::TaskProgress {

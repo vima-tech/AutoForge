@@ -87,7 +87,10 @@ export interface IssueAnalysisSpec {
   triage: {
     authenticity_score: number; feasibility_score: number; priority_suggestion: number;
     category_suggestion: string; severity_suggestion: string; is_duplicate: boolean;
-    duplicate_of: string | null; duplicate_hint: string; analysis_summary: string; confidence: number;
+    duplicate_of: string | null; duplicate_hint: string;
+    /** 分析判定该需求是否真的需要改动代码；false 表示误报/已实现/纯提问，AutoForge 默认不建议执行。缺省视为 true。 */
+    needs_changes?: boolean; no_change_reason?: string;
+    analysis_summary: string; confidence: number;
   };
   understanding: {
     problem_type: string; restated_requirement: string; user_story: string | null;
@@ -532,6 +535,35 @@ export const setWebSearchSettings = (
   provider: string, endpoint: string, max_results: number, api_key?: string,
 ) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key });
 
+// ── 操作者身份卡（rail-me）────────────────────────────────────────────────────
+export interface OperatorProfile {
+  display_name: string; avatar: string; accent_color: string; role: string;
+}
+export const getOperatorProfile = () => ipc<OperatorProfile>('get_operator_profile');
+export const setOperatorProfile = (profile: OperatorProfile) =>
+  ipc<OperatorProfile>('set_operator_profile', { profile });
+
+// ── 活动通知收件箱 ────────────────────────────────────────────────────────────
+export type NotificationCategory = 'intervene' | 'progress' | 'result' | 'intake';
+export interface AppNotification {
+  id: string;
+  category: NotificationCategory;
+  kind: string;
+  title: string;
+  body: string;
+  link_page: string | null;
+  link_ref: string | null;
+  read: boolean;
+  created_at: string;
+}
+export interface NotificationInbox { items: AppNotification[]; unread: number; }
+export const listNotifications = (limit?: number) =>
+  ipc<NotificationInbox>('list_notifications', { limit });
+export const unreadNotificationCount = () => ipc<number>('unread_notification_count');
+export const markNotificationRead = (id: string) =>
+  ipc<void>('mark_notification_read', { id });
+export const markAllNotificationsRead = () => ipc<void>('mark_all_notifications_read');
+
 // ── Settings — 语音录入（ASR）────────────────────────────────────────────────
 export interface AsrSettings {
   provider: string; endpoint: string; model: string; language: string; api_key_set: boolean;
@@ -772,6 +804,9 @@ export const refineTriage = (issueIds: string[]) =>
   ipc<RefineResult>('refine_triage', { issueIds });
 export const discardTriage = (issueId: string) =>
   ipc<void>('discard_triage', { issueId });
+export interface RejectResult { deleted: number; rejected: number; skipped: number; }
+export const rejectIssues = (issueIds: string[]) =>
+  ipc<RejectResult>('reject_issues', { issueIds });
 
 // ── 工厂自喂料（autosupply）────────────────────────────────────────────────────
 export interface AutosupplySettings {

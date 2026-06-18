@@ -79,6 +79,48 @@ pub async fn get_worktree_session(
     .map_err(|e| e.to_string())
 }
 
+/// Compute the CR's full code diff by running git **inside its worktree**.
+///
+/// Returns `None` when the worktree directory no longer exists (e.g. it was torn
+/// down after a successful merge) — callers should then fall back to the diff
+/// snapshot persisted on the session. Returns `Some(diff)` otherwise, where an
+/// empty string is an authoritative "this branch changed nothing" answer.
+pub async fn compute_worktree_diff(
+    worktree_path: &str,
+    branch_name: &str,
+    target_branch: &str,
+) -> Option<String> {
+    if !std::path::Path::new(worktree_path).exists() {
+        return None;
+    }
+
+    // Diff against the base branch *inside the worktree* — this surfaces the CR's
+    // full contribution whether or not it has been committed yet. (Claude Code can't
+    // run git, so changes may still be uncommitted; diffing the committed range in the
+    // main repo would then return empty and the audit page would hang on "加载中…".)
+    let wt_git = GitProxy::new(worktree_path);
+    if !target_branch.is_empty() {
+        // Diffing the working tree against the base branch captures the CR's full
+        // contribution — committed or not. An *empty* result is authoritative:
+        // the branch added nothing (e.g. a `no_change_needed` CR where the agent
+        // made no commit), so return it verbatim. Falling through to the
+        // `branch^1..branch` fallback here would instead surface the base
+        // commit's own unrelated changes (showing spurious `/dev/null` additions
+        // for a requirement that produced no real diff).
+        if let Ok((_code, stdout, _stderr)) = wt_git.run(&["diff", target_branch]).await {
+            return Some(stdout);
+        }
+    }
+
+    // Fallback only when the base branch is unknown or the diff command failed:
+    // show this branch's last commit.
+    let diff_arg = format!("{}^1", branch_name);
+    match wt_git.run(&["diff", &diff_arg, branch_name]).await {
+        Ok((_code, stdout, _stderr)) => Some(stdout),
+        Err(_) => Some(String::new()),
+    }
+}
+
 #[tauri::command]
 pub async fn get_code_diff(cr_id: String, state: State<'_, AppState>) -> Result<String, String> {
     // Get worktree session
@@ -95,56 +137,29 @@ pub async fn get_code_diff(cr_id: String, state: State<'_, AppState>) -> Result<
         None => return Ok(String::new()),
     };
 
-    if !std::path::Path::new(&session.worktree_path).exists() {
-        return Ok(String::new());
-    }
-
-    // Get project repo path
+    // Get the CR's base branch (worktree diffs need it to scope the change).
     let cr: Option<ChangeRequest> = sqlx::query_as("SELECT * FROM change_requests WHERE id=?")
         .bind(&cr_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| e.to_string())?;
+    let target_branch = cr.map(|c| c.target_branch).unwrap_or_default();
 
-    let (repo_path, target_branch) = match cr {
-        Some(c) => {
-            let proj: Option<(String,)> =
-                sqlx::query_as("SELECT repo_path FROM projects WHERE id=?")
-                    .bind(&c.project_id)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            (proj.map(|p| p.0).unwrap_or_default(), c.target_branch)
+    // Live path: the worktree still exists (CR not yet merged / not torn down).
+    // Prefer the live diff so in-flight, uncommitted edits show up immediately.
+    if let Some(diff) =
+        compute_worktree_diff(&session.worktree_path, &session.branch_name, &target_branch).await
+    {
+        if !diff.is_empty() {
+            return Ok(diff);
         }
-        None => return Ok(String::new()),
-    };
-
-    if repo_path.is_empty() {
-        return Ok(String::new());
+        // Live diff was empty: fall through to the persisted snapshot below in
+        // case it captured something (covers torn-down vs. genuinely-empty).
     }
 
-    let _ = repo_path; // kept for the legacy fallback below
-    // Diff against the base branch *inside the worktree* — this surfaces the CR's
-    // full contribution whether or not it has been committed yet. (Claude Code can't
-    // run git, so changes may still be uncommitted; diffing the committed range in the
-    // main repo would then return empty and the audit page would hang on "加载中…".)
-    let wt_git = GitProxy::new(&session.worktree_path);
-    if !target_branch.is_empty() {
-        if let Ok((_code, stdout, _stderr)) = wt_git.run(&["diff", &target_branch]).await {
-            if !stdout.trim().is_empty() {
-                return Ok(stdout);
-            }
-        }
-    }
-
-    // Fallback: base branch unknown or empty diff — show this branch's last commit.
-    let diff_arg = format!("{}^1", session.branch_name);
-    let result = wt_git.run(&["diff", &diff_arg, &session.branch_name]).await;
-
-    match result {
-        Ok((_code, stdout, _stderr)) => Ok(stdout),
-        Err(_) => Ok(String::new()),
-    }
+    // Fallback: worktree is gone (merged) — return the diff snapshot taken at
+    // merge time so already-merged requirements still show their code changes.
+    Ok(session.diff_content.unwrap_or_default())
 }
 
 /// Review 1: approve moves to pending_execution and creates a CR + enqueues Execution job
@@ -512,9 +527,12 @@ pub async fn retry_change_request(
         .await
         .map_err(|e| e.to_string())?;
 
-    if cr.status != "execution_failed" && cr.status != "merge_failed" {
+    if cr.status != "execution_failed"
+        && cr.status != "merge_failed"
+        && cr.status != "no_change_needed"
+    {
         return Err(format!(
-            "只有执行失败 / 合并失败的需求可以重新执行（当前状态：{}）",
+            "只有执行失败 / 合并失败 / 无需改动的需求可以重新执行（当前状态：{}）",
             cr.status
         ));
     }

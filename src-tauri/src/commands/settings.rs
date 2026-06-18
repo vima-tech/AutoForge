@@ -863,6 +863,67 @@ async fn write_setting(state: &AppState, key: &str, value: &str) -> Result<(), S
     Ok(())
 }
 
+// ---- 操作者身份卡（rail-me）：单操作者桌面端，存 app_settings 的 operator_profile KV ----
+
+/// 操作者（Human-Lite-in-the-Loop 的「人」）身份。无登录/多用户概念。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorProfile {
+    /// 显示名（群聊/直聊里人类发言的作者名）。
+    pub display_name: String,
+    /// 头像内容：emoji 或 1–2 个字符的首字母缩写。
+    pub avatar: String,
+    /// 强调色（CSS 颜色串）；空串表示沿用主题默认 `--me-avatar-bg`。
+    pub accent_color: String,
+    /// 角色/头衔（可选，注入编排上下文供 Agent 称呼）。
+    pub role: String,
+}
+
+impl Default for OperatorProfile {
+    fn default() -> Self {
+        OperatorProfile {
+            display_name: "我".into(),
+            avatar: "管".into(),
+            accent_color: String::new(),
+            role: "操作者".into(),
+        }
+    }
+}
+
+async fn load_operator_profile(state: &AppState) -> OperatorProfile {
+    match read_setting(state, "operator_profile").await {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        None => OperatorProfile::default(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_operator_profile(state: State<'_, AppState>) -> Result<OperatorProfile, String> {
+    Ok(load_operator_profile(&state).await)
+}
+
+#[tauri::command]
+pub async fn set_operator_profile(
+    state: State<'_, AppState>,
+    profile: OperatorProfile,
+) -> Result<OperatorProfile, String> {
+    // 归一：去空白；显示名/头像兜底，避免渲染出空头像或空作者名。
+    let mut p = profile;
+    p.display_name = p.display_name.trim().to_string();
+    if p.display_name.is_empty() {
+        p.display_name = OperatorProfile::default().display_name;
+    }
+    p.avatar = p.avatar.trim().chars().take(2).collect();
+    if p.avatar.is_empty() {
+        p.avatar = p.display_name.chars().next().map(|c| c.to_string()).unwrap_or_default();
+    }
+    p.accent_color = p.accent_color.trim().to_string();
+    p.role = p.role.trim().to_string();
+
+    let json = serde_json::to_string(&p).map_err(|e| e.to_string())?;
+    write_setting(&state, "operator_profile", &json).await?;
+    Ok(p)
+}
+
 #[tauri::command]
 pub async fn get_web_search_settings(
     state: State<'_, AppState>,

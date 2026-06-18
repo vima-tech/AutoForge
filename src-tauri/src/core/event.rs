@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::models::notification::NotificationDraft;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -80,5 +82,20 @@ pub enum AppEvent {
 }
 
 pub fn emit(app: &AppHandle, event: AppEvent) {
-    let _ = app.emit("AutoForge://event", event);
+    let _ = app.emit("AutoForge://event", &event);
+
+    // 在传输适配层（本文件是唯一的 Tauri 事件出口）顺手把「有动作价值」的事件
+    // 沉淀进通知收件箱——这样所有 emit 调用点零改动即可获得持久化活动流。
+    // 业务层仍只感知 `event::emit(app, AppEvent)`，不触碰持久化与 Tauri state。
+    if NotificationDraft::from_event(&event).is_some() {
+        if let Some(state) = app.try_state::<crate::state::AppState>() {
+            // 仅在已有 tokio 运行时上下文里 spawn（emit 始终在 Tauri 的 tokio 运行时内被调用）。
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let db = state.db.clone();
+                tokio::spawn(async move {
+                    let _ = crate::commands::notifications::record_notification(&db, &event).await;
+                });
+            }
+        }
+    }
 }

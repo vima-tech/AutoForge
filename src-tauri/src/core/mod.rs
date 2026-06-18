@@ -8,4 +8,5 @@ pub mod notify;
 pub mod platform;
 pub mod secrets;
 pub mod security;
+pub mod stack;
 pub mod trace;

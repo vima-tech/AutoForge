@@ -665,12 +665,7 @@ function McpServers() {
                     {agents.map(a => {
                       const on = scoped.includes(a.id);
                       return (
-                        <button key={a.id} className={'chip ' + (on ? 'ember' : '')} style={{
-                            cursor: 'pointer',
-                            background: on ? 'var(--ember-tint-strong)' : 'var(--bg-3)',
-                            border: on ? '1px solid var(--ember-soft)' : '1px solid var(--border-strong)',
-                            color: on ? 'var(--ember)' : 'var(--text-2)',
-                          }}
+                        <button key={a.id} className={'filter-chip' + (on ? ' on' : '')}
                           onClick={() => toggleAgent(s, d, a.id)}>
                           {on ? '✓ ' : ''}{a.name}
                         </button>

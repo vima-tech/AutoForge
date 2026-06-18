@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |------|----|
-| 状态 | 待实现（提案 v2，2026-06-18 复核仍成立） |
+| 状态 | ✅ 已实现（2026-06-18，含持久化收件箱） |
 | 优先级 | P1（高 — 填补真实空缺，价值最高） |
 | 涉及层 | 前端（rail / Conversations）+ 后端（新命令）+ DB（复用 app_settings） |
 | 工作量 | 中（身份卡核心闭环约 0.5–1 天；通知中心持久化版再 0.5–1 天） |
@@ -102,6 +102,29 @@ ConversationTaskUpdated），但前端唯一监听器（`src/App.tsx:215`）只�
 3. popover 内活动流按 4 类正确分组展示最近事件；点击「需介入」项可跳转对应页面。
 4. 有未读时 rail-me 头像显示角标数字，进入活动中心后清零。
 5. 持久化版：重启应用后历史通知仍在，已读状态保留。
+
+## ✅ 实现落地（2026-06-18）
+
+身份卡与通知中心**完整实现，含持久化层**（非仅 MVP）：
+
+**后端**
+- `migrations/0042_notifications.sql`：`notifications` 表（category/kind/title/body/link_page/link_ref/read/created_at + 两个索引）。
+- `models/notification.rs`：`Notification`（FromRow）+ `NotificationDraft::from_event(&AppEvent)` —— 纯 Rust 映射，决定哪些事件入收件箱：
+  保留 IssueCreated / AnalysisCompleted / ReviewNeeded / IterationWarning / TestCompleted / CrMerged / SecurityAuditCompleted；
+  心跳/高频/已有角标覆盖的（WorktreeUpdate / TaskProgress / PreviewUpdate / PipelineStatus / MessageReceived / ConversationTaskUpdated / AsrResult）返回 `None` 不入库。
+- `commands/notifications.rs`：纯 async `record_notification(db, &AppEvent)`（插入 + 保留最近 500 条裁剪）+ 命令 `list_notifications` / `unread_notification_count` / `mark_notification_read` / `mark_all_notifications_read`。
+- **持久化挂在 `core/event.rs::emit` 这一传输适配层**：emit 后 `app.try_state::<AppState>()` 取 db、`tokio::spawn` 调 `record_notification`。**所有 44 处 emit 调用点零改动**，业务层仍只感知 `event::emit(app, AppEvent)`（遵守 CLAUDE.md 铁律 #1）。
+- `commands/settings.rs`：`OperatorProfile` + `get_operator_profile` / `set_operator_profile`（薄包装，存 `app_settings.operator_profile`，无新迁移）。
+
+**前端**
+- `src/operator.ts`：操作者身份全局 store（模块单例 cache + 订阅 hook `useOperator`），真源是后端 KV。
+- `components/Avatar.tsx`：`MeAvatar` 改读 profile（头像字 / 强调色），去掉写死的「管」。
+- `pages/Conversations.tsx`：人类发言作者名（`:329`）与全文检索发言人改读 `display_name`。
+- `components/OperatorPanel.tsx`：rail-me popover（菜单语义，点击外部 / Esc 关闭，不画模态遮罩）——上半身份卡（行内编辑名/头像/头衔/强调色预设并即时落库），下半活动收件箱（4 类筛选 chip + 未读高亮 + 全部已读 + 点击跳转对应页面）。
+- `App.tsx`：rail-me 改 `<button>` 开关 popover + 未读角标（`.rail-badge`）；启动 `loadOperator()` + 拉未读数；事件监听里 900ms 防抖重数未读（避开后端异步插入竞态）。
+- `index.css`：rail-me 由 `cursor:default` 改为可交互。
+
+**未做（提案的可选项）**：把操作者显示名注入编排上下文让 Agent 称呼人类（`orchestration.rs`）——跨模块取 KV 的小改动，留待后续。
 
 ## 6. 风险与缓解
 

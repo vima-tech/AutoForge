@@ -1,6 +1,7 @@
 import React from 'react';
 import { AGENT_MAP, type Agent as MockAgent } from '../data/mock';
 import { PixelAvatar } from './PixelAvatar';
+import { useOperator } from '../operator';
 
 type AgentLike = MockAgent | {
   id?: string;
@@ -58,20 +59,22 @@ export function Avatar({ agent, size = 40, status }: AvatarProps) {
 }
 
 export function MeAvatar({ size = 40 }: { size?: number }) {
+  const op = useOperator();
+  const accent = op.accent_color.trim();
   return (
     <div
       className="av"
       style={{
         width: size,
         height: size,
-        fontSize: size * 0.4,
+        fontSize: size * (op.avatar.length > 1 ? 0.34 : 0.4),
         borderRadius: size * 0.32,
-        background: 'var(--me-avatar-bg)',
-        color: 'var(--me-avatar-color)',
+        background: accent || 'var(--me-avatar-bg)',
+        color: accent ? '#fff' : 'var(--me-avatar-color)',
         border: '1px solid var(--border-strong)',
       }}
     >
-      管
+      {op.avatar || op.display_name.slice(0, 1) || '我'}
     </div>
   );
 }

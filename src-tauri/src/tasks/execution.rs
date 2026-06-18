@@ -404,26 +404,34 @@ pub async fn run(
         .map(|(_, out, _)| !out.trim().is_empty())
         .unwrap_or(false);
     if !has_changes {
-        let reason = build_failure_reason(
-            exit_code,
-            &stdout,
-            "Agent 执行完成但未对 worktree 产生任何文件改动，无法生成可审核的 diff。",
-        );
+        // The agent ran cleanly (exit 0) but produced no diff. This is a
+        // legitimate terminal outcome — typically the agent concluded the
+        // requirement was a misjudgment / already satisfied / a no-op — not a
+        // failure. Surface it as `no_change_needed` so it doesn't masquerade as
+        // a red error, and preserve the agent's own explanation (its report)
+        // verbatim so the operator can see *why* nothing changed.
+        let note = "ℹ️ Agent 执行完成，但分析后认为无需改动代码（未产生 diff）。以下为 Agent 的说明：";
+        let report_body = if report.trim().is_empty() {
+            "（Agent 未给出说明）".to_string()
+        } else {
+            report.clone()
+        };
+        let no_change_report = format!("{}\n\n{}", note, report_body);
         sqlx::query(
-            "UPDATE worktree_sessions SET status='failed', report_content=?, completed_at=datetime('now') WHERE id=?",
+            "UPDATE worktree_sessions SET status='no_change', report_content=?, completed_at=datetime('now') WHERE id=?",
         )
-        .bind(&reason)
+        .bind(&no_change_report)
         .bind(&session_id)
         .execute(db)
         .await?;
         sqlx::query(
-            "UPDATE change_requests SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
+            "UPDATE change_requests SET status='no_change_needed', updated_at=datetime('now') WHERE id=?",
         )
         .bind(cr_id)
         .execute(db)
         .await?;
         sqlx::query(
-            "UPDATE issues SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
+            "UPDATE issues SET status='no_change_needed', updated_at=datetime('now') WHERE id=?",
         )
         .bind(&issue.id)
         .execute(db)
@@ -432,11 +440,11 @@ pub async fn run(
             app,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
-                status: "execution_failed".to_string(),
-                message: Some("Agent 未产生任何文件改动".to_string()),
+                status: "no_change_needed".to_string(),
+                message: Some("Agent 分析后认为无需改动代码".to_string()),
             },
         );
-        return Err(anyhow!("no changes produced by agent for {}", cr_id));
+        return Ok(());
     }
     let _ = wt_git.run(&["add", "-A"]).await;
     let commit_msg = format!("AutoForge: {} (i{})", issue.title, iteration);

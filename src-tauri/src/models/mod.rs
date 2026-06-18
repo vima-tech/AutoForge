@@ -15,6 +15,7 @@ pub mod llm_config;
 pub mod llm_trace;
 pub mod material;
 pub mod mcp_server;
+pub mod notification;
 pub mod notify;
 pub mod orchestration;
 pub mod preview;

@@ -403,11 +403,8 @@ function ProjectBulkTab({ projectId }: { projectId: string }) {
             {/* compact format chips + inline hint */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
               {(Object.entries(BULK_FORMAT_META) as [keyof typeof BULK_FORMAT_META, { label: string; desc: string }][]).map(([key, meta]) => (
-                <button key={key} className={'chip' + (format === key ? ' ember' : '')}
-                  onClick={() => { setFormat(key); setContent(''); }}
-                  style={format === key
-                    ? { cursor: 'pointer' }
-                    : { cursor: 'pointer', background: 'var(--bg-3)', color: 'var(--text)', border: '1px solid var(--border-strong)' }}>
+                <button key={key} className={'filter-chip' + (format === key ? ' on' : '')}
+                  onClick={() => { setFormat(key); setContent(''); }}>
                   {meta.label}
                 </button>
               ))}

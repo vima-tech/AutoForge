@@ -61,3 +61,11 @@ pub struct RefineResult {
     pub discarded: u32,
     pub errors: u32,
 }
+
+/// 需求拒绝结果：硬删除数（triage 碎片）/ 软归档数（置 rejected）/ 跳过数（执行中/已合并）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectResult {
+    pub deleted: u32,
+    pub rejected: u32,
+    pub skipped: u32,
+}

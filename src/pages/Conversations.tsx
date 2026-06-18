@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import { Avatar, MeAvatar } from '../components/Avatar';
+import { useOperator } from '../operator';
 import Block from '../components/Block';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
@@ -323,10 +324,11 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   receipt?: boolean;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
+  const op = useOperator();
   const isInnate = m.from_agent === INNATE_SENDER;
   const me = !m.from_agent;
   const a  = me || isInnate ? null : agentMap[m.from_agent!];
-  const author = me ? '我' : isInnate ? 'Innate' : (a?.name ?? 'Agent');
+  const author = me ? op.display_name : isInnate ? 'Innate' : (a?.name ?? 'Agent');
   const blocks = visibleMessageBlocks(m);
   const quote = messageQuote(m);
   // Agent/Innate 回复一律用「文档流」（bubble doc）统一呈现；「我」的消息保持气泡右对齐。
@@ -1770,14 +1772,15 @@ export default function ConversationsPage() {
     });
   }, [msgs, showContext]);
 
+  const operator = useOperator();
   const normalizedQ = searchQuery.trim().toLowerCase();
   const visibleMsgCount = useMemo(() => msgs.filter(m => !m.id.startsWith('typing-')).length, [msgs]);
   const searchResults = useMemo(() => {
     if (!showSearch || !normalizedQ) return [];
     return msgs
       .filter(m => !m.id.startsWith('typing-') && msgText(m).toLowerCase().includes(normalizedQ))
-      .map(m => ({ message: m, text: msgText(m).replace(/\s+/g, ' ').trim(), sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : '我' }));
-  }, [msgs, showSearch, normalizedQ, agentMap]);
+      .map(m => ({ message: m, text: msgText(m).replace(/\s+/g, ' ').trim(), sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : operator.display_name }));
+  }, [msgs, showSearch, normalizedQ, agentMap, operator.display_name]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
 

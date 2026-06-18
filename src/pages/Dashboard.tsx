@@ -184,7 +184,7 @@ export default function Dashboard({ onOpenInAudit }: {
             </div>
             {queueIssues.length === 0
               ? <div className="empty-compact" style={{ padding: '20px 18px' }}>暂无需求</div>
-              : queueIssues.map((q, i) => (
+              : <div className="q-list">{queueIssues.map((q, i) => (
               <div className="q-row" key={q.id} onClick={() => onOpenInAudit({ projectId: q.project_id, issueId: q.id })}
                 style={{ cursor: 'pointer' }} title="在功能审计中查看">
                 <div className="q-pr">{i + 1}</div>
@@ -204,7 +204,7 @@ export default function Dashboard({ onOpenInAudit }: {
                   <Icon name="chevRight" size={15} style={{ color: 'var(--text-faint)' }} />
                 </div>
               </div>
-            ))}
+            ))}</div>}
           </div>
 
           {/* slots + backpressure */}

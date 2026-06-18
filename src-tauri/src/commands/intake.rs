@@ -1,10 +1,11 @@
 use crate::intake::{self, gateway, IntakeMode, IntakePayload};
 use crate::models::intake::{
-    BulkResult, IntakeConfig, RefineResult, ScanResult, SyncResult, UpdateIntakeConfig,
-    WebhookStatus,
+    BulkResult, IntakeConfig, RefineResult, RejectResult, ScanResult, SyncResult,
+    UpdateIntakeConfig, WebhookStatus,
 };
 use crate::models::issue::{CreateIssue, Issue};
 use crate::state::AppState;
+use futures::StreamExt;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tokio::sync::Mutex;
@@ -236,19 +237,38 @@ pub async fn run_code_scan(
     }
     let repo_path = project.repo_path.clone();
 
-    let do_todo = scan_types.is_empty() || scan_types.iter().any(|t| t == "todo");
-    let do_cargo = scan_types.is_empty() || scan_types.iter().any(|t| t == "cargo_audit");
-    let do_npm = scan_types.is_empty() || scan_types.iter().any(|t| t == "npm_audit");
+    // scan_types 为空 = 自动模式：todo 总跑，安全扫描器按栈画像自动启用
+    // （cargo_audit/npm_audit/pip_audit/govulncheck）。显式指定时按 token 各自启用。
+    let auto = scan_types.is_empty();
+    let detected: Vec<&str> = if auto {
+        crate::core::stack::security_scanners(std::path::Path::new(&repo_path))
+    } else {
+        vec![]
+    };
+    let enabled = |id: &str| {
+        if auto {
+            detected.contains(&id)
+        } else {
+            scan_types.iter().any(|t| t == id)
+        }
+    };
+    let do_todo = auto || scan_types.iter().any(|t| t == "todo");
 
     let mut all_payloads: Vec<IntakePayload> = vec![];
     if do_todo {
         all_payloads.extend(intake::scanner::scan_todos(&project_id, &repo_path).await);
     }
-    if do_cargo {
+    if enabled("cargo_audit") {
         all_payloads.extend(intake::scanner::scan_cargo_audit(&project_id, &repo_path).await);
     }
-    if do_npm {
+    if enabled("npm_audit") {
         all_payloads.extend(intake::scanner::scan_npm_audit(&project_id, &repo_path).await);
+    }
+    if enabled("pip_audit") {
+        all_payloads.extend(intake::scanner::scan_pip_audit(&project_id, &repo_path).await);
+    }
+    if enabled("govulncheck") {
+        all_payloads.extend(intake::scanner::scan_govulncheck(&project_id, &repo_path).await);
     }
 
     let found = all_payloads.len() as u32;
@@ -440,8 +460,10 @@ pub async fn refine_triage(
     let mut discarded = 0u32;
     let mut errors = 0u32;
 
+    // 先串行（快速 DB 读）取出仍处于 triage 的碎片，跳过已不存在/状态已变的。
+    let mut loaded = Vec::new();
     for id in issue_ids {
-        let issue = match sqlx::query_as::<_, Issue>(
+        if let Some(issue) = sqlx::query_as::<_, Issue>(
             "SELECT * FROM issues WHERE id=? AND status='triage'",
         )
         .bind(&id)
@@ -449,34 +471,31 @@ pub async fn refine_triage(
         .await
         .map_err(|e| e.to_string())?
         {
-            Some(i) => i,
-            None => continue,
-        };
+            loaded.push(issue);
+        }
+    }
 
-        let raw = issue
-            .raw_capture
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("{}\n{}", issue.title, issue.description));
+    // triage LLM 调用是整批耗时的瓶颈。两级优化：
+    //   1) 按项目 + token 预算切成小批，每批一次 LLM 请求整理多条（省往返/省重复系统提示）；
+    //   2) 批之间仍有界并发；批响应漏返的条目自动回退单条整理，绝不丢需求。
+    // DB 写入与事件发射仍在下方串行进行，对 Tauri 类型的依赖只留在命令体内（解耦铁律）。
+    const BATCH_CONCURRENCY: usize = 4;
+    let batches = group_for_triage(loaded);
+    let nested: Vec<Vec<(Issue, Option<TriageParsed>)>> = futures::stream::iter(
+        batches.into_iter().map(|batch| {
+            let db = &state.db;
+            async move { refine_triage_batch(db, batch).await }
+        }),
+    )
+    .buffer_unordered(BATCH_CONCURRENCY)
+    .collect()
+    .await;
+    let outcomes: Vec<(Issue, Option<TriageParsed>)> = nested.into_iter().flatten().collect();
 
-        let out = match crate::agents::llm::run_system_role_text(
-            &state.db,
-            "triage",
-            &raw,
-            None,
-            Some(&issue.project_id),
-            None,
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(_) => {
-                errors += 1;
-                continue;
-            }
-        };
-
-        let Some(p) = parse_triage_json(&out) else {
+    for (issue, parsed) in outcomes {
+        let id = issue.id.clone();
+        // LLM 失败或解析失败：计为出错，跳过。
+        let Some(p) = parsed else {
             errors += 1;
             continue;
         };
@@ -537,6 +556,62 @@ pub async fn discard_triage(issue_id: String, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
+/// 批量拒绝需求（全量总账的「拒绝（删除/归档）」操作）。
+///
+/// 按状态采取安全语义：
+/// - `triage` 碎片：尚未进入流水线、无下游数据，直接硬删除。
+/// - 执行中 / 待合并 / 已合并：不动（避免与运行中的 worktree 任务或已落地结果脱节），计入 skipped。
+/// - 其余（待审核/分析中/各类失败/等待）：软归档为 `rejected`，保留记录可回看、规避外键孤儿。
+#[tauri::command]
+pub async fn reject_issues(
+    issue_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<RejectResult, String> {
+    let mut r = RejectResult { deleted: 0, rejected: 0, skipped: 0 };
+    for id in issue_ids {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM issues WHERE id=?")
+                .bind(&id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+        let Some(status) = status else {
+            r.skipped += 1;
+            continue;
+        };
+        match status.as_str() {
+            "triage" => {
+                sqlx::query("DELETE FROM issues WHERE id=? AND status='triage'")
+                    .bind(&id)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                r.deleted += 1;
+            }
+            // 运行中 / 已落地：不允许拒绝，避免脱节。
+            "executing" | "building" | "running" | "pending_execution" | "pending_merge"
+            | "merged" => {
+                r.skipped += 1;
+            }
+            // 已拒绝：幂等跳过。
+            "rejected" => {
+                r.skipped += 1;
+            }
+            _ => {
+                sqlx::query(
+                    "UPDATE issues SET status='rejected', updated_at=datetime('now') WHERE id=?",
+                )
+                .bind(&id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+                r.rejected += 1;
+            }
+        }
+    }
+    Ok(r)
+}
+
 // ── 工厂自喂料手动触发 ────────────────────────────────────────────────────────
 
 /// 立即对单个项目跑 proposer，提议入 triage 池（安全护栏：永远 Triage）。
@@ -582,6 +657,7 @@ pub async fn run_autosupply_now(
     })
 }
 
+#[derive(Clone)]
 struct TriageParsed {
     title: String,
     category: String,
@@ -590,14 +666,8 @@ struct TriageParsed {
     is_noise: bool,
 }
 
-/// 解析 triage Agent 输出的 JSON 对象（容忍 ```json 围栏与前后噪声）。
-fn parse_triage_json(out: &str) -> Option<TriageParsed> {
-    let start = out.find('{')?;
-    let end = out.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(&out[start..=end]).ok()?;
+/// 从单个 JSON 对象抽取 triage 字段（容错缺省）。title 为空且非噪音视为无效。
+fn triage_from_value(v: &serde_json::Value) -> Option<TriageParsed> {
     let is_noise = v.get("is_noise").and_then(|x| x.as_bool()).unwrap_or(false);
     let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     if title.is_empty() && !is_noise {
@@ -610,4 +680,150 @@ fn parse_triage_json(out: &str) -> Option<TriageParsed> {
         description: v.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         is_noise,
     })
+}
+
+/// 解析 triage Agent 输出的单个 JSON 对象（容忍 ```json 围栏与前后噪声）。
+fn parse_triage_json(out: &str) -> Option<TriageParsed> {
+    let start = out.find('{')?;
+    let end = out.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out[start..=end]).ok()?;
+    triage_from_value(&v)
+}
+
+/// 解析批量 triage 输出的 JSON 数组：返回 `idx -> TriageParsed` 映射。
+/// 每个元素需带 `idx`（或 `index`/`id`）整数指向输入序号；缺失/坏元素被跳过，
+/// 由上层对未命中的 idx 回退到单条整理，保证不丢需求。
+fn parse_triage_batch(out: &str) -> std::collections::HashMap<usize, TriageParsed> {
+    let mut map = std::collections::HashMap::new();
+    let (Some(start), Some(end)) = (out.find('['), out.rfind(']')) else {
+        return map;
+    };
+    if end <= start {
+        return map;
+    }
+    let Ok(serde_json::Value::Array(arr)) =
+        serde_json::from_str::<serde_json::Value>(&out[start..=end])
+    else {
+        return map;
+    };
+    for el in &arr {
+        let idx = el
+            .get("idx")
+            .or_else(|| el.get("index"))
+            .or_else(|| el.get("id"))
+            .and_then(|x| x.as_u64());
+        if let (Some(idx), Some(parsed)) = (idx, triage_from_value(el)) {
+            map.insert(idx as usize, parsed);
+        }
+    }
+    map
+}
+
+/// 取一条碎片用于整理的原始文本：优先 raw_capture，否则回退 title+description。
+fn triage_raw(issue: &Issue) -> String {
+    issue
+        .raw_capture
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{}\n{}", issue.title, issue.description))
+}
+
+/// 单条整理：调 triage Agent → 解析单 JSON 对象。失败返回 None（计为出错）。
+async fn refine_triage_one(db: &crate::db::Db, issue: &Issue) -> Option<TriageParsed> {
+    crate::agents::llm::run_system_role_text(
+        db,
+        "triage",
+        &triage_raw(issue),
+        None,
+        Some(&issue.project_id),
+        None,
+    )
+    .await
+    .ok()
+    .and_then(|out| parse_triage_json(&out))
+}
+
+/// 一个小批的整理：单条直接走单请求；多条拼成一次批请求（输出 JSON 数组），
+/// 对批响应里缺失的 idx 逐条回退到单请求。返回与输入同序的 (Issue, 解析结果)。
+async fn refine_triage_batch(
+    db: &crate::db::Db,
+    batch: Vec<Issue>,
+) -> Vec<(Issue, Option<TriageParsed>)> {
+    if batch.len() <= 1 {
+        let mut out = Vec::with_capacity(batch.len());
+        for issue in batch {
+            let parsed = refine_triage_one(db, &issue).await;
+            out.push((issue, parsed));
+        }
+        return out;
+    }
+
+    // 同批共用一次召回（按首条所在项目），系统提示词来自 triage 角色；
+    // 这里用 user prompt 显式切到「批量数组」模式，覆盖单对象输出约束。
+    let mut prompt = String::with_capacity(256);
+    prompt.push_str(&format!(
+        "本次为**批量整理模式**（忽略系统提示中「只输出一个对象」的约束）。下面是 {} 条待整理的原始碎片，每条以 [序号] 开头。\n\
+         请对每条按同样的整理规则处理，输出一个**严格 JSON 数组**（不要 Markdown、不要解释文字），\n\
+         数组每个元素字段：idx（整数，对应下面的序号）、title、category、severity、description、is_noise（含义同单条规则）。\n\
+         务必为每个序号都返回恰好一个元素，只输出 JSON 数组。\n",
+        batch.len()
+    ));
+    for (i, it) in batch.iter().enumerate() {
+        prompt.push_str(&format!("\n[{}] {}\n", i, triage_raw(it)));
+    }
+
+    let project_id = batch[0].project_id.clone();
+    let map = match crate::agents::llm::run_system_role_text(
+        db, "triage", &prompt, None, Some(&project_id), None,
+    )
+    .await
+    {
+        Ok(out) => parse_triage_batch(&out),
+        Err(_) => std::collections::HashMap::new(),
+    };
+
+    let mut results = Vec::with_capacity(batch.len());
+    for (i, issue) in batch.into_iter().enumerate() {
+        match map.get(&i) {
+            Some(p) => results.push((issue, Some(p.clone()))),
+            // 批响应漏了这条 → 回退单条整理，绝不丢需求。
+            None => {
+                let parsed = refine_triage_one(db, &issue).await;
+                results.push((issue, parsed));
+            }
+        }
+    }
+    results
+}
+
+/// 按「项目边界 + 条数/字符预算」把碎片切成小批，控制单次请求体量，
+/// 避免输出过长被截断（token 感知的粗粒度近似：字符数 ≈ token 的保守上界）。
+fn group_for_triage(items: Vec<Issue>) -> Vec<Vec<Issue>> {
+    const MAX_ITEMS: usize = 8;
+    const MAX_CHARS: usize = 6000;
+    let mut batches: Vec<Vec<Issue>> = Vec::new();
+    let mut cur: Vec<Issue> = Vec::new();
+    let mut cur_chars = 0usize;
+    for it in items {
+        let c = triage_raw(&it).chars().count();
+        let cross_project = cur
+            .first()
+            .map(|f: &Issue| f.project_id != it.project_id)
+            .unwrap_or(false);
+        if !cur.is_empty()
+            && (cross_project || cur.len() >= MAX_ITEMS || cur_chars + c > MAX_CHARS)
+        {
+            batches.push(std::mem::take(&mut cur));
+            cur_chars = 0;
+        }
+        cur_chars += c;
+        cur.push(it);
+    }
+    if !cur.is_empty() {
+        batches.push(cur);
+    }
+    batches
 }

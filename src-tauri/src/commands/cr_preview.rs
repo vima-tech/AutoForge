@@ -151,7 +151,10 @@ fn effective_spec(config_yaml: Option<&str>, dir: &str) -> Option<EffectiveSpec>
         .as_ref()
         .and_then(|s| s.command.clone())
         .filter(|c| !c.trim().is_empty())
-        .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))?;
+        .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))
+        // 非 npm 栈（Java/Go/Python 后端、静态站）的兜底：用栈画像建议的 dev 命令，
+        // 使这些项目也能启动预览（端口探活），而不是直接 no_config。
+        .or_else(|| crate::core::stack::suggest_run_config(std::path::Path::new(dir)).dev_command)?;
 
     // Preview URL is fixed to localhost on the auto-allocated port (no longer configurable).
     let url = "http://localhost:{port}".to_string();
@@ -610,13 +613,17 @@ async fn ensure_branch_worktree(repo_path: &str, branch: &str, wt_path: &str) ->
     if code != 0 {
         return Err(format!("git worktree add 失败: {err}"));
     }
-    // 软链 node_modules（gitignore 不在 worktree 内），免重复安装。
+    // 软链依赖缓存目录（gitignore 的 node_modules 等不在 worktree 内），免重复安装。
+    // 由栈画像决定要软链哪些目录：前端/Tauri/Node → node_modules；Java/Go/Python
+    // 走全局缓存（~/.m2、GOMODCACHE、pip cache），不在仓库内故无需软链。
     #[cfg(unix)]
     {
-        let src = std::path::Path::new(repo_path).join("node_modules");
-        let dst = std::path::Path::new(wt_path).join("node_modules");
-        if src.exists() && !dst.exists() {
-            let _ = std::os::unix::fs::symlink(&src, &dst);
+        for rel in crate::core::stack::dep_cache_dirs(std::path::Path::new(repo_path)) {
+            let src = std::path::Path::new(repo_path).join(&rel);
+            let dst = std::path::Path::new(wt_path).join(&rel);
+            if src.exists() && !dst.exists() {
+                let _ = std::os::unix::fs::symlink(&src, &dst);
+            }
         }
     }
     Ok(())

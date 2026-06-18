@@ -12,7 +12,9 @@ import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
 import TracePage from './pages/Trace';
 import QuickCapture from './components/QuickCapture';
-import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
+import OperatorPanel from './components/OperatorPanel';
+import { loadOperator } from './operator';
+import { getSystemHealth, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, type SystemHealth } from './services';
 import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
 type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
@@ -102,6 +104,8 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 
 export default function App() {
   const [showQuick, setShowQuick] = useState(false);
+  const [showOperator, setShowOperator] = useState(false);
+  const [notifUnread, setNotifUnread] = useState(0);
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
     return saved && (['home', 'chat', 'projects', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
@@ -113,10 +117,16 @@ export default function App() {
   const [maximized, setMaximized] = useState(false);
   // Cross-page jump target: Dashboard → Audit (a requirement to open in 功能审计).
   const [auditTarget, setAuditTarget] = useState<{ projectId: string; issueId: string } | null>(null);
+  // 通知导航请求自动打开「全量需求总账」弹窗（新需求录入）。
+  const [auditOpenLedger, setAuditOpenLedger] = useState(false);
   const goToAudit = useCallback((target: { projectId: string; issueId: string }) => {
     setAuditTarget(target);
     setPage('audit');
     sessionStorage.setItem('AutoForge:page', 'audit');
+  }, []);
+
+  const refreshNotifUnread = useCallback(() => {
+    unreadNotificationCount().then(setNotifUnread).catch(() => { /* keep stale */ });
   }, []);
 
   const badgeRefreshInFlight = useRef(false);
@@ -169,6 +179,12 @@ export default function App() {
     return () => window.removeEventListener('AutoForge:badges-refresh', onCustom);
   }, [refreshBadges]);
 
+  // Load operator profile + activity-inbox unread count on startup.
+  useEffect(() => {
+    void loadOperator();
+    refreshNotifUnread();
+  }, [refreshNotifUnread]);
+
   // Track maximize state so the window shadow gutter collapses when maximized.
   useEffect(() => {
     if (!isTauri) return;
@@ -202,6 +218,7 @@ export default function App() {
     // Debounce heavy refresh calls: collapse bursts within 500 ms into one call.
     let badgeTimer: ReturnType<typeof setTimeout> | null = null;
     let healthTimer: ReturnType<typeof setTimeout> | null = null;
+    let notifTimer: ReturnType<typeof setTimeout> | null = null;
     const debouncedBadges = () => {
       if (badgeTimer) clearTimeout(badgeTimer);
       badgeTimer = setTimeout(() => { badgeTimer = null; refreshBadges(); }, 500);
@@ -209,6 +226,13 @@ export default function App() {
     const debouncedHealth = () => {
       if (healthTimer) clearTimeout(healthTimer);
       healthTimer = setTimeout(() => { healthTimer = null; refreshHealth(); }, 500);
+    };
+    // Notifications are persisted by a task spawned *after* event::emit, so the
+    // row may not exist the instant the webview receives the event — wait 900 ms
+    // before re-counting unread to avoid racing the backend insert.
+    const debouncedNotif = () => {
+      if (notifTimer) clearTimeout(notifTimer);
+      notifTimer = setTimeout(() => { notifTimer = null; refreshNotifUnread(); }, 900);
     };
 
     let unlisten: (() => void) | undefined;
@@ -221,6 +245,7 @@ export default function App() {
       // Debounced IPC refreshes.
       debouncedBadges();
       debouncedHealth();
+      debouncedNotif();
 
       // Desktop notifications (only for actionable events).
       switch (ev?.type) {
@@ -252,9 +277,10 @@ export default function App() {
       clearTimeout(startupHealthTimer);
       if (badgeTimer) clearTimeout(badgeTimer);
       if (healthTimer) clearTimeout(healthTimer);
+      if (notifTimer) clearTimeout(notifTimer);
       unlisten?.();
     };
-  }, [refreshBadges, refreshHealth]);
+  }, [refreshBadges, refreshHealth, refreshNotifUnread]);
 
   const stageLabel = health
     ? health.stage === 'paused' ? '系统暂停'
@@ -335,10 +361,17 @@ export default function App() {
             <span className="rail-ic"><Icon name="settings" size={23} /></span>
             <span className="rail-label">设置</span>
           </button>
-          <div className="rail-item rail-me">
-            <span className="rail-ic"><MeAvatar size={34} /></span>
+          <button
+            className={'rail-item rail-me' + (showOperator ? ' active' : '')}
+            title="我的账户 · 活动中心"
+            onClick={() => setShowOperator(v => !v)}
+          >
+            <span className="rail-ic">
+              <MeAvatar size={34} />
+              {notifUnread > 0 && !showOperator && <span className="rail-badge">{notifUnread}</span>}
+            </span>
             <span className="rail-label">我的账户</span>
-          </div>
+          </button>
           </div>
         </div>
 
@@ -346,11 +379,18 @@ export default function App() {
         {page === 'chat'     && <ConversationsPage />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'delivery' && <DeliveryPage />}
-        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} />}
+        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} openLedger={auditOpenLedger} onLedgerConsumed={() => setAuditOpenLedger(false)} />}
         {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
       {showQuick && <QuickCapture onClose={() => setShowQuick(false)} />}
+      {showOperator && (
+        <OperatorPanel
+          onClose={() => setShowOperator(false)}
+          onNavigate={(p, opts) => { setPage(p); sessionStorage.setItem('AutoForge:page', p); if (opts?.openLedger) setAuditOpenLedger(true); }}
+          onUnreadChange={refreshNotifUnread}
+        />
+      )}
     </div>
   );
 }

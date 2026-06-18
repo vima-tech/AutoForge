@@ -947,8 +947,8 @@ button { font-family: inherit; cursor: pointer; }
   content: ""; position: absolute; left: -11px; top: 50%; transform: translateY(-50%);
   width: 3px; height: 22px; border-radius: 0 99px 99px 0; background: var(--ember);
 }
-.rail-me { cursor: default; }
-.rail-me:hover { background: transparent; }
+/* rail-me 现已是「操作者身份卡 + 活动中心」入口，按普通 rail-item 交互。 */
+.rail-me { cursor: pointer; }
 .rail-badge {
   position: absolute; top: -3px; right: -3px;
   min-width: 16px; height: 16px; padding: 0 4px;
@@ -959,11 +959,30 @@ button { font-family: inherit; cursor: pointer; }
 }
 .rail-spacer { flex: 1; }
 
+/* 速录：唯一带「蓄电闪电」动效的 rail 项 —— 静止即 ember 着色微亮，
+   周期性蓄能后一记急促双闪（模拟雷击），把「随手一记」的即时感视觉化。
+   只着 ember（品牌色），不引入新色；尊重 reduced-motion / data-motion。 */
+.rail-zap .rail-ic { color: var(--ember-soft); }
+.rail-zap .rail-ic svg {
+  filter: drop-shadow(0 0 3px var(--ember-tint-strong));
+  animation: zap-charge 4.2s ease-in-out infinite;
+}
+.rail-zap:hover .rail-ic { color: var(--ember); }
+@keyframes zap-charge {
+  0%, 62%   { filter: drop-shadow(0 0 2px var(--ember-tint)); transform: none; }
+  70%       { filter: drop-shadow(0 0 7px var(--ember-soft)); transform: scale(1.12); }
+  73%       { filter: drop-shadow(0 0 1px var(--ember-tint)); transform: scale(.96); }
+  77%       { filter: drop-shadow(0 0 9px var(--ember)); transform: scale(1.1); }
+  82%, 100% { filter: drop-shadow(0 0 2px var(--ember-tint)); transform: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .rail-inner, .rail-label { transition: none; }
+  .rail-zap .rail-ic svg { animation: none; }
 }
 [data-motion="off"] .rail-inner,
 [data-motion="off"] .rail-label { transition: none; }
+[data-motion="off"] .rail-zap .rail-ic svg { animation: none; }
 
 /* Middle list column */
 .list-col {
@@ -1054,6 +1073,23 @@ button { font-family: inherit; cursor: pointer; }
 .chip.violet { color: var(--violet); background: rgba(139,122,216,.16); border-color: transparent; }
 .chip.red { color: var(--red); background: rgba(219,90,64,.14); border-color: transparent; }
 .chip.amber { color: var(--amber); background: rgba(224,163,46,.14); border-color: transparent; }
+
+/* 筛选/切换标签按钮：可点选的 tag 过滤器（区别于只读状态徽章 .chip）。
+   未选：bg-3 底 + 描边 + 次级字，明显是「可点但未选」；
+   选中：ember-tint-strong 底 + ember-soft 字 + ember 描边，呼应 .seg/.rail 激活态，
+   只引用主题变量，各 palette × dark/light 下选中态都清晰可辨。 */
+.filter-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-mono); font-size: var(--text-caption); font-weight: 600;
+  letter-spacing: .02em; padding: 3px 9px; border-radius: 99px; white-space: nowrap;
+  background: var(--bg-3); border: 1px solid var(--border-strong); color: var(--text-3);
+  cursor: pointer; transition: background .14s, color .14s, border-color .14s, box-shadow .14s;
+}
+.filter-chip:hover { color: var(--text); border-color: var(--ember-soft); background: var(--surface-hover); }
+.filter-chip.on {
+  background: var(--ember-tint-strong); color: var(--ember-soft);
+  border-color: var(--ember); box-shadow: var(--shadow-sm), inset 0 0 0 1px var(--ember-tint-strong);
+}
 
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.green { background: var(--green); box-shadow: 0 0 0 3px rgba(79,157,107,.2); }
@@ -1678,6 +1714,7 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .pipe-cnt { font-family: var(--font-mono); font-size: var(--text-caption); font-weight: 700; }
 .pipe-name { font-size: var(--text-caption); color: var(--text-3); line-height: var(--leading-snug); }
 
+.q-list { max-height: 420px; overflow-y: auto; }
 .q-row { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); transition: background .12s; }
 .q-row:last-child { border-bottom: none; }
 .q-row:hover { background: var(--surface-hover); }
@@ -1746,6 +1783,14 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .req-id { font-family: var(--font-mono); font-size: var(--text-caption); color: var(--ember); font-weight: 700; }
 .req-time { margin-left: auto; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-3); white-space: nowrap; }
 .req-title { font-size: var(--text-body); font-weight: 600; line-height: var(--leading-normal); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 全量需求总账：宽弹窗下用单行密排，充分利用横向空间（编号 · 标题 · 整理 · 状态 · 时间）。 */
+.ledger-row { display: flex; align-items: center; gap: 10px; padding: 9px 14px; }
+.ledger-row > .req-id,
+.ledger-row > .chip,
+.ledger-row > .req-time,
+.ledger-row > .btn { flex: 0 0 auto; }
+.ledger-row > .req-title { flex: 1 1 auto; min-width: 0; margin: 0; font-size: var(--text-control); }
+.ledger-row > .req-time { margin-left: 0; }
 .iter-badge { font-family: var(--font-mono); font-size: var(--text-micro); padding: 1px 6px; border-radius: 6px; background: var(--bg-2); border: 1px solid var(--border-strong); }
 .iter-badge.hot { color: var(--amber); border-color: rgba(224,163,46,.4); background: rgba(224,163,46,.1); }
 
