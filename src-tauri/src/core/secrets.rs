@@ -136,10 +136,13 @@ fn keychain_get_or_create() -> Option<[u8; 32]> {
 }
 
 fn file_get_or_create() -> [u8; 32] {
-    let path = FALLBACK_PATH
-        .get()
-        .cloned()
-        .unwrap_or_else(|| "/tmp/autoforge-master.key".to_string());
+    let path = FALLBACK_PATH.get().cloned().unwrap_or_else(|| {
+        // 仅未经 init_secrets 注入路径时的兜底；走系统临时目录而非硬编码 /tmp。
+        std::env::temp_dir()
+            .join("autoforge-master.key")
+            .to_string_lossy()
+            .to_string()
+    });
     if let Ok(data) = std::fs::read_to_string(&path) {
         if let Some(k) = decode_key(data.trim()) {
             return k;

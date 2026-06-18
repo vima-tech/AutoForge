@@ -169,6 +169,19 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     // Quality gate: run configured tests on the un-merged worktree branch
     // FIRST. A failing gate must block the merge (spec: testing.md).
     let passed = crate::tasks::testing::run_and_gate(db, tx, app, cr_id).await?;
+
+    // D3：CR 级测试遥测——把这次合并前自动测试的整体结果落一条记录（吞吐质量趋势）。
+    let _ = sqlx::query(
+        "INSERT INTO cr_test_runs (id, cr_id, result, summary, run_by)
+         VALUES (?, ?, ?, ?, 'auto')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(cr_id)
+    .bind(if passed { "pass" } else { "fail" })
+    .bind(if passed { "合并前自动测试通过" } else { "合并前自动测试失败，已阻断合并" })
+    .execute(db)
+    .await;
+
     if !passed {
         info!("pre-merge tests failed for cr {}, blocking merge", cr_id);
         sqlx::query(

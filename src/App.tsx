@@ -11,6 +11,7 @@ import ProjectsPage from './pages/Projects';
 import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
 import TracePage from './pages/Trace';
+import QuickCapture from './components/QuickCapture';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
 import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
 
@@ -100,6 +101,7 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 ];
 
 export default function App() {
+  const [showQuick, setShowQuick] = useState(false);
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
     return saved && (['home', 'chat', 'projects', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
@@ -300,6 +302,14 @@ export default function App() {
             </button>
             );
           })}
+          <button
+            className="rail-item rail-zap"
+            title="速录念头（随手记，入待整理池）"
+            onClick={() => setShowQuick(true)}
+          >
+            <span className="rail-ic"><Icon name="zap" size={23} /></span>
+            <span className="rail-label">速录</span>
+          </button>
           <div className="rail-spacer" />
           <button
             className="rail-item"
@@ -340,6 +350,7 @@ export default function App() {
         {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
+      {showQuick && <QuickCapture onClose={() => setShowQuick(false)} />}
     </div>
   );
 }

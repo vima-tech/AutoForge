@@ -1,4 +1,5 @@
 pub mod admin_decision;
+pub mod agent_output;
 pub mod artifact;
 pub mod spec;
 pub mod intake;
@@ -20,5 +21,7 @@ pub mod preview;
 pub mod project;
 pub mod prototype;
 pub mod security_audit;
+pub mod test_run;
 pub mod test_session;
+pub mod widget;
 pub mod worktree;

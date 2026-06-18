@@ -37,7 +37,11 @@ impl McpConnection {
                 if server.command.trim().is_empty() {
                     return Err(anyhow!("stdio MCP server 未配置 command"));
                 }
-                let mut cmd = tokio::process::Command::new(server.command.trim());
+                // Resolve via PATH so Windows can launch `.cmd`/`.bat` shims
+                // (e.g. `npx`, `npm`)—`Command::new` only auto-appends `.exe`.
+                let mut cmd = tokio::process::Command::new(crate::core::platform::program(
+                    server.command.trim(),
+                ));
                 let args: Vec<String> = serde_json::from_str(&server.args_json).unwrap_or_default();
                 cmd.args(&args);
                 let env_json = crate::core::secrets::decrypt(&server.env_json).unwrap_or_default();

@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Icon from './Icon';
 import Select from './Select';
 import {
-  getIntakeConfig, updateIntakeConfig, syncGithubIssues, runCodeScan, bulkImportIssues, submitIssue,
+  getIntakeConfig, updateIntakeConfig, syncGithubIssues, runCodeScan, bulkImportIssues,
+  bulkImportFile, exportBulkTemplate, submitIssue,
   type IntakeConfig, type SyncResult, type ScanResult, type BulkResult,
 } from '../services';
 
@@ -42,18 +43,23 @@ function IResultBanner({ ok, children }: { ok?: boolean; children: React.ReactNo
 // ── ProjectManualTab ──────────────────────────────────────────────────────────
 
 function ProjectManualTab({ projectId }: { projectId: string }) {
-  const [form, setForm] = useState({ title: '', description: '', category: 'Feature', severity: 'medium' });
+  const [form, setForm] = useState({ title: '', description: '', category: 'Feature', severity: 'medium', repro_steps: '', environment: '', expected: '', actual: '' });
   const [submitting, setSubmitting] = useState(false);
   const [okTitle, setOkTitle] = useState('');
   const [err, setErr] = useState('');
+  const isBug = form.category === 'Bug';
 
   const submit = async () => {
     if (!form.title.trim()) { setErr('需求标题不能为空'); return; }
     setSubmitting(true); setErr(''); setOkTitle('');
     try {
-      await submitIssue({ project_id: projectId, ...form });
+      await submitIssue({
+        project_id: projectId, title: form.title, description: form.description,
+        category: form.category, severity: form.severity,
+        ...(isBug ? { repro_steps: form.repro_steps, environment: form.environment, expected: form.expected, actual: form.actual } : {}),
+      });
       setOkTitle(form.title.trim());
-      setForm({ title: '', description: '', category: 'Feature', severity: 'medium' });
+      setForm({ title: '', description: '', category: 'Feature', severity: 'medium', repro_steps: '', environment: '', expected: '', actual: '' });
     } catch (e) { setErr(String(e)); }
     finally { setSubmitting(false); }
   };
@@ -92,6 +98,31 @@ function ProjectManualTab({ projectId }: { projectId: string }) {
               options={[{ value: 'critical', label: 'Critical' }, { value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }]} />
           </div>
         </div>
+
+        {isBug && (
+          <>
+            <ISectionLabel>Bug 载体（喂给自主修复的高质量输入）</ISectionLabel>
+            <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
+              <div className="field full" style={{ margin: 0 }}>
+                <label>复现步骤</label>
+                <textarea rows={2} value={form.repro_steps} onChange={e => setForm(f => ({ ...f, repro_steps: e.target.value }))} placeholder="1. … 2. … 3. …" />
+              </div>
+              <div className="field" style={{ margin: 0 }}>
+                <label>环境</label>
+                <input value={form.environment} onChange={e => setForm(f => ({ ...f, environment: e.target.value }))} placeholder="OS / 版本 / 分支" />
+              </div>
+              <div className="field" style={{ margin: 0 }} />
+              <div className="field" style={{ margin: 0 }}>
+                <label>期望结果</label>
+                <textarea rows={2} value={form.expected} onChange={e => setForm(f => ({ ...f, expected: e.target.value }))} placeholder="应当发生什么" />
+              </div>
+              <div className="field" style={{ margin: 0 }}>
+                <label>实际结果</label>
+                <textarea rows={2} value={form.actual} onChange={e => setForm(f => ({ ...f, actual: e.target.value }))} placeholder="实际发生了什么" />
+              </div>
+            </div>
+          </>
+        )}
 
         {okTitle && <IResultBanner ok>已提交「<strong>{okTitle}</strong>」，需求已进入分析队列</IResultBanner>}
         {err && <IResultBanner ok={false}>{err}</IResultBanner>}
@@ -293,12 +324,33 @@ const BULK_PLACEHOLDERS: Record<string, string> = {
   json: '[\n  { "title": "需求1", "description": "描述", "category": "Feature", "severity": "medium" },\n  { "title": "需求2" }\n]',
 };
 
+// File → base64（剥离 data URL 前缀，与 QuickCapture 一致）。
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const s = String(fr.result);
+      resolve(s.includes(',') ? s.slice(s.indexOf(',') + 1) : s);
+    };
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(file);
+  });
+}
+
 function ProjectBulkTab({ projectId }: { projectId: string }) {
+  const [mode, setMode]       = useState<'paste' | 'file'>('paste');
   const [format, setFormat]   = useState<'text' | 'csv' | 'json'>('text');
   const [content, setContent] = useState('');
   const [importing, setImporting] = useState(false);
   const [result, setResult]   = useState<BulkResult | null>(null);
   const [importErr, setImportErr] = useState('');
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [fileImporting, setFileImporting] = useState(false);
+  const [fileName, setFileName] = useState('');
+  const [tplMsg, setTplMsg] = useState('');
+
+  const lineCount = content.split('\n').filter(l => l.trim()).length;
 
   const doImport = async () => {
     if (!content.trim()) return;
@@ -308,37 +360,99 @@ function ProjectBulkTab({ projectId }: { projectId: string }) {
     finally { setImporting(false); }
   };
 
+  const doFileImport = async (file: File) => {
+    setFileName(file.name);
+    setFileImporting(true); setResult(null); setImportErr(''); setTplMsg('');
+    try {
+      const b64 = await fileToBase64(file);
+      setResult(await bulkImportFile(projectId, file.name, b64));
+    } catch (e) { setImportErr(String(e)); }
+    finally { setFileImporting(false); }
+  };
+
+  const doTemplate = async (fmt: 'csv' | 'xlsx') => {
+    setTplMsg(''); setImportErr('');
+    try {
+      const path = await exportBulkTemplate(fmt);
+      setTplMsg(`模板已保存到：${path}`);
+    } catch (e) { setImportErr(String(e)); }
+  };
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <ICard>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 9, background: 'rgba(224,163,46,.15)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Icon name="arrowUp" size={16} style={{ color: 'var(--amber)' }} />
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <ICard style={{ padding: '16px 18px' }}>
+        {/* header + mode switch on one row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 9, background: 'var(--ember-tint-strong)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <Icon name="arrowUp" size={15} style={{ color: 'var(--ember)' }} />
           </div>
-          <div>
+          <div style={{ minWidth: 0, flex: 1 }}>
             <div style={{ fontWeight: 600, fontSize: 'var(--text-body)' }}>批量导入</div>
-            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 1 }}>粘贴多条需求，一次性入队分析（最多 200 条）</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginTop: 1 }}>一次性入队分析，最多 200 条</div>
+          </div>
+          <div className="seg" style={{ flexShrink: 0 }}>
+            {([['paste', '粘贴文本'], ['file', '上传文件']] as const).map(([id, label]) => (
+              <button key={id} type="button" className={mode === id ? 'on' : ''}
+                onClick={() => setMode(id)} style={{ padding: '4px 12px' }}>{label}</button>
+            ))}
           </div>
         </div>
 
-        <ISectionLabel>格式</ISectionLabel>
-        <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
-          {(Object.entries(BULK_FORMAT_META) as [keyof typeof BULK_FORMAT_META, { label: string; desc: string }][]).map(([key, meta]) => (
-            <button key={key} className={'btn btn-sm' + (format === key ? ' btn-primary' : '')}
-              onClick={() => { setFormat(key); setContent(''); }}
-              style={{ flexDirection: 'column', alignItems: 'flex-start', padding: '8px 12px', height: 'auto', gap: 2 }}>
-              <span style={{ fontWeight: 600, fontSize: 'var(--text-label)', color: format === key ? 'var(--bubble-me-text)' : 'var(--text)' }}>{meta.label}</span>
-              <span style={{ fontSize: 'var(--text-caption)', color: format === key ? 'rgba(255,255,255,.75)' : 'var(--text-2)', fontWeight: 400 }}>{meta.desc}</span>
+        {mode === 'paste' ? (
+          <>
+            {/* compact format chips + inline hint */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+              {(Object.entries(BULK_FORMAT_META) as [keyof typeof BULK_FORMAT_META, { label: string; desc: string }][]).map(([key, meta]) => (
+                <button key={key} className={'chip' + (format === key ? ' ember' : '')}
+                  onClick={() => { setFormat(key); setContent(''); }}
+                  style={format === key
+                    ? { cursor: 'pointer' }
+                    : { cursor: 'pointer', background: 'var(--bg-3)', color: 'var(--text)', border: '1px solid var(--border-strong)' }}>
+                  {meta.label}
+                </button>
+              ))}
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginLeft: 2 }}>
+                {BULK_FORMAT_META[format].desc}
+              </span>
+            </div>
+            <textarea value={content} onChange={e => setContent(e.target.value)}
+              placeholder={BULK_PLACEHOLDERS[format]} rows={8}
+              style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px', color: 'var(--text)', resize: 'vertical', outline: 'none' }} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+              <button className="btn btn-primary btn-sm" onClick={doImport} disabled={importing || !content.trim()}>
+                <Icon name="arrowUp" size={13} />{importing ? '导入中…' : '开始导入'}
+              </button>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{lineCount} 行</span>
+            </div>
+          </>
+        ) : (
+          <>
+            {/* upload dropzone */}
+            <input ref={fileInputRef} type="file" accept=".csv,.xlsx,.xls,.ods" style={{ display: 'none' }}
+              onChange={e => { const f = e.target.files?.[0]; if (f) doFileImport(f); e.target.value = ''; }} />
+            <button onClick={() => fileInputRef.current?.click()} disabled={fileImporting}
+              style={{ width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '22px 16px', background: 'var(--bg-3)', border: '1px dashed var(--border-strong)', borderRadius: 10, cursor: fileImporting ? 'default' : 'pointer', color: 'var(--text-2)' }}>
+              <Icon name="upload" size={20} style={{ color: 'var(--ember)', ...(fileImporting ? { animation: 'spin 1s linear infinite' } : {}) }} />
+              <span style={{ fontSize: 'var(--text-control)', fontWeight: 600, color: 'var(--text)' }}>
+                {fileImporting ? '解析导入中…' : (fileName || '选择文件导入')}
+              </span>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>支持 .csv / .xlsx / .xls，首行表头 title · description · category · severity</span>
             </button>
-          ))}
-        </div>
-      </ICard>
-
-      <ICard>
-        <ISectionLabel>内容（{content.split('\n').filter(l => l.trim()).length} 行）</ISectionLabel>
-        <textarea value={content} onChange={e => setContent(e.target.value)}
-          placeholder={BULK_PLACEHOLDERS[format]} rows={10}
-          style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px', color: 'var(--text)', resize: 'vertical', outline: 'none' }} />
+            {/* template links */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+              <span>需要模板？</span>
+              <button className="btn btn-ghost btn-sm" onClick={() => doTemplate('csv')} style={{ padding: '3px 9px' }}>
+                <Icon name="download" size={12} />CSV
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => doTemplate('xlsx')} style={{ padding: '3px 9px' }}>
+                <Icon name="download" size={12} />Excel
+              </button>
+            </div>
+            {tplMsg && (
+              <div style={{ marginTop: 8, fontSize: 'var(--text-caption)', color: 'var(--text-2)', wordBreak: 'break-all' }}>{tplMsg}</div>
+            )}
+          </>
+        )}
       </ICard>
 
       {result && (
@@ -353,11 +467,6 @@ function ProjectBulkTab({ projectId }: { projectId: string }) {
         </IResultBanner>
       )}
       {importErr && <IResultBanner ok={false}>{importErr}</IResultBanner>}
-
-      <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }}
-        onClick={doImport} disabled={importing || !content.trim()}>
-        <Icon name="arrowUp" size={14} />{importing ? '导入中…' : '开始导入'}
-      </button>
     </div>
   );
 }

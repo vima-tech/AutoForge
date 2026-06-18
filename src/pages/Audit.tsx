@@ -6,7 +6,7 @@ import IntakePanel from '../components/IntakePanel';
 import {
   listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, getCrGrade,
   retryChangeRequest, deleteChangeRequest, retryAnalysis,
-  openUrl, listIssues, getIssueAnalysis, review1, parseAnalysisSpec,
+  openUrl, listIssues, getIssueAnalysis, review1, parseAnalysisSpec, updateIssueAcceptance, refineTriage,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
@@ -246,9 +246,10 @@ function LiveLogModal({ title, load, onClose }: {
 
 // ── BranchLauncher（页头：启动项目 + 运行中分支）────────────────────────────────
 
-function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog }: {
+function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, onOpenIntake, onOpenLedger }: {
   branches: BranchInfo[]; branchPreviews: BranchPreviewStatus[];
   onStart: (b: string) => void; onStop: (b: string) => void; onShowLog: (b: string) => void;
+  onOpenIntake: () => void; onOpenLedger: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -287,6 +288,12 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog }
           ))}
         </div>
       )}
+      <button className="icon-btn" style={{ flexShrink: 0 }} onClick={onOpenLedger} title="全量需求总账（全屏查看所有状态需求）">
+        <Icon name="list" size={16} />
+      </button>
+      <button className="icon-btn" style={{ flexShrink: 0 }} onClick={onOpenIntake} title="需求入口（提交 / 同步 / 扫描 / 批量导入）">
+        <Icon name="download" size={16} />
+      </button>
       <div style={{ position: 'relative', flexShrink: 0 }}>
         <button className="btn btn-sm" onClick={() => setOpen(o => !o)} title="选择分支启动（main 即线上版本）">
           <Icon name="play" size={14} />启动项目
@@ -323,13 +330,12 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog }
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
-  onSelectCr, onSelectIssue, onOpenIntake,
+  onSelectCr, onSelectIssue,
   width }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
   issueTitles: Record<string, string>; sel: Sel | null;
   onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void;
-  onOpenIntake: () => void;
   width: number;
 }) {
   const [open, setOpen] = useState(false);
@@ -390,12 +396,6 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         </div>
       </div>
 
-      <div className="list-group-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-        <span>全部需求 · {crs.length + pendingIssues.length} 条</span>
-        <button className="btn btn-sm" style={{ padding: '3px 9px' }} disabled={!activeProject} onClick={onOpenIntake} title="提交 / 同步需求到当前项目">
-          <Icon name="inbox" size={13} />需求入口
-        </button>
-      </div>
       <div className="list-body scroll" style={{ paddingTop: 0 }}>
         {crs.length === 0 && pendingIssues.length === 0 && <div className="empty-compact">暂无需求</div>}
 
@@ -443,6 +443,69 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           });
         })()}
       </div>
+    </div>
+  );
+}
+
+// ── LedgerView：全量需求总账（玻璃墙）──────────────────────────────────────────
+// 只「看 / 下钻 / 整理」：所有状态可见 + 筛选搜索；状态只读、优先级不可拖；无拖拽/改状态/指派。
+const LEDGER_STATUS_LABEL: Record<string, string> = {
+  triage: '待整理', pending_analysis: '分析中', analysis_failed: '分析失败',
+  pending_review_1: '待审核 1', pending_execution: '待编码', executing: '编码中',
+  pending_review_2: '待审核 2', pending_merge: '待合并', merged: '已合并',
+  rejected: '已拒绝', merge_failed: '合并失败', execution_failed: '执行失败',
+};
+const LEDGER_STATUS_CHIP: Record<string, string> = {
+  triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_review_1: 'amber',
+  executing: 'blue', pending_review_2: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
+};
+function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage }: {
+  allIssues: Issue[]; sel: Sel | null; onSelectIssue: (id: string) => void; onRefineTriage: (ids: string[]) => void;
+}) {
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const statuses = useMemo(() => Array.from(new Set(allIssues.map(i => i.status))), [allIssues]);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return allIssues
+      .filter(i => statusFilter === 'all' || i.status === statusFilter)
+      .filter(i => !q || i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q))
+      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+  }, [allIssues, search, statusFilter]);
+
+  return (
+    <div className="list-body scroll" style={{ paddingTop: 0 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 12px' }}>
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
+          style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {['all', ...statuses].map(s => (
+            <button key={s} onClick={() => setStatusFilter(s)}
+              className={'chip ' + (statusFilter === s ? 'ember' : '')}
+              style={{ cursor: 'pointer', fontSize: 'var(--text-micro)', padding: '2px 8px', border: statusFilter === s ? undefined : '1px solid var(--border)' }}>
+              {s === 'all' ? '全部' : (LEDGER_STATUS_LABEL[s] ?? s)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div style={{ padding: '0 12px 6px', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>{filtered.length} 条</div>
+      {filtered.length === 0 && <div className="empty-compact">无匹配需求</div>}
+      {filtered.map(i => (
+        <div key={i.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === i.id ? ' active' : '')} onClick={() => onSelectIssue(i.id)}>
+          <div className="req-item-top">
+            <span className="req-id">{i.id.slice(0, 8)}</span>
+            <span className={'chip ' + (LEDGER_STATUS_CHIP[i.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{LEDGER_STATUS_LABEL[i.status] ?? i.status}</span>
+            <span className="req-time">{new Date(i.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+          </div>
+          <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={i.title}>{i.title}</div>
+          {i.status === 'triage' && (
+            <button className="btn btn-sm" style={{ padding: '2px 8px', marginTop: 4 }}
+              onClick={e => { e.stopPropagation(); onRefineTriage([i.id]); }} title="triage Agent 整理成正经需求">
+              <Icon name="inbox" size={12} />整理
+            </button>
+          )}
+        </div>
+      ))}
     </div>
   );
 }
@@ -635,6 +698,88 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
   );
 }
 
+// Bug 载体只读展示（复现/环境/期望/实际）——喂自主修复的高质量输入。
+function BugCarrier({ issue }: { issue: Issue }) {
+  const rows = [
+    ['复现步骤', issue.repro_steps], ['环境', issue.environment],
+    ['期望结果', issue.expected], ['实际结果', issue.actual],
+  ].filter(([, v]) => v && String(v).trim());
+  if (rows.length === 0) return null;
+  return (
+    <>
+      <h2><Icon name="alert" size={18} style={{ color: 'var(--amber)' }} />Bug 载体</h2>
+      {rows.map(([label, val]) => (
+        <div key={label as string} style={{ marginBottom: 8 }}>
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', textTransform: 'uppercase', letterSpacing: '.08em', color: 'var(--text-faint)', marginBottom: 3 }}>{label}</div>
+          <p style={{ whiteSpace: 'pre-line', margin: 0 }}>{val}</p>
+        </div>
+      ))}
+    </>
+  );
+}
+
+// AI 生成的验收标准（人审改）——code agent 的 DoD + review_2 核对依据。
+function AcceptancePanel({ issue }: { issue: Issue }) {
+  type Crit = { id?: string; statement: string; verify?: string | null };
+  const [criteria, setCriteria] = useState<Crit[]>([]);
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    try { const a = issue.acceptance_json ? JSON.parse(issue.acceptance_json) : []; setCriteria(Array.isArray(a) ? a : []); }
+    catch { setCriteria([]); }
+    setEditing(false); setErr('');
+  }, [issue.id, issue.acceptance_json]);
+
+  const save = async () => {
+    setSaving(true); setErr('');
+    try {
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error('需为 JSON 数组');
+      await updateIssueAcceptance(issue.id, JSON.stringify(parsed));
+      setCriteria(parsed); setEditing(false);
+    } catch (e) { setErr('JSON 非法：' + String(e)); }
+    finally { setSaving(false); }
+  };
+
+  if (criteria.length === 0 && !editing) return null;
+  return (
+    <>
+      <h2 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Icon name="check" size={18} style={{ color: 'var(--green)' }} />验收标准
+        <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontWeight: 400 }}>AI 生成 · 可审改</span>
+        {!editing && (
+          <button className="btn btn-sm btn-ghost" style={{ marginLeft: 'auto' }} onClick={() => { setText(JSON.stringify(criteria, null, 2)); setEditing(true); }}>
+            <Icon name="code" size={12} />编辑
+          </button>
+        )}
+      </h2>
+      {editing ? (
+        <div>
+          <textarea value={text} onChange={e => setText(e.target.value)} rows={8}
+            style={{ width: '100%', boxSizing: 'border-box', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '10px 12px', color: 'var(--text)', resize: 'vertical', outline: 'none' }} />
+          {err && <div style={{ color: 'var(--red)', fontSize: 'var(--text-label)', marginTop: 6 }}>{err}</div>}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button className="btn btn-sm btn-primary" disabled={saving} onClick={save}><Icon name="check" size={12} />保存</button>
+            <button className="btn btn-sm btn-ghost" onClick={() => setEditing(false)}>取消</button>
+          </div>
+        </div>
+      ) : (
+        <ul style={{ margin: 0, paddingLeft: 18 }}>
+          {criteria.map((c, i) => (
+            <li key={c.id || i} style={{ marginBottom: 6 }}>
+              {c.statement || JSON.stringify(c)}
+              {c.verify && <span style={{ color: 'var(--text-3)', fontSize: 'var(--text-label)' }}> — 验证：{c.verify}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
 function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide, onRetryAnalysis }: {
   issue: Issue; analysis: IssueAnalysis | null; analysisLoading: boolean;
   submitting: boolean; decided: string | null;
@@ -682,6 +827,9 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
         <div className="report" style={{ maxWidth: 760 }}>
           <h2><Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />需求描述</h2>
           <p style={{ whiteSpace: 'pre-line' }}>{issue.description || '（无描述）'}</p>
+
+          <BugCarrier issue={issue} />
+          <AcceptancePanel issue={issue} />
 
           {analysisFailed && (
             <div className="chip red" style={{ display: 'block', padding: '12px 14px', margin: '12px 0', lineHeight: 'var(--leading-normal)' }}>
@@ -755,6 +903,8 @@ export default function AuditPage({ target, onTargetConsumed }: {
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [crs, setCrs] = useState<ChangeRequest[]>([]);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
+  const [allIssues, setAllIssues] = useState<Issue[]>([]);
+  const [showLedger, setShowLedger] = useState(false);
   const [issueTitles, setIssueTitles] = useState<Record<string, string>>({});
   const [issuesById, setIssuesById] = useState<Record<string, Issue>>({});
   const [origReqOpen, setOrigReqOpen] = useState(false);
@@ -842,12 +992,20 @@ export default function AuditPage({ target, onTargetConsumed }: {
       listIssues(projectId),
     ]);
     setCrs(allCrs);
+    setAllIssues(allIssues);
     // 审核 1 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
     setPendingIssues(allIssues.filter(i => i.status === 'pending_review_1' || i.status === 'analysis_failed'));
     setIssueTitles(Object.fromEntries(allIssues.map(i => [i.id, i.title])));
     setIssuesById(Object.fromEntries(allIssues.map(i => [i.id, i])));
     setLoadedProjectId(projectId);
   }, []);
+
+  // 整理待整理池条目：triage Agent 炼成正经需求并转入流水线。
+  const refineTriageItems = useCallback(async (ids: string[]) => {
+    try { await refineTriage(ids); }
+    catch (e) { showError(String(e)); }
+    if (activeProject) await loadList(activeProject.id);
+  }, [activeProject, loadList]);
 
   useEffect(() => { if (activeProject) loadList(activeProject.id); }, [activeProject, loadList]);
 
@@ -1198,6 +1356,7 @@ export default function AuditPage({ target, onTargetConsumed }: {
           <BranchLauncher
             branches={branches} branchPreviews={branchPreviews}
             onStart={doStartBranch} onStop={doStopBranch} onShowLog={showBranchLog}
+            onOpenIntake={() => setIntakeOpen(true)} onOpenLedger={() => setShowLedger(true)}
           />
         )}
       </div>
@@ -1210,7 +1369,6 @@ export default function AuditPage({ target, onTargetConsumed }: {
           projectReviewCounts={projectReviewCounts} crs={crs} pendingIssues={pendingIssues} issueTitles={issueTitles} sel={sel}
           onSelectCr={id => { setSel({ kind: 'cr', id }); setDecided(null); }}
           onSelectIssue={id => { setSel({ kind: 'issue', id }); setDecided(null); }}
-          onOpenIntake={() => setIntakeOpen(true)}
           width={listWidth}
         />
         <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
@@ -1434,6 +1592,27 @@ export default function AuditPage({ target, onTargetConsumed }: {
             </div>
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
               <IntakePanel key={activeProject.id} projectId={activeProject.id} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLedger && (
+        <div onMouseDown={() => setShowLedger(false)}
+          style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
+          <div onMouseDown={e => e.stopPropagation()}
+            style={{ width: 'min(820px, calc(100vw - 64px))', height: 'min(860px, calc(100vh - 48px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ padding: '16px 20px 12px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}>
+                <span className="cn">全量需求总账</span>
+                <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginLeft: 8, fontFamily: 'var(--font-sans)', letterSpacing: 0, textTransform: 'none' }}>所有状态 · 看 / 下钻 / 整理</span>
+              </div>
+              <button className="icon-btn" onClick={() => setShowLedger(false)}><Icon name="x" size={18} /></button>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <LedgerView allIssues={allIssues} sel={sel}
+                onSelectIssue={id => { setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false); }}
+                onRefineTriage={refineTriageItems} />
             </div>
           </div>
         </div>

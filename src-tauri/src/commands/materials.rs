@@ -1651,11 +1651,14 @@ pub async fn backup_material_files(
 
         let result: Result<String, String> = match config.provider.as_str() {
             "local" => {
+                // 未配置 path 时的兜底：走系统临时目录而非硬编码 /tmp（Windows 无 /tmp）。
+                let default_dir = std::env::temp_dir().join("autoforge-backup");
                 let dest_dir = cfg_val
                     .get("path")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("/tmp/autoforge-backup");
-                let dest = PathBuf::from(dest_dir)
+                    .map(PathBuf::from)
+                    .unwrap_or(default_dir);
+                let dest = dest_dir
                     .join(&project_id)
                     .join(&file.original_name);
                 if let Some(p) = dest.parent() {

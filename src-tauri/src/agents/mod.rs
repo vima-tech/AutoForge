@@ -1,7 +1,10 @@
 pub mod analysis;
+pub mod asr;
 pub mod code_agent;
 pub mod grader;
 pub mod llm;
 pub mod local_claude;
 pub mod roles;
+pub mod schema;
+pub mod test_agent;
 pub mod tools;

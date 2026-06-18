@@ -2,11 +2,12 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
+import Toast, { type ToastData } from '../components/Toast';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
   listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
   runProactiveScan, listTestSessions, getWidgetSnippet, getWebhookStatus,
-  listDeliveryArtifacts, importDeliveryArtifact, deleteDeliveryArtifact, revealDeliveryArtifact,
+  listDeliveryArtifacts, importDeliveryArtifact, deleteDeliveryArtifact, revealDeliveryArtifact, renameDeliveryArtifact,
   type Project, type PrototypePrompt, type SecurityAudit, type Deployment, type TestSession,
   type DeliveryArtifact, type WebhookStatus,
 } from '../services';
@@ -125,7 +126,8 @@ export default function Delivery() {
   const [toolTarget, setToolTarget] = useState('generic');
   const [targetEnv, setTargetEnv] = useState('production');
   const [busy, setBusy] = useState('');
-  const [err, setErr] = useState('');
+  const [toast, setToast] = useState<ToastData | null>(null);
+  const showError = useCallback((msg: string) => setToast({ msg, tone: 'error' }), []);
   const [stage, setStage] = useState<StageId>('design');
   const [openDeploy, setOpenDeploy] = useState<string>('');
   const [snippet, setSnippet] = useState('');
@@ -136,6 +138,7 @@ export default function Delivery() {
   const [artifacts, setArtifacts] = useState<DeliveryArtifact[]>([]);
   const [artNode, setArtNode] = useState('prototype');
   const [confirmDelArt, setConfirmDelArt] = useState<DeliveryArtifact | null>(null);
+  const [editArt, setEditArt] = useState<{ id: string; name: string } | null>(null);
   const [webhook, setWebhook] = useState<WebhookStatus | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -166,33 +169,43 @@ export default function Delivery() {
       setDeploys(dp);
       setScans(tsx.filter(s => s.session_type === 'proactive'));
       setArtifacts(ar);
-    } catch (e) { setErr(String(e)); }
-  }, []);
+    } catch (e) { showError(String(e)); }
+  }, [showError]);
 
-  // Clear the generated widget snippet only when switching projects — not after
-  // every `run` action (which calls load), otherwise generating it would wipe it.
-  useEffect(() => { setSnippet(''); load(projectId); }, [projectId, load]);
+  // The widget snippet is deterministic (derived from projectId + webhook config),
+  // so auto-generate it on project change / mount instead of keeping it in ephemeral
+  // state — otherwise a full page refresh would wipe it and force a manual re-click.
+  useEffect(() => {
+    load(projectId);
+    if (projectId) getWidgetSnippet(projectId).then(setSnippet).catch(() => setSnippet(''));
+    else setSnippet('');
+  }, [projectId, load]);
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
-    setErr(''); setBusy(key);
+    setBusy(key);
     try { await fn(); await load(projectId); }
-    catch (e) { setErr(String(e)); }
+    catch (e) { showError(String(e)); }
     finally { setBusy(''); }
   };
 
-  const copy = (text: string) => { try { navigator.clipboard?.writeText(text); } catch { /* ignore */ } };
+  const copy = async (text: string) => {
+    try {
+      await navigator.clipboard?.writeText(text);
+      setToast({ msg: '已复制到剪贴板', tone: 'success' });
+    } catch { showError('复制失败，请手动选择文本复制'); }
+  };
 
   const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      setBusy('upload'); setErr('');
+      setBusy('upload');
       const reader = new FileReader();
       reader.onload = async () => {
         try {
           const b64 = String(reader.result).split(',')[1] ?? '';
           await importDeliveryArtifact(projectId, artNode, file.name, file.type || 'application/octet-stream', b64);
           await load(projectId);
-        } catch (x) { setErr(String(x)); }
+        } catch (x) { showError(String(x)); }
         finally { setBusy(''); }
       };
       reader.readAsDataURL(file);
@@ -200,10 +213,21 @@ export default function Delivery() {
     e.target.value = '';
   };
   const reveal = async (a: DeliveryArtifact) => {
-    setErr('');
     try {
       await revealDeliveryArtifact(a.id);
-    } catch (x) { setErr(String(x)); }
+    } catch (x) { showError(String(x)); }
+  };
+  const saveArtName = async () => {
+    if (!editArt) return;
+    const name = editArt.name.trim();
+    const prev = artifacts.find(a => a.id === editArt.id)?.original_name;
+    if (!name || name === prev) { setEditArt(null); return; }
+    const target = editArt.id;
+    setEditArt(null);
+    try {
+      await renameDeliveryArtifact(target, name);
+      await load(projectId);
+    } catch (x) { showError(String(x)); }
   };
 
   const activeProject = projects.find(p => p.id === projectId) ?? null;
@@ -258,7 +282,6 @@ export default function Delivery() {
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
         <div className="scroll" style={{ flex: 1, minWidth: 0, overflow: 'auto', background: 'var(--bg)' }}>
         <div className="rise" style={{ maxWidth: 1280, width: '100%', margin: '0 auto', padding: '22px 24px', minHeight: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: 16 }}>
-        {err && <div className="chip red" style={{ alignSelf: 'flex-start' }}><Icon name="alert" size={12} />{err}</div>}
         {!projectId && <div className="empty-compact" style={{ padding: '24px 18px' }}>请从左侧选择一个在产项目</div>}
 
         {projectId && <>
@@ -453,7 +476,7 @@ export default function Delivery() {
               <button className="btn btn-sm" disabled={busy === 'scan'}
                 onClick={() => {
                   if (checkCount === 0) {
-                    setErr('项目未配置任何检查命令，无需巡检。请先在「项目管理 → 运行配置」的 test / quality 中至少填写一条检查命令。');
+                    setToast({ msg: '项目未配置任何检查命令，无需巡检。请先在「项目管理 → 运行配置」的 test / quality 中至少填写一条检查命令。', tone: 'info' });
                     return;
                   }
                   run('scan', () => runProactiveScan(projectId));
@@ -522,10 +545,26 @@ export default function Delivery() {
               ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无交付产物</div>
               : artifacts.map(a => (
                 <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                    <span className="chip">{ART_NODE_LABEL[a.node] || a.node}</span>
-                    <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.original_name}</span>
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{fmtSize(a.size_bytes)}</span>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                      <span className="chip">{ART_NODE_LABEL[a.node] || a.node}</span>
+                      {editArt?.id === a.id
+                        ? <input
+                            autoFocus
+                            value={editArt.name}
+                            onChange={e => setEditArt(s => s && { ...s, name: e.target.value })}
+                            onBlur={saveArtName}
+                            onKeyDown={e => { if (e.key === 'Enter') saveArtName(); else if (e.key === 'Escape') setEditArt(null); }}
+                            style={{ ...inputStyle, padding: '3px 8px', fontSize: 'var(--text-control)', fontWeight: 600, minWidth: 0, flex: 1 }}
+                          />
+                        : <span
+                            onClick={() => setEditArt({ id: a.id, name: a.original_name })}
+                            title="点击修改文件名"
+                            style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'text' }}
+                          >{a.original_name}</span>}
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', flexShrink: 0 }}>{fmtSize(a.size_bytes)}</span>
+                    </div>
+                    <span title={a.rel_path} style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.rel_path}</span>
                   </div>
                   <div style={{ display: 'flex', gap: 6 }}>
                     <button className="btn btn-sm" onClick={() => reveal(a)}><Icon name="folderOpen" size={13} />打开所在文件夹</button>
@@ -555,6 +594,7 @@ export default function Delivery() {
           onCancel={() => setConfirmDelDeploy(null)}
         />
       )}
+      <Toast data={toast} onClose={() => setToast(null)} />
     </div>
   );
 }

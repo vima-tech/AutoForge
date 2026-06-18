@@ -67,6 +67,10 @@ export interface Issue {
   title: string; description: string; category: string;
   severity: string; priority: number | null; status: string;
   fingerprint: string; created_at: string; updated_at: string;
+  source_ref?: string | null; raw_capture?: string | null;
+  repro_steps?: string | null; environment?: string | null;
+  expected?: string | null; actual?: string | null;
+  acceptance_json?: string | null;
 }
 export interface IssueAnalysis {
   id: string; issue_id: string; authenticity_score: number;
@@ -341,10 +345,23 @@ export const getIssueAnalysis = (issueId: string) =>
 export const submitIssue = (payload: {
   project_id: string; title: string; description?: string;
   category?: string; severity?: string; source_type?: string;
+  mode?: 'flow' | 'triage';
+  repro_steps?: string; environment?: string; expected?: string; actual?: string;
 }) => ipc<Issue>('submit_issue', { payload });
 // 分析失败/卡住时重新触发需求分析（回到分析队列）。
 export const retryAnalysis = (issueId: string) =>
   ipc<void>('retry_analysis', { issueId });
+
+// 人审改 AI 生成的验收标准（acceptance_json，JSON 数组字符串）。
+export const updateIssueAcceptance = (issueId: string, acceptanceJson: string) =>
+  ipc<void>('update_issue_acceptance', { issueId, acceptanceJson });
+
+// CR 级测试遥测记录。
+export interface CrTestRun {
+  id: string; cr_id: string; result: string; summary: string; run_by: string; run_at: string;
+}
+export const listCrTestRuns = (crId: string) =>
+  ipc<CrTestRun[]>('list_cr_test_runs', { crId });
 
 // ── Change Requests ──────────────────────────────────────────────────────────
 export const listChangeRequests = (projectId?: string, status?: string) =>
@@ -443,6 +460,10 @@ export const startConversationTask = (payload: {
 }) => ipc<ConversationTask>('start_conversation_task', { payload });
 export const listConversationTasks = (conversationId: string) =>
   ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
+// 总结/结论 + 压缩上下文：生成摘要并把当前窗口内历史消息移出后续上下文。
+export const compressConversationContext = (payload: {
+  conversation_id: string; mode: 'summary' | 'conclusion';
+}) => ipc<void>('compress_conversation_context', { payload });
 
 // ── Innate 知识库（会议室命令 + 自成长配置） ─────────────────────────────────
 export const INNATE_SENDER = '__innate__';
@@ -510,6 +531,27 @@ export const getWebSearchSettings = () =>
 export const setWebSearchSettings = (
   provider: string, endpoint: string, max_results: number, api_key?: string,
 ) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key });
+
+// ── Settings — 语音录入（ASR）────────────────────────────────────────────────
+export interface AsrSettings {
+  provider: string; endpoint: string; model: string; language: string; api_key_set: boolean;
+}
+export const getAsrSettings = () => ipc<AsrSettings>('get_asr_settings');
+export const setAsrSettings = (
+  provider: string, endpoint: string, model: string, language: string, api_key?: string,
+) => ipc<AsrSettings>('set_asr_settings', { provider, endpoint, model, language, apiKey: api_key });
+
+// 语音转写：前端录音得到的音频(base64)交后端转写，返回文本（已过注入过滤）。
+export const transcribeAudio = (audio_base64: string, mime?: string) =>
+  ipc<{ text: string }>('transcribe_audio', { audioBase64: audio_base64, mime });
+
+// 实时语音识别（阿里 DashScope 流式）：start 返回 session_id，结果经 AutoForge://event 的
+// asr_result 事件推送；前端按 16kHz/单声道/16bit PCM 分帧 feed，结束调 stop。
+export const asrRealtimeStart = () => ipc<string>('asr_realtime_start');
+export const asrRealtimeFeed = (session_id: string, audio_base64: string) =>
+  ipc<void>('asr_realtime_feed', { sessionId: session_id, audioBase64: audio_base64 });
+export const asrRealtimeStop = (session_id: string) =>
+  ipc<void>('asr_realtime_stop', { sessionId: session_id });
 
 // 凭据加密主密钥后端："keychain"（系统钥匙环）或 "file"（0600 文件兜底，安全性较弱）。
 export type SecretBackend = 'keychain' | 'file';
@@ -605,6 +647,25 @@ export const getLlmTrace = (traceId: string) => ipc<LlmTrace[]>('get_llm_trace',
 export const listTraceAgentNames = () => ipc<string[]>('list_trace_agent_names');
 export const clearLlmTraces = (traceId?: string) => ipc<void>('clear_llm_traces', { traceId: traceId ?? null });
 
+// ── Agent Outputs（环节 Agent 结构化产出 / schema 驱动）─────────────────────────
+export interface AgentOutputSummary {
+  id: string; role: string; schema_version: string;
+  target_kind: string; target_id: string;
+  project_id: string | null; trace_id: string | null;
+  status: string; output_json: string | null; created_at: string;
+}
+export interface AgentOutput extends AgentOutputSummary {
+  raw: string | null;
+}
+export interface AgentOutputFilter {
+  role?: string; target_kind?: string; target_id?: string;
+  project_id?: string; status?: string; limit?: number;
+}
+export const listAgentOutputs = (filter: AgentOutputFilter = {}) => ipc<AgentOutputSummary[]>('list_agent_outputs', { filter });
+export const getAgentOutput = (id: string) => ipc<AgentOutput | null>('get_agent_output', { id });
+export const listAgentOutputRoles = () => ipc<string[]>('list_agent_output_roles');
+export const clearAgentOutputs = (id?: string) => ipc<void>('clear_agent_outputs', { id: id ?? null });
+
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
 
 // ── Materials ─────────────────────────────────────────────────────────────────
@@ -692,10 +753,45 @@ export const runCodeScan = (projectId: string, scanTypes?: string[]) =>
   ipc<ScanResult>('run_code_scan', { projectId, scanTypes: scanTypes ?? [] });
 export const bulkImportIssues = (projectId: string, format: string, content: string) =>
   ipc<BulkResult>('bulk_import_issues', { projectId, format, content });
+// 文件批量导入（csv/xlsx/xls/ods）：文件内容以 base64 传入，后端按后缀解析。
+export const bulkImportFile = (projectId: string, fileName: string, dataBase64: string) =>
+  ipc<BulkResult>('bulk_import_file', { projectId, fileName, dataBase64 });
+// 导出批量导入模板（csv/xlsx）：写入系统下载目录并在文件管理器中定位，返回路径。
+export const exportBulkTemplate = (format: 'csv' | 'xlsx') =>
+  ipc<string>('export_bulk_template', { format });
 export const submitFromArtifact = (payload: {
   project_id: string; title: string; description?: string;
   category?: string; severity?: string; source_ref?: string;
 }) => ipc<Issue>('submit_from_artifact', { payload });
+
+// ── Triage（待整理池）─────────────────────────────────────────────────────────
+export interface RefineResult { refined: number; discarded: number; errors: number; }
+export const listTriageIssues = (projectId?: string) =>
+  ipc<Issue[]>('list_triage_issues', { projectId: projectId ?? null });
+export const refineTriage = (issueIds: string[]) =>
+  ipc<RefineResult>('refine_triage', { issueIds });
+export const discardTriage = (issueId: string) =>
+  ipc<void>('discard_triage', { issueId });
+
+// ── 工厂自喂料（autosupply）────────────────────────────────────────────────────
+export interface AutosupplySettings {
+  enabled: boolean; interval_min: number; scan_enabled: boolean;
+  proposer_enabled: boolean; max_per_run: number;
+}
+export const getAutosupplySettings = () => ipc<AutosupplySettings>('get_autosupply_settings');
+export const setAutosupplySettings = (s: AutosupplySettings) =>
+  ipc<AutosupplySettings>('set_autosupply_settings', {
+    enabled: s.enabled, intervalMin: s.interval_min, scanEnabled: s.scan_enabled,
+    proposerEnabled: s.proposer_enabled, maxPerRun: s.max_per_run,
+  });
+export const runProposer = (projectId: string, max?: number) =>
+  ipc<ScanResult>('run_proposer', { projectId, max: max ?? null });
+export const runAutosupplyNow = () => ipc<ScanResult>('run_autosupply_now');
+
+// 信任旋钮：strict / standard / loose。应用预设到自喂料，不触碰审核闸。
+export type AutonomyLevel = 'strict' | 'standard' | 'loose';
+export const getAutonomyLevel = () => ipc<AutonomyLevel>('get_autonomy_level');
+export const setAutonomyLevel = (level: AutonomyLevel) => ipc<AutonomyLevel>('set_autonomy_level', { level });
 
 // ── Dev Server ───────────────────────────────────────────────────────────────
 export const getDevServerStatus = (projectId: string) =>
@@ -757,7 +853,11 @@ export const getBranchPreviewLog = (projectId: string, branch: string) =>
 
 // ── Specs ─────────────────────────────────────────────────────────────────────
 
-export type SpecCategory = 'tech_stack' | 'architecture' | 'coding' | 'api' | 'testing';
+export type SpecCategory = 'tech_stack' | 'architecture' | 'coding' | 'api' | 'testing' | 'reference';
+/** 规格来源：'db'(内容内联) | 'file'(指向 .autoforge/specs 磁盘文件) */
+export type SpecSource = 'db' | 'file';
+/** 注入档位：always 全文常驻 / on_demand 工具按需读 / off 不暴露 */
+export type SpecInjection = 'always' | 'on_demand' | 'off';
 
 export interface ProjectSpec {
   id: string;
@@ -766,6 +866,10 @@ export interface ProjectSpec {
   title: string;
   content: string;
   sort_order: number;
+  source: SpecSource;
+  rel_path: string;
+  description: string;
+  injection: SpecInjection;
   created_at: string;
   updated_at: string;
 }
@@ -774,11 +878,21 @@ export const listProjectSpecs = (projectId: string) =>
   ipc<ProjectSpec[]>('list_project_specs', { projectId });
 export const upsertProjectSpec = (
   projectId: string, id: string | null, category: SpecCategory, title: string, content: string,
-) => ipc<ProjectSpec>('upsert_project_spec', { projectId, id, category, title, content });
+  description?: string, injection?: SpecInjection,
+) => ipc<ProjectSpec>('upsert_project_spec', { projectId, id, category, title, content, description, injection });
 export const deleteProjectSpec = (id: string) =>
   ipc<boolean>('delete_project_spec', { id });
 export const aiGenerateSpecs = (projectId: string) =>
   ipc<string>('ai_generate_specs', { projectId });
+/** 扫描 .autoforge/specs 目录，把自由 .md 文件对账登记为文件规格 */
+export const scanSpecFiles = (projectId: string) =>
+  ipc<string>('scan_spec_files', { projectId });
+/** 取规格全文（db 源内联 / file 源读盘） */
+export const getSpecContent = (id: string) =>
+  ipc<string>('get_spec_content', { id });
+/** 轻量切换注入档位 */
+export const setSpecInjection = (id: string, injection: SpecInjection) =>
+  ipc<boolean>('set_spec_injection', { id, injection });
 
 // ── Delivery pipeline: prototype (03) / security (07) / deploy (08) / scan (06) ──
 
@@ -853,23 +967,57 @@ export const provisionPreviewContainer = (crId: string) =>
 // M11 — notification hub
 export interface NotifyChannel {
   id: string; name: string; kind: string;
-  target: string; events: string; enabled: boolean; created_at: string;
+  target: string; events: string; enabled: boolean;
+  has_secret: boolean; created_at: string;
+}
+export interface NotifyChannelPayload {
+  name: string; kind: string; target: string;
+  events?: string; secret?: string; enabled?: boolean;
 }
 export const listNotifyChannels = () => ipc<NotifyChannel[]>('list_notify_channels');
-export const createNotifyChannel = (payload: {
-  name: string; kind: string; target: string; events?: string; enabled?: boolean;
-}) => ipc<NotifyChannel>('create_notify_channel', { payload });
-export const updateNotifyChannel = (id: string, payload: {
-  name: string; kind: string; target: string; events?: string; enabled?: boolean;
-}) => ipc<NotifyChannel>('update_notify_channel', { id, payload });
+export const createNotifyChannel = (payload: NotifyChannelPayload) =>
+  ipc<NotifyChannel>('create_notify_channel', { payload });
+export const updateNotifyChannel = (id: string, payload: NotifyChannelPayload) =>
+  ipc<NotifyChannel>('update_notify_channel', { id, payload });
 export const deleteNotifyChannel = (id: string) =>
   ipc<void>('delete_notify_channel', { id });
-export const testNotifyChannel = (kind: string, target: string) =>
-  ipc<void>('test_notify_channel', { kind, target });
+export const testNotifyChannel = (id: string) =>
+  ipc<void>('test_notify_channel', { id });
+
+// 微信 ClawBot 扫码绑定
+export interface ClawbotQrStart {
+  qrcode: string; qr_svg: string; qr_url: string; base_url: string;
+}
+export interface ClawbotQrPoll {
+  status: string; base_url: string;
+  bot_token: string | null; to_user_id: string | null;
+  bot_id: string | null; target: string | null;
+}
+export const clawbotStartLogin = () => ipc<ClawbotQrStart>('clawbot_start_login');
+export const clawbotPollLogin = (qrcode: string, baseUrl: string, verifyCode?: string) =>
+  ipc<ClawbotQrPoll>('clawbot_poll_login', { qrcode, baseUrl, verifyCode: verifyCode ?? null });
 
 // M10 — embeddable feedback widget
+export interface WidgetToken {
+  id: string;
+  project_id: string;
+  token: string;
+  label: string;
+  enabled: boolean;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+}
 export const getWidgetSnippet = (projectId: string) =>
   ipc<string>('get_widget_snippet', { projectId });
+export const listWidgetTokens = (projectId: string) =>
+  ipc<WidgetToken[]>('list_widget_tokens', { projectId });
+export const createWidgetToken = (projectId: string, label?: string) =>
+  ipc<WidgetToken>('create_widget_token', { projectId, label: label ?? null });
+export const setWidgetTokenEnabled = (id: string, enabled: boolean) =>
+  ipc<void>('set_widget_token_enabled', { id, enabled });
+export const deleteWidgetToken = (id: string) =>
+  ipc<void>('delete_widget_token', { id });
 
 // Node 03 — prototype prompt edit / delete
 export const deletePrototypePrompt = (id: string) =>
@@ -890,6 +1038,8 @@ export const importDeliveryArtifact = (
 ) => ipc<DeliveryArtifact>('import_delivery_artifact', { projectId, node, fileName, mime, dataBase64 });
 export const updateDeliveryArtifactMeta = (id: string, description: string) =>
   ipc<DeliveryArtifact>('update_delivery_artifact_meta', { id, description });
+export const renameDeliveryArtifact = (id: string, name: string) =>
+  ipc<DeliveryArtifact>('rename_delivery_artifact', { id, name });
 export const deleteDeliveryArtifact = (id: string) =>
   ipc<void>('delete_delivery_artifact', { id });
 export const deliveryArtifactDataUrl = (id: string) =>

@@ -16,6 +16,10 @@ pub struct AppState {
     pub concurrency: Arc<ConcurrencyManager>,
     pub dev_servers: Arc<Mutex<HashMap<String, DevServerHandle>>>,
     pub webhook_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// 实时 ASR 会话：session_id → 音频/控制发送端。
+    pub asr_sessions: Arc<
+        Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::core::asr_realtime::AsrCtl>>>,
+    >,
 }
 
 static WORKTREES_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -35,25 +39,34 @@ pub fn init_materials_base(path: String) {
     MATERIALS_BASE.set(path).ok();
 }
 
+/// 兜底目录：仅在未经 `init_*_base` 初始化（如非 Tauri 入口）时使用。走系统临时目录
+/// 而非硬编码 `/tmp`，以便 Windows 也有合法路径。
+fn temp_fallback(name: &str) -> String {
+    std::env::temp_dir()
+        .join(name)
+        .to_string_lossy()
+        .to_string()
+}
+
 pub fn worktrees_base() -> String {
     WORKTREES_BASE
         .get()
         .cloned()
-        .unwrap_or_else(|| "/tmp/autoforge-worktrees".to_string())
+        .unwrap_or_else(|| temp_fallback("autoforge-worktrees"))
 }
 
 pub fn attachments_base() -> String {
     ATTACHMENTS_BASE
         .get()
         .cloned()
-        .unwrap_or_else(|| "/tmp/autoforge-attachments".to_string())
+        .unwrap_or_else(|| temp_fallback("autoforge-attachments"))
 }
 
 pub fn materials_base() -> String {
     MATERIALS_BASE
         .get()
         .cloned()
-        .unwrap_or_else(|| "/tmp/autoforge-materials".to_string())
+        .unwrap_or_else(|| temp_fallback("autoforge-materials"))
 }
 
 pub fn init_kb_base(path: String) {
@@ -64,5 +77,5 @@ pub fn kb_base() -> String {
     KB_BASE
         .get()
         .cloned()
-        .unwrap_or_else(|| "/tmp/autoforge-kb".to_string())
+        .unwrap_or_else(|| temp_fallback("autoforge-kb"))
 }

@@ -12,8 +12,33 @@ const CATEGORIES: &[(&str, &str)] = &[
     ("coding", "编码规范"),
     ("api", "API 契约"),
     ("testing", "测试要求"),
+    ("reference", "参考"),
 ];
+/// 会聚合写出 `.autoforge/specs/{cat}.md` 并被 CLAUDE.md @import 的「宪法级」分类。
+/// `reference` 分类（多为 agent 写的自由文件）不参与聚合写出与 @import。
+const AGGREGATE_CATEGORIES: &[&str] = &["tech_stack", "architecture", "coding", "api", "testing"];
+fn is_aggregate(category: &str) -> bool {
+    AGGREGATE_CATEGORIES.contains(&category)
+}
 const SPEC_AI_SYSTEM_KIND: &str = "spec_writer";
+
+/// 取项目仓库根路径（去空白；不校验存在性，调用方按需处理）。
+async fn project_repo_path(project_id: &str, state: &AppState) -> Result<String, String> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT repo_path FROM projects WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(row.map(|(p,)| p.trim().to_string()).unwrap_or_default())
+}
+
+/// 把仓库相对的 .autoforge/specs 文件路径规整为「相对 .autoforge/」形式（如 `specs/foo.md`），
+/// 供 workspace 守卫复用。接受带或不带 `.autoforge/` 前缀的输入。
+fn to_workspace_rel(rel_path: &str) -> String {
+    let p = rel_path.trim().trim_start_matches("./");
+    p.strip_prefix(".autoforge/").unwrap_or(p).to_string()
+}
 
 fn now_str() -> String {
     chrono::Utc::now()
@@ -43,6 +68,10 @@ async fn write_category_file(
     category: &str,
     state: &AppState,
 ) -> Result<(), String> {
+    // 仅宪法级分类聚合写出到 .autoforge/specs/{cat}.md；reference 等不落聚合文件。
+    if !is_aggregate(category) {
+        return Ok(());
+    }
     let Some((repo_path,)) =
         sqlx::query_as::<_, (String,)>("SELECT repo_path FROM projects WHERE id = ?")
             .bind(project_id)
@@ -63,7 +92,7 @@ async fn write_category_file(
     }
 
     let specs: Vec<ProjectSpec> = sqlx::query_as::<_, ProjectSpec>(
-        "SELECT * FROM project_specs WHERE project_id = ? AND category = ?
+        "SELECT * FROM project_specs WHERE project_id = ? AND category = ? AND source = 'db'
          ORDER BY sort_order, created_at",
     )
     .bind(project_id)
@@ -101,11 +130,11 @@ fn update_claude_md_spec_section(repo_path: &str) {
 
     let specs_dir = repo.join(".autoforge").join("specs");
 
-    // Build @import lines only for spec files that actually exist
-    let imports: String = CATEGORIES
+    // Build @import lines only for aggregate spec files that actually exist
+    let imports: String = AGGREGATE_CATEGORIES
         .iter()
-        .filter(|(cat, _)| specs_dir.join(format!("{}.md", cat)).exists())
-        .map(|(cat, _)| format!("@.autoforge/specs/{}.md\n", cat))
+        .filter(|cat| specs_dir.join(format!("{}.md", cat)).exists())
+        .map(|cat| format!("@.autoforge/specs/{}.md\n", cat))
         .collect();
 
     if imports.is_empty() {
@@ -159,13 +188,23 @@ pub async fn list_project_specs(
     .map_err(|e| e.to_string())
 }
 
+fn normalize_injection(mode: &str) -> Result<String, String> {
+    match mode {
+        "always" | "on_demand" | "off" => Ok(mode.to_string()),
+        _ => Err(format!("无效的注入档位: {}", mode)),
+    }
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_project_spec(
     project_id: String,
     id: Option<String>,
     category: String,
     title: String,
     content: String,
+    description: Option<String>,
+    injection: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ProjectSpec, String> {
     let title = title.trim().to_string();
@@ -175,36 +214,80 @@ pub async fn upsert_project_spec(
     if !CATEGORIES.iter().any(|(k, _)| *k == category) {
         return Err(format!("无效的规格分类: {}", category));
     }
+    let description = description.unwrap_or_default();
+    let injection = normalize_injection(injection.as_deref().unwrap_or("always"))?;
 
     let now = now_str();
 
     if let Some(id) = id.filter(|s| !s.is_empty()) {
-        sqlx::query(
-            "UPDATE project_specs
-             SET title = ?, content = ?, updated_at = ?
-             WHERE id = ? AND project_id = ?",
+        // 取现有行以判断来源（file 源写回磁盘，content 不入库）。
+        let existing = sqlx::query_as::<_, ProjectSpec>(
+            "SELECT * FROM project_specs WHERE id = ? AND project_id = ?",
         )
-        .bind(&title)
-        .bind(&content)
-        .bind(&now)
         .bind(&id)
         .bind(&project_id)
-        .execute(&state.db)
+        .fetch_optional(&state.db)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .ok_or("规格不存在")?;
 
-        let spec = sqlx::query_as::<_, ProjectSpec>(
-            "SELECT * FROM project_specs WHERE id = ?",
-        )
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+        if existing.source == "file" {
+            // 内容写回其文件，DB content 保持空。
+            let repo_path = project_repo_path(&project_id, &state).await?;
+            if repo_path.is_empty() {
+                return Err("项目未设置仓库路径".into());
+            }
+            let rel = to_workspace_rel(&existing.rel_path);
+            crate::commands::workspace::write_workspace_path(&repo_path, &rel, &content).await?;
+            sqlx::query(
+                "UPDATE project_specs
+                 SET title = ?, category = ?, description = ?, injection = ?, updated_at = ?
+                 WHERE id = ? AND project_id = ?",
+            )
+            .bind(&title)
+            .bind(&category)
+            .bind(&description)
+            .bind(&injection)
+            .bind(&now)
+            .bind(&id)
+            .bind(&project_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        } else {
+            sqlx::query(
+                "UPDATE project_specs
+                 SET title = ?, category = ?, content = ?, description = ?, injection = ?, updated_at = ?
+                 WHERE id = ? AND project_id = ?",
+            )
+            .bind(&title)
+            .bind(&category)
+            .bind(&content)
+            .bind(&description)
+            .bind(&injection)
+            .bind(&now)
+            .bind(&id)
+            .bind(&project_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
 
+        let spec = sqlx::query_as::<_, ProjectSpec>("SELECT * FROM project_specs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 分类可能变动：旧分类与新分类的聚合文件都重写（仅 db 源 + 宪法级分类生效）。
+        if existing.category != category {
+            write_category_file(&project_id, &existing.category, &state).await?;
+        }
         write_category_file(&project_id, &category, &state).await?;
         return Ok(spec);
     }
 
+    // 新建：UI 只创建 db 源规格（file 源由扫描登记）。
     let (next_order,): (i64,) = sqlx::query_as(
         "SELECT COALESCE(MAX(sort_order), -1) + 1
          FROM project_specs WHERE project_id = ? AND category = ?",
@@ -218,8 +301,8 @@ pub async fn upsert_project_spec(
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO project_specs
-         (id, project_id, category, title, content, sort_order, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, project_id, category, title, content, sort_order, source, rel_path, description, injection, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'db', '', ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project_id)
@@ -227,6 +310,8 @@ pub async fn upsert_project_spec(
     .bind(&title)
     .bind(&content)
     .bind(next_order)
+    .bind(&description)
+    .bind(&injection)
     .bind(&now)
     .bind(&now)
     .execute(&state.db)
@@ -264,8 +349,204 @@ pub async fn delete_project_spec(
         .await
         .map_err(|e| e.to_string())?;
 
+    // file 源连带删除磁盘文件（经工作区守卫，越界/失败仅告警不阻断索引删除）。
+    if spec.source == "file" && !spec.rel_path.is_empty() {
+        let repo_path = project_repo_path(&spec.project_id, &state).await?;
+        if !repo_path.is_empty() {
+            let rel = to_workspace_rel(&spec.rel_path);
+            if let Err(e) = crate::commands::workspace::delete_workspace_path(&repo_path, &rel).await {
+                warn!("[specs] 删除文件 {} 失败: {}", spec.rel_path, e);
+            }
+        }
+    }
+
     write_category_file(&spec.project_id, &spec.category, &state).await?;
     Ok(true)
+}
+
+// ── 文件规格对账 / 读取 / 注入档位 ─────────────────────────────────────────────
+
+/// 取文件首个非空、非标题行作为描述（截断 120 字符）；退化用首个标题行。
+fn derive_description(content: &str) -> String {
+    let mut heading: Option<String> = None;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(h) = t.strip_prefix('#') {
+            if heading.is_none() {
+                heading = Some(h.trim_start_matches('#').trim().to_string());
+            }
+            continue;
+        }
+        if t.starts_with("> ") || t == ">" {
+            continue;
+        }
+        return t.chars().take(120).collect();
+    }
+    heading.unwrap_or_default().chars().take(120).collect()
+}
+
+/// 扫描 `.autoforge/specs/*.md`，与索引对账：
+/// - 跳过 5 个聚合产物文件（tech_stack.md…testing.md）。
+/// - 未登记的自由 .md 文件插入为 source='file'、category='reference'、injection='on_demand'。
+/// - file 源行对应文件已消失 → 删除该行。
+/// 返回新登记数量的提示文案。
+#[tauri::command]
+pub async fn scan_spec_files(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let repo_path = project_repo_path(&project_id, &state).await?;
+    if repo_path.is_empty() {
+        return Err("项目未设置仓库路径".into());
+    }
+    let specs_dir = match autoforge_specs_dir(&repo_path) {
+        Some(d) => d,
+        None => return Ok("项目目录不存在，未扫描".into()),
+    };
+
+    // 现有 file 源行：rel_path -> id（用于去重与清理）。
+    let existing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, rel_path FROM project_specs WHERE project_id = ? AND source = 'file'",
+    )
+    .bind(&project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let aggregate_names: Vec<String> = AGGREGATE_CATEGORIES
+        .iter()
+        .map(|c| format!("{}.md", c))
+        .collect();
+
+    // 1) 扫描磁盘 .md 文件，收集自由文件的 workspace 相对路径。
+    let mut on_disk: Vec<(String, String, String)> = Vec::new(); // (rel `specs/x.md`, file_name, full_path)
+    if specs_dir.is_dir() {
+        let mut rd = tokio::fs::read_dir(&specs_dir).await.map_err(|e| e.to_string())?;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+                continue;
+            };
+            if !fname.to_lowercase().ends_with(".md") {
+                continue;
+            }
+            if aggregate_names.iter().any(|a| a == &fname) {
+                continue; // 聚合产物文件不登记
+            }
+            on_disk.push((format!("specs/{}", fname), fname, path.to_string_lossy().to_string()));
+        }
+    }
+
+    let existing_rels: std::collections::HashSet<String> =
+        existing.iter().map(|(_, r)| to_workspace_rel(r)).collect();
+
+    let now = now_str();
+    let mut added = 0usize;
+
+    // 2) 新文件 → 登记。
+    let (next_order,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1
+         FROM project_specs WHERE project_id = ? AND category = 'reference'",
+    )
+    .bind(&project_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut order = next_order;
+
+    for (rel, fname, full) in &on_disk {
+        if existing_rels.contains(rel) {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(full).await.unwrap_or_default();
+        let description = derive_description(&content);
+        let title = fname.trim_end_matches(".md").to_string();
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO project_specs
+             (id, project_id, category, title, content, sort_order, source, rel_path, description, injection, created_at, updated_at)
+             VALUES (?, ?, 'reference', ?, '', ?, 'file', ?, ?, 'on_demand', ?, ?)",
+        )
+        .bind(&id)
+        .bind(&project_id)
+        .bind(&title)
+        .bind(order)
+        .bind(rel)
+        .bind(&description)
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        order += 1;
+        added += 1;
+    }
+
+    // 3) 文件已消失的 file 源行 → 清理。
+    let disk_rels: std::collections::HashSet<String> =
+        on_disk.iter().map(|(r, _, _)| r.clone()).collect();
+    let mut removed = 0usize;
+    for (rid, rrel) in &existing {
+        if !disk_rels.contains(&to_workspace_rel(rrel)) {
+            sqlx::query("DELETE FROM project_specs WHERE id = ?")
+                .bind(rid)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+            removed += 1;
+        }
+    }
+
+    Ok(format!("扫描完成：新登记 {} 个文件规格，清理 {} 个失效条目", added, removed))
+}
+
+/// 取规格全文：db 源返回内联 content；file 源经守卫读盘。
+#[tauri::command]
+pub async fn get_spec_content(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let spec = sqlx::query_as::<_, ProjectSpec>("SELECT * FROM project_specs WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("规格不存在")?;
+
+    if spec.source == "file" {
+        let repo_path = project_repo_path(&spec.project_id, &state).await?;
+        if repo_path.is_empty() {
+            return Err("项目未设置仓库路径".into());
+        }
+        let rel = to_workspace_rel(&spec.rel_path);
+        crate::commands::workspace::read_workspace_path(&repo_path, &rel).await
+    } else {
+        Ok(spec.content)
+    }
+}
+
+/// 轻量切换注入档位（不重写文件）。
+#[tauri::command]
+pub async fn set_spec_injection(
+    id: String,
+    injection: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let injection = normalize_injection(&injection)?;
+    let res = sqlx::query("UPDATE project_specs SET injection = ?, updated_at = ? WHERE id = ?")
+        .bind(&injection)
+        .bind(now_str())
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(res.rows_affected() > 0)
 }
 
 // ── AI Generation ─────────────────────────────────────────────────────────────

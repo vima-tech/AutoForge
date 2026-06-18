@@ -295,18 +295,15 @@ pub async fn start_dev_server(
         .try_clone()
         .map_err(|e| format!("日志文件克隆失败: {}", e))?;
 
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&command)
-        .current_dir(&project.repo_path)
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(&project.repo_path)
         .env("PORT", port.to_string())
         .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_err))
-        // Run in its own process group so the whole tree (sh → npm → node …)
-        // can be torn down together; killing only `sh` would orphan the rest.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {}", e))?;
+        .stderr(std::process::Stdio::from(log_err));
+    // Run in its own process group so the whole tree (shell → npm → node …)
+    // can be torn down together; killing only the shell would orphan the rest.
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {}", e))?;
 
     let handle = DevServerHandle {
         child: Arc::new(Mutex::new(Some(child))),
@@ -354,17 +351,32 @@ pub async fn stop_dev_server(project_id: String, state: State<'_, AppState>) -> 
     Ok(())
 }
 
-/// Kill an entire dev-server process group. The child is spawned with
-/// `process_group(0)`, so its PID equals the group id; sending the signal to the
-/// negative PID reaps the whole tree (sh, npm, node, …). Falls back to killing
-/// the direct child for reaping and on non-unix platforms.
+/// Kill an entire dev-server process tree. The child is spawned in its own
+/// process group (unix: `setpgid`; windows: `CREATE_NEW_PROCESS_GROUP`), so the
+/// whole tree (shell → npm → node, …) can be reaped together instead of orphaning
+/// grandchildren. Falls back to killing the direct child for reaping.
 pub(crate) async fn kill_child_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
+        // PID == process-group id; signal the negative PID to reap the whole group.
         if let Some(pid) = child.id() {
             let _ = Command::new("kill")
                 .arg("-KILL")
                 .arg(format!("-{}", pid))
+                .output()
+                .await;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // TerminateProcess on cmd.exe alone leaves npm/node orphaned; taskkill
+        // with /T walks and kills the child tree by PID.
+        if let Some(pid) = child.id() {
+            let _ = Command::new("taskkill")
+                .arg("/F")
+                .arg("/T")
+                .arg("/PID")
+                .arg(pid.to_string())
                 .output()
                 .await;
         }

@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
 import IntakePanel from '../components/IntakePanel';
-import { getPipelineStats, listActiveProjects, listIssues, type PipelineStats, type Project, type Issue } from '../services';
+import { getPipelineStats, listActiveProjects, listIssues, listTriageIssues, getAutosupplySettings, type PipelineStats, type Project, type Issue, type AutosupplySettings } from '../services';
 
 const SEV_COLOR: Record<string, string> = {
   critical: 'red', high: 'amber', medium: 'blue', low: 'green',
@@ -48,9 +48,16 @@ export default function Dashboard({ onOpenInAudit }: {
   const [showSubmit, setShowSubmit] = useState(false);
   const [carouselIndex, setCarouselIndex] = useState(0);
   const [carouselPaused, setCarouselPaused] = useState(false);
+  const [triage, setTriage] = useState<Issue[]>([]);
+  const [autosupply, setAutosupply] = useState<AutosupplySettings | null>(null);
 
   const loadAll = useCallback(async () => {
-    const [s, ps, is] = await Promise.all([getPipelineStats(), listActiveProjects(), listIssues()]);
+    const [s, ps, is, tri, supply] = await Promise.all([
+      getPipelineStats(), listActiveProjects(), listIssues(),
+      listTriageIssues().catch(() => [] as Issue[]), getAutosupplySettings().catch(() => null),
+    ]);
+    setTriage(tri);
+    setAutosupply(supply);
     setStats(s);
     setProjects(ps);
     setIssues(is.sort((a, b) => {
@@ -146,6 +153,26 @@ export default function Dashboard({ onOpenInAudit }: {
               <div className="stat-delta up">{s.delta || '实时数据'}</div>
             </div>
           ))}
+        </div>
+
+        {/* 控制室信号：待整理池 + 自动供料状态（传送带第 0 站 + 自喂料）。看而非管。 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', margin: '2px 0 4px' }}>
+          <div onClick={() => triage[0] && onOpenInAudit({ projectId: triage[0].project_id, issueId: triage[0].id })}
+            title={triage.length ? '在功能审计 → 全量总账中整理' : '待整理池为空'}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '7px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border)', cursor: triage.length ? 'pointer' : 'default' }}>
+            <Icon name="inbox" size={15} style={{ color: triage.length ? 'var(--ember)' : 'var(--text-faint)' }} />
+            <span style={{ fontSize: 'var(--text-control)' }}>待整理池</span>
+            <span className={'chip ' + (triage.length ? 'ember' : '')} style={{ fontSize: 'var(--text-micro)' }}>{triage.length}</span>
+          </div>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '7px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border)' }}>
+            <Icon name="refresh" size={15} style={{ color: autosupply?.enabled ? 'var(--green)' : 'var(--text-faint)' }} />
+            <span style={{ fontSize: 'var(--text-control)' }}>自动供料</span>
+            <span className={'chip ' + (autosupply?.enabled ? 'green' : '')} style={{ fontSize: 'var(--text-micro)' }}>
+              {autosupply?.enabled ? `每 ${autosupply.interval_min}分` : '关'}
+            </span>
+            {autosupply?.enabled && autosupply.proposer_enabled && <span className="chip blue" style={{ fontSize: 'var(--text-micro)' }}>proposer</span>}
+          </div>
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>CONTROL ROOM · 看而非管</span>
         </div>
 
         <div className="dash-cols">

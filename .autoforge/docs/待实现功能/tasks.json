@@ -1,0 +1,330 @@
+{
+  "meta": {
+    "title": "需求供给丝滑化 + AI 原生需求管理 — 长程执行任务清单",
+    "plan_ref": ".autoforge/docs/待实现功能/需求供给丝滑化与PM化总体方案.md",
+    "created": "2026-06-17",
+    "status": "已实现（A–D + X1/X2/X3 落地，X4 复用既有 trace 基建）；cargo test 54 passed，npm run build 通过",
+    "migration_note": "0037 被既有 notify_secret 占用，本批 intake_triage 改为 0038、cr_test_runs 为 0039",
+    "north_star": "需求是一条会自己流动/排序/标注的传送带；人只做两个手势——扔念头(捕获)+闸口点头/摇头(裁决)。现阶段信任旋钮拧最紧，靠可观测性攒信任再放权。",
+    "judge": "每个特性必过：给机器更好的料/让机器自检产出(留) vs 给人一个管理工作的台子(杀)。不做：人工用例库/模块树/迭代/看板/工时/指派/发布。",
+    "global_constraints": [
+      "迁移文件仅追加，不改已有；下一序号从 0037 起",
+      "新增 command 四步：commands/<m>.rs 写函数 → mod.rs 导出 → lib.rs invoke_handler 注册 → services/index.ts 封装；前端禁直接 invoke",
+      "业务逻辑零 Tauri 类型(tasks/agents/core/models/service fn 禁 AppHandle/State/Window/Manager/tauri::*)；事件只走 core/event::emit(AppEvent)",
+      "command 保持薄包装：取 state → 调纯 async fn → 返回",
+      "路径/全局走 state.rs OnceLock；异步用 tokio::spawn 或 runner 入队",
+      "前端只用 src/index.css CSS 变量，禁硬编码色值/px；图标走 <Icon/>；下拉用 proj-select+mention-pop，禁原生 select",
+      "密钥写入走 secrets::encrypt_field、读取走 secrets::decrypt；所有外部输入(转写文本/proposer 产出/导入)回灌前过 core/security::has_obvious_injection()",
+      "涉及 IPC/窗口/文件/麦克风的功能必须在 npm run tauri:dev 完整环境验证，npm run dev 浏览器模式不算"
+    ],
+    "verify_default": "cargo build (src-tauri) 通过 + npm run tauri:dev 手动走查相关交互",
+    "execution_order": "A0 → A1..A5 → B1 → B2..B6 → C1..C4 → D1..D3 → X1..X4；标 depends_on 的须前置完成"
+  },
+  "phases": [
+    {
+      "id": "A",
+      "name": "语音速录 (ASR)",
+      "goal": "Audit 话筒 → 悬浮录音 → ASR 转写 → 可改错别字 → 提交，降低捕获摩擦",
+      "tasks": [
+        {
+          "id": "A0",
+          "title": "风险前置：验证 WebKitGTK 麦克风可行性",
+          "intent": "阶段 A 唯一硬不确定性，先打通再投入",
+          "desc": "在 npm run tauri:dev 里用 navigator.mediaDevices.getUserMedia 采集麦克风；确认 WebKitGTK 是否放行，必要时在 tauri.conf.json / webview 设置开启媒体权限。不通则切换到降级方案『拖音频文件转写』，并据此调整 A5。",
+          "creates": [],
+          "edits": ["src-tauri/tauri.conf.json", "src-tauri/capabilities/main.json"],
+          "depends_on": [],
+          "acceptance": "tauri:dev 中能成功取得音频流并录到一段可播放 blob；或明确判定降级为文件上传转写",
+          "verify": "npm run tauri:dev 手动录音 5 秒并回放",
+          "risk": "high",
+          "notes": "go/no-go 结论写回方案 §2.4；后续 A5 依赖此结论"
+        },
+        {
+          "id": "A1",
+          "title": "后端 ASR 配置存储 + 读写命令",
+          "intent": "照抄 web_search 配置范式",
+          "desc": "在 app_settings KV 存 asr.provider/endpoint/model/api_key(加密)/language；新增 get_asr_settings(key 仅回 api_key_set:bool) 与 set_asr_settings(key 走 secrets::encrypt_field)。逻辑放 commands/settings.rs 或 commands/asr.rs。",
+          "creates": ["src-tauri/src/commands/asr.rs (可选, 或并入 settings.rs)"],
+          "edits": ["src-tauri/src/commands/settings.rs", "src-tauri/src/commands/mod.rs"],
+          "depends_on": [],
+          "acceptance": "set 后 get 能回显非密钥字段且 api_key_set=true；直接查 .db 看不到明文 key",
+          "verify": "cargo build + 单元/手动调用",
+          "ref": "settings.rs:832 web_search get/set 范式；core/secrets.rs"
+        },
+        {
+          "id": "A2",
+          "title": "纯 Rust 转写器 + transcribe_audio 命令",
+          "intent": "业务零 Tauri 依赖",
+          "desc": "agents/asr.rs：纯 Rust，multipart POST 到 OpenAI 兼容 /audio/transcriptions，返回文本；转写结果过 has_obvious_injection()。commands 侧薄包装 transcribe_audio(audio_base64, mime) → {text}，限制 ≤25MB/≤60s。",
+          "creates": ["src-tauri/src/agents/asr.rs"],
+          "edits": ["src-tauri/src/agents/mod.rs", "src-tauri/src/commands/asr.rs"],
+          "depends_on": ["A1"],
+          "acceptance": "给定测试音频返回正确中文文本；超限/无配置给清晰错误",
+          "verify": "cargo build + 真实 endpoint 调一次",
+          "notes": "agents/asr.rs 禁出现 tauri::*"
+        },
+        {
+          "id": "A3",
+          "title": "命令注册 + 权限 + services 封装",
+          "intent": "打通 IPC 四步",
+          "desc": "lib.rs invoke_handler 注册 transcribe_audio/get_asr_settings/set_asr_settings；capabilities/main.json 加权限；services/index.ts 加 transcribeAudio/getAsrSettings/setAsrSettings 及 AsrSettings 类型。",
+          "creates": [],
+          "edits": ["src-tauri/src/lib.rs", "src-tauri/capabilities/main.json", "src/services/index.ts"],
+          "depends_on": ["A2"],
+          "acceptance": "前端经 services 调用三个命令无 not allowed 报错",
+          "verify": "npm run tauri:dev 控制台调用"
+        },
+        {
+          "id": "A4",
+          "title": "Settings 新增「语音录入」section",
+          "intent": "ASR 配置归属(已定:独立 section)",
+          "desc": "SET_ITEMS 加 {id:'asr',name:'语音录入',ic:'mic'}(放集成与通知组)；新增 <AsrSettings/> 卡(provider/endpoint/model/key/language)，全用 CSS 变量与 .field/proj-select；Icon.tsx 确认/新增 mic 图标。",
+          "creates": [],
+          "edits": ["src/pages/Settings.tsx", "src/components/Icon.tsx"],
+          "depends_on": ["A3"],
+          "acceptance": "Settings 出现「语音录入」可配置并保存；下拉非原生",
+          "verify": "npm run tauri:dev 走查",
+          "ref": "Settings.tsx:1686 SET_ITEMS；ToolsSettings web_search 卡范式"
+        },
+        {
+          "id": "A5",
+          "title": "Audit 话筒按钮 + 录音悬浮层",
+          "intent": "捕获主交互",
+          "desc": "「需求入口」按钮右侧加 icon-btn 话筒(disabled=!activeProject)；点击弹悬浮录音框：MediaRecorder 录→停→transcribeAudio→填入可编辑 textarea(允许改错别字)→提交走 submitIssue。浮层遵守 win-gutter 规范(inset:var(--win-gutter,0)+radius:14px)，复用 proj-select/mention-pop 定位；尊重 prefers-reduced-motion。若 A0 降级则改文件选择转写。",
+          "creates": ["src/components/VoiceCapture.tsx (建议独立组件)"],
+          "edits": ["src/pages/Audit.tsx"],
+          "depends_on": ["A4", "A0"],
+          "acceptance": "录音→转写→改字→提交后需求进入分析队列，列表刷新可见",
+          "verify": "npm run tauri:dev 全链路走一遍",
+          "ref": "Audit.tsx:395 需求入口按钮"
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "name": "捕获/分析解耦 + triage 池",
+      "goal": "录入与加工解耦：碎片先入待整理池，AI 事后炼成正经 issue",
+      "tasks": [
+        {
+          "id": "B1",
+          "title": "迁移 0037：issues 扩展 triage/载体/验收字段",
+          "intent": "闸门与载体的数据基础",
+          "desc": "0037_intake_triage.sql：issues 加 raw_capture TEXT、repro_steps/environment/expected/actual TEXT、acceptance_json TEXT；triage 态用 status 新增值'triage'(不加额外列)。models/issue.rs Issue 同步加字段(#[sqlx(default)])。",
+          "creates": ["src-tauri/migrations/0037_intake_triage.sql"],
+          "edits": ["src-tauri/src/models/issue.rs"],
+          "depends_on": [],
+          "acceptance": "迁移自动执行成功，现有数据不受影响；Issue 反序列化通过",
+          "verify": "cargo build + 启动跑迁移",
+          "notes": "不可改已有迁移；status='triage' 不进流水线由 B3 保证"
+        },
+        {
+          "id": "B2",
+          "title": "gateway::receive 增加 intake mode(flow/triage)",
+          "intent": "唯一闸门",
+          "desc": "receive 加 mode 参数：triage 时入库 status='triage' 并跳过 enqueue analysis；flow 维持现状。IntakePayload/models 加 mode(默认 flow)，现有 6 通道全部默认 flow 不变。",
+          "creates": [],
+          "edits": ["src-tauri/src/intake/gateway.rs", "src-tauri/src/intake/mod.rs", "src-tauri/src/models/intake.rs"],
+          "depends_on": ["B1"],
+          "acceptance": "triage 入库后 job_executions 无 analysis 入队；flow 行为不变",
+          "verify": "cargo build + 两路各提交一条核对",
+          "ref": "gateway.rs:11 receive"
+        },
+        {
+          "id": "B3",
+          "title": "排查并隔离 triage 态查询",
+          "intent": "防止 triage 污染流水线计数/列表",
+          "desc": "审查所有 WHERE status 过滤点(分析任务、CR 生成、Dashboard 统计、Audit 待办)，把 status='triage' 从『流水线/待审』口径排除，只在 triage 池与全量总账可见。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/*", "src-tauri/src/commands/system.rs", "src-tauri/src/commands/issues.rs"],
+          "depends_on": ["B2"],
+          "acceptance": "triage 条目不出现在 Dashboard 流水线计数与 Audit 待办闸口",
+          "verify": "cargo build + grep 审查 + 运行核对"
+        },
+        {
+          "id": "B4",
+          "title": "triage Agent + 『整理待整理池』命令",
+          "intent": "加工自动化",
+          "desc": "roles.rs 注册 triage 系统角色提示词(碎片→正经 issue:补 title/category/severity、去重合并、建议项目)；命令 triage_pool / refine_triage(issue_ids) 调 run_system_role_text，产出待人工确认(转 flow 或保留)。复用 kb_recall。",
+          "creates": [],
+          "edits": ["src-tauri/src/agents/roles.rs", "src-tauri/src/commands/intake.rs", "src-tauri/src/lib.rs", "src/services/index.ts"],
+          "depends_on": ["B2"],
+          "acceptance": "对一批 triage 碎片执行整理，生成结构化建议；确认后转入分析队列",
+          "verify": "npm run tauri:dev 走一批"
+        },
+        {
+          "id": "B5",
+          "title": "全局速录入口(rail 按钮 + 零结构速录框)",
+          "intent": "轴 A 丝滑捕获",
+          "desc": "App.tsx rail 加常驻『速录』按钮 → 弹极简单框(只一个文本框，可选绑当前项目) → 回车 submitIssue(mode=triage, source_type='quickcapture')。浮层遵守 win-gutter；CSS 变量。",
+          "creates": [],
+          "edits": ["src/App.tsx", "src/services/index.ts", "src/components/Icon.tsx"],
+          "depends_on": ["B2"],
+          "acceptance": "任意页面速录一句话即进待整理池",
+          "verify": "npm run tauri:dev",
+          "ref": "App.tsx:291 rail-item"
+        },
+        {
+          "id": "B6",
+          "title": "会议室消息『沉淀为需求』",
+          "intent": "会话即入口",
+          "desc": "Conversations 消息操作加『沉淀为需求』→ 取消息内容 submit(mode=triage, source_type='conversation')，复用 submit_from_artifact。",
+          "creates": [],
+          "edits": ["src/pages/Conversations.tsx", "src/services/index.ts"],
+          "depends_on": ["B2"],
+          "acceptance": "聊天中一条消息可一键沉淀进待整理池",
+          "verify": "npm run tauri:dev"
+        }
+      ]
+    },
+    {
+      "id": "C",
+      "name": "工厂自喂料",
+      "goal": "周期调度自动扫描 + proposer 提议，让供给不枯竭(修复『自动扫描没运行』)",
+      "tasks": [
+        {
+          "id": "C1",
+          "title": "proposer Agent(工程视角带证据 + 少量新功能)",
+          "intent": "自产高质量料",
+          "desc": "intake/proposer.rs(纯 Rust)：工程视角为主，用 codegraph 指认具体符号/文件，每条工程提议必带 file:line 证据(无证据丢弃)；另允许少量高优先级新功能(kind=feature 标注理由)，每轮受限。产出 → gateway(mode=triage)。roles.rs 加 proposer 提示词。",
+          "creates": ["src-tauri/src/intake/proposer.rs"],
+          "edits": ["src-tauri/src/intake/mod.rs", "src-tauri/src/agents/roles.rs"],
+          "depends_on": ["B2"],
+          "acceptance": "执行一次产出若干带 file:line 的工程提议 + ≤N 条 feature 提议，全部入 triage 池",
+          "verify": "cargo build + 手动触发一次",
+          "notes": "proposer.rs 禁 tauri::*；产出过 has_obvious_injection"
+        },
+        {
+          "id": "C2",
+          "title": "自喂料周期调度器",
+          "intent": "让供给自动",
+          "desc": "lib.rs setup 内 tauri::async_runtime::spawn 一个 interval 循环(壳层，循环体只调纯 async fn)，照抄 knowledge.evolve(\"scheduled\") 范式；读 autosupply.* 配置，到点对启用项目跑 scan(scan_todos/cargo/npm) + proposer，max_per_run 限流，全部 mode=triage。",
+          "creates": [],
+          "edits": ["src-tauri/src/lib.rs"],
+          "depends_on": ["C1"],
+          "acceptance": "开启后按间隔自动入池；关闭则不跑；每轮不超过 max_per_run",
+          "verify": "调短间隔 npm run tauri:dev 观察",
+          "ref": "knowledge/mod.rs:500 evolve scheduled；intake.rs:215 run_code_scan"
+        },
+        {
+          "id": "C3",
+          "title": "autosupply 配置 + Settings「自动供料」卡",
+          "intent": "信任旋钮的一部分",
+          "desc": "app_settings 存 autosupply.enabled/interval_min(默认1440)/scan_enabled/proposer_enabled(默认 false)/max_per_run；get/set 命令 + services；Settings 新增「自动供料」卡(或并入并发与流控)。",
+          "creates": [],
+          "edits": ["src-tauri/src/commands/settings.rs", "src-tauri/src/lib.rs", "src/services/index.ts", "src/pages/Settings.tsx"],
+          "depends_on": ["C2"],
+          "acceptance": "界面可开关/调间隔/调上限；proposer 默认关",
+          "verify": "npm run tauri:dev"
+        },
+        {
+          "id": "C4",
+          "title": "自喂料安全护栏",
+          "intent": "防自嗨刷需求",
+          "desc": "确保 proposer/scan 产出永远 mode=triage、过 has_obvious_injection、绝不自动 flow 进流水线；越界即拒。",
+          "creates": [],
+          "edits": ["src-tauri/src/intake/proposer.rs", "src-tauri/src/intake/gateway.rs"],
+          "depends_on": ["C2"],
+          "acceptance": "构造测试：自喂料无法触发 analysis/CR；注入样本被拦",
+          "verify": "cargo test / 手动核对"
+        }
+      ]
+    },
+    {
+      "id": "D",
+      "name": "需求载体增强 + AI 验收标准 (非 PM 工具)",
+      "goal": "让需求成为机器能更好执行的载体，让机器能自检产出",
+      "tasks": [
+        {
+          "id": "D1",
+          "title": "Bug 字段录入与上下文注入",
+          "intent": "高质量输入喂自主修复",
+          "desc": "Audit 录入(含语音)与 IntakePanel 手动提交：category=Bug 时展开折叠面板(复现/环境/期望/实际)；字段(B1 已建)注入分析/编码上下文。CSS 变量、proj-select。",
+          "creates": [],
+          "edits": ["src/components/IntakePanel.tsx", "src/pages/Audit.tsx", "src-tauri/src/agents/analysis.rs", "src-tauri/src/agents/code_agent.rs"],
+          "depends_on": ["B1"],
+          "acceptance": "Bug 类需求可填四字段并在分析/编码上下文中出现",
+          "verify": "npm run tauri:dev",
+          "ref": "IntakePanel.tsx:44 ProjectManualTab"
+        },
+        {
+          "id": "D2",
+          "title": "AI 验收标准生成(人审改)",
+          "intent": "让机器自检产出",
+          "desc": "analysis/triage Agent 从 issue 生成可判定『验收标准』写 acceptance_json(人只审改)；注入 code agent 当 DoD，review_2 供核对。后端生成 + Audit 审核1详情可编辑列表。",
+          "creates": [],
+          "edits": ["src-tauri/src/agents/analysis.rs", "src-tauri/src/commands/issues.rs", "src/pages/Audit.tsx", "src/services/index.ts"],
+          "depends_on": ["B1"],
+          "acceptance": "新需求分析后产出验收标准草稿，可在 Audit 编辑保存",
+          "verify": "npm run tauri:dev",
+          "ref": "Audit.tsx:638 IssueReviewView"
+        },
+        {
+          "id": "D3",
+          "title": "迁移 0038 cr_test_runs + review_2 测试遥测",
+          "intent": "CR 级吞吐质量遥测(无逐用例)",
+          "desc": "0038_cr_test_runs.sql：cr_test_runs(id,result,summary,related_cr_id,run_at)；review_2 合并前自动测试结果落一条；Audit/Dashboard 展示。明确不做逐用例映射/通过率/用例库。",
+          "creates": ["src-tauri/migrations/0038_cr_test_runs.sql", "src-tauri/src/models/test_run.rs"],
+          "edits": ["src-tauri/src/tasks/merge.rs", "src-tauri/src/models/mod.rs", "src/pages/Audit.tsx", "src/services/index.ts"],
+          "depends_on": ["B1"],
+          "acceptance": "一次 CR 合并流程后生成一条 pass/fail 遥测记录并可见",
+          "verify": "npm run tauri:dev 走 review_2"
+        }
+      ]
+    },
+    {
+      "id": "X",
+      "name": "把控感落地(三层 + 全量总账 + 信任旋钮)",
+      "goal": "现阶段强观测把控：看/否/究三层 + 全量玻璃墙 + 可调放权",
+      "tasks": [
+        {
+          "id": "X1",
+          "title": "Audit「全量总账」seg 视图",
+          "intent": "全量玻璃墙(已定落 Audit)",
+          "desc": "Audit 顶部加 seg:『待办闸口』(现状)/『全量总账』(新)。总账复用列表+详情：全状态一行一条(待整理/分析中/待审1/编码中/待审2/已合并/已拒)+按项目/状态/分类/来源/时间筛选搜索；状态列只读(观测)，优先级点开看原因(不可拖)；下钻详情或跳 Trace。红线：无拖优先级/改状态/指派/迭代/看板。需后端 list_issues(全状态,分页,筛选) 命令。",
+          "creates": [],
+          "edits": ["src/pages/Audit.tsx", "src-tauri/src/commands/issues.rs", "src-tauri/src/lib.rs", "src/services/index.ts"],
+          "depends_on": ["B3"],
+          "acceptance": "全量总账可见所有状态需求、可筛选搜索下钻；无任何 PM 式编辑动作",
+          "verify": "npm run tauri:dev",
+          "ref": "DESIGN seg 组件；Audit.tsx 列表"
+        },
+        {
+          "id": "X2",
+          "title": "Dashboard 控制室增强",
+          "intent": "总览(看)",
+          "desc": "传送带加第0站『待整理(triage)』计数；显示自喂料状态(上次自喂/proposer 待确认数)；显示 autonomy 当前档位并可快调；在途条目可深链 Trace。纯观测，不在此操作单条需求。",
+          "creates": [],
+          "edits": ["src/pages/Dashboard.tsx", "src-tauri/src/commands/system.rs", "src/services/index.ts"],
+          "depends_on": ["B3", "C3"],
+          "acceptance": "Dashboard 一屏看到 triage 计数、自喂料状态、autonomy 档位",
+          "verify": "npm run tauri:dev",
+          "ref": "Dashboard.tsx:121 工厂总览"
+        },
+        {
+          "id": "X3",
+          "title": "autonomy level 信任旋钮",
+          "intent": "渐变放权",
+          "desc": "把 gating 降级 + 并发流控 + review_1/2 抽象成一个可调 autonomy level(如:严格/标准/放手)，映射到 proposer 开关、批量、是否自动合并、检查点密度。Settings「门控降级」扩展承载。默认最紧档。",
+          "creates": [],
+          "edits": ["src/pages/Settings.tsx", "src-tauri/src/commands/system.rs", "src-tauri/src/core/concurrency.rs", "src/services/index.ts"],
+          "depends_on": ["C3"],
+          "acceptance": "切换档位实际改变放权行为；默认最紧档(proposer 关/零自动合并)",
+          "verify": "npm run tauri:dev",
+          "ref": "GatingSettings；core/concurrency.rs"
+        },
+        {
+          "id": "X4",
+          "title": "Trace 把控深链 + 维度筛选",
+          "intent": "显微镜(究)",
+          "desc": "控制室/总账条目深链到对应 trace；Trace 页可加按 proposer/triage 维度筛选。",
+          "creates": [],
+          "edits": ["src/pages/Trace.tsx", "src/services/index.ts"],
+          "depends_on": ["X1"],
+          "acceptance": "从需求一键看到其相关 AI 决策推理",
+          "verify": "npm run tauri:dev",
+          "ref": "project_llm_trace; Trace.tsx"
+        }
+      ]
+    }
+  ]
+}

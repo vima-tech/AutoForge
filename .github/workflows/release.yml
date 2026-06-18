@@ -21,15 +21,16 @@ jobs:
           - platform: macos-latest
             target: x86_64-apple-darwin
             args: "--target x86_64-apple-darwin --bundles dmg"
+          # Build both .deb and .rpm on Ubuntu. Tauri 2's rpm bundler is pure
+          # Rust (no rpmbuild needed), and `fedora-latest` is not a valid
+          # GitHub-hosted runner. Two jobs sharing one target also collided on
+          # the upload-artifact name, so they're merged into one.
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            args: "--bundles deb"
-          - platform: fedora-latest
-            target: x86_64-unknown-linux-gnu
-            args: "--bundles rpm"
+            args: "--target x86_64-unknown-linux-gnu --bundles deb,rpm"
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            args: "--bundles nsis"
+            args: "--target x86_64-pc-windows-msvc --bundles nsis"
 
     runs-on: ${{ matrix.platform }}
 
@@ -67,25 +68,6 @@ jobs:
             curl \
             wget \
             file
-
-      - name: Install Linux system deps (fedora)
-        if: matrix.platform == 'fedora-latest'
-        run: |
-          sudo dnf install -y \
-            webkit2gtk4.1-devel \
-            gtk3-devel \
-            libappindicator-gtk3-devel \
-            librsvg2-devel \
-            openssl-devel \
-            rpm-build \
-            patchelf \
-            gcc \
-            gcc-c++ \
-            make \
-            curl \
-            wget \
-            file
-          sudo dnf groupinstall -y "Development Tools"
 
       - name: Install frontend dependencies
         run: npm ci

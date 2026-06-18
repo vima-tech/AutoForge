@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod autosupply;
 pub mod execution;
 pub mod merge;
 pub mod preview;

@@ -75,6 +75,9 @@ pub fn run() {
                     std::collections::HashMap::new(),
                 )),
                 webhook_handle: webhook_handle.clone(),
+                asr_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             });
 
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
@@ -100,6 +103,29 @@ pub fn run() {
                             )
                             .await;
                         }
+                    }
+                }
+            });
+
+            // 工厂自喂料调度（design 阶段 C）：按 autosupply.interval_min 对活跃项目跑
+            // 扫描 + proposer，产物全部进 triage 池（永不自动进流水线）。默认关闭。
+            let db_for_supply = db.clone();
+            let tx_for_supply = job_tx.clone();
+            let app_for_supply = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    let sleep_min = cfg.interval_min.max(5) as u64;
+                    tokio::time::sleep(std::time::Duration::from_secs(sleep_min * 60)).await;
+                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    if cfg.enabled {
+                        let _ = tasks::autosupply::run_cycle(
+                            &db_for_supply,
+                            &tx_for_supply,
+                            &app_for_supply,
+                            &cfg,
+                        )
+                        .await;
                     }
                 }
             });
@@ -176,6 +202,32 @@ pub fn run() {
                 if let Ok(icon) = tauri::image::Image::from_bytes(icon_bytes) {
                     let _ = win.set_icon(icon);
                 }
+
+                // Linux/WebKitGTK 默认拒绝 getUserMedia，导致语音录入报 NotAllowedError。
+                // 开启 media-stream 并自动放行麦克风/摄像头权限请求（本地桌面应用，可信）。
+                // macOS/Windows 的 webview 默认即放行，无需处理。
+                #[cfg(target_os = "linux")]
+                {
+                    use webkit2gtk::glib::object::ObjectExt;
+                    use webkit2gtk::{
+                        PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt,
+                    };
+                    let _ = win.with_webview(|webview| {
+                        let wv = webview.inner();
+                        if let Some(settings) = WebViewExt::settings(&wv) {
+                            settings.set_enable_media_stream(true);
+                        }
+                        // 仅放行麦克风/摄像头（UserMedia）请求，其余权限交回默认处理。
+                        wv.connect_permission_request(|_, req| {
+                            if req.is::<UserMediaPermissionRequest>() {
+                                req.allow();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    });
+                }
             }
 
             Ok(())
@@ -194,13 +246,26 @@ pub fn run() {
             commands::issues::get_issue_analysis,
             commands::issues::submit_issue,
             commands::issues::retry_analysis,
+            commands::issues::update_issue_acceptance,
+            commands::issues::list_cr_test_runs,
             commands::intake::get_intake_config,
             commands::intake::update_intake_config,
             commands::intake::get_webhook_status,
             commands::intake::sync_github_issues,
             commands::intake::run_code_scan,
             commands::intake::bulk_import_issues,
+            commands::intake::bulk_import_file,
+            commands::intake::export_bulk_template,
             commands::intake::submit_from_artifact,
+            commands::intake::list_triage_issues,
+            commands::intake::refine_triage,
+            commands::intake::discard_triage,
+            commands::intake::run_proposer,
+            commands::intake::run_autosupply_now,
+            commands::settings::get_autosupply_settings,
+            commands::settings::set_autosupply_settings,
+            commands::settings::get_autonomy_level,
+            commands::settings::set_autonomy_level,
             commands::change_requests::list_change_requests,
             commands::change_requests::get_change_request,
             commands::change_requests::get_worktree_session,
@@ -241,6 +306,7 @@ pub fn run() {
             commands::workspace::write_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::list_conversation_tasks,
+            commands::orchestration::compress_conversation_context,
             commands::knowledge::run_conversation_command,
             commands::knowledge::get_knowledge_settings,
             commands::knowledge::set_knowledge_settings,
@@ -253,11 +319,21 @@ pub fn run() {
             commands::settings::test_llm_connection,
             commands::settings::get_web_search_settings,
             commands::settings::set_web_search_settings,
+            commands::settings::get_asr_settings,
+            commands::settings::set_asr_settings,
+            commands::asr::transcribe_audio,
+            commands::asr::asr_realtime_start,
+            commands::asr::asr_realtime_feed,
+            commands::asr::asr_realtime_stop,
             commands::settings::list_builtin_tools,
             commands::trace::list_llm_traces,
             commands::trace::get_llm_trace,
             commands::trace::list_trace_agent_names,
             commands::trace::clear_llm_traces,
+            commands::agent_outputs::list_agent_outputs,
+            commands::agent_outputs::get_agent_output,
+            commands::agent_outputs::list_agent_output_roles,
+            commands::agent_outputs::clear_agent_outputs,
             commands::settings::secret_backend_status,
             commands::mcp::list_mcp_servers,
             commands::mcp::create_mcp_server,
@@ -320,6 +396,9 @@ pub fn run() {
             commands::specs::upsert_project_spec,
             commands::specs::delete_project_spec,
             commands::specs::ai_generate_specs,
+            commands::specs::scan_spec_files,
+            commands::specs::get_spec_content,
+            commands::specs::set_spec_injection,
             commands::security::list_security_audits,
             commands::deploy::list_deployments,
             commands::deploy::generate_deploy_script,
@@ -333,6 +412,7 @@ pub fn run() {
             commands::artifacts::list_delivery_artifacts,
             commands::artifacts::import_delivery_artifact,
             commands::artifacts::update_delivery_artifact_meta,
+            commands::artifacts::rename_delivery_artifact,
             commands::artifacts::delete_delivery_artifact,
             commands::artifacts::delivery_artifact_data_url,
             commands::artifacts::reveal_delivery_artifact,
@@ -347,7 +427,13 @@ pub fn run() {
             commands::notify::update_notify_channel,
             commands::notify::delete_notify_channel,
             commands::notify::test_notify_channel,
+            commands::notify::clawbot_start_login,
+            commands::notify::clawbot_poll_login,
             commands::widget::get_widget_snippet,
+            commands::widget::list_widget_tokens,
+            commands::widget::create_widget_token,
+            commands::widget::set_widget_token_enabled,
+            commands::widget::delete_widget_token,
             commands::preview::mask_preview_data,
             commands::preview::provision_preview_container,
         ])

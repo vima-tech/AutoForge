@@ -1,4 +1,4 @@
-use crate::intake::{gateway, IntakePayload};
+use crate::intake::{gateway, IntakeMode, IntakePayload};
 use crate::models::issue::{CreateIssue, Issue, IssueAnalysis};
 use crate::models::job::JobPayload;
 use crate::state::AppState;
@@ -52,6 +52,11 @@ pub async fn submit_issue(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Issue, String> {
+    let mode = IntakeMode::from_opt(payload.mode.as_deref());
+    let has_bug = payload.repro_steps.is_some()
+        || payload.environment.is_some()
+        || payload.expected.is_some()
+        || payload.actual.is_some();
     let intake = IntakePayload {
         project_id: payload.project_id,
         title: payload.title,
@@ -61,7 +66,28 @@ pub async fn submit_issue(
         source_type: payload.source_type.unwrap_or_else(|| "manual".to_string()),
         source_ref: payload.source_ref,
     };
-    gateway::receive(&state.db, &state.job_tx, &app, intake).await
+    let issue = gateway::receive(&state.db, &state.job_tx, &app, intake, mode).await?;
+
+    // Bug 载体字段单独落库（保持 IntakePayload 与六通道不变）。
+    if has_bug {
+        sqlx::query(
+            "UPDATE issues SET repro_steps=?, environment=?, expected=?, actual=? WHERE id=?",
+        )
+        .bind(&payload.repro_steps)
+        .bind(&payload.environment)
+        .bind(&payload.expected)
+        .bind(&payload.actual)
+        .bind(&issue.id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        return sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
+            .bind(&issue.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    Ok(issue)
 }
 
 /// Re-run requirement analysis for an issue whose analysis failed (or is stuck at
@@ -97,5 +123,39 @@ pub async fn retry_analysis(
     )
     .await
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 列出某 CR 的测试遥测记录（review_2 合并前自动测试结果）。
+#[tauri::command]
+pub async fn list_cr_test_runs(
+    cr_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::test_run::CrTestRun>, String> {
+    sqlx::query_as::<_, crate::models::test_run::CrTestRun>(
+        "SELECT * FROM cr_test_runs WHERE cr_id=? ORDER BY run_at DESC",
+    )
+    .bind(&cr_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 人审改 AI 生成的验收标准（acceptance_json，JSON 数组字符串）。
+#[tauri::command]
+pub async fn update_issue_acceptance(
+    issue_id: String,
+    acceptance_json: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // 校验是合法 JSON，避免写入脏数据破坏后续解析。
+    serde_json::from_str::<serde_json::Value>(&acceptance_json)
+        .map_err(|e| format!("验收标准 JSON 非法：{}", e))?;
+    sqlx::query("UPDATE issues SET acceptance_json=?, updated_at=datetime('now') WHERE id=?")
+        .bind(&acceptance_json)
+        .bind(&issue_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

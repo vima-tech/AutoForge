@@ -71,6 +71,12 @@ pub enum AppEvent {
         task_id: String,
         status: String,
     },
+    /// 实时 ASR 转写结果：增量(is_final=false)或整句(is_final=true)。
+    AsrResult {
+        session_id: String,
+        text: String,
+        is_final: bool,
+    },
 }
 
 pub fn emit(app: &AppHandle, event: AppEvent) {

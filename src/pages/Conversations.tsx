@@ -7,12 +7,12 @@ import {
   listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
-  toggleMessageContext, startConversationTask,
+  toggleMessageContext, startConversationTask, compressConversationContext,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
   listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
-  runConversationCommand, INNATE_SENDER,
+  runConversationCommand, INNATE_SENDER, submitIssue,
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
   type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
@@ -45,6 +45,23 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'evolve',   usage: '/evolve',          desc: '立即蒸馏整理（进化）',           icon: 'zap' },
   { name: 'innate',   usage: '/innate',          desc: '查看知识库健康度',               icon: 'flask' },
 ];
+// 群聊快捷指令 tag：放在 composer-tools 行，一键触发常用指令，省去重复打字。
+// 带 compress 的指令（总结内容/形成结论）会在生成摘要的同时压缩上下文：
+// 把当前窗口内的历史消息移出后续 Agent 上下文，让摘要成为新的上下文基线。
+interface QuickPrompt {
+  label: string;
+  icon: string;
+  /** 普通指令：作为用户消息发送并触发编排。 */
+  prompt?: string;
+  /** 压缩指令：summary=压缩摘要，conclusion=收敛结论；二者都会压缩上下文。 */
+  compress?: 'summary' | 'conclusion';
+}
+const QUICK_PROMPTS: QuickPrompt[] = [
+  { label: '总结内容', icon: 'log', compress: 'summary' },
+  { label: '形成结论', icon: 'check', compress: 'conclusion' },
+  { label: '列出待办', icon: 'quote', prompt: '请从以上讨论中提取所有待办事项，标注负责人（若有）与优先级。' },
+];
+
 /** 解析以 `/` 开头的输入；返回命令与参数，未知命令 name 为 null。 */
 function parseSlashCommand(text: string): { name: ConvCommandName | null; raw: string; arg: string } | null {
   const t = text.trimStart();
@@ -136,17 +153,35 @@ function visibleMessageBlocks(m: Message): BlockType[] {
   return parseMessageBlocks(m).filter(b => b.t !== 'quote_ref');
 }
 
-// 判定一条消息是否为「长文档」：含较长的 markdown 正文（或多个标题）。
-// 命中后整条改用「文档流」呈现（中性面板 + 限定阅读行宽 + prose 排版，全文常显），
-// 短消息仍保持对话气泡。仅对 Agent 输出生效——「我」的消息保持气泡右对齐。
-function isLongDoc(blocks: BlockType[]): boolean {
+// 抽取文档流消息的 h1–h3 标题，生成右侧大纲（TOC）。跳过围栏代码块内的 # 行，
+// 仅收 1–3 级——与 DOM 中 querySelectorAll('h1,h2,h3') 的集合/顺序一致，索引可直接对应。
+function docHeadings(blocks: BlockType[]): { level: number; text: string }[] {
   const md = blocks
     .filter((b): b is Extract<BlockType, { t: 'md' }> => b.t === 'md')
     .map(b => b.md)
     .join('\n');
-  if (!md) return false;
-  const headings = (md.match(/^#{1,6}\s/gm) || []).length;
-  return md.length >= 600 || headings >= 2;
+  if (!md) return [];
+  const out: { level: number; text: string }[] = [];
+  let fenced = false;
+  for (const ln of md.split('\n')) {
+    if (/^\s*(```+|~~~+)/.test(ln)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const h = ln.match(/^(#{1,3})\s+(.+)$/);
+    if (h) out.push({ level: h[1].length, text: h[2].replace(/[*`]/g, '').trim() });
+  }
+  return out;
+}
+
+// 长文档右侧 sticky 大纲。点击平滑滚动到气泡内第 i 个标题。
+function DocToc({ headings, onJump }: { headings: { level: number; text: string }[]; onJump: (i: number) => void }) {
+  return (
+    <nav className="doc-toc" aria-label="文档大纲">
+      <div className="doc-toc-label">大纲</div>
+      {headings.map((h, i) => (
+        <a key={i} className={`lvl-${h.level}`} title={h.text} onClick={() => onJump(i)}>{h.text}</a>
+      ))}
+    </nav>
+  );
 }
 
 async function copyText(text: string): Promise<void> {
@@ -280,11 +315,12 @@ function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive, colla
   );
 }
 
-function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBubbleContextMenu, projectId }: {
+function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBubbleContextMenu, projectId, receipt }: {
   m: Message; agents: Agent[]; isGroup: boolean;
   highlighted?: boolean; searchTerm?: string; rowRef?: (el: HTMLDivElement | null) => void;
   onBubbleContextMenu?: (e: React.MouseEvent, message: Message, author: string) => void;
   projectId?: string;
+  receipt?: boolean;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const isInnate = m.from_agent === INNATE_SENDER;
@@ -293,7 +329,14 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   const author = me ? '我' : isInnate ? 'Innate' : (a?.name ?? 'Agent');
   const blocks = visibleMessageBlocks(m);
   const quote = messageQuote(m);
-  const longDoc = !me && isLongDoc(blocks);
+  // Agent/Innate 回复一律用「文档流」（bubble doc）统一呈现；「我」的消息保持气泡右对齐。
+  const longDoc = !me;
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const headings = useMemo(() => (longDoc ? docHeadings(blocks) : []), [longDoc, blocks]);
+  const showToc = headings.length >= 3;
+  const jumpToHeading = (i: number) => {
+    bubbleRef.current?.querySelectorAll('h1,h2,h3')[i]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
   return (
     <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (longDoc ? ' msg-doc' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
       {me
@@ -315,6 +358,7 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
           </div>
         )}
         <div
+          ref={bubbleRef}
           className={'bubble' + (longDoc ? ' doc' : '')}
           onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
           style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
@@ -332,14 +376,19 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
             <span className="quote-text">{quote.text}</span>
           </div>
         )}
+        {me && receipt && (
+          <div className="msg-receipt"><Icon name="check" size={11} />已送达</div>
+        )}
       </div>
+      {showToc && <DocToc headings={headings} onJump={jumpToHeading} />}
     </div>
   );
 }
 
-function Composer({ conv, agents, contextAttachments, onSend, onError, quote, onClearQuote, busy }: {
+function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
   onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
+  onCompress: (mode: 'summary' | 'conclusion') => Promise<boolean>;
   onError: (message: string) => void;
   quote: QuoteDraft | null;
   onClearQuote: () => void;
@@ -705,6 +754,25 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     await onSend(outgoing, pendingItems, refs, mentions);
   };
 
+  // 快捷 tag：压缩类走 onCompress（生成摘要并压缩上下文），普通类直接发送预设指令。
+  // quickState 让被点击的 tag 在执行期间显示 spinner+「正在总结…」，完成后短暂回执「✓ 已完成」。
+  const [quickState, setQuickState] = useState<{ label: string; phase: 'run' | 'done' } | null>(null);
+  const handleQuick = async (q: QuickPrompt) => {
+    if (busy) return;
+    if (q.compress) {
+      setQuickState({ label: q.label, phase: 'run' });
+      const ok = await onCompress(q.compress);
+      if (ok) {
+        setQuickState({ label: q.label, phase: 'done' });
+        setTimeout(() => setQuickState(s => (s && s.label === q.label ? null : s)), 1800);
+      } else {
+        setQuickState(null);
+      }
+    } else if (q.prompt) {
+      await onSend(q.prompt, [], [], []);
+    }
+  };
+
   const onKey = (e: React.KeyboardEvent) => {
     if (showMention && mentionItems.length > 0) {
       if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMentionItem(mentionItems[mentionSel]); return; }
@@ -823,6 +891,31 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           <span>会议室上下文附件</span>
           <b>{contextAttachments.length}</b>
         </button>
+        {isG && QUICK_PROMPTS.map(q => {
+          const running = quickState?.phase === 'run' && quickState.label === q.label;
+          const done = quickState?.phase === 'done' && quickState.label === q.label;
+          const runLabel = q.compress === 'conclusion' ? '正在收敛…' : '正在总结…';
+          return (
+            <button
+              key={q.label}
+              type="button"
+              className={'composer-quick-tag' + (running ? ' active' : '') + (done ? ' done' : '')}
+              title={q.compress
+                ? (q.compress === 'conclusion' ? '收敛结论并压缩上下文（历史消息移出后续上下文）' : '总结内容并压缩上下文（历史消息移出后续上下文）')
+                : q.prompt}
+              disabled={busy}
+              onMouseDown={e => e.preventDefault()}
+              onClick={() => handleQuick(q)}
+            >
+              {running
+                ? <Icon name="refresh" size={13} className="spin" />
+                : done
+                  ? <Icon name="check" size={13} />
+                  : <Icon name={q.icon} size={13} />}
+              <span>{running ? runLabel : done ? '已完成' : q.label}</span>
+            </button>
+          );
+        })}
         {pending.map(item => (
           <div key={item.id} className="composer-pending-item">
             <Icon name={item.mode === 'image' ? 'image' : 'file'} size={15} />
@@ -1181,7 +1274,14 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
   };
   const blocks = visibleMessageBlocks(pseudo);
   const quote = messageQuote(pseudo);
-  const longDoc = !m.is_me && isLongDoc(blocks);
+  // Agent/Innate 回复一律用「文档流」（bubble doc）统一呈现；「我」的消息保持气泡右对齐。
+  const longDoc = !m.is_me;
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const headings = useMemo(() => (longDoc ? docHeadings(blocks) : []), [longDoc, blocks]);
+  const showToc = headings.length >= 3;
+  const jumpToHeading = (i: number) => {
+    bubbleRef.current?.querySelectorAll('h1,h2,h3')[i]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
   return (
     <div className={'msg' + (m.is_me ? ' me' : '') + (longDoc ? ' msg-doc' : '')}>
       {m.is_me
@@ -1201,7 +1301,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
             <span className="msg-time" title={fmtFull(m.created_at)}>{fmtMsgTime(m.created_at)}</span>
           </div>
         )}
-        <div className={'bubble' + (longDoc ? ' doc' : '')} style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
+        <div ref={bubbleRef} className={'bubble' + (longDoc ? ' doc' : '')} style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
           {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
         </div>
         {quote && (
@@ -1211,6 +1311,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
           </div>
         )}
       </div>
+      {showToc && <DocToc headings={headings} onJump={jumpToHeading} />}
     </div>
   );
 }
@@ -1424,7 +1525,36 @@ export default function ConversationsPage() {
   const [showArchive,    setShowArchive]    = useState(false);
   const [memberError,    setMemberError]    = useState('');
   const [sending,        setSending]        = useState(false);
+  // 任务活动态：驱动「正在思考」气泡 + 顶部状态条；running 常驻，done/error 短暂闪现后自动清除。
+  const [activity,       setActivity]       = useState<{ phase: 'running' | 'done' | 'error'; label: string } | null>(null);
+  const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 发送回执：刚发出的「我」消息短暂显示「已送达」。
+  const [justSentId,     setJustSentId]     = useState('');
+  const sentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [loadError,      setLoadError]      = useState('');
+
+  // 设置活动态；done/error 自动在 2.4s 后清除，running 常驻直到下一次状态变更。
+  const flashActivity = useCallback((phase: 'running' | 'done' | 'error', label: string) => {
+    if (activityTimer.current) { clearTimeout(activityTimer.current); activityTimer.current = null; }
+    setActivity({ phase, label });
+    // done/error 短暂闪现后清除；running 设一个较长的兜底，避免漏收 completed 事件时永久卡住。
+    activityTimer.current = setTimeout(() => setActivity(null), phase === 'running' ? 240000 : 2400);
+  }, []);
+  const markSent = useCallback((id: string) => {
+    setJustSentId(id);
+    if (sentTimer.current) clearTimeout(sentTimer.current);
+    sentTimer.current = setTimeout(() => setJustSentId(cur => (cur === id ? '' : cur)), 3500);
+  }, []);
+  useEffect(() => () => {
+    if (activityTimer.current) clearTimeout(activityTimer.current);
+    if (sentTimer.current) clearTimeout(sentTimer.current);
+  }, []);
+  // 思考气泡出现时滚到底，确保用户看到「Agent 正在思考」。
+  useEffect(() => {
+    if (activity?.phase === 'running') {
+      setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 60);
+    }
+  }, [activity?.phase]);
   const [quoteDraft,     setQuoteDraft]     = useState<QuoteDraft | null>(null);
   const [bubbleMenu,     setBubbleMenu]     = useState<BubbleMenuState | null>(null);
   const [reader,         setReader]         = useState<{ message: Message; author: string } | null>(null);
@@ -1508,6 +1638,8 @@ export default function ConversationsPage() {
     setQuoteDraft(null);
     setBubbleMenu(null);
     setEditGroup(null);
+    setActivity(null);
+    setJustSentId('');
   }, [active]);
 
   // 4. Auto-focus search input when panel opens.
@@ -1527,8 +1659,14 @@ export default function ConversationsPage() {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     listen<unknown>('AutoForge://event', e => {
-      const ev = e.payload as { type?: string; conversation_id?: string };
+      const ev = e.payload as { type?: string; conversation_id?: string; status?: string };
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
+      // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。
+      if (ev.type === 'conversation_task_updated' && !!activeRef.current && ev.conversation_id === activeRef.current) {
+        if (ev.status === 'running') flashActivity('running', 'Agent 正在思考…');
+        else if (ev.status === 'completed') flashActivity('done', '已完成');
+        else if (ev.status === 'failed') flashActivity('error', '处理失败');
+      }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
@@ -1557,7 +1695,7 @@ export default function ConversationsPage() {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [loadConvs, loadMsgs]); // stable callbacks — this effect runs once
+  }, [loadConvs, loadMsgs, flashActivity]); // stable callbacks — this effect runs once
 
   // 6. Close panels when clicking outside the header actions area.
   useEffect(() => {
@@ -1682,6 +1820,25 @@ export default function ConversationsPage() {
     setBubbleMenu(null);
   };
 
+  // 会话即入口：把一条消息「沉淀为需求」，入待整理池（triage），交 AI 炼成正经需求。
+  const distillBubbleToIssue = async () => {
+    if (!bubbleMenu || !conv?.project_id) return;
+    const text = msgText(bubbleMenu.message).trim();
+    setBubbleMenu(null);
+    if (!text) return;
+    try {
+      const first = text.split(/[\n。.!?！？]/)[0]?.trim() ?? text;
+      await submitIssue({
+        project_id: conv.project_id,
+        title: first.length > 30 ? first.slice(0, 30) : first,
+        description: text,
+        source_type: 'conversation',
+        mode: 'triage',
+      });
+      setLoadError('');
+    } catch (e) { setLoadError(String(e)); }
+  };
+
   const toggleContextBubbleMessage = async () => {
     if (!bubbleMenu) return;
     const id = bubbleMenu.message.id;
@@ -1757,6 +1914,7 @@ export default function ConversationsPage() {
       if (blocks.length === 0) return false;
       const m = await sendMessage({ conversation_id: conv.id, content_json: JSON.stringify(blocks) });
       setMsgs(ms => [...ms, m]);
+      markSent(m.id);
       setQuoteDraft(null);
       loadConvs().catch(() => {});
       if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
@@ -1784,6 +1942,8 @@ export default function ConversationsPage() {
               return !!a && a.enabled;
             }).slice(0, 1)
           : [];
+        // 乐观置为「思考中」：让用户立刻知道 Agent 已收到并开始处理，无需等后端 running 事件。
+        flashActivity('running', 'Agent 正在思考…');
         await startConversationTask({
           conversation_id: conv.id,
           trigger_message_id: m.id,
@@ -1795,6 +1955,30 @@ export default function ConversationsPage() {
       return true;
     } catch (e) {
       setLoadError(String(e));
+      flashActivity('error', '发送失败');
+      return false;
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // 总结/结论快捷指令：调用后端在生成摘要的同时压缩上下文，随后重载消息（事件也会触发重载）。
+  // 返回是否成功，供 Composer 决定快捷 tag 显示「已完成」还是回退。
+  const onCompress = async (mode: 'summary' | 'conclusion'): Promise<boolean> => {
+    if (!conv || sending) return false;
+    setSending(true);
+    setLoadError('');
+    flashActivity('running', mode === 'conclusion' ? '正在收敛结论…' : '正在总结上下文…');
+    try {
+      await compressConversationContext({ conversation_id: conv.id, mode });
+      await loadMsgs(conv.id);
+      loadConvs().catch(() => {});
+      flashActivity('done', mode === 'conclusion' ? '结论已生成' : '上下文已压缩');
+      setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
+      return true;
+    } catch (e) {
+      setLoadError(String(e));
+      flashActivity('error', '处理失败');
       return false;
     } finally {
       setSending(false);
@@ -2228,9 +2412,32 @@ export default function ConversationsPage() {
                 rowRef={el => { messageRefs.current[m.id] = el; }}
                 onBubbleContextMenu={openBubbleMenu}
                 projectId={conv.project_id ?? undefined}
+                receipt={m.id === justSentId}
               />
             ))}
+            {activity?.phase === 'running' && (
+              <div className="msg rise">
+                <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Icon name="bot" size={20} />
+                </div>
+                <div className="msg-body">
+                  <div className="typing-cap">{activity.label}</div>
+                  <div className="bubble typing-bubble"><div className="typing"><i /><i /><i /></div></div>
+                </div>
+              </div>
+            )}
           </div>
+
+          {activity && (
+            <div className={'chat-activity ' + activity.phase}>
+              {activity.phase === 'running'
+                ? <span className="dot amber" />
+                : activity.phase === 'done'
+                  ? <Icon name="check" size={13} />
+                  : <Icon name="alert" size={13} />}
+              <span>{activity.label}</span>
+            </div>
+          )}
 
           {loadError && (
             <div className="chat-error-bar">
@@ -2248,6 +2455,7 @@ export default function ConversationsPage() {
             agents={agents}
             contextAttachments={contextAttachments}
             onSend={onSend}
+            onCompress={onCompress}
             onError={setLoadError}
             quote={quoteDraft}
             onClearQuote={() => setQuoteDraft(null)}
@@ -2279,6 +2487,9 @@ export default function ConversationsPage() {
           <button onClick={openReader}><Icon name="maximize" size={14} />阅读模式</button>
           <button onClick={copyBubbleMessage}><Icon name="copy" size={14} />复制</button>
           <button onClick={quoteBubbleMessage}><Icon name="quote" size={14} />引用</button>
+          {conv?.project_id && (
+            <button onClick={distillBubbleToIssue}><Icon name="inbox" size={14} />沉淀为需求</button>
+          )}
           <button onClick={toggleContextBubbleMessage} title={bubbleMenu.message.excluded_from_context ? '恢复：重新加入上下文' : '排除：不进入 AI 上下文'}>
             <Icon name={bubbleMenu.message.excluded_from_context ? 'eye' : 'eye-off'} size={14} />
             {bubbleMenu.message.excluded_from_context ? '恢复' : '排除'}

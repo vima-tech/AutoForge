@@ -141,6 +141,34 @@ pub async fn update_delivery_artifact_meta(
         .map_err(|e| e.to_string())
 }
 
+/// Rename an artifact's display name (`original_name`). The on-disk file keeps its
+/// UUID-prefixed `stored_name` / `rel_path` untouched — only the logical label changes.
+#[tauri::command]
+pub async fn rename_delivery_artifact(
+    id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<DeliveryArtifact, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("文件名不能为空".to_string());
+    }
+    if name.chars().count() > 200 {
+        return Err("文件名过长（上限 200 字）".to_string());
+    }
+    sqlx::query("UPDATE delivery_artifacts SET original_name=? WHERE id=?")
+        .bind(name)
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query_as::<_, DeliveryArtifact>("SELECT * FROM delivery_artifacts WHERE id=?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn delete_delivery_artifact(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let row: Option<(String, String)> =

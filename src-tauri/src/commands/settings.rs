@@ -912,3 +912,130 @@ pub async fn set_web_search_settings(
     }
     get_web_search_settings(state).await
 }
+
+// ---- 语音录入（ASR）配置（存 app_settings，供 agents/asr 读取）----
+
+/// 回传给前端的 ASR 配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsrSettings {
+    pub provider: String,
+    pub endpoint: String,
+    pub model: String,
+    pub language: String,
+    pub api_key_set: bool,
+}
+
+#[tauri::command]
+pub async fn get_asr_settings(state: State<'_, AppState>) -> Result<AsrSettings, String> {
+    let provider = read_setting(&state, "asr.provider").await.unwrap_or_default();
+    let endpoint = read_setting(&state, "asr.endpoint").await.unwrap_or_default();
+    let model = read_setting(&state, "asr.model").await.unwrap_or_default();
+    let language = read_setting(&state, "asr.language").await.unwrap_or_default();
+    let api_key_set = read_setting(&state, "asr.api_key")
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    Ok(AsrSettings {
+        provider,
+        endpoint,
+        model,
+        language,
+        api_key_set,
+    })
+}
+
+/// 保存 ASR 配置。`api_key` 为 None 时不改动已存的 key（与 LLM/web_search 一致）。
+#[tauri::command]
+pub async fn set_asr_settings(
+    provider: String,
+    endpoint: String,
+    model: String,
+    language: String,
+    api_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AsrSettings, String> {
+    write_setting(&state, "asr.provider", provider.trim()).await?;
+    write_setting(&state, "asr.endpoint", endpoint.trim()).await?;
+    write_setting(&state, "asr.model", model.trim()).await?;
+    write_setting(&state, "asr.language", language.trim()).await?;
+    if let Some(key) = api_key {
+        let enc = crate::core::secrets::encrypt_field(key.trim())?;
+        write_setting(&state, "asr.api_key", &enc).await?;
+    }
+    get_asr_settings(state).await
+}
+
+// ---- 工厂自喂料（autosupply）配置（存 app_settings，供调度器读取）----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutosupplySettings {
+    pub enabled: bool,
+    pub interval_min: i64,
+    pub scan_enabled: bool,
+    pub proposer_enabled: bool,
+    pub max_per_run: i64,
+}
+
+#[tauri::command]
+pub async fn get_autosupply_settings(
+    state: State<'_, AppState>,
+) -> Result<AutosupplySettings, String> {
+    let cfg = crate::tasks::autosupply::AutosupplyConfig::load(&state.db).await;
+    Ok(AutosupplySettings {
+        enabled: cfg.enabled,
+        interval_min: cfg.interval_min,
+        scan_enabled: cfg.scan_enabled,
+        proposer_enabled: cfg.proposer_enabled,
+        max_per_run: cfg.max_per_run as i64,
+    })
+}
+
+#[tauri::command]
+pub async fn set_autosupply_settings(
+    enabled: bool,
+    interval_min: i64,
+    scan_enabled: bool,
+    proposer_enabled: bool,
+    max_per_run: i64,
+    state: State<'_, AppState>,
+) -> Result<AutosupplySettings, String> {
+    write_setting(&state, "autosupply.enabled", if enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.interval_min", &interval_min.max(5).to_string()).await?;
+    write_setting(&state, "autosupply.scan_enabled", if scan_enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.proposer_enabled", if proposer_enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.max_per_run", &max_per_run.clamp(1, 200).to_string()).await?;
+    get_autosupply_settings(state).await
+}
+
+// ---- 信任旋钮（autonomy level）：strict / standard / loose ----
+// 现阶段对 AI 未完全放心 → 默认 strict。档位应用预设到 autosupply（已被 triage 池闸门兜底），
+// **不触碰**审核闸/并发/合并——两道人工审核闸在任何档位都保留（裁决权不下放）。
+
+#[tauri::command]
+pub async fn get_autonomy_level(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(read_setting(&state, "autonomy.level")
+        .await
+        .filter(|s| matches!(s.as_str(), "strict" | "standard" | "loose"))
+        .unwrap_or_else(|| "strict".to_string()))
+}
+
+#[tauri::command]
+pub async fn set_autonomy_level(
+    level: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let level = match level.as_str() {
+        "standard" | "loose" => level,
+        _ => "strict".to_string(),
+    };
+    write_setting(&state, "autonomy.level", &level).await?;
+    // 应用预设到自喂料（信任越高，放得越开）。proposer 仅 loose 档自动开。
+    let (proposer, max) = match level.as_str() {
+        "loose" => ("1", "40"),
+        "standard" => ("0", "20"),
+        _ => ("0", "10"),
+    };
+    write_setting(&state, "autosupply.proposer_enabled", proposer).await?;
+    write_setting(&state, "autosupply.max_per_run", max).await?;
+    Ok(level)
+}

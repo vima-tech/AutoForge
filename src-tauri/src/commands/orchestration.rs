@@ -136,6 +136,136 @@ pub async fn list_conversation_tasks(
     .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompressContextPayload {
+    pub conversation_id: String,
+    /// "summary"（默认）= 纯压缩摘要；"conclusion" = 收敛结论。
+    #[serde(default)]
+    pub mode: String,
+}
+
+/// 手动触发的「总结内容 / 形成结论」快捷指令：在生成摘要/结论的同时，把当前窗口内的
+/// 历史消息全部移出后续上下文（excluded_from_context=1），让摘要本身成为新的上下文基线，
+/// 起到压缩上下文的作用。命令体保持薄包装，逻辑下沉到 `compress_context_now`。
+#[tauri::command]
+pub async fn compress_conversation_context(
+    payload: CompressContextPayload,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trace_tags = crate::core::trace::TraceTags {
+        conversation_id: Some(payload.conversation_id.clone()),
+        ..Default::default()
+    };
+    crate::core::trace::with_tags(
+        trace_tags,
+        compress_context_now(&state.db, &app, &payload.conversation_id, &payload.mode),
+    )
+    .await
+}
+
+async fn compress_context_now(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(conversation_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    let project_id = conversation.project_id.as_deref();
+
+    let is_conclusion = mode == "conclusion";
+    // 结论用 summarizer 角色，纯压缩用 context_compressor；任一缺失则互相回退。
+    let primary_kind = if is_conclusion { "summarizer" } else { "context_compressor" };
+    let fallback_kind = if is_conclusion { "context_compressor" } else { "summarizer" };
+    let (agent, used_kind) = match load_system_role_agent(db, primary_kind).await? {
+        Some(a) => (a, primary_kind),
+        None => (
+            load_system_role_agent(db, fallback_kind)
+                .await?
+                .ok_or_else(|| "未配置总结/压缩系统角色".to_string())?,
+            fallback_kind,
+        ),
+    };
+
+    let messages = sqlx::query_as::<_, Message>(
+        "SELECT *
+         FROM messages
+         WHERE conversation_id=? AND excluded_from_context=0
+         ORDER BY created_at ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if messages.len() < 2 {
+        return Err("当前窗口内的消息太少，无需总结压缩".to_string());
+    }
+    let source = messages_to_context_text(db, &messages).await?;
+    if source.trim().is_empty() {
+        return Err("没有可用于总结的消息内容".to_string());
+    }
+
+    let prompt = if is_conclusion {
+        format!(
+            "以下是群聊到目前为止的完整讨论：\n\n{}\n\n请综合各方观点，收敛出明确结论与下一步行动方案。要求：\n- 明确给出结论/裁决及理由。\n- 列出后续行动项（含负责人，如有）。\n- 保留关键约束、分歧与重要事实。\n- 用结构化 Markdown 输出，不要复述完整原文，不要编造未出现的信息。",
+            source
+        )
+    } else {
+        format!(
+            "以下是群聊到目前为止的完整讨论，请压缩成一份可长期引用的上下文摘要：\n\n{}\n\n要求：\n- 保留需求、决策、约束、待办、分歧和重要事实。\n- 删除寒暄和重复表达。\n- 用结构化 Markdown 输出。\n- 不要编造未出现的信息。",
+            source
+        )
+    };
+    let fallback_system = if is_conclusion {
+        "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。"
+    } else {
+        "你是 AutoForge 的上下文压缩器，负责把长对话压缩成可靠摘要，降低后续 Agent 的上下文负担。"
+    };
+
+    let (ok, summary) = run_system_agent_text(
+        db, &agent, used_kind, &prompt, fallback_system, project_id, Some(&source),
+    )
+    .await;
+    if !ok {
+        return Err(summary);
+    }
+
+    let heading = if is_conclusion {
+        "讨论结论"
+    } else {
+        "上下文压缩摘要"
+    };
+    let markdown = format!(
+        "## {}\n\n{}\n\n> 已压缩 {} 条历史消息；原消息仍保留在对话中，但不再进入后续 Agent 上下文。",
+        heading,
+        summary.trim(),
+        messages.len()
+    );
+    let message_id =
+        insert_agent_markdown_message(db, conversation_id, &agent.id, &markdown).await?;
+    for msg in &messages {
+        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
+            .bind(&msg.id)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    event::emit(
+        app,
+        event::AppEvent::MessageReceived {
+            conversation_id: conversation_id.to_string(),
+            message_id,
+        },
+    );
+    Ok(())
+}
+
 async fn execute_conversation_task(
     db: crate::db::Db,
     app: AppHandle,
@@ -385,8 +515,40 @@ async fn build_plan(
     // Pure synthesis request with no @mentions: skip Planner and all business-agent steps.
     // Returning an empty plan makes plan_has_final_single=false, so the post-plan
     // summarizer hook fires directly with the conversation snapshot as context.
-    if mentioned.is_empty() && asks_for_synthesis(instruction) && !asks_for_artifact(instruction) {
+    //
+    // 方向三：收窄触发面。原先只要消息"含"总结/建议/最后等任一词就走纯 summarizer 空计划，
+    // 导致"再优化一下并给点建议""那最后这块怎么改"这类日常对话被误判为只综合不回应（伪沉默）。
+    // 现要求这是一条很短的、主旨即收口的请求（is_pure_synthesis_request），且确有前一轮 Agent
+    // 发言可供综合（last_speaking_member 命中）时才走空计划，否则按普通对话正常选人接话。
+    if mentioned.is_empty()
+        && is_pure_synthesis_request(instruction)
+        && !asks_for_artifact(instruction)
+        && last_speaking_member(db, &conversation.id, members)
+            .await
+            .is_some()
+    {
         return Ok(ConversationPlan { steps: vec![] });
+    }
+
+    // 方向一 + 方向二：无 @ 且非显式"序列/产物"请求时，用零成本"分诊 + 连续性"直接选出接话人，
+    // 跳过 planner 这一跳 LLM——更快、更省，也让每句话都有相关 Agent 接话（无需每次 @）。
+    //   1) 相关性分诊：消息字面命中某成员的名字/英文名/角色/专长 → 由该成员接话（等价于"软 @"）。
+    //   2) 对话连续性：否则默认由上一轮发言的成员接话，自然承接追问（"再细化一下""那这样呢"）。
+    // 两者都没命中（如全新群聊的首条、无关键词消息）才落到 planner / fallback 既有兜底，不放大并发。
+    if mentioned.is_empty() && !asks_for_sequence(instruction) && !asks_for_artifact(instruction) {
+        let mut target = route_by_relevance(instruction, members);
+        if target.is_none() {
+            target = last_speaking_member(db, &conversation.id, members).await;
+        }
+        if let Some(agent_id) = target {
+            return Ok(ConversationPlan {
+                steps: vec![ConversationPlanStep {
+                    step_type: "single".to_string(),
+                    agents: vec![agent_id],
+                    instruction: instruction.to_string(),
+                }],
+            });
+        }
     }
 
     let needs_planner = mentioned.is_empty() || asks_for_sequence(instruction);
@@ -540,10 +702,11 @@ fn fallback_plan(
     members: &[Agent],
 ) -> Result<ConversationPlan, String> {
     let agents = if mentioned_agent_ids.is_empty() {
-        members
-            .iter()
-            .take(1)
-            .map(|a| a.id.clone())
+        // 方向一（兜底）：planner 缺失/失败且无 @ 时，优先选与消息最相关的成员，
+        // 而非机械地取成员顺序里的第一个；都不相关才退回第一个成员。
+        route_by_relevance(instruction, members)
+            .or_else(|| members.first().map(|a| a.id.clone()))
+            .into_iter()
             .collect::<Vec<_>>()
     } else {
         mentioned_agent_ids
@@ -1468,6 +1631,64 @@ fn asks_for_artifact(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+/// 收窄版"纯综合/收尾请求"判定：消息很短且主旨就是收口（总结/裁决/综合/结论…），
+/// 而非在正常对话里顺带提到这些词。配合 last_speaking_member 一起，决定是否走
+/// "只综合前文、不安排业务 Agent 新答"的空计划路径，避免日常对话被误判为伪沉默。
+fn is_pure_synthesis_request(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().count() <= 24 && asks_for_synthesis(t)
+}
+
+/// 无 @ 时的零成本相关性分诊（方向一）：按成员的 name / name_en / role / role_type
+/// 与消息做大小写无关的字面匹配打分，返回得分最高的成员 id（得分>0）；平局取成员
+/// 顺序靠前者。任何成员都没命中则返回 None，交由连续性 / planner / fallback 处理。
+/// 纯函数、不触 LLM，等价于用户"打了角色名但忘了加 @"的软提及。
+fn route_by_relevance(instruction: &str, members: &[Agent]) -> Option<String> {
+    let hay = instruction.to_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for m in members {
+        let mut score = 0usize;
+        for kw in [
+            m.name.as_str(),
+            m.name_en.as_str(),
+            m.role.as_str(),
+            m.role_type.as_str(),
+        ] {
+            let kw = kw.trim();
+            // 至少 2 个字符才算关键词，避免单字/空串造成的噪声误命中。
+            if kw.chars().count() >= 2 && hay.contains(&kw.to_lowercase()) {
+                score += 1;
+            }
+        }
+        if score > 0 && best.map_or(true, |(b, _)| score > b) {
+            best = Some((score, m.id.as_str()));
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
+/// 找出会议室中最近一次"由某 Agent 发出"的消息作者，即上一轮发言人（方向二）。
+/// 触发任务的用户消息 from_agent 为 NULL，故这里取到的是真正的上一轮 Agent。
+/// 仅当该作者仍是当前可调度成员时返回，用于无 @ 追问时的对话连续性默认接话。
+async fn last_speaking_member(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    members: &[Agent],
+) -> Option<String> {
+    let last: Option<(String,)> = sqlx::query_as(
+        "SELECT from_agent FROM messages
+         WHERE conversation_id=? AND from_agent IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let last = last.map(|(a,)| a)?;
+    members.iter().find(|m| m.id == last).map(|m| m.id.clone())
 }
 
 fn infer_artifact_kind(text: &str) -> &'static str {

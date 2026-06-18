@@ -94,6 +94,12 @@ fn run() -> Option<TraceRun> {
     RUN.try_with(|r| r.clone()).ok()
 }
 
+/// 当前 trace 的 id（若处于某个 [`scope_run`] 内）。供 schema agent 把结构化产出
+/// （`agent_outputs.trace_id`）链回本次调用的 llm/tool span，实现"环节产出 → 单步推理"下钻。
+pub fn current_trace_id() -> Option<String> {
+    RUN.try_with(|r| r.trace_id.clone()).ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert(
     run: &TraceRun,

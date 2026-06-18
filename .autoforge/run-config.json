@@ -1,0 +1,7 @@
+{
+  "dev": {
+    "app_command": "npm run tauri:dev",
+    "command": "npm run dev",
+    "kind": "tauri"
+  }
+}

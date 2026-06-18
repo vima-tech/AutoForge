@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
 use tauri::State;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Deserialize)]
@@ -392,18 +391,15 @@ pub async fn start_cr_preview(
     }
 
     let (out, err) = log_stdio(&preview_log_path(&cr_id), &command, &session.worktree_path)?;
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&command)
-        .current_dir(&session.worktree_path)
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(&session.worktree_path)
         .env("PORT", port.to_string())
         .stdout(out)
-        .stderr(err)
-        // Own process group so the whole preview tree (sh → vite → node …) can be
-        // torn down together instead of orphaning grandchildren.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .stderr(err);
+    // Own process group so the whole preview tree (shell → vite → node …) can be
+    // torn down together instead of orphaning grandchildren.
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     state.dev_servers.lock().await.insert(
         key,
@@ -472,18 +468,15 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
     }
 
     let (out, err) = log_stdio(&preview_log_path(&format!("app-{cr_id}")), &app_cmd, &session.worktree_path)?;
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&app_cmd)
-        .current_dir(&session.worktree_path)
+    let mut cmd = crate::core::platform::shell(&app_cmd);
+    cmd.current_dir(&session.worktree_path)
         // 隔离 DB，避免与主 AutoForge 共享生产库导致迁移不一致 panic。
         .envs(isolated_app_env(&session.worktree_path))
         .stdout(out)
-        .stderr(err)
-        // Own process group so the launched app tree can be torn down together.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .stderr(err);
+    // Own process group so the launched app tree can be torn down together.
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     state.dev_servers.lock().await.insert(
         key,
@@ -678,17 +671,14 @@ pub async fn start_branch_preview(
         &command,
         &wt_path,
     )?;
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&command)
-        .current_dir(&wt_path)
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(&wt_path)
         .env("PORT", port.to_string())
         .envs(isolated_app_env(&wt_path))
         .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .stderr(err);
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     state.dev_servers.lock().await.insert(
         key,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, Fragment } from 'react';
 import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
@@ -11,12 +11,16 @@ import {
   getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
   listPreviewEnvironments, listTestSessions, listAdminDecisions, listJobFailures,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
-  listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
+  listNotifyChannels, createNotifyChannel, updateNotifyChannel, deleteNotifyChannel, testNotifyChannel,
+  clawbotStartLogin, clawbotPollLogin,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   getWebSearchSettings, setWebSearchSettings,
+  getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
+  getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, type AutosupplySettings as AutosupplyT,
+  getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
   listBuiltinTools, type BuiltinToolInfo,
   getSecretBackendStatus, type SecretBackend,
   listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
@@ -296,6 +300,168 @@ function useBuiltinTools(): BuiltinToolInfo[] {
     listBuiltinTools().then(t => { _builtinToolsCache = t; setTools(t); }).catch(() => {});
   }, []);
   return tools;
+}
+
+// ── 语音录入（ASR）设置 ───────────────────────────────────────────────────────
+function AsrSettings() {
+  const [cfg, setCfg] = useState<AsrSettingsT>({ provider: 'aliyun', endpoint: '', model: '', language: 'zh', api_key_set: false });
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getAsrSettings().then(c => { if (!c.provider) c.provider = 'aliyun'; setCfg(c); }).catch(e => setStatus(String(e))); }, []);
+
+  // 阿里百炼（DashScope 实时流式）只需 API Key；其余文件转写 Provider 暂不在 UI 暴露。
+  const enabled = cfg.provider === 'aliyun'
+    ? (cfg.api_key_set || apiKey.trim().length > 0)
+    : cfg.model.trim().length > 0 && (cfg.endpoint.trim().length > 0 || ['openai', 'groq', 'siliconflow'].includes(cfg.provider));
+
+  const save = async () => {
+    setBusy(true); setStatus('');
+    try {
+      const r = await setAsrSettings(cfg.provider, cfg.endpoint, cfg.model, cfg.language, apiKey.trim() || undefined);
+      setCfg(r); setApiKey(''); setStatus('已保存');
+    } catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">语音录入</div>
+      <div className="set-desc">配置语音转写（ASR），用于「速录」弹窗口述需求。当前仅支持<strong>阿里百炼 ASR</strong>（DashScope 实时流式，边说边出字，模型默认 paraformer-realtime-v2，只需填百炼 API Key，无需 Endpoint）；其余 Provider 暂不开放。结果视为不可信外部输入，提交时自动过安全过滤。</div>
+
+      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-top" style={{ gap: 10 }}>
+          <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="mic" size={15} /></div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">语音转写 · ASR</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>INPUT</span>
+            </div>
+            <div className="cfg-sub">口述需求 → 转写文本 → 可改错别字后提交</div>
+          </div>
+          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未配置'}</span>
+        </div>
+
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field"><label>Provider</label>
+            <Select value={cfg.provider || 'aliyun'} onChange={val => setCfg(c => ({ ...c, provider: val }))}
+              options={[
+                { value: 'aliyun', label: '阿里百炼 ASR（实时流式 · 推荐）' },
+              ]} />
+          </div>
+          <div className="field"><label>模型（可空，默认 paraformer-realtime-v2）</label>
+            <input type="text" className="mono" value={cfg.model} placeholder={cfg.provider === 'aliyun' ? 'paraformer-realtime-v2' : 'whisper-1 / gpt-4o-transcribe'}
+              onChange={e => setCfg(c => ({ ...c, model: e.target.value }))} />
+          </div>
+          <div className="field"><label>语言（可空，自动检测）</label>
+            <input type="text" className="mono" value={cfg.language} placeholder="zh"
+              onChange={e => setCfg(c => ({ ...c, language: e.target.value }))} />
+          </div>
+          {cfg.provider !== 'aliyun' && (
+            <div className="field full"><label>Endpoint{cfg.provider !== 'custom' ? '（留空用 Provider 默认）' : ''}</label>
+              <input type="text" className="mono" value={cfg.endpoint} placeholder="https://api.openai.com/v1/audio/transcriptions"
+                onChange={e => setCfg(c => ({ ...c, endpoint: e.target.value }))} />
+            </div>
+          )}
+          <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />API Key</label>
+            <input type="password" className="mono" value={apiKey}
+              placeholder={cfg.api_key_set ? '已设置（留空则不修改）' : 'sk-...'}
+              onChange={e => setApiKey(e.target.value)} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存语音配置</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── 工厂自喂料（autosupply）设置 ──────────────────────────────────────────────
+function AutosupplySettings() {
+  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20 });
+  const [level, setLevel] = useState<AutonomyLevel>('strict');
+  const [busy, setBusy] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => {
+    getAutosupplySettings().then(setCfg).catch(e => setStatus(String(e)));
+    getAutonomyLevel().then(setLevel).catch(() => {});
+  }, []);
+
+  const changeLevel = async (l: AutonomyLevel) => {
+    setLevel(l);
+    try { await setAutonomyLevel(l); setCfg(await getAutosupplySettings()); setStatus('信任档位已应用'); }
+    catch (e) { setStatus(String(e)); }
+  };
+
+  const save = async (next: AutosupplyT) => {
+    setCfg(next); setBusy(true); setStatus('');
+    try { setCfg(await setAutosupplySettings(next)); setStatus('已保存'); }
+    catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+  const runNow = async () => {
+    setRunning(true); setStatus('');
+    try { const r = await runAutosupplyNow(); setStatus(`本轮入待整理池 ${r.new_issues} 条`); }
+    catch (e) { setStatus(String(e)); }
+    finally { setRunning(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">自动供料</div>
+      <div className="set-desc">让工厂自己找活干：周期性扫描代码 + proposer 主动提议改进，产物<strong>全部进「待整理池」，绝不自动进流水线</strong>，等你在功能审计里整理确认。两道人工审核闸在任何档位都保留。</div>
+
+      <div className="cfg-card" style={{ marginBottom: 14 }}>
+        <div className="field full" style={{ margin: 0 }}>
+          <label>信任档位（autonomy）</label>
+          <Select value={level} onChange={v => changeLevel(v as AutonomyLevel)}
+            options={[
+              { value: 'strict', label: 'Strict · 最紧（proposer 关 · 每轮 10 · 推荐）' },
+              { value: 'standard', label: 'Standard · 标准（proposer 关 · 每轮 20）' },
+              { value: 'loose', label: 'Loose · 放手（proposer 开 · 每轮 40）' },
+            ]} />
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 6 }}>档位应用预设到下方自喂料参数；不改变审核闸/并发/合并——裁决权始终在你手里。信任长出来再往上拧。</span>
+        </div>
+      </div>
+
+      <div className="cfg-card" style={{ borderColor: cfg.enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-fields rise" style={{ marginTop: 0 }}>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.enabled} onToggle={() => save({ ...cfg, enabled: !cfg.enabled })} />
+            <span style={{ fontWeight: 600 }}>启用周期自喂料</span>
+          </div>
+          <div className="field"><label>间隔（分钟）</label>
+            <input type="number" min="5" value={cfg.interval_min}
+              onChange={e => setCfg(c => ({ ...c, interval_min: Math.max(5, Number(e.target.value) || 1440) }))}
+              onBlur={() => save(cfg)} />
+          </div>
+          <div className="field"><label>每轮入池上限</label>
+            <input type="number" min="1" max="200" value={cfg.max_per_run}
+              onChange={e => setCfg(c => ({ ...c, max_per_run: Math.max(1, Math.min(200, Number(e.target.value) || 20)) }))}
+              onBlur={() => save(cfg)} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.scan_enabled} onToggle={() => save({ ...cfg, scan_enabled: !cfg.scan_enabled })} />
+            <span>代码扫描（TODO / cargo audit / npm audit）</span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.proposer_enabled} onToggle={() => save({ ...cfg, proposer_enabled: !cfg.proposer_enabled })} />
+            <span>proposer 工程提议<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（默认关，需绑定 proposer 角色 LLM）</span></span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 4 }}>
+            <button className="btn" disabled={running} onClick={runNow}>
+              <Icon name="refresh" size={14} style={{ animation: running ? 'spin 1s linear infinite' : undefined }} />{running ? '运行中…' : '立即跑一轮'}
+            </button>
+            {(busy || status) && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{busy ? '保存中…' : status}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ToolsSettings() {
@@ -1336,14 +1502,52 @@ const notifyInputStyle: React.CSSProperties = {
   padding: '8px 10px', color: 'var(--text)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-control)',
 };
 
+// 各通道类型的展示文案与目标/密钥占位提示。
+const NOTIFY_KINDS: { value: string; label: string; targetPh: string; secretLabel?: string; secretPh?: string }[] = [
+  { value: 'slack', label: 'Slack', targetPh: 'Slack Incoming Webhook URL' },
+  { value: 'wecom', label: '企业微信群机器人', targetPh: '企业微信群机器人 Webhook URL' },
+  { value: 'feishu', label: '飞书 (Lark) 机器人', targetPh: '飞书自定义机器人 Webhook URL', secretLabel: '签名密钥', secretPh: '加签 secret（可选，启用签名时填）' },
+  { value: 'dingtalk', label: '钉钉机器人', targetPh: '钉钉自定义机器人 Webhook URL', secretLabel: '加签密钥', secretPh: 'SECxxxx 加签密钥（可选）' },
+  { value: 'ntfy', label: 'ntfy', targetPh: 'topic URL，如 https://ntfy.sh/your-topic', secretLabel: '访问 Token', secretPh: 'Bearer Token（可选，私有 topic）' },
+  { value: 'clawbot', label: '微信ClawBot', targetPh: '扫码绑定后自动填充', secretLabel: 'Bearer Token', secretPh: '扫码绑定后自动填充' },
+  { value: 'email', label: 'Email (SMTP)', targetPh: 'smtp://user:pass@host:port?from=a@b&to=c@d' },
+  { value: 'webhook', label: '通用 Webhook', targetPh: '通用 Webhook URL' },
+];
+
+// 流水线会发出的事件（与后端 dispatch 调用点一致）。空选择 = 订阅全部。
+const NOTIFY_EVENTS: { value: string; label: string }[] = [
+  { value: 'review_needed', label: '待审核' },
+  { value: 'auto_merged', label: '自动合并' },
+  { value: 'cr_merged', label: '已合并' },
+  { value: 'test_failed', label: '测试失败' },
+  { value: 'analysis_failed', label: '分析失败' },
+  { value: 'security_high', label: '安全高危' },
+];
+
+const emptyNotifyForm = { name: '', kind: 'slack', target: '', secret: '', events: [] as string[], enabled: true };
+
 function NotifySettings() {
   const [channels, setChannels] = useState<NotifyChannel[]>([]);
-  const [form, setForm] = useState({ name: '', kind: 'slack', target: '' });
+  const [form, setForm] = useState(emptyNotifyForm);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
   const [err, setErr] = useState('');
+  // 微信 ClawBot 扫码绑定态
+  const [bind, setBind] = useState<{ qrSvg: string; qrUrl: string; status: string; bound: boolean } | null>(null);
+  const bindCancel = useRef(false);
+  const codeRef = useRef('');
+  const [needCode, setNeedCode] = useState(false);
 
   const reload = () => { listNotifyChannels().then(setChannels).catch(() => setChannels([])); };
   useEffect(() => { reload(); }, []);
+  useEffect(() => () => { bindCancel.current = true; }, []);
+
+  const CLAW_STATUS_MSG: Record<string, string> = {
+    starting: '正在申请二维码…', wait: '用手机微信扫描二维码以绑定', scaned: '已扫描，请在手机上确认',
+    need_verifycode: '请输入手机微信显示的数字验证码后继续', scaned_but_redirect: '正在切换接入节点…',
+    expired: '二维码已过期，请重新获取', verify_code_blocked: '验证码多次错误，请稍后重试',
+    binded_redirect: '该微信已绑定过此 OpenClaw（无新凭据）', confirmed: '绑定成功',
+  };
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setErr(''); setBusy(key);
@@ -1352,37 +1556,175 @@ function NotifySettings() {
     finally { setBusy(''); }
   };
 
+  const kindMeta = NOTIFY_KINDS.find(k => k.value === form.kind);
+  const resetForm = () => { setForm(emptyNotifyForm); setEditingId(null); };
+
+  const toggleEvent = (ev: string) => setForm(f => ({
+    ...f, events: f.events.includes(ev) ? f.events.filter(e => e !== ev) : [...f.events, ev],
+  }));
+
+  const startEdit = (c: NotifyChannel) => {
+    setEditingId(c.id);
+    setForm({
+      name: c.name, kind: c.kind, target: c.target, secret: '',
+      events: c.events.split(',').map(s => s.trim()).filter(Boolean), enabled: c.enabled,
+    });
+  };
+
+  const save = () => run('save', async () => {
+    const payload = {
+      name: form.name, kind: form.kind, target: form.target,
+      events: form.events.join(','), enabled: form.enabled,
+      ...(form.secret.trim() ? { secret: form.secret } : {}),
+    };
+    if (editingId) await updateNotifyChannel(editingId, payload);
+    else await createNotifyChannel(payload);
+    resetForm();
+  });
+
+  const toggleEnabled = (c: NotifyChannel) => run('en' + c.id, () => updateNotifyChannel(c.id, {
+    name: c.name, kind: c.kind, target: c.target, events: c.events, enabled: !c.enabled,
+  }));
+
+  const stopBind = () => { bindCancel.current = true; setBind(null); setNeedCode(false); codeRef.current = ''; };
+
+  const startClawbotBind = async () => {
+    setErr(''); bindCancel.current = false; codeRef.current = ''; setNeedCode(false);
+    setBind({ qrSvg: '', qrUrl: '', status: 'starting', bound: false });
+    try {
+      const s = await clawbotStartLogin();
+      if (bindCancel.current) return;
+      setBind({ qrSvg: s.qr_svg, qrUrl: s.qr_url, status: 'wait', bound: false });
+      let baseUrl = s.base_url;
+      const deadline = Date.now() + 5 * 60_000;
+      while (!bindCancel.current && Date.now() < deadline) {
+        const r = await clawbotPollLogin(s.qrcode, baseUrl, codeRef.current || undefined);
+        if (bindCancel.current) return;
+        baseUrl = r.base_url;
+        setNeedCode(r.status === 'need_verifycode');
+        setBind(b => (b ? { ...b, status: r.status } : b));
+        if (r.status === 'confirmed' && r.target && r.bot_token) {
+          await createNotifyChannel({
+            name: form.name.trim() || '微信ClawBot', kind: 'clawbot', target: r.target,
+            secret: r.bot_token, events: form.events.join(','), enabled: form.enabled,
+          });
+          setBind(b => (b ? { ...b, status: 'confirmed', bound: true } : b));
+          resetForm(); reload();
+          return;
+        }
+        if (r.status === 'expired' || r.status === 'verify_code_blocked' || r.status === 'binded_redirect') {
+          return; // 终态：保留面板与提示，由用户「重新获取」
+        }
+        await new Promise(res => setTimeout(res, 1200));
+      }
+    } catch (e) { setErr(String(e)); setBind(null); }
+  };
+
+  const kindLabel = (k: string) => NOTIFY_KINDS.find(x => x.value === k)?.label ?? k;
+
   return (
     <div className="set-inner rise">
       <div className="set-h">通知通道</div>
-      <div className="set-desc">全局通知通道，用于推送流水线事件（审核、部署、安全告警等）。所有项目共享。</div>
+      <div className="set-desc">全局通知通道，用于推送流水线事件（审核、部署、安全告警等）。所有项目共享。签名密钥 / Token 加密存储，不回显。</div>
       {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
       <div className="panel">
         <div className="panel-head">
-          <div className="panel-title"><Icon name="bell" size={16} style={{ color: 'var(--ember)' }} />通知通道</div>
+          <div className="panel-title"><Icon name="bell" size={16} style={{ color: 'var(--ember)' }} />{editingId ? '编辑通道' : '通知通道'}</div>
           <span className="sec-kicker">全局 · {channels.length} 个</span>
         </div>
-        <div style={{ display: 'flex', gap: 8, padding: '12px 16px', borderTop: '1px solid var(--border)', alignItems: 'center', flexWrap: 'wrap' }}>
-          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="名称" style={{ ...notifyInputStyle, width: 120 }} />
-          <div style={{ minWidth: 130 }}>
-            <Select value={form.kind} onChange={v => setForm(f => ({ ...f, kind: v }))}
-              options={[{ value: 'slack', label: 'Slack' }, { value: 'wecom', label: '企业微信' }, { value: 'webhook', label: '通用 Webhook' }]} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 16px', borderTop: '1px solid var(--border)' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="名称" style={{ ...notifyInputStyle, width: 140 }} />
+            <div style={{ minWidth: 180 }}>
+              <Select value={form.kind} onChange={v => { setForm(f => ({ ...f, kind: v })); stopBind(); }}
+                options={NOTIFY_KINDS.map(k => ({ value: k.value, label: k.label }))} />
+            </div>
+            {form.kind !== 'clawbot' && (
+              <input value={form.target} onChange={e => setForm(f => ({ ...f, target: e.target.value }))} placeholder={kindMeta?.targetPh ?? 'URL'} style={{ ...notifyInputStyle, flex: 1, minWidth: 220 }} />
+            )}
+            {form.kind === 'clawbot' && editingId && (
+              <span style={{ flex: 1, minWidth: 220, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{form.target || '（已绑定）'}</span>
+            )}
           </div>
-          <input value={form.target} onChange={e => setForm(f => ({ ...f, target: e.target.value }))} placeholder="Webhook URL" style={{ ...notifyInputStyle, flex: 1, minWidth: 200 }} />
-          <button className="btn btn-primary btn-sm" disabled={!form.name.trim() || !form.target.trim() || busy === 'add'}
-            onClick={() => run('add', async () => { await createNotifyChannel(form); setForm({ name: '', kind: 'slack', target: '' }); })}>
-            <Icon name="plus" size={14} />添加
-          </button>
+          {kindMeta?.secretLabel && form.kind !== 'clawbot' && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', width: 80 }}>{kindMeta.secretLabel}</span>
+              <input type="password" autoComplete="new-password" value={form.secret} onChange={e => setForm(f => ({ ...f, secret: e.target.value }))}
+                placeholder={editingId ? (kindMeta.secretPh + '（留空保留原值）') : kindMeta.secretPh} style={{ ...notifyInputStyle, flex: 1 }} />
+            </div>
+          )}
+          {form.kind === 'clawbot' && !editingId && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '12px', borderRadius: 9, background: 'var(--bg-3)', border: '1px solid var(--border)' }}>
+              {!bind && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <button className="btn btn-primary btn-sm" disabled={!form.name.trim()} onClick={startClawbotBind}>
+                    <Icon name="bot" size={14} />扫码绑定
+                  </button>
+                  <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>先填名称，点击后用手机微信扫码绑定 ClawBot</span>
+                </div>
+              )}
+              {bind && (
+                <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                  <div style={{ width: 160, height: 160, borderRadius: 9, background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    {bind.qrSvg
+                      ? <img src={bind.qrSvg} alt="ClawBot 绑定二维码" style={{ width: 152, height: 152 }} />
+                      : <span className="typing" style={{ color: 'var(--bg)' }} />}
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minWidth: 200 }}>
+                    <div style={{ fontSize: 'var(--text-control)', color: bind.bound ? 'var(--green)' : 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {bind.bound && <Icon name="check" size={14} />}{CLAW_STATUS_MSG[bind.status] ?? bind.status}
+                    </div>
+                    {needCode && !bind.bound && (
+                      <input autoFocus placeholder="输入手机上显示的数字" onChange={e => { codeRef.current = e.target.value.trim(); }}
+                        style={{ ...notifyInputStyle, width: 200 }} />
+                    )}
+                    {bind.qrUrl && !bind.bound && (
+                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', wordBreak: 'break-all' }}>二维码无法显示？也可在手机打开：{bind.qrUrl}</span>
+                    )}
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {(bind.status === 'expired' || bind.status === 'verify_code_blocked' || bind.status === 'binded_redirect') && !bind.bound && (
+                        <button className="btn btn-sm" onClick={startClawbotBind}><Icon name="refresh" size={13} />重新获取</button>
+                      )}
+                      {!bind.bound && <button className="btn btn-sm btn-ghost" onClick={stopBind}>取消</button>}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginRight: 4 }}>订阅事件</span>
+            {NOTIFY_EVENTS.map(ev => (
+              <button key={ev.value} type="button" className={`chip${form.events.includes(ev.value) ? ' ember' : ''}`}
+                style={{ cursor: 'pointer', border: form.events.includes(ev.value) ? 'none' : '1px solid var(--border-strong)' }}
+                onClick={() => toggleEvent(ev.value)}>{ev.label}</button>
+            ))}
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{form.events.length === 0 ? '（全部）' : ''}</span>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {!(form.kind === 'clawbot' && !editingId) && (
+              <button className="btn btn-primary btn-sm" disabled={!form.name.trim() || !form.target.trim() || busy === 'save'}
+                onClick={save}>
+                <Icon name={editingId ? 'check' : 'plus'} size={14} />{editingId ? '保存' : '添加'}
+              </button>
+            )}
+            {editingId && <button className="btn btn-sm btn-ghost" onClick={resetForm}>取消</button>}
+          </div>
         </div>
         {channels.map(c => (
-          <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+          <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)', opacity: c.enabled ? 1 : 0.55 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-              <span className="chip">{c.kind}</span>
+              <button type="button" className={`switch${c.enabled ? ' on' : ''}`} aria-checked={c.enabled} role="switch"
+                onClick={() => toggleEnabled(c)} disabled={busy === 'en' + c.id}><i /></button>
+              <span className="chip">{kindLabel(c.kind)}</span>
               <span style={{ fontWeight: 600 }}>{c.name}</span>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>{c.target}</span>
+              {c.has_secret && <Icon name="lock" size={12} style={{ color: 'var(--text-faint)' }} />}
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>{c.target}</span>
+              {c.events.trim() && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>· {c.events.split(',').filter(Boolean).length} 事件</span>}
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              <button className="btn btn-sm" disabled={busy === 'test' + c.id} onClick={() => run('test' + c.id, () => testNotifyChannel(c.kind, c.target))}><Icon name="send" size={13} />测试</button>
+              <button className="btn btn-sm" disabled={busy === 'test' + c.id} onClick={() => run('test' + c.id, () => testNotifyChannel(c.id))}><Icon name="send" size={13} />测试</button>
+              <button className="btn btn-sm" onClick={() => startEdit(c)}><Icon name="edit" size={13} /></button>
               <button className="btn btn-sm btn-danger" onClick={() => run('del' + c.id, () => deleteNotifyChannel(c.id))}><Icon name="trash" size={13} /></button>
             </div>
           </div>
@@ -1683,24 +2025,43 @@ function SelfUpdateSettings() {
   );
 }
 
-const SET_ITEMS = [
-  // —— AI 核心：搭建智能体的地基（模型 → 能力 → 角色 → 记忆）——
-  { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-  { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
-  { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
-  { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
-  // —— 运行与流控 ——
-  { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
-  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
-  { id: 'security',    name: '安全与权限',   ic: 'shield' },
-  // —— 集成与通知 ——
-  { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
-  { id: 'notify',      name: '通知通道',     ic: 'bell' },
-  // —— 系统 ——
-  { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
-  { id: 'theme',       name: '主题设置',     ic: 'palette' },
-  { id: 'about',       name: '关于 AutoForge', ic: 'box' },
+const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string }[] }[] = [
+  {
+    group: 'AI 核心', // 搭建智能体的地基（模型 → 能力 → 角色 → 记忆）
+    items: [
+      { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
+      { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
+      { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
+      { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
+    ],
+  },
+  {
+    group: '运行与流控',
+    items: [
+      { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+      { id: 'autosupply',  name: '自动供料',     ic: 'refresh' },
+      { id: 'gating',      name: '门控降级',     ic: 'sliders' },
+      { id: 'security',    name: '安全与权限',   ic: 'shield' },
+    ],
+  },
+  {
+    group: '集成与通知',
+    items: [
+      { id: 'asr',         name: '语音录入',     ic: 'mic' },
+      { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
+      { id: 'notify',      name: '通知通道',     ic: 'bell' },
+    ],
+  },
+  {
+    group: '系统',
+    items: [
+      { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+      { id: 'theme',       name: '主题设置',     ic: 'palette' },
+      { id: 'about',       name: '关于 AutoForge', ic: 'box' },
+    ],
+  },
 ];
+const SET_ITEMS = SET_GROUPS.flatMap(g => g.items);
 
 export default function SettingsPage({
   theme,
@@ -1711,6 +2072,18 @@ export default function SettingsPage({
 }) {
   const [sec, setSec] = useState('llm');
   const cur = SET_ITEMS.find(i => i.id === sec)!;
+
+  // 分组折叠：默认只展开当前激活项所在组，其余收起，避免一次铺开全部。
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+    const open = SET_GROUPS.find(g => g.items.some(it => it.id === sec))?.group;
+    return new Set(SET_GROUPS.map(g => g.group).filter(name => name !== open));
+  });
+  const toggleGroup = (name: string) =>
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      next.has(name) ? next.delete(name) : next.add(name);
+      return next;
+    });
 
   // 待拉取提交数角标：每分钟检查一次自管理仓库落后 origin/dev 的提交数。
   const [pendingBehind, setPendingBehind] = useState(0);
@@ -1730,14 +2103,28 @@ export default function SettingsPage({
       </div>
       <div className="set-wrap">
         <div className="set-nav">
-          {SET_ITEMS.map(it => (
-            <div key={it.id} className={'set-nav-item' + (sec === it.id ? ' active' : '')} onClick={() => setSec(it.id)}>
-              <Icon name={it.ic} size={18} />{it.name}
-              {it.id === 'selfupdate' && pendingBehind > 0 && (
-                <span className="set-nav-badge" title={`有 ${pendingBehind} 个提交待拉取`}>{pendingBehind}</span>
-              )}
-            </div>
-          ))}
+          {SET_GROUPS.map(g => {
+            const isCollapsed = collapsed.has(g.group);
+            // 折叠态仍有该组项被选中时，用角标提示当前位置不丢失。
+            const hasActive = g.items.some(it => it.id === sec);
+            return (
+              <Fragment key={g.group}>
+                <div className={'set-nav-group' + (isCollapsed ? ' collapsed' : '')} onClick={() => toggleGroup(g.group)}>
+                  {g.group}
+                  {isCollapsed && hasActive && <span className="dot ember" style={{ marginLeft: 4 }} />}
+                  <Icon name="chevron" size={14} className="set-nav-chevron" />
+                </div>
+                {!isCollapsed && g.items.map(it => (
+                  <div key={it.id} className={'set-nav-item' + (sec === it.id ? ' active' : '')} onClick={() => setSec(it.id)}>
+                    <Icon name={it.ic} size={18} />{it.name}
+                    {it.id === 'selfupdate' && pendingBehind > 0 && (
+                      <span className="set-nav-badge" title={`有 ${pendingBehind} 个提交待拉取`}>{pendingBehind}</span>
+                    )}
+                  </div>
+                ))}
+              </Fragment>
+            );
+          })}
         </div>
         <div className="set-body scroll">
           {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
@@ -1748,11 +2135,13 @@ export default function SettingsPage({
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
+          {sec === 'asr'         && <AsrSettings />}
+          {sec === 'autosupply'  && <AutosupplySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','tools','roles','concurrency','selfupdate','knowledge','security','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','llm','tools','roles','concurrency','selfupdate','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

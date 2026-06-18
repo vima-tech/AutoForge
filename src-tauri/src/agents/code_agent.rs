@@ -280,7 +280,9 @@ pub async fn run(
     // `--disallowedTools` flag is variadic and would otherwise greedily consume
     // the prompt as a list of tool names, leaving the run with no actual prompt
     // ("Input must be provided ... when using --print").
-    let mut cmd = Command::new("claude");
+    // Resolve `claude` via PATH so Windows finds the `claude.cmd` npm shim
+    // (`Command::new` only auto-appends `.exe`); no-op on unix.
+    let mut cmd = Command::new(crate::core::platform::program("claude"));
     cmd.arg("--print")
         .arg("--permission-mode")
         .arg("acceptEdits")

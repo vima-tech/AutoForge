@@ -3,7 +3,9 @@ import Icon from '../components/Icon';
 import Select from '../components/Select';
 import {
   listLlmTraces, getLlmTrace, listTraceAgentNames, clearLlmTraces,
+  listAgentOutputs, getAgentOutput, listAgentOutputRoles, clearAgentOutputs,
   type LlmTraceSummary, type LlmTrace, type TraceFilter,
+  type AgentOutputSummary, type AgentOutput,
 } from '../services';
 
 // span 类型 → chip 语义色（仅语义状态色，遵循设计系统）。
@@ -133,7 +135,160 @@ function TraceBlock({ label, text, tone }: { label: string; text: string; tone?:
   );
 }
 
+// 产出解析状态 → 语义色。
+const OUT_STATUS_CHIP: Record<string, string> = { ok: 'green', partial: 'amber', error: 'red' };
+
+// 环节 Agent 结构化产出浏览器（agent_outputs）：流水线级粒度，点 trace 下钻到单步推理。
+function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void }) {
+  const [role, setRole] = useState('');
+  const [targetId, setTargetId] = useState('');
+  const [status, setStatus] = useState('');
+  const [roles, setRoles] = useState<string[]>([]);
+  const [rows, setRows] = useState<AgentOutputSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [detail, setDetail] = useState<AgentOutput | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    listAgentOutputs({
+      role: role || undefined,
+      target_id: targetId.trim() || undefined,
+      status: status || undefined,
+      limit: 300,
+    }).then(setRows).catch(() => setRows([])).finally(() => setLoading(false));
+  }, [role, targetId, status]);
+
+  useEffect(() => { listAgentOutputRoles().then(setRoles).catch(() => {}); }, []);
+  useEffect(() => { const t = setTimeout(load, 300); return () => clearTimeout(t); }, [load]);
+
+  const open = (id: string) => {
+    setSelected(id);
+    setDetail(null);
+    getAgentOutput(id).then(setDetail).catch(() => setDetail(null));
+  };
+
+  const pretty = useMemo(() => {
+    if (!detail?.output_json) return '';
+    try { return JSON.stringify(JSON.parse(detail.output_json), null, 2); } catch { return detail.output_json; }
+  }, [detail]);
+
+  const copyOut = async () => {
+    if (!pretty) return;
+    try { await navigator.clipboard.writeText(pretty); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* ignore */ }
+  };
+
+  // 从结构化产出里取一句话结论（兼容不同 schema：test 用 verdict/summary，analysis 用 triage.analysis_summary）。
+  const headline = (j: string | null): string => {
+    if (!j) return '';
+    try {
+      const o = JSON.parse(j);
+      if (o.verdict) return `${o.verdict}${o.summary ? ' · ' + o.summary : ''}`;
+      if (o.triage?.analysis_summary) return o.triage.analysis_summary;
+      if (o.summary) return o.summary;
+      return '';
+    } catch { return ''; }
+  };
+
+  return (
+    <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+      {/* 左：筛选 + 产出列表 */}
+      <div className="list-col" style={{ width: 360, flex: '0 0 360px', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6, borderBottom: '1px solid var(--border)' }}>
+          <input className="trace-filter-input" value={targetId} onChange={e => setTargetId(e.target.value)} placeholder="🔍 关联编号（需求 / CR）" />
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <Select value={role} onChange={setRole} style={{ flex: 1, minWidth: 0 }}
+              options={[{ value: '', label: '全部环节' }, ...roles.map(r => ({ value: r, label: r }))]} />
+            <div className="seg" style={{ flexShrink: 0 }}>
+              {[['', '全部'], ['ok', 'ok'], ['partial', 'partial'], ['error', 'err']].map(([v, l]) => (
+                <button key={v} className={status === v ? 'on' : ''} onClick={() => setStatus(v)}>{l}</button>
+              ))}
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', padding: '1px 2px' }}>
+            <span>{loading ? '查询中…' : `共 ${rows.length} 条`}</span>
+            {(role || targetId || status) && (
+              <button className="btn btn-ghost btn-sm" style={{ padding: '1px 6px', height: 'auto', fontSize: 'var(--text-micro)', gap: 3 }}
+                onClick={() => { setRole(''); setTargetId(''); setStatus(''); }}>
+                <Icon name="x" size={11} />重置
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="list-body scroll" style={{ flex: 1 }}>
+          {!loading && rows.length === 0 && (
+            <div className="empty" style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)' }}>
+              <Icon name="log" size={28} /><div style={{ marginTop: 8 }}>暂无环节产出</div>
+            </div>
+          )}
+          {rows.map(r => (
+            <div key={r.id} className="cfg-card" onClick={() => open(r.id)}
+              style={{ margin: '8px 10px', padding: '10px 12px', cursor: 'pointer', ...(selected === r.id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{r.role}</span>
+                <span className={'chip ' + (OUT_STATUS_CHIP[r.status] ?? '')} style={{ fontSize: 'var(--text-micro)' }}>{r.status}</span>
+                <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)' }}>v{r.schema_version}</span>
+              </div>
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)', margin: '6px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {preview(headline(r.output_json), 64) || '—'}
+              </div>
+              <div style={{ display: 'flex', gap: 10, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)' }}>
+                <span>{r.target_kind}:{preview(r.target_id, 14)}</span>
+                {r.trace_id && <span title="可下钻到调用链"><Icon name="log" size={10} /> trace</span>}
+                <span style={{ marginLeft: 'auto' }}>{fmtTime(r.created_at)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 右：选中产出详情 */}
+      <div className="scroll" style={{ flex: 1, minWidth: 0, padding: '16px 20px', overflow: 'auto' }}>
+        {!selected && (
+          <div className="empty" style={{ marginTop: 80, textAlign: 'center', color: 'var(--text-3)' }}>
+            <Icon name="eye" size={32} /><div style={{ marginTop: 10 }}>从左侧选择一条环节产出查看结构化结果</div>
+          </div>
+        )}
+        {selected && !detail && <div className="empty" style={{ padding: 24 }}>加载中…</div>}
+        {selected && detail && (
+          <>
+            <div className="panel" style={{ marginBottom: 12 }}>
+              <div className="panel-head">
+                <div className="panel-title"><Icon name="layers" size={16} style={{ color: 'var(--ember)' }} />{detail.role} · 结构化产出</div>
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                  {detail.trace_id && (
+                    <button className="btn btn-sm" onClick={() => onDrill(detail.trace_id!)}
+                      title="下钻到本次调用的 LLM/工具 调用链">
+                      <Icon name="log" size={13} />查看调用链
+                    </button>
+                  )}
+                  <button className="btn btn-sm" onClick={copyOut} title="复制结构化产出 JSON">
+                    <Icon name={copied ? 'check' : 'copy'} size={13} />{copied ? '已复制' : '复制 JSON'}
+                  </button>
+                </div>
+              </div>
+              <div style={{ padding: '12px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 18px', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+                <span>环节：<b style={{ color: 'var(--text-2)' }}>{detail.role}</b></span>
+                <span>schema：<b style={{ color: 'var(--text-2)' }}>v{detail.schema_version}</b></span>
+                <span>状态：<b style={{ color: 'var(--text-2)' }}>{detail.status}</b></span>
+                <span>关联：<b style={{ color: 'var(--text-2)' }}>{detail.target_kind}:{detail.target_id}</b></span>
+                <span>项目：<b style={{ color: 'var(--text-2)' }}>{detail.project_id || '—'}</b></span>
+                <span>trace：<b style={{ color: 'var(--text-2)' }}>{detail.trace_id ? detail.trace_id.slice(0, 8) : '—'}</b></span>
+              </div>
+            </div>
+            <TraceBlock label="结构化产出 OUTPUT" text={pretty} />
+            {detail.raw && <TraceBlock label="原始模型文本 RAW" text={detail.raw} />}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function TracePage() {
+  const [tab, setTab] = useState<'trace' | 'outputs'>('trace');
+  const [outputsKey, setOutputsKey] = useState(0);
   const [issueId, setIssueId] = useState('');
   const [conversationId, setConversationId] = useState('');
   const [agentName, setAgentName] = useState('');
@@ -187,16 +342,36 @@ export default function TracePage() {
     <div className="content">
       <div className="audit-top" style={{ height: 56 }}>
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
-          <span className="en">LLM TRACE</span><span className="cn">· 调用链路追踪</span>
+          <span className="en">TRACE</span><span className="cn">· 智能体可观测</span>
+        </div>
+        <div className="seg" style={{ marginLeft: 16 }}>
+          <button className={tab === 'trace' ? 'on' : ''} onClick={() => setTab('trace')}>调用链路</button>
+          <button className={tab === 'outputs' ? 'on' : ''} onClick={() => setTab('outputs')}>环节产出</button>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-          <button className="btn btn-sm" onClick={load} title="刷新"><Icon name="refresh" size={14} />刷新</button>
-          <button className="btn btn-sm btn-danger" onClick={() => { if (confirm('确认清空全部 trace 记录？')) clearLlmTraces().then(() => { setTraces([]); setSpans([]); setSelected(null); }); }}>
-            <Icon name="trash" size={14} />清空
-          </button>
+          {tab === 'trace' ? (
+            <>
+              <button className="btn btn-sm" onClick={load} title="刷新"><Icon name="refresh" size={14} />刷新</button>
+              <button className="btn btn-sm btn-danger" onClick={() => { if (confirm('确认清空全部 trace 记录？')) clearLlmTraces().then(() => { setTraces([]); setSpans([]); setSelected(null); }); }}>
+                <Icon name="trash" size={14} />清空
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn btn-sm" onClick={() => setOutputsKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
+              <button className="btn btn-sm btn-danger" onClick={() => { if (confirm('确认清空全部环节产出记录？')) clearAgentOutputs().then(() => setOutputsKey(k => k + 1)); }}>
+                <Icon name="trash" size={14} />清空
+              </button>
+            </>
+          )}
         </div>
       </div>
 
+      {tab === 'outputs' && (
+        <AgentOutputsExplorer key={outputsKey} onDrill={(tid) => { setTab('trace'); openTrace(tid); }} />
+      )}
+
+      {tab === 'trace' && (
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         {/* 左：筛选 + trace 列表 */}
         <div className="list-col" style={{ width: 360, flex: '0 0 360px', display: 'flex', flexDirection: 'column' }}>
@@ -294,6 +469,7 @@ export default function TracePage() {
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

@@ -369,6 +369,9 @@ pub struct AnalysisResult {
     pub raw_output: String,
     pub analysis_json: String,
     pub spec: IssueAnalysisSpec,
+    /// 本次分析的 trace_id（若走自定义 LLM agent），供 dual-write 到 agent_outputs 链回下钻。
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 impl Default for AnalysisResult {
@@ -387,6 +390,7 @@ impl Default for AnalysisResult {
             raw_output: String::new(),
             analysis_json: serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
             spec,
+            trace_id: None,
         }
     }
 }
@@ -412,6 +416,7 @@ impl AnalysisResult {
             raw_output: String::new(),
             analysis_json,
             spec,
+            trace_id: None,
         }
     }
 }
@@ -500,19 +505,11 @@ pub async fn build_project_context(repo_path: &str) -> String {
         }
     }
 
-    // Directory tree (depth 2, skip hidden / build dirs)
-    if let Ok(out) = Command::new("find")
-        .arg(repo_path)
-        .arg("-maxdepth").arg("2")
-        .arg("-type").arg("d")
-        .arg("!").arg("-path").arg("*/.*")
-        .arg("!").arg("-path").arg("*/node_modules/*")
-        .arg("!").arg("-path").arg("*/target/*")
-        .arg("!").arg("-path").arg("*/__pycache__/*")
-        .output()
-        .await
+    // Directory tree (depth 2, skip hidden / build dirs). Pure-Rust walk so it
+    // works identically on Linux/macOS/Windows (no `find` shell-out — Windows'
+    // `find.exe` is an unrelated text-search tool).
     {
-        let tree = String::from_utf8_lossy(&out.stdout);
+        let tree = list_dirs_depth2(repo_path);
         let limited: String = tree.chars().take(1500).collect();
         if !limited.trim().is_empty() {
             parts.push(format!("## 目录结构\n{}", limited));
@@ -535,6 +532,41 @@ pub async fn build_project_context(repo_path: &str) -> String {
     }
 
     parts.join("\n\n")
+}
+
+/// List directories up to depth 2 under `root`, skipping hidden and common build
+/// dirs. Replaces a `find` shell-out for cross-platform parity. Output mirrors
+/// `find`'s newline-separated paths, sorted for determinism.
+fn list_dirs_depth2(root: &str) -> String {
+    fn skip(name: &str) -> bool {
+        name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__")
+    }
+    let mut dirs: Vec<String> = Vec::new();
+    let root_path = std::path::Path::new(root);
+    let read = |p: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| !skip(n))
+                    .unwrap_or(false)
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    for d1 in read(root_path) {
+        dirs.push(d1.to_string_lossy().to_string());
+        for d2 in read(&d1) {
+            dirs.push(d2.to_string_lossy().to_string());
+        }
+    }
+    dirs.join("\n")
 }
 
 /// Resolve the agent holding the `analysis` forge role (comma-separated field).
@@ -574,7 +606,7 @@ pub async fn analyze(
     // Run via the analysis Agent's bound LLM (custom/低成本 model) so only Claude Code
     // hits the Claude CLI. Fall back to the local Claude CLI only when no analysis Agent
     // is assigned, so a fresh install still works.
-    let raw = match resolve_analysis_agent(db).await {
+    let (raw, trace_id) = match resolve_analysis_agent(db).await {
         Some(agent) => {
             let sys = crate::agents::roles::compose_system_prompt(
                 Some("analysis"),
@@ -585,14 +617,24 @@ pub async fn analyze(
             // 让评估基于实际代码而非仅需求文本。未开启工具/无项目时自动回退单轮。
             let ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
             let registry = crate::agents::tools::build_registry_for_agent(db, &agent, &ctx).await;
-            crate::agents::llm::run_agent_text_with_tools(db, &agent, &prompt, Some(&sys), &[], &registry).await?
+            // 包一层 scope_run（内部 LLM 调用复用同一 trace），以便取到 trace_id 链回下钻。
+            crate::core::trace::scope_run(db, &agent, async {
+                let raw = crate::agents::llm::run_agent_text_with_tools(
+                    db, &agent, &prompt, Some(&sys), &[], &registry,
+                )
+                .await?;
+                let tid = crate::core::trace::current_trace_id();
+                Ok::<_, anyhow::Error>((raw, tid))
+            })
+            .await?
         }
-        None => local_claude::run_text(&prompt, Some(SYSTEM_PROMPT)).await?,
+        None => (local_claude::run_text(&prompt, Some(SYSTEM_PROMPT)).await?, None),
     };
 
     // Parse into the full structured spec (with legacy fallback); keep raw for audit.
     let mut result = parse_analysis(&raw).unwrap_or_default();
     result.raw_output = raw;
+    result.trace_id = trace_id;
     Ok(result)
 }
 

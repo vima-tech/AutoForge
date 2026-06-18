@@ -455,7 +455,16 @@ pub async fn load_project_context_for_conversation(
     }
     let instructions = crate::commands::workspace::WORKSPACE_INSTRUCTIONS;
 
-    if parts.is_empty() {
+    // 4. 规格注入（统一来源：project_specs，含 db 内联与 file 指针）。
+    //    - always 的 file 源规格 → 全文随上下文（db 的 always 已由 CLAUDE.md @import 覆盖，不重复）。
+    //    - on_demand 规格（任意来源）→ 仅紧凑清单，Agent 用 read_spec 工具按需拉全文。
+    let (always_specs_text, on_demand_catalog) =
+        build_spec_injection(db, &project_id).await;
+    if !always_specs_text.is_empty() {
+        parts.push(always_specs_text);
+    }
+
+    if parts.is_empty() && on_demand_catalog.is_empty() {
         return format!("## 项目上下文\n\n{}\n\n---\n", instructions);
     }
 
@@ -466,7 +475,88 @@ pub async fn load_project_context_for_conversation(
     const MAX_PROJECT_CTX_BYTES: usize = 16 * 1024;
     let body = truncate_to_bytes(&parts.join("\n\n"), MAX_PROJECT_CTX_BYTES);
 
-    format!("## 项目上下文\n\n{}\n\n{}\n\n---\n", body, instructions)
+    // on_demand 清单接在预算外（与 instructions 同级，体积小、必须保留），
+    // 确保 Agent 始终知道有哪些规格可用 read_spec 拉取。
+    let catalog_block = if on_demand_catalog.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", on_demand_catalog)
+    };
+
+    format!(
+        "## 项目上下文\n\n{}{}\n\n{}\n\n---\n",
+        body, catalog_block, instructions
+    )
+}
+
+/// 构造规格注入两部分：(always 的 file 源规格全文, on_demand 规格紧凑清单)。
+/// db 源的 always 规格不在此返回——它们已经由 CLAUDE.md `@import` 聚合文件注入，避免重复。
+async fn build_spec_injection(db: &crate::db::Db, project_id: &str) -> (String, String) {
+    let specs = sqlx::query_as::<_, crate::models::spec::ProjectSpec>(
+        "SELECT * FROM project_specs
+         WHERE project_id = ? AND injection IN ('always','on_demand')
+         ORDER BY category, sort_order, created_at",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    if specs.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    // 取项目仓库根，用于读 file 源 always 规格全文。
+    let repo_path: String = sqlx::query_as::<_, (String,)>(
+        "SELECT repo_path FROM projects WHERE id = ?",
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(p,)| p)
+    .unwrap_or_default();
+
+    let mut always_parts: Vec<String> = Vec::new();
+    let mut catalog_lines: Vec<String> = Vec::new();
+
+    for s in &specs {
+        if s.injection == "always" && s.source == "file" {
+            let rel = s
+                .rel_path
+                .trim()
+                .trim_start_matches("./")
+                .strip_prefix(".autoforge/")
+                .unwrap_or(s.rel_path.trim())
+                .to_string();
+            if let Ok(content) =
+                crate::commands::workspace::read_workspace_path(&repo_path, &rel).await
+            {
+                if !content.trim().is_empty() {
+                    always_parts.push(format!("=== 项目规格: {} ===\n{}", s.title, content.trim()));
+                }
+            }
+        } else if s.injection == "on_demand" {
+            let desc = if s.description.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", s.description.trim())
+            };
+            catalog_lines.push(format!("- [{}] {}{} (id={})", s.category, s.title, desc, s.id));
+        }
+    }
+
+    let always_text = always_parts.join("\n\n");
+    let catalog = if catalog_lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## 可用规格（按需用 read_spec 工具读取全文，勿凭空臆测）\n{}",
+            catalog_lines.join("\n")
+        )
+    };
+    (always_text, catalog)
 }
 
 /// Truncate a string to at most `max_bytes`, on a char boundary, appending a

@@ -166,6 +166,67 @@ pub async fn list_workspace_files(
     Ok(files)
 }
 
+// ── 复用守卫的纯 IO 助手（供 specs.rs 等下层复用同一套 .autoforge 写入限制）──────
+// 入参 `rel_under_autoforge` 是相对 .autoforge/ 的路径（如 `specs/foo.md`），
+// 一律经 validate_workspace_path + ensure_within_workspace 守卫，禁止越界 / docs|specs 外。
+
+/// 守卫读取工作区文件（相对 .autoforge/）。
+pub async fn read_workspace_path(
+    repo_path: &str,
+    rel_under_autoforge: &str,
+) -> Result<String, String> {
+    validate_workspace_path(rel_under_autoforge)?;
+    let base = workspace_root(repo_path);
+    let full = base.join(rel_under_autoforge);
+    if !full.is_file() {
+        return Err(format!("{} 不存在", rel_under_autoforge));
+    }
+    ensure_within_workspace(&base, &full)?;
+    if full.metadata().map(|m| m.len()).unwrap_or(0) > 2 * 1024 * 1024 {
+        return Err("文件超过 2 MB".to_string());
+    }
+    tokio::fs::read_to_string(&full)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 守卫写入工作区文件（相对 .autoforge/）。
+pub async fn write_workspace_path(
+    repo_path: &str,
+    rel_under_autoforge: &str,
+    content: &str,
+) -> Result<(), String> {
+    validate_workspace_path(rel_under_autoforge)?;
+    let base = workspace_root(repo_path);
+    let full = base.join(rel_under_autoforge);
+    if let Some(parent) = full.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    ensure_within_workspace(&base, &full)?;
+    tokio::fs::write(&full, content.as_bytes())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 守卫删除工作区文件（相对 .autoforge/）。文件不存在视为成功（幂等）。
+pub async fn delete_workspace_path(
+    repo_path: &str,
+    rel_under_autoforge: &str,
+) -> Result<(), String> {
+    validate_workspace_path(rel_under_autoforge)?;
+    let base = workspace_root(repo_path);
+    let full = base.join(rel_under_autoforge);
+    ensure_within_workspace(&base, &full)?;
+    if full.is_file() {
+        tokio::fs::remove_file(&full)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn read_workspace_file(
     project_id: String,
@@ -384,9 +445,9 @@ pub async fn execute_agent_writes(
         match tokio::fs::write(&full, content.as_bytes()).await {
             Ok(_) => {
                 info!("[workspace] agent wrote {}", rel_path);
-                // preview: first 200 chars
-                let preview = if content.len() > 200 {
-                    format!("{}…", &content[..200])
+                // preview: first 200 chars（按字符截断，避免落在多字节 UTF-8 边界内 panic）
+                let preview = if content.chars().count() > 200 {
+                    format!("{}…", content.chars().take(200).collect::<String>())
                 } else {
                     content.clone()
                 };

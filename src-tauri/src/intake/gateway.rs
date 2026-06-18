@@ -1,4 +1,4 @@
-use super::IntakePayload;
+use super::{IntakeMode, IntakePayload};
 use crate::core::{event, security};
 use crate::db::Db;
 use crate::models::issue::Issue;
@@ -13,6 +13,7 @@ pub async fn receive(
     job_tx: &JobSender,
     app: &AppHandle,
     payload: IntakePayload,
+    mode: IntakeMode,
 ) -> Result<Issue, String> {
     if security::has_obvious_injection(&payload.title) {
         return Err("标题包含可疑内容，提交被拒绝".to_string());
@@ -48,10 +49,14 @@ pub async fn receive(
     let category = payload.category.unwrap_or_else(|| "Feature".to_string());
     let severity = payload.severity.unwrap_or_else(|| "medium".to_string());
 
+    // triage 模式落「待整理池」(status='triage')，保留原始文本，且不自动入队分析。
+    let status = mode.initial_status();
+    let raw_capture = (mode == IntakeMode::Triage).then(|| description.clone());
+
     sqlx::query(
         "INSERT INTO issues
-         (id, project_id, source_type, title, description, category, severity, fingerprint, source_ref)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, project_id, source_type, title, description, category, severity, status, fingerprint, source_ref, raw_capture)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&payload.project_id)
@@ -60,21 +65,26 @@ pub async fn receive(
     .bind(&description)
     .bind(&category)
     .bind(&severity)
+    .bind(status)
     .bind(&fp)
     .bind(&payload.source_ref)
+    .bind(&raw_capture)
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let idem_key = format!("analysis:{}", id);
-    let _ = enqueue(
-        db,
-        job_tx,
-        "analysis",
-        &idem_key,
-        JobPayload::Analysis { issue_id: id.clone() },
-    )
-    .await;
+    // 仅 Flow 模式自动入队分析；triage 待整理池等人/triage Agent 处理后再转 Flow。
+    if mode == IntakeMode::Flow {
+        let idem_key = format!("analysis:{}", id);
+        let _ = enqueue(
+            db,
+            job_tx,
+            "analysis",
+            &idem_key,
+            JobPayload::Analysis { issue_id: id.clone() },
+        )
+        .await;
+    }
 
     let issue = sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
         .bind(&id)

@@ -251,7 +251,8 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
            SUM(CASE WHEN status='executing'          THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='rejected'           THEN 1 ELSE 0 END),
            COUNT(*)
-         FROM issues",
+         FROM issues
+         WHERE status != 'triage'",
     )
     .fetch_one(&state.db)
     .await
@@ -321,6 +322,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
                 SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
                 COUNT(*)
          FROM issues
+         WHERE status != 'triage'
          GROUP BY project_id",
     )
     .fetch_all(&state.db)

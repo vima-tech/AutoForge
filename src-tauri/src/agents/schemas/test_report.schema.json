@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TestReport",
+  "description": "AutoForge 测试环节 schema 驱动 agent 的结构化产出（role=test, v1.0）。机器执行结果为事实权威（verdict/checks/summary），LLM 补充诊断与覆盖分析。落统一表 agent_outputs。",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "verdict": { "type": "string", "enum": ["pass", "fail", "flaky", "inconclusive"] },
+    "summary": { "type": "string" },
+    "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "command": { "type": "string" },
+          "ok": { "type": "boolean" },
+          "code": { "type": "integer" },
+          "output_excerpt": { "type": "string" }
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "properties": {
+        "acceptance_covered": { "type": "array", "items": { "type": "string" } },
+        "acceptance_uncovered": { "type": "array", "items": { "type": "string" } },
+        "gaps": { "type": "array", "items": { "type": "string" } },
+        "risk_areas": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "designed_cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "preconditions": { "type": ["string", "null"] },
+          "input": { "type": ["string", "null"] },
+          "steps": { "type": "array", "items": { "type": "string" } },
+          "expected": { "type": "string" },
+          "priority": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "check": { "type": "string" },
+          "root_cause": { "type": "string" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "expected_vs_actual": { "type": ["string", "null"] },
+          "fix_direction": { "type": ["string", "null"] },
+          "suspected_locations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "symbol": { "type": ["string", "null"] },
+                "reason": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "regression_risks": { "type": "array", "items": { "type": "string" } },
+    "recommendations": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["schema_version", "verdict"]
+}

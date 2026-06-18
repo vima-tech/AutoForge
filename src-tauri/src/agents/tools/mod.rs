@@ -18,6 +18,7 @@ use crate::core::security::{has_obvious_injection, safe_truncate};
 
 pub mod code_scan;
 pub mod mcp;
+pub mod specs;
 pub mod web_search;
 
 /// 单个工具回灌到上下文的最大字符数，防止超大响应撑爆 token / 上下文窗口。
@@ -207,6 +208,8 @@ pub fn builtin_catalog() -> Vec<Box<dyn BuiltinTool>> {
         Box::new(code_scan::CodeScanFactory::Read),
         Box::new(code_scan::CodeScanFactory::Search),
         Box::new(code_scan::CodeScanFactory::List),
+        Box::new(specs::SpecToolFactory::List),
+        Box::new(specs::SpecToolFactory::Read),
     ]
 }
 

@@ -81,12 +81,26 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
         project_id: Some(issue.project_id.clone()),
         ..Default::default()
     };
+    // D1：Bug 载体增强——把复现/环境/期望/实际作为高质量输入并入描述，喂自主分析与修复。
+    let enriched_desc = {
+        let mut d = issue.description.clone();
+        let mut push = |label: &str, val: &Option<String>| {
+            if let Some(s) = val.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                d.push_str(&format!("\n\n## {}\n{}", label, s));
+            }
+        };
+        push("复现步骤", &issue.repro_steps);
+        push("环境", &issue.environment);
+        push("期望结果", &issue.expected);
+        push("实际结果", &issue.actual);
+        d
+    };
     let result = match crate::core::trace::with_tags(
         trace_tags,
         crate::agents::analysis::analyze(
             db,
             &issue.title,
-            &issue.description,
+            &enriched_desc,
             project_context.as_deref(),
             Some(issue.project_id.as_str()),
         ),
@@ -159,6 +173,22 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     .execute(db)
     .await?;
 
+    // Dual-write 到统一产出表 agent_outputs（schema 驱动 agent 的统一落点）：保留 issue_analyses
+    // 向后兼容的同时，让需求分析与测试等环节产出在同一存储里按 issue 串成流水线、按 trace_id 下钻。
+    crate::agents::schema::record(
+        db,
+        "analysis",
+        &result.spec.schema_version,
+        "issue",
+        &issue.id,
+        Some(&issue.project_id),
+        result.trace_id.as_deref(),
+        "ok",
+        &result.analysis_json,
+        &result.raw_output,
+    )
+    .await;
+
     // Update issue status and promote analysis suggestions into queue fields.
     sqlx::query(
         "UPDATE issues
@@ -175,6 +205,19 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     .bind(&issue.id)
     .execute(db)
     .await?;
+
+    // D2：把 AI 生成的验收标准固化到 issues.acceptance_json（供人审改 + code agent DoD + review_2 核对）。
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.analysis_json) {
+        if let Some(ac) = v.get("acceptance_criteria").filter(|a| !a.is_null()) {
+            if let Ok(ac_str) = serde_json::to_string(ac) {
+                let _ = sqlx::query("UPDATE issues SET acceptance_json=? WHERE id=?")
+                    .bind(&ac_str)
+                    .bind(&issue.id)
+                    .execute(db)
+                    .await;
+            }
+        }
+    }
 
     // Emit events
     event::emit(

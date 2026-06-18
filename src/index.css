@@ -65,7 +65,9 @@
   --rail-expanded: 196px;
   --rail-ic: 46px;
   --list-w: 276px;
-  --measure: 780px;        /* 长文档阅读行宽上限（含内边距），保证舒适的每行字符数 */
+  --measure: clamp(760px, 52vw, 940px); /* 长文档正文阅读行宽：随屏幕温和增长，封顶 ~940 守住可读行长 */
+  --doc-wide: clamp(760px, 82vw, 1240px); /* 文档面板外层上限：表格/代码/图可破栏吃满横向空间 */
+  --thread-max: 1280px;    /* 消息线程居中带最大宽度（全屏不浪费空间又不至过宽） */
   /* 报纸波点纹理：极淡的网点底纹，随主题自动适配（中性气泡用文本色网点） */
   --paper-dot: color-mix(in srgb, var(--text) 5%, transparent);
 }
@@ -1057,6 +1059,7 @@ button { font-family: inherit; cursor: pointer; }
 .dot.green { background: var(--green); box-shadow: 0 0 0 3px rgba(79,157,107,.2); }
 .dot.amber { background: var(--amber); box-shadow: 0 0 0 3px rgba(224,163,46,.2); }
 .dot.gray { background: var(--text-faint); }
+.dot.ember { background: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); }
 
 .av {
   border-radius: 13px; flex: none; display: grid; place-items: center;
@@ -1075,8 +1078,10 @@ button { font-family: inherit; cursor: pointer; }
   font-size: var(--text-control); font-weight: 600; padding: 5px 13px; border-radius: 7px; white-space: nowrap;
   transition: background .14s, color .14s;
 }
-.seg button.on { background: var(--bg); color: var(--text); box-shadow: var(--shadow-sm); }
-[data-theme="light"] .seg button.on { background: #fff; }
+.seg button.on {
+  background: var(--ember-tint-strong); color: var(--ember-soft);
+  box-shadow: var(--shadow-sm), inset 0 0 0 1px var(--ember-tint-strong);
+}
 
 .empty {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -1146,7 +1151,9 @@ button { font-family: inherit; cursor: pointer; }
 .member-stack .av { margin-left: -8px; border: 2px solid var(--bg); }
 .member-stack .av:first-child { margin-left: 0; }
 
-.msgs { flex: 1; overflow-y: auto; padding: 22px 26px 8px; display: flex; flex-direction: column; gap: 16px; }
+/* 消息线程居中带：内容收束到 --thread-max 居中，全屏时左右留白对称而非右侧空一片；
+   滚动条仍在容器真实边缘。窄屏自动退化为 26px 内边距。 */
+.msgs { flex: 1; overflow-y: auto; padding: 22px max(26px, (100% - var(--thread-max)) / 2) 8px; display: flex; flex-direction: column; gap: 16px; }
 .chat-error-bar {
   flex: none; display: flex; align-items: center; gap: 8px;
   margin: 0 18px 10px; padding: 8px 10px;
@@ -1156,6 +1163,33 @@ button { font-family: inherit; cursor: pointer; }
 }
 .chat-error-bar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-error-bar .icon-btn { width: 24px; height: 24px; flex: none; color: currentColor; }
+
+/* 顶部任务状态条：薄、克制，复用语义色表达 running/done/error。 */
+.chat-activity {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  margin: 0 18px 8px; padding: 6px 11px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-2); color: var(--text-2);
+  font-size: var(--text-caption); font-family: var(--font-mono); letter-spacing: .03em;
+  animation: rise .2s ease;
+}
+.chat-activity svg { flex: none; }
+.chat-activity.running { color: var(--amber); border-color: rgba(224,163,46,.30); background: rgba(224,163,46,.08); }
+.chat-activity.done    { color: var(--green-soft); border-color: rgba(79,157,107,.30); background: rgba(79,157,107,.08); }
+.chat-activity.error   { color: var(--red); border-color: rgba(219,90,64,.30); background: rgba(219,90,64,.08); }
+
+/* 「正在思考」气泡：复用 .typing 三点动画 + 一行说明文案。 */
+.typing-cap { font-size: var(--text-caption); color: var(--text-3); font-family: var(--font-mono); letter-spacing: .03em; padding: 0 4px; }
+.typing-bubble { display: inline-flex; width: max-content; padding: 6px 12px; }
+
+/* 发送回执：紧贴「我」气泡下方的「已送达」微标。 */
+.msg-receipt {
+  display: inline-flex; align-items: center; gap: 3px; padding: 0 4px;
+  font-size: var(--text-micro); font-family: var(--font-mono); letter-spacing: .04em;
+  color: var(--text-faint);
+  animation: rise .2s ease;
+}
+.msg-receipt svg { color: var(--green-soft); }
 .day-sep { align-self: center; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-faint); letter-spacing: .1em; padding: 2px 0; }
 
 .msg { display: flex; gap: 11px; max-width: 90%; }
@@ -1175,6 +1209,9 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
     radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 7px 7px,
     var(--bubble-them);
   color: var(--bubble-them-text);
+  /* 与 .bubble.doc 一致的封顶宽度：长文气泡统一收束到阅读行宽，
+     避免普通气泡按外层 .msg 90% 列宽撑开、与 doc 气泡宽窄不一 */
+  max-width: var(--measure);
   padding: 12px 15px; border-radius: 4px 15px 15px 15px;
   font-size: var(--text-body); line-height: var(--leading-relaxed); box-shadow: var(--shadow-sm);
   border: 1px solid var(--border);
@@ -1246,7 +1283,8 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
    标题层级与段落留白更舒展，全文常显、无需展开。短消息仍用气泡。 */
 .msg.msg-doc { max-width: 100%; }
 .bubble.doc {
-  width: 100%; max-width: var(--measure);
+  /* 面板收缩到内容宽度（短回复不会撑成大宽板），上限放宽到 --doc-wide 供宽内容破栏 */
+  width: fit-content; max-width: var(--doc-wide);
   background:
     radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 8px 8px,
     var(--bg-2);
@@ -1256,6 +1294,10 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
   font-size: calc(var(--text-body) * var(--rs, 1));
   line-height: var(--leading-prose);
 }
+/* 正文（段落/列表/引用/标题/分隔线）锁阅读行宽，保证可读；
+   表格 / 代码块 / 图片 / artifact 等结构化内容不受限，破栏吃满面板宽度 → 既增密又不伤可读 */
+.bubble.doc > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6, hr) { max-width: var(--measure); }
+.bubble.doc :where(h1, h2, h3) { scroll-margin-top: 16px; }
 .bubble.doc :where(h1,h2,h3,h4,h5,h6) { font-family: var(--font-display); margin: 24px 0 11px; line-height: var(--leading-snug); letter-spacing: -.005em; }
 .bubble.doc > :first-child { margin-top: 0; }
 .bubble.doc h1 { font-size: calc(var(--text-page-title) * var(--rs, 1)); padding-bottom: 9px; border-bottom: 2px solid var(--border-strong); }
@@ -1280,6 +1322,35 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .bubble.doc .md-table { margin: 16px 0; }
 .bubble.doc hr { margin: 22px 0; }
 
+/* ── 长文档大纲（.doc-toc）──────────────────────────────────────────────────────
+   长 doc 回复在右侧 gutter 给一个 sticky 标题大纲，把全屏空白变导航；
+   随滚动跟随，点击平滑跳到对应标题。窄屏自动隐藏（空间不足）。 */
+.doc-toc {
+  align-self: flex-start; position: sticky; top: 8px;
+  /* 固定一条可读的右侧导航槽：不再用 flex-basis:0 + min-width:0，
+     否则文档气泡变宽时整行溢出、TOC 被压成 min-content（单个汉字逐行堆叠）。
+     给定稳定宽度后，溢出时改由 .msg-body（min-width:0）让位、气泡重排。 */
+  flex: 0 0 auto; width: clamp(180px, 14vw, 232px); min-width: 180px;
+  margin-top: 34px; display: flex; flex-direction: column; gap: 2px;
+  border-left: 1px solid var(--border);
+}
+.doc-toc-label {
+  font-family: var(--font-mono); font-size: var(--text-label);
+  letter-spacing: .14em; text-transform: uppercase; color: var(--text-3);
+  padding: 0 0 6px 12px;
+}
+.doc-toc a {
+  font-size: var(--text-control); color: var(--text-2); text-decoration: none;
+  padding: 4px 10px 4px 12px; border-radius: 0 6px 6px 0; line-height: var(--leading-snug);
+  border-left: 2px solid transparent; margin-left: -1px; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.doc-toc a:hover { color: var(--ember); background: var(--ember-tint); border-left-color: var(--ember); }
+.doc-toc a.lvl-2 { padding-left: 22px; }
+.doc-toc a.lvl-3 { padding-left: 32px; font-size: var(--text-caption); color: var(--text-3); }
+@media (max-width: 1180px) { .doc-toc { display: none; } }
+
 /* ── 阅读模式（窗口内全屏）─────────────────────────────────────────────────────
    右键气泡「阅读模式」：把内容以文档流全屏铺开，可调字号。遮罩走 win-gutter
    并 14px 圆角，避免盖住圆角窗口的透明留白槽（见 DESIGN.md 窗口阴影机制）。 */
@@ -1302,7 +1373,7 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .reader-scroll { flex: 1; overflow-y: auto; padding: 36px 32px 64px; display: flex; justify-content: center; }
 /* 全屏阅读：去掉气泡卡的边框/限宽约束，铺成居中的“纸张”阅读列 */
 .bubble.doc.reader-doc {
-  max-width: calc(var(--measure) + 60px); border: none; box-shadow: none;
+  width: 100%; max-width: calc(var(--measure) + 60px); border: none; box-shadow: none;
   background: transparent; padding: 0; height: max-content;
 }
 
@@ -1392,7 +1463,8 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .typing i:nth-child(2){ animation-delay: .2s; } .typing i:nth-child(3){ animation-delay: .4s; }
 @keyframes blink { 0%,60%,100%{ opacity:.3; transform: translateY(0);} 30%{ opacity:1; transform: translateY(-3px);} }
 
-.composer { flex: none; padding: 12px 18px 16px; border-top: 1px solid var(--border); background: var(--bg-1); }
+/* 输入区与消息线程对齐同一居中带 */
+.composer { flex: none; padding: 12px max(18px, (100% - var(--thread-max)) / 2) 16px; border-top: 1px solid var(--border); background: var(--bg-1); }
 .composer-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
 .composer-quote {
   display: flex; align-items: center; gap: 7px; margin: 0 0 8px;
@@ -1403,6 +1475,24 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .composer-quote .quote-author { flex: none; font-weight: 700; color: var(--text); }
 .composer-quote .quote-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); }
 .composer-quote .icon-btn { width: 22px; height: 22px; flex: none; margin-left: auto; }
+.composer-quick-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-mono); font-size: var(--text-caption); font-weight: 600; letter-spacing: .02em;
+  padding: 4px 10px; border-radius: 99px;
+  border: 1px solid var(--border-strong); background: var(--bg-3); color: var(--text-2);
+  cursor: pointer; transition: background .12s, color .12s, border-color .12s;
+}
+.composer-quick-tag svg { width: 13px; height: 13px; color: var(--ember); }
+.composer-quick-tag:hover:not(:disabled) { background: var(--ember-tint); border-color: transparent; color: var(--ember); }
+.composer-quick-tag:disabled { opacity: .5; cursor: default; }
+/* 快捷 tag 进行中 / 完成回执：保持点亮，不走 disabled 的整体置灰。 */
+.composer-quick-tag.active,
+.composer-quick-tag.done { opacity: 1; background: var(--ember-tint); border-color: transparent; color: var(--ember); }
+.composer-quick-tag.done { color: var(--green-soft); background: rgba(79,157,107,.14); }
+.composer-quick-tag.done svg { color: var(--green-soft); }
+.spin { animation: spin .9s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+[data-motion="off"] .spin { animation: none; }
 .composer-pending { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 8px; }
 .composer-pending-item {
   display: inline-flex; align-items: center; gap: 6px; max-width: 178px;
@@ -1768,6 +1858,20 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .set-nav-item:hover { background: var(--surface-hover); color: var(--text); }
 .set-nav-item.active { background: var(--ember-tint); color: var(--ember); }
 .set-nav-item svg { width: 18px; height: 18px; }
+.set-nav-group {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 12px; margin: 14px 0 4px; border-radius: 8px; cursor: pointer;
+  font-family: var(--font-mono); font-size: var(--text-micro); font-weight: 700;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--text-3);
+  user-select: none; transition: background .12s, color .12s;
+}
+.set-nav-group:first-child { margin-top: 0; }
+.set-nav-group:hover { background: var(--surface-hover); color: var(--text-2); }
+.set-nav-group .set-nav-chevron {
+  margin-left: auto; flex: none; transition: transform .15s;
+  color: var(--text-faint);
+}
+.set-nav-group.collapsed .set-nav-chevron { transform: rotate(-90deg); }
 .set-nav-badge {
   margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
   display: grid; place-items: center; border-radius: 99px;

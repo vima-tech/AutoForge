@@ -53,3 +53,11 @@ pub struct WebhookStatus {
     pub running: bool,
     pub port: u16,
 }
+
+/// triage 整理结果：炼成正经需求数 / 判为噪音丢弃数 / 出错数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefineResult {
+    pub refined: u32,
+    pub discarded: u32,
+    pub errors: u32,
+}

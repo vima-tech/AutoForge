@@ -1,4 +1,6 @@
+pub mod agent_outputs;
 pub mod artifacts;
+pub mod asr;
 pub mod change_requests;
 pub mod intake;
 pub mod conversations;
