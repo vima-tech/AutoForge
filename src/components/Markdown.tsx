@@ -119,16 +119,21 @@ export default function Markdown({ md, highlight }: { md: string; highlight?: st
     } else if (ln.trim() === '') {
       i++;
     } else {
-      const buf: string[] = [];
-      const stop = (l: string) => l.trim() === '' || /^[#>\-*]|^\d+\.|\||^\s*(```|~~~)/.test(l);
+      // Paragraph. We only reach here because `ln` matched none of the block
+      // openers above (heading/list/blockquote all require a trailing space, the
+      // fence/table/hr their own shapes), so it is genuine prose — consume it
+      // unconditionally. `stop` then bounds how far the paragraph extends; using
+      // it to gate the *first* line would silently drop lines like `#tag` or
+      // `*.png` (hash/star without the space that makes them a block), which is
+      // exactly how a `#引用` chip's text used to vanish from the bubble.
+      const stop = (l: string) => l.trim() === '' || /^#{1,6}\s|^>\s?|^[-*]\s|^\d+\.\s|\||^\s*(```|~~~)/.test(l);
+      const buf: string[] = [renderInline(ln)];
+      i++;
       while (i < lines.length && !stop(lines[i])) {
         buf.push(renderInline(lines[i]));
         i++;
       }
-      // Safety: if nothing was consumed (stop matched immediately), skip the
-      // line to avoid an infinite loop on unrecognised patterns.
-      if (buf.length === 0) { i++; }
-      else blocks.push({ tag: 'p', html: buf.join('<br/>') });
+      blocks.push({ tag: 'p', html: buf.join('<br/>') });
     }
   }
 

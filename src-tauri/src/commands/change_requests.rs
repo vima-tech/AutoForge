@@ -89,25 +89,52 @@ pub async fn compute_worktree_diff(
     worktree_path: &str,
     branch_name: &str,
     target_branch: &str,
+    base_commit: Option<&str>,
 ) -> Option<String> {
     if !std::path::Path::new(worktree_path).exists() {
         return None;
     }
 
-    // Diff against the base branch *inside the worktree* — this surfaces the CR's
+    // Diff against the fork point *inside the worktree* — this surfaces the CR's
     // full contribution whether or not it has been committed yet. (Claude Code can't
     // run git, so changes may still be uncommitted; diffing the committed range in the
     // main repo would then return empty and the audit page would hang on "加载中…".)
     let wt_git = GitProxy::new(worktree_path);
-    if !target_branch.is_empty() {
-        // Diffing the working tree against the base branch captures the CR's full
+
+    // Prefer the immutable fork-point SHA recorded when the worktree was created.
+    // Diffing against the *moving* base branch (`target_branch`) instead means any
+    // commit that lands on dev after this worktree forked — e.g. a parallel batch
+    // touching the same files — leaks (inverted) into this CR's diff. The recorded
+    // base commit is exactly where the branch forked, so the diff stays scoped to
+    // the CR's own changes no matter how far dev advances. Empty is authoritative:
+    // the branch added nothing.
+    let recorded = base_commit.map(str::trim).filter(|s| !s.is_empty());
+    // For sessions predating base_commit (NULL), recover the fork point on the fly:
+    // `merge-base dev <branch>` is the common ancestor, i.e. where the branch forked.
+    // This retroactively un-pollutes old CRs' diffs without a data backfill.
+    let derived;
+    let base = if let Some(b) = recorded {
+        b
+    } else if !target_branch.is_empty() {
+        match wt_git.run(&["merge-base", target_branch, branch_name]).await {
+            Ok((0, out, _)) if !out.trim().is_empty() => {
+                derived = out.trim().to_string();
+                derived.as_str()
+            }
+            _ => target_branch,
+        }
+    } else {
+        target_branch
+    };
+    if !base.is_empty() {
+        // Diffing the working tree against the fork point captures the CR's full
         // contribution — committed or not. An *empty* result is authoritative:
         // the branch added nothing (e.g. a `no_change_needed` CR where the agent
         // made no commit), so return it verbatim. Falling through to the
         // `branch^1..branch` fallback here would instead surface the base
         // commit's own unrelated changes (showing spurious `/dev/null` additions
         // for a requirement that produced no real diff).
-        if let Ok((_code, stdout, _stderr)) = wt_git.run(&["diff", target_branch]).await {
+        if let Ok((_code, stdout, _stderr)) = wt_git.run(&["diff", base]).await {
             return Some(stdout);
         }
     }
@@ -147,8 +174,13 @@ pub async fn get_code_diff(cr_id: String, state: State<'_, AppState>) -> Result<
 
     // Live path: the worktree still exists (CR not yet merged / not torn down).
     // Prefer the live diff so in-flight, uncommitted edits show up immediately.
-    if let Some(diff) =
-        compute_worktree_diff(&session.worktree_path, &session.branch_name, &target_branch).await
+    if let Some(diff) = compute_worktree_diff(
+        &session.worktree_path,
+        &session.branch_name,
+        &target_branch,
+        session.base_commit.as_deref(),
+    )
+    .await
     {
         if !diff.is_empty() {
             return Ok(diff);

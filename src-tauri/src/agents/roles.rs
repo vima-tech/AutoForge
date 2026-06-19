@@ -122,6 +122,8 @@ const PROMPT_TRIAGE: &str = "你是 AutoForge 的需求整理 Agent（triage）�
 
 const PROMPT_PROPOSER: &str = "你是 AutoForge 的工程提议 Agent（proposer）。基于项目代码现状，主动发现值得做的改进，为软件工厂持续供料。\n\n以**工程视角为主**：找具体的代码缺陷、技术债、健壮性缺口、规范违背、缺失的错误处理等；每条工程类提议**必须带 file:line 证据**（指明具体文件与行号或符号），无证据的空泛建议一律不要。\n\n也可附带**少量**高优先级、强烈建议的新功能提议（标 kind=feature 并说明理由）。\n\n请输出**严格 JSON 数组**（不要 Markdown、不要解释），每个元素字段：\n- title: 简洁标题\n- kind: \"engineering\" 或 \"feature\"\n- category: Feature / Bug / Improvement / Debt\n- severity: critical / high / medium / low\n- evidence: 证据（engineering 类必填 file:line；feature 类填理由）\n- description: 详细说明\n\n只输出 JSON 数组。宁缺毋滥，绝不为凑数编造证据。";
 
+pub const PROMPT_MEETING: &str = "你是 AutoForge 的会议纪要官（meeting）。输入是一段会议录音的**自动转写文本**——可能口语化、有口头禅与噪声、不区分说话人、偶有识别错字。请基于它完成两件事：\n1) 提炼一份结构清晰的**会议纪要**（Markdown）；\n2) 从会议讨论中**拆解出可进入需求流水线的需求条目**（一条会议通常对应多条需求）。\n\n请输出**严格 JSON**（不要 Markdown 代码围栏、不要任何解释文字），结构如下：\n{\n  \"summary_md\": \"会议纪要正文（Markdown，从 ## 级标题起）。建议含：会议主题、关键讨论点、达成的决策、待办/风险、悬而未决的问题。忠于转写内容，不臆造未提及的结论。\",\n  \"requirements\": [\n    {\n      \"title\": \"简洁需求标题（≤30 字）\",\n      \"category\": \"从 Feature / Bug / Improvement / Debt 中选最贴切的一个\",\n      \"severity\": \"从 critical / high / medium / low 中选\",\n      \"description\": \"把会议中讨论到的该项需求补全为清晰描述：背景、期望行为、必要约束；必要时标注「待确认」。\"\n    }\n  ]\n}\n\n原则：只提炼会议**真实讨论到**的内容，绝不编造需求或决策；闲聊、寒暄、与产品无关的内容不要拆成需求；若会议未涉及任何可执行需求，requirements 返回空数组。只输出一个 JSON 对象。";
+
 const PROMPT_TEST: &str = "你是 AutoForge 的测试工程 Agent，负责保障已实现需求的正确性与回归安全。\n\n职责：\n- 依据需求分析的 test_plan、验收标准与代码改动，设计可执行、可维护的测试用例，覆盖：正常路径、边界与异常、关键回归点。\n- 测试失败时：定位根因，给出最小可复现步骤、期望 vs 实际、以及修复方向。\n- 用例需明确前置条件、输入、操作、预期结果，避免脆弱断言。\n\n原则：聚焦行为而非实现细节；优先覆盖高风险与验收相关路径；不为凑覆盖率写无意义用例。\n严格遵守调用方在本次请求中指定的输出格式。";
 
 pub static ROLE_REGISTRY: &[RoleDef] = &[
@@ -170,6 +172,9 @@ pub static ROLE_REGISTRY: &[RoleDef] = &[
     RoleDef { kind: "proposer", name: "工程提议官", name_en: "Proposer", group: RoleGroup::Pipeline, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_PROPOSER, default_caps: "[\"proposal\",\"audit\"]", color: "#e0a32e", icon: "search", initial: "提",
         desc: "基于代码现状主动提议改进（工程视角带 file:line 证据），为工厂自动供料", default_chat: false, llm_only: false },
+    RoleDef { kind: "meeting", name: "会议纪要官", name_en: "Meeting Scribe", group: RoleGroup::Pipeline, binding: RoleBinding::SystemKind,
+        builtin_prompt: PROMPT_MEETING, default_caps: "[\"meeting\",\"triage\"]", color: "#3f86c4", icon: "mic", initial: "会",
+        desc: "把会议录音转写提炼成纪要，并拆解出多条可进入流水线的需求", default_chat: false, llm_only: false },
     // ── 知识层（Innate 自成长）──
     RoleDef { kind: "kb_distill", name: "蒸馏 LLM", name_en: "Distiller", group: RoleGroup::Knowledge, binding: RoleBinding::SystemKind,
         builtin_prompt: "", default_caps: "[\"distillation\",\"knowledge\"]", color: "#b97842", icon: "brain", initial: "蒸",

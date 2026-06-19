@@ -1,53 +1,92 @@
-//! 语音转写命令：薄包装（取 state → 调纯 async fn → 返回）。
+//! 语音识别命令：薄包装（取 state → 调纯 async fn → 返回）。
 //!
-//! 前端用 MediaRecorder 录音得到音频 blob，base64 经 IPC 传入；后端解码 → 调
-//! `agents::asr::transcribe` → 转写文本过 `has_obvious_injection` 后返回。
-//! 密钥不出 webview，留在后端配置里。
+//! 全部语音识别（实时麦克风 + 会议录音上传）统一收敛到**阿里百炼 DashScope 实时 WS**
+//! （`core/asr_realtime.rs`）：
+//!   - `asr_realtime_*`：实时麦克风边说边出字（事件回推）；
+//!   - `transcribe_recording_segment`：会议录音整段转写（收集模式，返回完整文本）。
+//! 密钥不出 webview，留在后端配置里。转写文本是不可信外部输入，过 `has_obvious_injection`。
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::core::asr_realtime::AsrCtl;
 use crate::state::AppState;
 
-/// 单条音频上限 25MB（与 OpenAI 一致），防止超大 base64 经 IPC。
-const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+/// 单段音频上限 25MB，防止超大 base64 经 IPC（前端已按时长切段，单段远小于此）。
+const MAX_SEGMENT_BYTES: usize = 25 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TranscribeResult {
-    pub text: String,
-}
-
+/// 转写一整段 16kHz/单声道/16bit 小端 PCM（base64），经 DashScope 实时 WS 收集完整文本。
+/// 会议录音上传的长音频由前端切成多段、逐段调用本命令后拼接。
 #[tauri::command]
-pub async fn transcribe_audio(
-    audio_base64: String,
-    mime: Option<String>,
+pub async fn transcribe_recording_segment(
+    pcm_base64: String,
     state: State<'_, AppState>,
-) -> Result<TranscribeResult, String> {
+) -> Result<String, String> {
     let bytes = B64
-        .decode(audio_base64.trim())
+        .decode(pcm_base64.trim())
         .map_err(|e| format!("音频 base64 解码失败：{}", e))?;
     if bytes.is_empty() {
-        return Err("音频为空".to_string());
+        return Err("音频段为空".to_string());
     }
-    if bytes.len() > MAX_AUDIO_BYTES {
-        return Err("音频超过 25MB 上限，请缩短录音".to_string());
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err("音频段过大，请减小分段时长".to_string());
     }
 
-    let mime = mime.unwrap_or_else(|| "audio/webm".to_string());
-    let (filename, mime) = normalize_audio_kind(&mime);
+    let text = crate::core::asr_realtime::transcribe_segment(&state.db, bytes).await?;
 
-    let cfg = crate::agents::asr::AsrConfig::load(&state.db).await;
-    let text = crate::agents::asr::transcribe(&cfg, bytes, filename, mime)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if crate::core::security::has_obvious_injection(&text) {
+    if !text.is_empty() && crate::core::security::has_obvious_injection(&text) {
         return Err("转写文本包含可疑内容，已拒绝".to_string());
     }
+    Ok(text)
+}
 
-    Ok(TranscribeResult { text })
+/// 原始录音文件上限 100MB（前端 WebView 解码失败时的后端兜底入口；压缩音频远小于此）。
+const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
+/// 后端解码后按 240s 分段送 WS（与前端分段一致，避免单个实时任务过长）。
+const SEGMENT_SAMPLES: usize = 240 * 16000;
+
+/// 兜底入口：当浏览器 WebView 解不出某音频格式时，前端把**原始文件字节**(base64) 交后端，
+/// 用 symphonia 内置解码（mp3/m4a-aac/wav/flac/ogg-vorbis）→ 16k 单声道 PCM → 分段经
+/// DashScope 实时 WS 转写 → 拼接完整文本。`mime` 作格式探测提示。
+#[tauri::command]
+pub async fn transcribe_recording_file(
+    file_base64: String,
+    mime: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let bytes = B64
+        .decode(file_base64.trim())
+        .map_err(|e| format!("文件 base64 解码失败：{}", e))?;
+    if bytes.is_empty() {
+        return Err("音频文件为空".to_string());
+    }
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err("音频文件超过 100MB，请压缩或分割后再上传".to_string());
+    }
+
+    // 解码 CPU 密集，放 blocking 线程。
+    let pcm = tokio::task::spawn_blocking(move || {
+        crate::core::audio_decode::decode_to_pcm16k_mono(&bytes, mime.as_deref())
+    })
+    .await
+    .map_err(|e| format!("解码任务失败：{}", e))??;
+
+    let mut out = String::new();
+    for seg in pcm.chunks(SEGMENT_SAMPLES) {
+        let frame = crate::core::audio_decode::i16_to_le_bytes(seg);
+        let text = crate::core::asr_realtime::transcribe_segment(&state.db, frame).await?;
+        if !text.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&text);
+        }
+    }
+
+    if !out.is_empty() && crate::core::security::has_obvious_injection(&out) {
+        return Err("转写文本包含可疑内容，已拒绝".to_string());
+    }
+    Ok(out)
 }
 
 // ── 实时语音识别（阿里 DashScope 流式）────────────────────────────────────────
@@ -90,18 +129,4 @@ pub async fn asr_realtime_stop(
         let _ = tx.send(AsrCtl::Finish);
     }
     Ok(())
-}
-
-/// 由前端 MIME 映射出 OpenAI 可识别的文件名与归一 MIME。
-fn normalize_audio_kind(mime: &str) -> (&'static str, &'static str) {
-    let m = mime.split(';').next().unwrap_or(mime).trim();
-    match m {
-        "audio/webm" => ("audio.webm", "audio/webm"),
-        "audio/ogg" | "audio/opus" => ("audio.ogg", "audio/ogg"),
-        "audio/wav" | "audio/x-wav" | "audio/wave" => ("audio.wav", "audio/wav"),
-        "audio/mpeg" | "audio/mp3" => ("audio.mp3", "audio/mpeg"),
-        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => ("audio.mp4", "audio/mp4"),
-        "audio/flac" => ("audio.flac", "audio/flac"),
-        _ => ("audio.webm", "audio/webm"),
-    }
 }

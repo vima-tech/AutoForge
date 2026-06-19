@@ -15,7 +15,8 @@ import QuickCapture from './components/QuickCapture';
 import OperatorPanel from './components/OperatorPanel';
 import { loadOperator } from './operator';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, type SystemHealth } from './services';
-import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, parseQuickCaptureShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
+import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
+import { triggerVoiceInput } from './lib/voiceInput';
 
 type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
 
@@ -104,8 +105,13 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 
 export default function App() {
   const [showQuick, setShowQuick] = useState(false);
+  // 经语音快捷键兜底打开速录念头时置真，让速录面板挂载后自动起录。
+  const [quickAutoVoice, setQuickAutoVoice] = useState(false);
   const [quickShortcut, setQuickShortcut] = useState<QuickCaptureShortcut>(
     () => parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)),
+  );
+  const [voiceShortcut, setVoiceShortcut] = useState<QuickCaptureShortcut>(
+    () => parseVoiceInputShortcut(localStorage.getItem(VOICE_INPUT_SHORTCUT_KEY)),
   );
   const [showOperator, setShowOperator] = useState(false);
   const [notifUnread, setNotifUnread] = useState(0);
@@ -172,7 +178,10 @@ export default function App() {
 
   // Re-read the quick-capture shortcut whenever Settings changes it (live, no reload).
   useEffect(() => {
-    const reread = () => setQuickShortcut(parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)));
+    const reread = () => {
+      setQuickShortcut(parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)));
+      setVoiceShortcut(parseVoiceInputShortcut(localStorage.getItem(VOICE_INPUT_SHORTCUT_KEY)));
+    };
     window.addEventListener(SHORTCUT_CHANGED_EVENT, reread);
     return () => window.removeEventListener(SHORTCUT_CHANGED_EVENT, reread);
   }, []);
@@ -185,11 +194,30 @@ export default function App() {
       if (e.repeat) return;
       if (!comboMatchesEvent(quickShortcut.combo, e)) return;
       e.preventDefault();
+      setQuickAutoVoice(false);
       setShowQuick(true);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [quickShortcut]);
+
+  // Global hotkey → toggle voice input on whichever live-voice surface is active
+  // (会议室 Composer / 速录念头…). If none is mounted, fall back to opening 速录念头
+  // and auto-starting its recording, so the key always does *something* voice-related.
+  useEffect(() => {
+    if (!voiceShortcut.enabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (!comboMatchesEvent(voiceShortcut.combo, e)) return;
+      e.preventDefault();
+      if (!triggerVoiceInput()) {
+        setQuickAutoVoice(true);
+        setShowQuick(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [voiceShortcut]);
 
   // Auth check intentionally removed: spawning the claude Electron subprocess
   // at any point while WebKitGTK is active delivers SIGTRAP to our process,
@@ -407,7 +435,7 @@ export default function App() {
         {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
-      {showQuick && <QuickCapture onClose={() => setShowQuick(false)} />}
+      {showQuick && <QuickCapture autoVoice={quickAutoVoice} onClose={() => { setShowQuick(false); setQuickAutoVoice(false); }} />}
       {showOperator && (
         <OperatorPanel
           onClose={() => setShowOperator(false)}

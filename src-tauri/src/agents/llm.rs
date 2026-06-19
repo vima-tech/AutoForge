@@ -4,7 +4,7 @@ use crate::models::llm_config::LlmConfig;
 use anyhow::{anyhow, Result};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// 工具循环最大轮数，防止模型无限调用工具。每轮 = 一次模型调用 + 一批工具执行。
@@ -56,17 +56,102 @@ pub async fn run_agent_text(
         return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
     }
 
-    if !image_paths.is_empty() {
-        return Err(anyhow!(
-            "当前 LLM 适配器暂不支持图片输入，请改用 Claude CLI 或移除图片附件"
-        ));
-    }
+    // 多模态：仅当 LLM 配置显式标记 supports_vision 时才把图片内联进请求。未标记的
+    // LLM（含纯文本模型）静默忽略图片、按纯文本处理——上下文快照里仍有「[图片: …]」描述，
+    // 不会因附带图片而让整轮对话失败（健壮性优先于报错）。
+    let images = if image_paths.is_empty() {
+        Vec::new()
+    } else if cfg.supports_vision {
+        let loaded = load_images_b64(image_paths).await;
+        if loaded.is_empty() {
+            eprintln!(
+                "[vision] LLM「{}」标记支持多模态，但 {} 张图片均读取失败/超限，按纯文本处理",
+                cfg.name,
+                image_paths.len()
+            );
+        }
+        loaded
+    } else {
+        eprintln!(
+            "[vision] LLM「{}」未标记支持多模态，忽略 {} 张图片附件，按纯文本处理",
+            cfg.name,
+            image_paths.len()
+        );
+        Vec::new()
+    };
 
     // 接口规范唯一真源：仅 openai、anthropic 两种 wire 格式，其余按 openai 处理。
     match cfg.api_spec.to_ascii_lowercase().as_str() {
-        "anthropic" => run_anthropic(&cfg, prompt, system_prompt).await,
-        _ => run_openai_compatible(&cfg, prompt, system_prompt).await,
+        "anthropic" => run_anthropic(&cfg, prompt, system_prompt, &images).await,
+        _ => run_openai_compatible(&cfg, prompt, system_prompt, &images).await,
     }
+}
+
+/// 读取图片文件为 `(mime, base64)` 列表，跳过读取失败 / 超过 10MB 的项。供多模态 LLM 内联图片。
+async fn load_images_b64(paths: &[PathBuf]) -> Vec<(String, String)> {
+    use base64::{engine::general_purpose, Engine as _};
+    const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+    let mut out = Vec::new();
+    for p in paths {
+        let bytes = match tokio::fs::read(p).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[vision] 读取图片失败 {:?}: {}", p, e);
+                continue;
+            }
+        };
+        if bytes.len() > MAX_IMAGE_BYTES {
+            eprintln!("[vision] 图片超过 10MB 上限，跳过 {:?}", p);
+            continue;
+        }
+        out.push((guess_image_mime(p), general_purpose::STANDARD.encode(&bytes)));
+    }
+    out
+}
+
+/// 由扩展名推断图片 MIME（兼容 OpenAI / Anthropic 多模态接口），未知按 png 兜底。
+fn guess_image_mime(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/png",
+    }
+    .to_string()
+}
+
+/// 把用户文本与可选图片组装成 OpenAI 多模态 content：无图片时退化为纯字符串。
+fn openai_user_content(prompt: &str, images: &[(String, String)]) -> Value {
+    if images.is_empty() {
+        return json!(prompt);
+    }
+    let mut arr = vec![json!({ "type": "text", "text": prompt })];
+    for (mime, b64) in images {
+        arr.push(json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:{};base64,{}", mime, b64) }
+        }));
+    }
+    json!(arr)
+}
+
+/// 把用户文本与可选图片组装成 Anthropic 多模态 content：无图片时退化为纯字符串。
+fn anthropic_user_content(prompt: &str, images: &[(String, String)]) -> Value {
+    if images.is_empty() {
+        return json!(prompt);
+    }
+    let mut arr = vec![json!({ "type": "text", "text": prompt })];
+    for (mime, b64) in images {
+        arr.push(json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": mime, "data": b64 }
+        }));
+    }
+    json!(arr)
 }
 
 /// 带工具调用循环的文本生成。`registry` 应已按 Agent 白名单收窄（见
@@ -257,13 +342,14 @@ async fn run_openai_compatible(
     cfg: &LlmConfig,
     prompt: &str,
     system_prompt: Option<&str>,
+    images: &[(String, String)],
 ) -> Result<String> {
     let client = http_client()?;
     let mut messages = Vec::new();
     if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
         messages.push(serde_json::json!({ "role": "system", "content": system }));
     }
-    messages.push(serde_json::json!({ "role": "user", "content": prompt }));
+    messages.push(serde_json::json!({ "role": "user", "content": openai_user_content(prompt, images) }));
 
     let mut req = client
         .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
@@ -276,7 +362,12 @@ async fn run_openai_compatible(
         req = req.bearer_auth(&cfg.api_key);
     }
 
-    let req_input = serde_json::to_string(&messages).unwrap_or_default();
+    // 图片 base64 体积巨大，trace 入参里只记文本 + 图片张数，避免 llm_traces 被撑爆。
+    let req_input = if images.is_empty() {
+        serde_json::to_string(&messages).unwrap_or_default()
+    } else {
+        format!("{} [+{} 张图片(base64 已省略)]", prompt, images.len())
+    };
     let t0 = std::time::Instant::now();
     let body = match send_json(req).await {
         Ok(b) => b,
@@ -310,11 +401,12 @@ async fn run_anthropic(
     cfg: &LlmConfig,
     prompt: &str,
     system_prompt: Option<&str>,
+    images: &[(String, String)],
 ) -> Result<String> {
     let client = http_client()?;
     let mut body = serde_json::json!({
         "model": cfg.model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": anthropic_user_content(prompt, images)}],
         "max_tokens": 4096,
         "temperature": cfg.temperature
     });
@@ -322,7 +414,12 @@ async fn run_anthropic(
         body["system"] = Value::String(system.to_string());
     }
 
-    let req_input = serde_json::to_string(&body).unwrap_or_default();
+    // 图片 base64 体积巨大，trace 入参里只记文本 + 图片张数，避免 llm_traces 被撑爆。
+    let req_input = if images.is_empty() {
+        serde_json::to_string(&body).unwrap_or_default()
+    } else {
+        format!("{} [+{} 张图片(base64 已省略)]", prompt, images.len())
+    };
     let t0 = std::time::Instant::now();
     let value = match send_json(
         client

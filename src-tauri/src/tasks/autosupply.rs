@@ -6,10 +6,26 @@
 //! - proposer 默认关，需显式开启。
 //! - 产物经 `gateway::receive` 落库，复用其去重 + `has_obvious_injection` 过滤。
 
+use crate::core::event::{emit, AppEvent};
 use crate::db::Db;
 use crate::intake::{gateway, proposer, scanner, IntakeMode};
 use crate::tasks::runner::JobSender;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::AppHandle;
+
+/// RAII 守卫：进入一轮自喂料时置位 + 广播「运行中」，离开（含 panic 提前返回）时
+/// 复位 + 广播「已结束」，确保前端回显不会因异常路径而卡在「运行中」。
+struct RunGuard<'a> {
+    running: &'a AtomicBool,
+    app: &'a AppHandle,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        emit(self.app, AppEvent::AutosupplyStatus { running: false });
+    }
+}
 
 /// 自喂料配置（存 app_settings，键前缀 autosupply.*）。
 #[derive(Debug, Clone)]
@@ -89,7 +105,15 @@ pub async fn run_cycle(
     job_tx: &JobSender,
     app: &AppHandle,
     cfg: &AutosupplyConfig,
+    running: &AtomicBool,
 ) -> CycleStats {
+    // 已有一轮在跑（手动与周期调度共用此标志）→ 直接返回，避免并发重复供料。
+    if running.swap(true, Ordering::SeqCst) {
+        return CycleStats::default();
+    }
+    emit(app, AppEvent::AutosupplyStatus { running: true });
+    let _guard = RunGuard { running, app };
+
     let projects = sqlx::query_as::<_, (String, String)>(
         "SELECT id, repo_path FROM projects WHERE status='active'",
     )

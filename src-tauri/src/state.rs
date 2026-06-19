@@ -20,6 +20,9 @@ pub struct AppState {
     pub asr_sessions: Arc<
         Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::core::asr_realtime::AsrCtl>>>,
     >,
+    /// 是否正有一轮自喂料在跑（手动「立即跑一轮」或周期调度共用）。状态真源在后端，
+    /// 前端切页重挂载后查询此标志恢复回显，并据 `AutosupplyStatus` 事件实时跟随。
+    pub autosupply_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static WORKTREES_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

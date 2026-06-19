@@ -66,6 +66,8 @@ pub fn run() {
             let job_tx = tasks::runner::start(db.clone(), app_handle.clone(), concurrency.clone());
 
             let webhook_handle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+            let autosupply_running =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             app.manage(AppState {
                 db: db.clone(),
@@ -78,6 +80,7 @@ pub fn run() {
                 asr_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
+                autosupply_running: autosupply_running.clone(),
             });
 
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
@@ -112,6 +115,7 @@ pub fn run() {
             let db_for_supply = db.clone();
             let tx_for_supply = job_tx.clone();
             let app_for_supply = app_handle.clone();
+            let running_for_supply = autosupply_running.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
@@ -124,6 +128,7 @@ pub fn run() {
                             &tx_for_supply,
                             &app_for_supply,
                             &cfg,
+                            &running_for_supply,
                         )
                         .await;
                     }
@@ -269,6 +274,7 @@ pub fn run() {
             commands::intake::reject_issues,
             commands::intake::run_proposer,
             commands::intake::run_autosupply_now,
+            commands::intake::autosupply_is_running,
             commands::settings::get_autosupply_settings,
             commands::settings::set_autosupply_settings,
             commands::settings::get_autonomy_level,
@@ -334,10 +340,13 @@ pub fn run() {
             commands::notifications::mark_all_notifications_read,
             commands::settings::get_asr_settings,
             commands::settings::set_asr_settings,
-            commands::asr::transcribe_audio,
+            commands::asr::transcribe_recording_segment,
+            commands::asr::transcribe_recording_file,
             commands::asr::asr_realtime_start,
             commands::asr::asr_realtime_feed,
             commands::asr::asr_realtime_stop,
+            commands::meetings::analyze_meeting,
+            commands::meetings::save_meeting_doc,
             commands::settings::list_builtin_tools,
             commands::trace::list_llm_traces,
             commands::trace::get_llm_trace,

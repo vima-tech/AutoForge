@@ -1,0 +1,190 @@
+{
+  "meta": {
+    "title": "并发合并冲突解决 — 串行合并 + 自动 rebase + AI 解冲突 任务清单",
+    "plan_ref": ".autoforge/docs/待实现功能/AutoForge-并发合并冲突解决-功能提案.md",
+    "created": "2026-06-19",
+    "status": "待实施（方案已评审锁定）",
+    "decisions": [
+      "L0 串行：按 project_id 串行合并，跨项目并行（无条件先修，竞态 bug）",
+      "L1 默认 A：合并前 git merge <dev> 入 CR 分支（非 rebase）+ git rerere + 重测",
+      "B 保留：merge_conflict 态的手动「AI 解冲突并合并」按钮",
+      "自动 B 开关与「跳过人工审核」(门控降级) 开关并排放 Settings 门控降级面板",
+      "新增状态 merge_conflict，区别于 merge_failed"
+    ],
+    "migration_note": "下一序号 0049（0048 已被 worktree base_commit 占用）；CR/issue status 字段无 CHECK 约束，可自由加 merge_conflict",
+    "global_constraints": [
+      "迁移仅追加不改已有；下一序号 0049",
+      "新增 command 四步：commands/<m>.rs → mod.rs 导出 → lib.rs invoke_handler 注册 → services/index.ts 封装；前端禁直接 invoke",
+      "业务逻辑零 Tauri 类型（tasks/core/state 新字段为纯类型）；事件只走 core/event::emit(AppEvent)，新增 MergeConflict 变体",
+      "command 保持薄包装：取 state → 调纯 async fn → 返回",
+      "所有 git 操作走 GitProxy；合并唯一入口仍是 review_2 approved / 门控放行，B 路径必经 review_2 复审",
+      "AI 解冲突产出回灌前过 core/security::has_obvious_injection()",
+      "前端只用 src/index.css CSS 变量，禁硬编码色值/px；图标走 <Icon/>；下拉用 proj-select+mention-pop；每屏 ≤1 主按钮",
+      "涉及 IPC/窗口/文件的功能须在 npm run tauri:dev 完整环境验证"
+    ],
+    "verify_default": "cargo build (src-tauri) 通过 + npm run tauri:dev 手动走查相关交互",
+    "execution_order": "P0-1 → P1-1..P1-3 → P2-1..P2-3 → P3-1..P3-4；标 depends_on 的须前置完成"
+  },
+  "phases": [
+    {
+      "id": "P0",
+      "name": "串行合并（修竞态）",
+      "goal": "同项目合并严格串行，消除并发踩 dev 工作树",
+      "tasks": [
+        {
+          "id": "P0-1",
+          "title": "按 project_id 的合并互斥锁",
+          "intent": "纯 bug 修，可独立验证",
+          "desc": "state.rs 的 AppState 加纯字段 merge_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>；merge.rs::run 加载 cr/project 后按 project_id get-or-insert 取该项目 tokio::Mutex，acquire 后再进入 rebase+测试+land 全流程，函数结束自动释放。",
+          "creates": [],
+          "edits": ["src-tauri/src/state.rs", "src-tauri/src/tasks/merge.rs"],
+          "depends_on": [],
+          "acceptance": "两个同项目 pending_merge CR 不并发 checkout dev；跨项目仍并行",
+          "verify": "cargo build + 构造两 CR 并发观测日志/工作树状态",
+          "ref": "runner.rs:28 每 job 独立 spawn；merge.rs:34 land_on_dev 快路径"
+        }
+      ]
+    },
+    {
+      "id": "P1",
+      "name": "方案 A：合并前自动 merge-dev + 重测",
+      "goal": "落地前并入 dev 并重测，自动消化假冲突；真冲突保留现场",
+      "tasks": [
+        {
+          "id": "P1-1",
+          "title": "迁移 0049：merge_conflict 数据模型",
+          "intent": "为状态/现场/开关备好存储",
+          "desc": "新增 0049_merge_conflict.sql：app_settings 预留键 auto_conflict_resolve_enabled（应用层默认 false，可不插初值）；worktree_sessions 加列 conflict_files TEXT、conflict_diff TEXT。models/worktree.rs 的 WorktreeSession 同步加两字段（Option<String>）。",
+          "creates": ["src-tauri/migrations/0049_merge_conflict.sql"],
+          "edits": ["src-tauri/src/models/worktree.rs"],
+          "depends_on": [],
+          "acceptance": "迁移幂等执行；SELECT * worktree_sessions 能映射新列",
+          "verify": "cargo build + 启动跑迁移",
+          "ref": "0048_worktree_base_commit.sql 同款 ALTER；gate.rs:16/26 app_settings KV 范式"
+        },
+        {
+          "id": "P1-2",
+          "title": "merge.rs：自动 merge-dev + rerere + 冲突落库",
+          "intent": "A 的核心",
+          "desc": "持锁中、land_on_dev 之前：fetch origin <dev> 定 dev ref；worktree 内 git config rerere.enabled true；git merge <devref>。干净→进 P1-3 重测→land_on_dev。冲突→ls-files -u/diff 取冲突文件+带标记快照写 conflict_files/conflict_diff→merge --abort→置 CR/issue merge_conflict；若 auto_conflict_resolve_enabled 则转 P3-3，否则停。新增 AppEvent::MergeConflict 并 emit。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs", "src-tauri/src/core/event.rs"],
+          "depends_on": ["P0-1", "P1-1"],
+          "acceptance": "改同一文件的两 CR：先合成功；后合自动 merge-dev，干净则合、冲突则置 merge_conflict 且现场已记录",
+          "verify": "构造冲突/非冲突两组 CR 走 npm run tauri:dev",
+          "ref": "merge.rs land_on_dev / merge --abort；change_requests.rs::compute_worktree_diff base_commit 同源思路"
+        },
+        {
+          "id": "P1-3",
+          "title": "集成后重测（best-effort）",
+          "intent": "merge-dev 后产出是新代码，需轻量校验",
+          "desc": "merge-dev 干净后，用 run_config::effective_config / core/stack 画像里的测试命令在 worktree 跑；无配置则跳过。失败→置 merge_conflict（原因『集成后测试失败』），不落地。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs"],
+          "depends_on": ["P1-2"],
+          "acceptance": "配了测试命令的项目：集成后测试失败则不落 dev、置 merge_conflict；未配则正常落地",
+          "verify": "在带/不带测试命令的项目各走一遍",
+          "ref": "commands/run_config.rs effective_config；core/stack.rs 默认命令；merge.rs:376 测试为执行期自跑的注释"
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "name": "人工兜底 UI（审核页）",
+      "goal": "冲突可视、可一键重试，人不被报错文本淹没",
+      "tasks": [
+        {
+          "id": "P2-1",
+          "title": "后端命令 get_merge_conflict / retry_merge",
+          "intent": "薄包装 + 下层纯 async fn",
+          "desc": "change_requests.rs 加 get_merge_conflict(cr_id)->{files,diff}（读 conflict_files/conflict_diff）与 retry_merge(cr_id)（重新入队 JobPayload::Merge，走 P1 流程）。mod.rs 导出、lib.rs 注册。",
+          "creates": [],
+          "edits": ["src-tauri/src/commands/change_requests.rs", "src-tauri/src/lib.rs"],
+          "depends_on": ["P1-2"],
+          "acceptance": "命令可取冲突现场；retry 后 CR 重新进入合并流程",
+          "verify": "cargo build + 手动调用",
+          "ref": "change_requests.rs:376 JobPayload::Merge 入队范式"
+        },
+        {
+          "id": "P2-2",
+          "title": "services 封装 + 状态映射同步",
+          "intent": "前端禁直接 invoke",
+          "desc": "services/index.ts 加 getMergeConflict/retryMerge 封装。Audit.tsx 状态映射加 merge_conflict（label「合并冲突」、color amber、STATUS_ORDER/FAILED_STATUSES，行 52/65/71/74/483/487）；Dashboard.tsx:24/39 同步。",
+          "creates": [],
+          "edits": ["src/services/index.ts", "src/pages/Audit.tsx", "src/pages/Dashboard.tsx"],
+          "depends_on": ["P2-1"],
+          "acceptance": "merge_conflict 态在审核页/总览正确显示标签与色",
+          "verify": "npm run tauri:dev 走查",
+          "ref": "Audit.tsx:52/65/71/74/483/487 现有 merge_failed 映射"
+        },
+        {
+          "id": "P2-3",
+          "title": "三方冲突视图 + 重试按钮",
+          "intent": "复用既有 diff 渲染与 .panel",
+          "desc": "Audit.tsx merge_conflict 态详情区渲染冲突文件列表 + 带标记 diff（三方视图），加「重试合并」按钮调 retryMerge。只用 CSS 变量、<Icon>，每屏 ≤1 主按钮。",
+          "creates": [],
+          "edits": ["src/pages/Audit.tsx"],
+          "depends_on": ["P2-2"],
+          "acceptance": "冲突态能看到冲突文件与内容，点重试触发重新合并",
+          "verify": "npm run tauri:dev 制造冲突后走查",
+          "ref": "Audit.tsx 现有 diff 渲染组件；DESIGN.md 组件规范"
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "name": "方案 B：手动 AI 解冲突 + 自动开关",
+      "goal": "可选 AI 自动解冲突，必经审核 2 复审兜底",
+      "tasks": [
+        {
+          "id": "P3-1",
+          "title": "gate.rs 自动开关读写",
+          "intent": "镜像 auto_pass_enabled",
+          "desc": "core/gate.rs 加 auto_conflict_resolve_enabled(db)->bool 与 set_auto_conflict_resolve_enabled(db,bool)，读写 app_settings key=auto_conflict_resolve_enabled，OFF 默认。",
+          "creates": [],
+          "edits": ["src-tauri/src/core/gate.rs"],
+          "depends_on": ["P1-1"],
+          "acceptance": "set 后 get 正确回显；默认 false",
+          "verify": "cargo build + 单测",
+          "ref": "gate.rs:16/26 auto_pass_enabled/set_auto_pass_enabled"
+        },
+        {
+          "id": "P3-2",
+          "title": "命令 get/set_auto_conflict_resolve_enabled",
+          "intent": "四步齐全",
+          "desc": "commands/grading.rs（或 settings.rs）加 get/set_auto_conflict_resolve_enabled 薄包装；lib.rs 注册；services/index.ts 封装 getAutoConflictResolveEnabled/setAutoConflictResolveEnabled。",
+          "creates": [],
+          "edits": ["src-tauri/src/commands/grading.rs", "src-tauri/src/lib.rs", "src/services/index.ts"],
+          "depends_on": ["P3-1"],
+          "acceptance": "前端可读写开关状态",
+          "verify": "cargo build + npm run tauri:dev",
+          "ref": "grading.rs:27 get/set_auto_pass_enabled 范式"
+        },
+        {
+          "id": "P3-3",
+          "title": "ai_resolve_conflict：worktree 内 AI 解冲突",
+          "intent": "B 的核心，必经复审",
+          "desc": "新增逻辑（commands/change_requests.rs 命令 + tasks 下层 fn）：worktree 重做 dev-merge→把 conflict_diff+两边意图喂 code_agent 消解→产出过 has_obvious_injection()→git add+commit→复跑测试→置 pending_review_2 回审核 2，不直接落 dev。手动按钮与 P1-2 自动开关共用此路径。",
+          "creates": [],
+          "edits": ["src-tauri/src/commands/change_requests.rs", "src-tauri/src/tasks/merge.rs", "src-tauri/src/lib.rs"],
+          "depends_on": ["P1-2", "P3-1"],
+          "acceptance": "冲突 CR 经 AI 解冲突后回到 pending_review_2，复审通过才落 dev",
+          "verify": "制造冲突→触发 AI 解→确认回审核 2",
+          "ref": "agents/code_agent.rs run；execution.rs review_2/门控范式；core/security::has_obvious_injection"
+        },
+        {
+          "id": "P3-4",
+          "title": "前端：门控面板开关 + 审核页 AI 解冲突按钮",
+          "intent": "开关与跳过审核并排",
+          "desc": "Settings.tsx 门控降级面板（:1906 panel 内）新增并排 toggle「冲突时自动 AI 解冲突合并」，绑 P3-2 命令，沿用 autoPassOn toggle 写法与 .panel-head/chip/btn-sm。Audit.tsx merge_conflict 态加「AI 解冲突并合并」按钮调 ai_resolve_conflict。",
+          "creates": [],
+          "edits": ["src/pages/Settings.tsx", "src/pages/Audit.tsx"],
+          "depends_on": ["P3-2", "P3-3", "P2-3"],
+          "acceptance": "开关可切换并持久化；冲突态按钮触发 AI 解冲突",
+          "verify": "npm run tauri:dev 走查开关与按钮",
+          "ref": "Settings.tsx:1906-1918 门控降级 toggle"
+        }
+      ]
+    }
+  ]
+}

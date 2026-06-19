@@ -37,19 +37,20 @@ async fn get_setting(db: &Db, key: &str) -> Option<String> {
         .flatten()
 }
 
-/// 打开一个实时识别会话，返回向其推送音频/结束信号的发送端。
-/// 后台任务负责：run-task 握手 → 转发音频 → 解析结果发事件 → finish。
-pub async fn start_session(
-    db: &Db,
-    app: &AppHandle,
-    session_id: String,
-) -> Result<mpsc::UnboundedSender<AsrCtl>, String> {
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// **全局唯一的百炼 ASR 接入点**：解析 API Key + 模型，与 DashScope 建链，返回
+/// `(ws, run-task JSON, task_id)`。实时麦克风（[`start_session`]）与会议录音上传
+/// （[`transcribe_segment`]）共用此入口——所有语音识别都收敛到这一条链路。
+async fn open_ws(db: &Db) -> Result<(WsStream, Value, String), String> {
     let api_key = crate::core::secrets::decrypt(
         &get_setting(db, "asr.api_key").await.unwrap_or_default(),
     )
     .unwrap_or_default();
     if api_key.trim().is_empty() {
-        return Err("实时语音未配置 API Key（设置 → 语音录入，Provider 选阿里云 DashScope）".into());
+        return Err("语音识别未配置 API Key（设置 → 语音录入，填阿里百炼 DashScope API Key）".into());
     }
     let model = get_setting(db, "asr.model")
         .await
@@ -84,7 +85,17 @@ pub async fn start_session(
             "input": {}
         }
     });
+    Ok((ws, run_task, task_id))
+}
 
+/// 打开一个实时识别会话，返回向其推送音频/结束信号的发送端。
+/// 后台任务负责：run-task 握手 → 转发音频 → 解析结果发事件 → finish。
+pub async fn start_session(
+    db: &Db,
+    app: &AppHandle,
+    session_id: String,
+) -> Result<mpsc::UnboundedSender<AsrCtl>, String> {
+    let (ws, run_task, task_id) = open_ws(db).await?;
     let (tx, rx) = mpsc::unbounded_channel::<AsrCtl>();
     let app = app.clone();
     tokio::spawn(async move {
@@ -94,6 +105,70 @@ pub async fn start_session(
     });
 
     Ok(tx)
+}
+
+/// 收集模式：把**一整段** 16kHz 单声道 16bit PCM（小端）经同一条 DashScope 实时 WS
+/// 转写为完整文本（用于会议录音上传）。与实时麦克风共用 [`open_ws`]，只是把结果由
+/// 「发事件」改成「累计整句后返回」。调用方应把长录音切成有界时长的段分别调用，避免单个
+/// 实时任务过长。
+pub async fn transcribe_segment(db: &Db, pcm: Vec<u8>) -> Result<String, String> {
+    let (ws, run_task, task_id) = open_ws(db).await?;
+    let (mut write, mut read) = ws.split();
+    write
+        .send(Message::Text(run_task.to_string()))
+        .await
+        .map_err(|e| format!("run-task 发送失败：{}", e))?;
+
+    // 音频分 ~8KB 二进制帧发送（结果消息很小，先写后读不会阻塞）。
+    for frame in pcm.chunks(8192) {
+        write
+            .send(Message::Binary(frame.to_vec()))
+            .await
+            .map_err(|e| format!("音频发送失败：{}", e))?;
+    }
+    let fin = json!({
+        "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": { "input": {} }
+    });
+    let _ = write.send(Message::Text(fin.to_string())).await;
+
+    // 读取直至 task-finished，累计每条「整句」。
+    let mut out = String::new();
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(t)) => {
+                if collect_sentence(&t, &mut out) {
+                    break;
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Err(e) => return Err(format!("WS 读取错误：{}", e)),
+            _ => {}
+        }
+    }
+    Ok(out.trim().to_string())
+}
+
+/// 解析一条服务端事件，把「整句」追加进 `out`；返回 true 表示任务终止。
+fn collect_sentence(text: &str, out: &mut String) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return false };
+    match v["header"]["event"].as_str() {
+        Some("result-generated") => {
+            let sentence = &v["payload"]["output"]["sentence"];
+            if sentence["sentence_end"].as_bool().unwrap_or(false) {
+                let t = sentence["text"].as_str().unwrap_or("").trim();
+                if !t.is_empty() {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+            false
+        }
+        Some("task-finished") | Some("task-failed") => true,
+        _ => false,
+    }
 }
 
 /// 会话主循环：拆分读写两半，select 转发音频 / 解析结果。

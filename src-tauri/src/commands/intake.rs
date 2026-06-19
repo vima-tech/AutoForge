@@ -740,12 +740,31 @@ pub async fn run_autosupply_now(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanResult, String> {
+    if state.autosupply_running.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("已有一轮自喂料正在进行".into());
+    }
     let cfg = crate::tasks::autosupply::AutosupplyConfig::load(&state.db).await;
-    let s = crate::tasks::autosupply::run_cycle(&state.db, &state.job_tx, &app, &cfg).await;
+    let s = crate::tasks::autosupply::run_cycle(
+        &state.db,
+        &state.job_tx,
+        &app,
+        &cfg,
+        &state.autosupply_running,
+    )
+    .await;
     let produced = s.scanned + s.proposed;
     Ok(ScanResult {
         found: produced,
         // 前置整理去噪后，实际留在待整理池的净条数。
         new_issues: produced.saturating_sub(s.discarded),
     })
+}
+
+/// 查询当前是否正有一轮自喂料在跑。前端切页重挂载后据此恢复「运行中」回显——
+/// 状态真源在后端，本地组件状态丢失也不影响。
+#[tauri::command]
+pub async fn autosupply_is_running(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state
+        .autosupply_running
+        .load(std::sync::atomic::Ordering::SeqCst))
 }

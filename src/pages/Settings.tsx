@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useRef, Fragment } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
 import Select from '../components/Select';
 import {
   THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode,
-  QUICK_CAPTURE_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, DEFAULT_QUICK_CAPTURE_SHORTCUT,
-  parseQuickCaptureShortcut, formatCombo, isModifierCode, comboHasModifier,
+  QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT,
+  DEFAULT_QUICK_CAPTURE_SHORTCUT, DEFAULT_VOICE_INPUT_SHORTCUT,
+  parseQuickCaptureShortcut, parseVoiceInputShortcut, formatCombo, isModifierCode, comboHasModifier,
   type ThemeMode, type ThemeSelection, type RailMode, type QuickCaptureShortcut, type ShortcutCombo,
 } from '../theme';
 import {
@@ -25,7 +27,7 @@ import {
   getWebSearchSettings, setWebSearchSettings,
   getOpenDesignSettings, setOpenDesignSettings, type OpenDesignSettings,
   getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
-  getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, type AutosupplySettings as AutosupplyT,
+  getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, autosupplyIsRunning, type AutosupplySettings as AutosupplyT,
   getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
   listBuiltinTools, type BuiltinToolInfo,
   getSecretBackendStatus, type SecretBackend,
@@ -128,10 +130,14 @@ function LLMSettings() {
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [secretBackend, setSecretBackend] = useState<SecretBackend | null>(null);
+  // 切页会卸载本组件，但测试连接等异步 IPC 仍在飞行；用此 ref 拦截卸载后的 setState，
+  // 避免无效更新与告警。准确的模型信息已落库，重新进入页面时 useEffect 会重新拉取。
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   useEffect(() => {
-    listLlmConfigs().then(cs => { setConfigs(cs); setLoading(false); }).catch(() => setLoading(false));
-    getSecretBackendStatus().then(setSecretBackend).catch(() => {});
+    listLlmConfigs().then(cs => { if (mounted.current) { setConfigs(cs); setLoading(false); } }).catch(() => { if (mounted.current) setLoading(false); });
+    getSecretBackendStatus().then(s => { if (mounted.current) setSecretBackend(s); }).catch(() => {});
   }, []);
 
   const setDraft = (id: string, field: string, val: unknown) =>
@@ -162,9 +168,19 @@ function LLMSettings() {
   const testConn = async (id: string) => {
     setTesting(id);
     setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
-    const result = await testLlmConnection(id, drafts[id]).catch(e => String(e));
-    setTestResult(r => ({ ...r, [id]: result }));
-    setTesting(null);
+    try {
+      // 测试连接同时刷新上下文窗口与多模态能力，回灌到配置展示。
+      const { message, config } = await testLlmConnection(id, drafts[id]);
+      if (!mounted.current) return; // 已切页：结果已落库，下次进页面会重新拉取
+      setTestResult(r => ({ ...r, [id]: message }));
+      setConfigs(cs => cs.map(c => c.id === id
+        ? { ...c, ctx_window: config.ctx_window, supports_vision: config.supports_vision }
+        : c));
+    } catch (e) {
+      if (mounted.current) setTestResult(r => ({ ...r, [id]: String(e) }));
+    } finally {
+      if (mounted.current) setTesting(null);
+    }
   };
 
   const doDelete = async (id: string) => {
@@ -227,11 +243,28 @@ function LLMSettings() {
                 <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />API Key</label>
                   <input className="mono" value={v('api_key')} onChange={e => setDraft(c.id, 'api_key', e.target.value)} type="password" />
                 </div>
-                <div className="field"><label>上下文窗口</label><input value={v('ctx_window')} onChange={e => setDraft(c.id, 'ctx_window', e.target.value)} /></div>
+                <div className="field"><label>上下文窗口 · 自动</label>
+                  <div className="mono" title="由后端按模型查表 + 接口探测自动得出；创建与修改模型/接口后自动刷新"
+                    style={{ padding: '9px 11px', color: 'var(--text-2)', fontSize: 'var(--text-control)',
+                      background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                    {v('ctx_window') || '未知'}
+                  </div>
+                </div>
                 <div className="field"><label>Temperature</label>
                   <input type="number" step="0.1" min="0" max="2"
                     value={d.temperature !== undefined ? String(d.temperature) : String(c.temperature)}
                     onChange={e => setDraft(c.id, 'temperature', parseFloat(e.target.value))} />
+                </div>
+                <div className="field full">
+                  <label><Icon name="image" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />多模态 · 图片识别 · 自动</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span className={'chip ' + (c.supports_vision ? 'green' : '')}>
+                      {c.supports_vision ? '● 支持' : '不支持'}
+                    </span>
+                    <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-3)', flex: 1 }}>
+                      由后端按模型名自动识别；创建与修改模型后自动更新。支持时，绑定此 LLM 的 Agent 可识别会议室中的图片附件。
+                    </span>
+                  </div>
                 </div>
                 <div className="field full" style={{ gap: 10, marginTop: 4 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -315,17 +348,16 @@ function AsrSettings() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
 
-  useEffect(() => { getAsrSettings().then(c => { if (!c.provider) c.provider = 'aliyun'; setCfg(c); }).catch(e => setStatus(String(e))); }, []);
+  useEffect(() => { getAsrSettings().then(c => setCfg(c)).catch(e => setStatus(String(e))); }, []);
 
-  // 阿里百炼（DashScope 实时流式）只需 API Key；其余文件转写 Provider 暂不在 UI 暴露。
-  const enabled = cfg.provider === 'aliyun'
-    ? (cfg.api_key_set || apiKey.trim().length > 0)
-    : cfg.model.trim().length > 0 && (cfg.endpoint.trim().length > 0 || ['openai', 'groq', 'siliconflow'].includes(cfg.provider));
+  // 全部语音识别统一走阿里百炼 DashScope，只需 API Key。
+  const enabled = cfg.api_key_set || apiKey.trim().length > 0;
 
   const save = async () => {
     setBusy(true); setStatus('');
     try {
-      const r = await setAsrSettings(cfg.provider, cfg.endpoint, cfg.model, cfg.language, apiKey.trim() || undefined);
+      // 收敛到百炼：provider 固定 aliyun、endpoint 不再使用。
+      const r = await setAsrSettings('aliyun', '', cfg.model, cfg.language, apiKey.trim() || undefined);
       setCfg(r); setApiKey(''); setStatus('已保存');
     } catch (e) { setStatus(String(e)); }
     finally { setBusy(false); }
@@ -334,7 +366,7 @@ function AsrSettings() {
   return (
     <div className="set-inner rise">
       <div className="set-h">语音录入</div>
-      <div className="set-desc">配置语音转写（ASR），用于「速录」弹窗口述需求。当前仅支持<strong>阿里百炼 ASR</strong>（DashScope 实时流式，边说边出字，模型默认 paraformer-realtime-v2，只需填百炼 API Key，无需 Endpoint）；其余 Provider 暂不开放。结果视为不可信外部输入，提交时自动过安全过滤。</div>
+      <div className="set-desc">配置语音识别（ASR）。所有语音识别——<strong>实时麦克风口述</strong>（速录/会议室边说边出字）与<strong>会议录音上传</strong>（整场录音转写+拆需求）——统一走<strong>阿里百炼 ASR</strong>（DashScope 实时流式，模型默认 paraformer-realtime-v2），只需填百炼 API Key，无需 Endpoint。结果视为不可信外部输入，提交时自动过安全过滤。</div>
 
       <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
         <div className="cfg-top" style={{ gap: 10 }}>
@@ -349,26 +381,14 @@ function AsrSettings() {
         </div>
 
         <div className="cfg-fields rise" style={{ marginTop: 14 }}>
-          <div className="field"><label>Provider</label>
-            <Select value={cfg.provider || 'aliyun'} onChange={val => setCfg(c => ({ ...c, provider: val }))}
-              options={[
-                { value: 'aliyun', label: '阿里百炼 ASR（实时流式 · 推荐）' },
-              ]} />
-          </div>
           <div className="field"><label>模型（可空，默认 paraformer-realtime-v2）</label>
-            <input type="text" className="mono" value={cfg.model} placeholder={cfg.provider === 'aliyun' ? 'paraformer-realtime-v2' : 'whisper-1 / gpt-4o-transcribe'}
+            <input type="text" className="mono" value={cfg.model} placeholder="paraformer-realtime-v2"
               onChange={e => setCfg(c => ({ ...c, model: e.target.value }))} />
           </div>
           <div className="field"><label>语言（可空，自动检测）</label>
             <input type="text" className="mono" value={cfg.language} placeholder="zh"
               onChange={e => setCfg(c => ({ ...c, language: e.target.value }))} />
           </div>
-          {cfg.provider !== 'aliyun' && (
-            <div className="field full"><label>Endpoint{cfg.provider !== 'custom' ? '（留空用 Provider 默认）' : ''}</label>
-              <input type="text" className="mono" value={cfg.endpoint} placeholder="https://api.openai.com/v1/audio/transcriptions"
-                onChange={e => setCfg(c => ({ ...c, endpoint: e.target.value }))} />
-            </div>
-          )}
           <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />API Key</label>
             <input type="password" className="mono" value={apiKey}
               placeholder={cfg.api_key_set ? '已设置（留空则不修改）' : 'sk-...'}
@@ -395,6 +415,14 @@ function AutosupplySettings() {
   useEffect(() => {
     getAutosupplySettings().then(setCfg).catch(e => setStatus(String(e)));
     getAutonomyLevel().then(setLevel).catch(() => {});
+    // 状态真源在后端：切页重挂载时查询当前是否有一轮在跑，恢复「运行中」回显，
+    // 并订阅 AutosupplyStatus 事件实时跟随开始/结束（手动或周期调度均覆盖）。
+    autosupplyIsRunning().then(setRunning).catch(() => {});
+    let unlisten: (() => void) | undefined;
+    listen<{ type?: string; running?: boolean }>('AutoForge://event', e => {
+      if (e.payload?.type === 'autosupply_status') setRunning(!!e.payload.running);
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
   }, []);
 
   const changeLevel = async (l: AutonomyLevel) => {
@@ -1320,15 +1348,23 @@ function KnowledgeSettings() {
   );
 }
 
-function ShortcutSettings() {
-  // 速录念头快捷键：纯前端偏好，落 localStorage 并派发事件让 App 实时重读。
-  const [shortcut, setShortcut] = useState<QuickCaptureShortcut>(
-    () => parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)),
-  );
+// 单个快捷键绑定面板（启用开关 + 组合键展示 + 录制/恢复默认）。纯前端偏好，落 localStorage
+// 并派发 SHORTCUT_CHANGED_EVENT 让 App 实时重读。
+function ShortcutBinding({
+  storageKey, defaultShortcut, parse, icon, title, enableHint,
+}: {
+  storageKey: string;
+  defaultShortcut: QuickCaptureShortcut;
+  parse: (v: string | null | undefined) => QuickCaptureShortcut;
+  icon: string;
+  title: string;
+  enableHint: string;
+}) {
+  const [shortcut, setShortcut] = useState<QuickCaptureShortcut>(() => parse(localStorage.getItem(storageKey)));
   const [recording, setRecording] = useState(false);
   const persistShortcut = (s: QuickCaptureShortcut) => {
     setShortcut(s);
-    localStorage.setItem(QUICK_CAPTURE_SHORTCUT_KEY, JSON.stringify(s));
+    localStorage.setItem(storageKey, JSON.stringify(s));
     window.dispatchEvent(new Event(SHORTCUT_CHANGED_EVENT));
   };
 
@@ -1350,42 +1386,62 @@ function ShortcutSettings() {
   }, [recording]);
 
   return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel-head"><div className="panel-title"><Icon name={icon} size={16} style={{ color: 'var(--ember)' }} />{title}</div></div>
+      <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+        <div>
+          <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>启用全局快捷键</div>
+          <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{enableHint}</div>
+        </div>
+        <Switch on={shortcut.enabled} onToggle={() => persistShortcut({ ...shortcut, enabled: !shortcut.enabled })} />
+      </div>
+      <div style={{ padding: '0 18px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.06em',
+          background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8,
+          padding: '5px 10px', color: shortcut.enabled ? 'var(--ember-soft)' : 'var(--text-3)',
+        }}>
+          {formatCombo(shortcut.combo)}
+        </span>
+        <button className="btn btn-sm" onClick={() => setRecording(r => !r)} disabled={!shortcut.enabled}>
+          <Icon name="edit" size={13} />{recording ? '按下组合键…' : '录制'}
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={() => persistShortcut(defaultShortcut)} disabled={!shortcut.enabled}>
+          恢复默认
+        </button>
+        {recording && (
+          <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+            需配合 Ctrl / Alt / Shift / ⌘ · Esc 取消
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ShortcutSettings() {
+  return (
     <div className="set-inner rise">
       <div className="set-h">快捷键</div>
       <div className="set-desc">为常用操作绑定键盘快捷键。组合键需配合至少一个修饰键（Ctrl / Alt / Shift / ⌘），在应用内任意位置生效。</div>
 
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-head"><div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />速录念头</div></div>
-        <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
-          <div>
-            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>启用全局快捷键</div>
-            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
-              在应用内任意位置按下快捷键即可弹出「速录念头」，随手把念头丢进待整理池。
-            </div>
-          </div>
-          <Switch on={shortcut.enabled} onToggle={() => persistShortcut({ ...shortcut, enabled: !shortcut.enabled })} />
-        </div>
-        <div style={{ padding: '0 18px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <span style={{
-            fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.06em',
-            background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8,
-            padding: '5px 10px', color: shortcut.enabled ? 'var(--ember-soft)' : 'var(--text-3)',
-          }}>
-            {formatCombo(shortcut.combo)}
-          </span>
-          <button className="btn btn-sm" onClick={() => setRecording(r => !r)} disabled={!shortcut.enabled}>
-            <Icon name="edit" size={13} />{recording ? '按下组合键…' : '录制'}
-          </button>
-          <button className="btn btn-sm btn-ghost" onClick={() => persistShortcut(DEFAULT_QUICK_CAPTURE_SHORTCUT)} disabled={!shortcut.enabled}>
-            恢复默认
-          </button>
-          {recording && (
-            <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
-              需配合 Ctrl / Alt / Shift / ⌘ · Esc 取消
-            </span>
-          )}
-        </div>
-      </div>
+      <ShortcutBinding
+        storageKey={QUICK_CAPTURE_SHORTCUT_KEY}
+        defaultShortcut={DEFAULT_QUICK_CAPTURE_SHORTCUT}
+        parse={parseQuickCaptureShortcut}
+        icon="zap"
+        title="速录念头"
+        enableHint="在应用内任意位置按下快捷键即可弹出「速录念头」，随手把念头丢进待整理池。"
+      />
+
+      <ShortcutBinding
+        storageKey={VOICE_INPUT_SHORTCUT_KEY}
+        defaultShortcut={DEFAULT_VOICE_INPUT_SHORTCUT}
+        parse={parseVoiceInputShortcut}
+        icon="mic"
+        title="快速语音录入"
+        enableHint="在任意含语音录入的界面（会议室、速录念头…）一键开/关录音；若当前无语音界面，则弹出「速录念头」并自动起录。"
+      />
     </div>
   );
 }

@@ -269,6 +269,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         &session.worktree_path,
         &session.branch_name,
         &cr.target_branch,
+        session.base_commit.as_deref(),
     )
     .await
     {

@@ -225,6 +225,17 @@ pub async fn run(
         )
     };
 
+    // Record the fork point: the worktree's HEAD right after creation == dev's tip
+    // before the agent commits anything. This is the immutable base the CR diff is
+    // scoped against, so a later independent advance of dev can't pollute the diff.
+    let base_commit = GitProxy::new(&worktree_path)
+        .run(&["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|(code, _, _)| *code == 0)
+        .map(|(_, out, _)| out.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     // Create WorktreeSession record
     let session_id = Uuid::new_v4().to_string();
     let prompt = crate::agents::code_agent::build_prompt(
@@ -242,8 +253,8 @@ pub async fn run(
 
     sqlx::query(
         "INSERT INTO worktree_sessions
-         (id, change_request_id, worktree_path, branch_name, status, prompt_snapshot, iteration_count, started_at)
-         VALUES (?, ?, ?, ?, 'running', ?, ?, datetime('now'))"
+         (id, change_request_id, worktree_path, branch_name, status, prompt_snapshot, iteration_count, base_commit, started_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, ?, datetime('now'))"
     )
     .bind(&session_id)
     .bind(cr_id)
@@ -251,6 +262,7 @@ pub async fn run(
     .bind(&branch_name)
     .bind(&prompt)
     .bind(iteration)
+    .bind(&base_commit)
     .execute(db)
     .await?;
 

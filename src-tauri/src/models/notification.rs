@@ -147,7 +147,8 @@ impl NotificationDraft {
             | AppEvent::PipelineStatus { .. }
             | AppEvent::MessageReceived { .. }
             | AppEvent::ConversationTaskUpdated { .. }
-            | AppEvent::AsrResult { .. } => None,
+            | AppEvent::AsrResult { .. }
+            | AppEvent::AutosupplyStatus { .. } => None,
         }
     }
 }

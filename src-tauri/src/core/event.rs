@@ -79,6 +79,11 @@ pub enum AppEvent {
         text: String,
         is_final: bool,
     },
+    /// 自喂料一轮的开始/结束。前端据此实时回显「运行中」状态——状态真源在后端，
+    /// 切换页面后重挂载只需查询 `autosupply_is_running` 即可恢复，不再丢失回显。
+    AutosupplyStatus {
+        running: bool,
+    },
 }
 
 impl AppEvent {

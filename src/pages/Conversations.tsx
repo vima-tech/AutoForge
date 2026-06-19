@@ -21,6 +21,7 @@ import {
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
 import { RealtimeAsr } from '../lib/realtimeAsr';
+import { registerVoiceSurface } from '../lib/voiceInput';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -451,11 +452,17 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const attachmentPopRef = useRef<HTMLDivElement>(null);
   const attachmentTriggerRef = useRef<HTMLButtonElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  // IME（中文/日文）合成态。WebKitGTK(Tauri Linux) 上 KeyboardEvent.isComposing 在「上屏候选词的
+  // 那次 Enter」上报不可靠，故自己用 compositionstart/end 维护一份状态，作为 Enter 发送的权威闸门——
+  // 否则合成期 Enter 会被当成发送、preventDefault 掐断上屏，正在输入的文字直接丢失（气泡里没有文本）。
+  const composingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   // 实时语音录入（复用已有 RealtimeAsr / asrRealtime* IPC）：识别结果写进一个专用文本节点，
   // 保留编辑器内已有文本与 @ 标签；committed 为已定句、partial 为当前增量句。
   const [asrRecording, setAsrRecording] = useState(false);
+  // 点击后到麦克风/后端就绪前的过渡态，用于立刻给出「连接中…」反馈，消除点击空窗。
+  const [asrStarting, setAsrStarting] = useState(false);
   const asrRef = useRef<RealtimeAsr | null>(null);
   const asrNodeRef = useRef<Text | null>(null);
   const asrCommittedRef = useRef('');
@@ -529,6 +536,17 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const setCaretAfter = (node: Node) => {
     const range = document.createRange();
     range.setStartAfter(node);
+    range.collapse(true);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+  };
+
+  // 把光标放进文本节点「内部」的末尾，而非节点之间的边界。紧跟 contentEditable=false 标签插入文字时，
+  // WebKitGTK 对「编辑器元素层的边界光标」会把 IME 合成结果丢弃；落在真实文本节点内部则能稳定追加。
+  const setCaretInsideEnd = (node: Text) => {
+    const range = document.createRange();
+    range.setStart(node, node.length);
     range.collapse(true);
     const sel = window.getSelection();
     sel?.removeAllRanges();
@@ -678,6 +696,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
 
   const stopAsr = async () => {
     setAsrRecording(false);
+    setAsrStarting(false);
     const rt = asrRef.current;
     asrRef.current = null;
     asrNodeRef.current = null;
@@ -687,15 +706,19 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
 
   const startAsr = async () => {
     const editor = editorRef.current;
-    if (!editor || busy || asrRecording) return;
+    if (!editor || busy || asrRecording || asrStarting) return;
+    // 立刻进入「连接中」态——在任何 await 前点亮，消除点击后到识别就绪的反馈空窗。
+    setAsrStarting(true);
     // 未配置 ASR（无 API Key）→ 友好引导，且不触发麦克风权限弹窗。
     try {
       const cfg = await getAsrSettings();
       if (!cfg.api_key_set) {
+        setAsrStarting(false);
         onError('尚未配置语音识别，请前往「设置 → 语音录入」配置 API Key 后再试');
         return;
       }
     } catch (e) {
+      setAsrStarting(false);
       onError('读取语音识别配置失败：' + String(e));
       return;
     }
@@ -724,9 +747,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
         n.data = asrCommittedRef.current + asrPartialRef.current;
         setCaretAfter(n);
         setText(editorText());
+      }, () => {
+        // 麦克风就绪、开始收音（后端握手可能仍在进行）：立即切到「聆听中」。
+        setAsrStarting(false);
+        setAsrRecording(true);
       });
-      setAsrRecording(true);
     } catch (e) {
+      setAsrStarting(false);
+      setAsrRecording(false);
       asrRef.current = null;
       asrNodeRef.current = null;
       try { node.remove(); } catch { /* ignore */ }
@@ -736,6 +764,15 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
 
   // 卸载或切换会话时停止录音（已识别文本保留在编辑器草稿中）。
   useEffect(() => () => { if (asrRef.current) void stopAsr(); }, [conv.id]);
+
+  // 把开/关录音逻辑镜像进 ref，供全局语音快捷键调用最新闭包。
+  const toggleAsrRef = useRef<() => void>(() => {});
+  toggleAsrRef.current = () => {
+    if (busy) return;
+    if (asrRecording || asrStarting) void stopAsr(); else void startAsr();
+  };
+  // 登记为活跃语音面：会议室 Composer 挂载时，全局语音快捷键切换它的录音。
+  useEffect(() => registerVoiceSurface(() => toggleAsrRef.current()), []);
 
   const insertMentionTag = (className: string, agentId: string, label: string) => {
     const editor = editorRef.current;
@@ -762,7 +799,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const spacer = document.createTextNode('\u00a0');
     range.insertNode(spacer);
     range.insertNode(tag);
-    setCaretAfter(spacer);
+    setCaretInsideEnd(spacer);
     setShowMention(false);
     setText(editorText());
     editor.focus();
@@ -815,7 +852,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const spacer = document.createTextNode('\u00a0');
     range.insertNode(spacer);
     range.insertNode(tag);
-    setCaretAfter(spacer);
+    setCaretInsideEnd(spacer);
     setShowAttachmentPicker(false);
     setAttachmentQuery('');
     setText(editorText());
@@ -921,6 +958,10 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   };
 
   const onKey = (e: React.KeyboardEvent) => {
+    // 中文/日文等 IME 合成期间，Enter/Tab/方向键都属于输入法（上屏候选词、翻页）——
+    // 不能在此发送或操作弹窗，否则 preventDefault 会取消合成，导致正在输入的文字丢失。
+    // 以自维护的 composingRef 为权威闸门，再叠加浏览器原生 isComposing / keyCode 229 兜底。
+    if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (showMention && mentionItems.length > 0) {
       if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMentionItem(mentionItems[mentionSel]); return; }
       if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel(s => (s + 1) % mentionItems.length); return; }
@@ -1016,16 +1057,18 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
         <button className="icon-btn" title="添加附件" disabled={busy} onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={18} /></button>
         <button className="icon-btn" title="添加图片" disabled={busy} onClick={() => imageInputRef.current?.click()}><Icon name="image" size={18} /></button>
         <button
-          className={'icon-btn' + (asrRecording ? ' composer-mic-on' : '')}
-          title={asrRecording ? '停止语音录入' : '语音输入（边说边转写）'}
+          className={'icon-btn' + (asrRecording || asrStarting ? ' composer-mic-on' : '')}
+          title={asrRecording || asrStarting ? '停止语音录入' : '语音输入（边说边转写）'}
           disabled={busy}
           onMouseDown={e => e.stopPropagation()}
-          onClick={() => { if (asrRecording) void stopAsr(); else void startAsr(); }}
+          onClick={() => { if (asrRecording || asrStarting) void stopAsr(); else void startAsr(); }}
         >
-          <Icon name={asrRecording ? 'pause' : 'mic'} size={18} />
+          <Icon name={asrRecording || asrStarting ? 'pause' : 'mic'} size={18} />
         </button>
-        {asrRecording && (
-          <span className="composer-asr-live"><span className="composer-asr-dot" />聆听中…</span>
+        {(asrRecording || asrStarting) && (
+          <span className="composer-asr-live">
+            <span className="composer-asr-dot" />{asrRecording ? '聆听中…' : '连接中…'}
+          </span>
         )}
         {isG && (
           <button className="icon-btn" title="@ 指定 Agent" onClick={() => insertPlainText('@')}>
@@ -1143,7 +1186,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
               visibleContextAttachments.map((a, i) => (
                 <div
                   key={a.id}
-                  className={'mention-row attachment-row' + (i === attachmentSel ? ' sel' : '')}
+                  className={'mention-row attachment-row' + (i === attachmentSel ? ' mention-active' : '')}
                   onMouseDown={e => e.preventDefault()}
                   onMouseEnter={() => setAttachmentSel(i)}
                   onClick={() => pickContextAttachment(a)}
@@ -1169,6 +1212,8 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
           suppressContentEditableWarning
           data-placeholder={isG ? '输入消息，@ 可指定 Agent 回答…' : `给 ${agentName} 发消息…`}
           onInput={syncEditor}
+          onCompositionStart={() => { composingRef.current = true; }}
+          onCompositionEnd={() => { composingRef.current = false; syncEditor(); }}
           onKeyDown={onKey}
           onPaste={e => {
             e.preventDefault();

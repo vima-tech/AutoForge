@@ -37,7 +37,8 @@ function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 export interface LlmConfig {
   id: string; name: string; model: string;
   endpoint: string; api_key: string; ctx_window: string;
-  temperature: number; enabled: boolean; api_spec: ApiSpec; created_at: string;
+  temperature: number; enabled: boolean; api_spec: ApiSpec;
+  supports_vision: boolean; created_at: string;
 }
 /** 接口规范（wire spec）：决定文本生成路由与工具调用格式。目前仅支持两种。 */
 export type ApiSpec = 'openai' | 'anthropic';
@@ -550,12 +551,12 @@ export const writeWorkspaceFile = (projectId: string, relPath: string, content: 
 export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');
 export const createLlmConfig = (payload: {
   name: string; model: string;
-  endpoint: string; api_key: string; ctx_window?: string; temperature?: number;
+  endpoint: string; api_key: string; temperature?: number;
   api_spec?: ApiSpec;
 }) => ipc<LlmConfig>('create_llm_config', { payload });
 export const updateLlmConfig = (id: string, payload: Partial<{
   name: string; model: string; endpoint: string;
-  api_key: string; ctx_window: string; temperature: number; enabled: boolean;
+  api_key: string; temperature: number; enabled: boolean;
   api_spec: ApiSpec;
 }>) => ipc<LlmConfig>('update_llm_config', { id, payload });
 
@@ -607,9 +608,15 @@ export const setAsrSettings = (
   provider: string, endpoint: string, model: string, language: string, api_key?: string,
 ) => ipc<AsrSettings>('set_asr_settings', { provider, endpoint, model, language, apiKey: api_key });
 
-// 语音转写：前端录音得到的音频(base64)交后端转写，返回文本（已过注入过滤）。
-export const transcribeAudio = (audio_base64: string, mime?: string) =>
-  ipc<{ text: string }>('transcribe_audio', { audioBase64: audio_base64, mime });
+// 会议录音整段转写：一段 16kHz/单声道/16bit PCM(base64) 经阿里百炼 DashScope 实时 WS
+// 转写为完整文本（与实时麦克风同一条链路）。长录音由前端切段、逐段调用后拼接。
+export const transcribeRecordingSegment = (pcm_base64: string) =>
+  ipc<string>('transcribe_recording_segment', { pcmBase64: pcm_base64 });
+
+// 兜底：浏览器 WebView 解不出某格式时，把原始文件字节(base64)交后端 symphonia 解码
+// （mp3/m4a-aac/wav/flac/ogg-vorbis）→ 分段经 DashScope WS → 返回完整转写文本。
+export const transcribeRecordingFile = (file_base64: string, mime?: string) =>
+  ipc<string>('transcribe_recording_file', { fileBase64: file_base64, mime });
 
 // 实时语音识别（阿里 DashScope 流式）：start 返回 session_id，结果经 AutoForge://event 的
 // asr_result 事件推送；前端按 16kHz/单声道/16bit PCM 分帧 feed，结束调 stop。
@@ -618,6 +625,21 @@ export const asrRealtimeFeed = (session_id: string, audio_base64: string) =>
   ipc<void>('asr_realtime_feed', { sessionId: session_id, audioBase64: audio_base64 });
 export const asrRealtimeStop = (session_id: string) =>
   ipc<void>('asr_realtime_stop', { sessionId: session_id });
+
+// ── 会议录音：转写文本 → AI 提炼纪要 + 拆解需求（先审后入）────────────────────
+export interface MeetingRequirement {
+  title: string; category: string; severity: string; description: string;
+}
+export interface MeetingAnalysis {
+  summary_md: string; requirements: MeetingRequirement[];
+}
+// 分析会议转写：返回纪要 + 需求列表（不落盘、不入池）。
+export const analyzeMeeting = (transcript: string) =>
+  ipc<MeetingAnalysis>('analyze_meeting', { transcript });
+// 把会议纪要写入项目 .autoforge/docs/meetings/，返回相对路径。
+export const saveMeetingDoc = (
+  project_id: string, title: string, summary_md: string, transcript: string,
+) => ipc<string>('save_meeting_doc', { projectId: project_id, title, summaryMd: summary_md, transcript });
 
 // 凭据加密主密钥后端："keychain"（系统钥匙环）或 "file"（0600 文件兜底，安全性较弱）。
 export type SecretBackend = 'keychain' | 'file';
@@ -645,8 +667,10 @@ export const updateMcpServer = (id: string, payload: McpServerInput) =>
 export const deleteMcpServer = (id: string) => ipc<void>('delete_mcp_server', { id });
 export const testMcpConnection = (id: string) => ipc<string[]>('test_mcp_connection', { id });
 export const deleteLlmConfig = (id: string) => ipc<void>('delete_llm_config', { id });
+/** 测试连接结果：状态文案 + 顺带刷新（上下文窗口 / 多模态）后的配置。 */
+export interface TestLlmResult { message: string; config: LlmConfig; }
 export const testLlmConnection = (id: string, draft?: Partial<LlmConfig>) =>
-  ipc<string>('test_llm_connection', { id, draft: draft && Object.keys(draft).length ? draft : null });
+  ipc<TestLlmResult>('test_llm_connection', { id, draft: draft && Object.keys(draft).length ? draft : null });
 
 // ── Settings — Agents ────────────────────────────────────────────────────────
 export const listAgents = () => ipc<Agent[]>('list_agents');
@@ -866,6 +890,8 @@ export const setAutosupplySettings = (s: AutosupplySettings) =>
 export const runProposer = (projectId: string, max?: number) =>
   ipc<ScanResult>('run_proposer', { projectId, max: max ?? null });
 export const runAutosupplyNow = () => ipc<ScanResult>('run_autosupply_now');
+// 当前是否正有一轮自喂料在跑（状态真源在后端，供切页重挂载后恢复回显）。
+export const autosupplyIsRunning = () => ipc<boolean>('autosupply_is_running');
 
 // 信任旋钮：strict / standard / loose。应用预设到自喂料，不触碰审核闸。
 export type AutonomyLevel = 'strict' | 'standard' | 'loose';

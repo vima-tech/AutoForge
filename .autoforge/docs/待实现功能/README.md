@@ -12,6 +12,7 @@
 
 | 优先级 | 提案 | 一句话 |
 |--------|------|--------|
+| P0 | [并发合并冲突解决](AutoForge-并发合并冲突解决-功能提案.md) | 修 `runner.rs:28` 合并不串行的竞态 + 合并前自动 merge-dev/rerere/重测，真冲突走三方视图与可选 AI 解冲突（任务清单 `并发合并冲突解决-tasks.json`） |
 | P1 | [操作者身份卡 + 通知中心](AutoForge-操作者身份卡与通知中心-功能提案-v2.md) | 激活 `App.tsx:338` 静态 rail-me：操作者身份配置 + 把 13 类 AppEvent 中被丢弃的 9 类汇成活动收件箱 |
 | P2 | [自定义 LLM 图片输入](AutoForge-自定义LLM图片输入支持-功能提案-v2.md) | 移除 `llm.rs:54-58` 对图片附件的一刀切硬报错，anthropic/openai 走多模态 |
 | P2 | [@提及/头像脱离 mock](AutoForge-提及与头像脱离Mock改用DB真源-功能提案-v2.md) | `Markdown.tsx:25` / `Avatar.tsx:18` 改用 DB 真源，修自建 Agent 提及/头像渲染缺陷 |

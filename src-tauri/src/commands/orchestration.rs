@@ -1003,12 +1003,15 @@ async fn run_agent_for_step(
     let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
     let registry =
         crate::agents::tools::build_registry_for_agent(&db, &agent, &tool_ctx).await;
+    // 多模态：收集最近上下文窗口内的图片附件，交给绑定多模态 LLM 的 Agent 识别。
+    // 非多模态 LLM 会在 llm 层静默忽略这些图片（快照里仍保留「[图片: …]」文字描述）。
+    let images = collect_context_images(&db, &conversation_id, 40, 6).await;
     // 把「LLM 调用 + 解析 <write-file> + 落盘」包进同一个 trace run：写文件以 tool span
     // 挂在与本次 Agent 调用相同的 trace 下，链路追踪里即可审计 Agent 写了哪些工作区文件。
     let (ok, text, text_after_writes, error, write_blocks) =
         crate::core::trace::scope_run(&db, &agent, async {
             let result = crate::agents::llm::run_agent_text_with_tools(
-                &db, &agent, &prompt, Some(system_prompt.as_str()), &[], &registry,
+                &db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
             )
             .await;
             let (ok, text, error) = match result {
@@ -1568,6 +1571,69 @@ fn attachment_path(attachment: &ConversationAttachment) -> Result<PathBuf, Strin
         return Err("附件路径无效".to_string());
     }
     Ok(PathBuf::from(crate::state::attachments_base()).join(rel))
+}
+
+/// 收集会议室最近上下文窗口内的图片附件路径（按时间顺序，最多 `max_images` 张），
+/// 供多模态 Agent 识别。扫描最近 `limit` 条未移出上下文的消息中的 `image` 块，解析其
+/// 附件 id 为磁盘路径；非图片 / 路径非法的项忽略。best-effort，任何查询失败返回空。
+async fn collect_context_images(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    limit: i64,
+    max_images: usize,
+) -> Vec<PathBuf> {
+    let messages = match sqlx::query_as::<_, Message>(
+        "SELECT * FROM messages
+         WHERE conversation_id=? AND excluded_from_context=0
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind(conversation_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    // messages 为时间倒序（最新在前）；从最新往回收集图片附件 id，凑满上限即停。
+    let mut ids: Vec<String> = Vec::new();
+    for msg in &messages {
+        let blocks: Vec<serde_json::Value> =
+            serde_json::from_str(&msg.content_json).unwrap_or_default();
+        for block in &blocks {
+            if block.get("t").and_then(|v| v.as_str()) == Some("image") {
+                if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        if ids.len() >= max_images {
+            break;
+        }
+    }
+    ids.truncate(max_images);
+    // 还原为时间正序（最旧在前），让多模态请求里的图片顺序贴近对话阅读顺序。
+    ids.reverse();
+
+    let mut paths = Vec::new();
+    for id in ids {
+        if let Ok(Some(att)) = sqlx::query_as::<_, ConversationAttachment>(
+            "SELECT * FROM conversation_attachments WHERE id=?",
+        )
+        .bind(&id)
+        .fetch_optional(db)
+        .await
+        {
+            if att.kind == "image" {
+                if let Ok(path) = attachment_path(&att) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
 }
 
 async fn load_schedulable_members(
