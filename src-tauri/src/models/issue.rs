@@ -26,6 +26,9 @@ pub struct Issue {
     pub actual: Option<String>,
     #[sqlx(default)]
     pub acceptance_json: Option<String>,
+    /// 审核 1 管理员补充意见（一次性）：提交后需求带此意见重新分析，被分析任务消费后清空。
+    #[sqlx(default)]
+    pub review_feedback: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

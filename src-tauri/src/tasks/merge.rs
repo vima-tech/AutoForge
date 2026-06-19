@@ -410,7 +410,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
 
     // Innate: close the recall feedback loop — the recalled knowledge fed code
     // that passed review 2 + tests and merged, so reinforce it (positive signal).
-    crate::knowledge::consume_trace_outcome(db, cr_id, "ok", Some("up")).await;
+    crate::knowledge::consume_recall_trace(db, "change_request", cr_id, "ok", Some("up")).await;
 
     // Innate: distil this project's accumulated logs into knowledge after a successful merge.
     crate::knowledge::kb_evolve(&cr.project_id).await;

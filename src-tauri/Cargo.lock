@@ -2591,9 +2591,9 @@ dependencies = [
 
 [[package]]
 name = "innate"
-version = "0.1.11"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69683158aab8ea4a3e7dd637f127f635d05a2796235f4c6f7de9a2c5c6f1fcc6"
+checksum = "fbe0baebfaa25a5c424cfb8a3e263d64b17206db2cdbf8f719b745d10bd0cce8"
 dependencies = [
  "anyhow",
  "chrono",

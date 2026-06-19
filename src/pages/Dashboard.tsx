@@ -10,6 +10,38 @@ const SEV_COLOR: Record<string, string> = {
   Bug: 'red', Feature: 'ember', Improvement: 'blue', Debt: 'violet',
 };
 
+// 需求状态统一中文文案（与 Audit.tsx 的 STATUS_LABEL 对齐，避免中英混用）。
+const STATUS_LABEL: Record<string, string> = {
+  triage: '待整理',
+  pending_analysis: '分析中',
+  analysis_failed: '分析失败',
+  pending_review_1: '待需求审核',
+  pending_execution: '待执行',
+  executing: 'AI 执行中',
+  pending_review_2: '待代码审核',
+  pending_merge: '待合并',
+  execution_failed: '执行失败',
+  merge_failed: '合并失败',
+  no_change_needed: '无需改动',
+  merged: '已合并',
+  rejected: '已拒绝',
+};
+const STATUS_COLOR: Record<string, string> = {
+  triage: '',
+  pending_analysis: 'amber',
+  analysis_failed: 'red',
+  pending_review_1: 'amber',
+  pending_execution: 'amber',
+  executing: 'blue',
+  pending_review_2: 'ember',
+  pending_merge: 'blue',
+  execution_failed: 'red',
+  merge_failed: 'red',
+  no_change_needed: 'blue',
+  merged: 'green',
+  rejected: 'red',
+};
+
 // ── Submit Issue Modal ────────────────────────────────────────────────────────
 // Hosts the shared IntakePanel (手动提交 / GitHub / 代码扫描 / 批量导入) so the
 // homepage entry stays consistent with the project-level「需求入口」in Audit.
@@ -22,7 +54,7 @@ function SubmitIssueModal({ projects, onClose }: { projects: Project[]; onClose:
         <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 12 }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-section)', flexShrink: 0 }}><span className="cn">需求入口</span></div>
           <div style={{ marginLeft: 'auto', minWidth: 200 }}>
-            <Select value={projectId} onChange={setProjectId}
+            <Select className="sm" value={projectId} onChange={setProjectId}
               options={projects.map(p => ({ value: p.id, label: p.name }))}
               placeholder="选择项目" />
           </div>
@@ -60,11 +92,9 @@ export default function Dashboard({ onOpenInAudit }: {
     setAutosupply(supply);
     setStats(s);
     setProjects(ps);
-    setIssues(is.sort((a, b) => {
-      const priorityDiff = (b.priority ?? 0) - (a.priority ?? 0);
-      if (priorityDiff !== 0) return priorityDiff;
-      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
-    }));
+    setIssues(is.sort((a, b) =>
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    ));
   }, []);
 
   useEffect(() => {
@@ -179,7 +209,7 @@ export default function Dashboard({ onOpenInAudit }: {
           {/* queue */}
           <div className="panel">
             <div className="panel-head">
-              <div className="panel-title"><Icon name="inbox" size={17} style={{ color: 'var(--ember)' }} />需求队列 · 优先级排序</div>
+              <div className="panel-title"><Icon name="inbox" size={17} style={{ color: 'var(--ember)' }} />需求队列 · 时间倒序</div>
               <span className="sec-kicker">显示 {queueIssues.length} / {issues.length} 条</span>
             </div>
             {queueIssues.length === 0
@@ -198,8 +228,8 @@ export default function Dashboard({ onOpenInAudit }: {
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-                  <span className={'chip ' + (q.status === 'pending_review_1' ? 'amber' : q.status.includes('review') ? 'amber' : q.status === 'executing' ? 'ember' : '')}>
-                    {q.status === 'pending_review_1' ? '待需求审核' : q.status.replace(/_/g, ' ')}
+                  <span className={'chip ' + (STATUS_COLOR[q.status] ?? '')}>
+                    {STATUS_LABEL[q.status] ?? q.status}
                   </span>
                   <Icon name="chevRight" size={15} style={{ color: 'var(--text-faint)' }} />
                 </div>

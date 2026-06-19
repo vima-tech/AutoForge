@@ -36,6 +36,10 @@ pub struct LlmTrace {
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub created_at: String,
+
+    /// 派生字段（非存储列）：本次调用的 system_prompt 是否注入了 Innate 记忆召回小节。
+    /// 由查询层用 `system_prompt LIKE` 计算（见 `commands/trace.rs`），供 Trace 页面打 INNATE 标志。
+    pub innate_triggered: bool,
 }
 
 /// trace 列表项：每个 trace_id 的 root(agent) 汇总 + 统计（供列表页）。
@@ -57,4 +61,7 @@ pub struct LlmTraceSummary {
     pub latency_ms: Option<i64>,
     pub span_count: i64,
     pub created_at: String,
+
+    /// 派生字段（非存储列）：本 trace 的 root span 是否注入了 Innate 记忆召回（见 `commands/trace.rs`）。
+    pub innate_triggered: bool,
 }

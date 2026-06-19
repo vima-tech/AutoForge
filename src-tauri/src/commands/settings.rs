@@ -838,6 +838,8 @@ pub struct WebSearchSettings {
     pub endpoint: String,
     pub max_results: u32,
     pub api_key_set: bool,
+    /// 是否默认在搜索后自动抓取前几条结果的正文摘录。
+    pub fetch_content: bool,
 }
 
 async fn read_setting(state: &AppState, key: &str) -> Option<String> {
@@ -942,11 +944,16 @@ pub async fn get_web_search_settings(
         .await
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    let fetch_content = read_setting(&state, "web_search.fetch_content")
+        .await
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
     Ok(WebSearchSettings {
         provider,
         endpoint,
         max_results,
         api_key_set,
+        fetch_content,
     })
 }
 
@@ -957,6 +964,7 @@ pub async fn set_web_search_settings(
     endpoint: String,
     max_results: u32,
     api_key: Option<String>,
+    fetch_content: bool,
     state: State<'_, AppState>,
 ) -> Result<WebSearchSettings, String> {
     write_setting(&state, "web_search.provider", provider.trim()).await?;
@@ -965,6 +973,12 @@ pub async fn set_web_search_settings(
         &state,
         "web_search.max_results",
         &max_results.clamp(1, 10).to_string(),
+    )
+    .await?;
+    write_setting(
+        &state,
+        "web_search.fetch_content",
+        if fetch_content { "1" } else { "0" },
     )
     .await?;
     if let Some(key) = api_key {
@@ -1035,6 +1049,8 @@ pub struct AutosupplySettings {
     pub scan_enabled: bool,
     pub proposer_enabled: bool,
     pub max_per_run: i64,
+    pub analyze_enabled: bool,
+    pub triage_enabled: bool,
 }
 
 #[tauri::command]
@@ -1048,16 +1064,21 @@ pub async fn get_autosupply_settings(
         scan_enabled: cfg.scan_enabled,
         proposer_enabled: cfg.proposer_enabled,
         max_per_run: cfg.max_per_run as i64,
+        analyze_enabled: cfg.analyze_enabled,
+        triage_enabled: cfg.triage_enabled,
     })
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_autosupply_settings(
     enabled: bool,
     interval_min: i64,
     scan_enabled: bool,
     proposer_enabled: bool,
     max_per_run: i64,
+    analyze_enabled: bool,
+    triage_enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<AutosupplySettings, String> {
     write_setting(&state, "autosupply.enabled", if enabled { "1" } else { "0" }).await?;
@@ -1065,6 +1086,8 @@ pub async fn set_autosupply_settings(
     write_setting(&state, "autosupply.scan_enabled", if scan_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.proposer_enabled", if proposer_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.max_per_run", &max_per_run.clamp(1, 200).to_string()).await?;
+    write_setting(&state, "autosupply.analyze_enabled", if analyze_enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.triage_enabled", if triage_enabled { "1" } else { "0" }).await?;
     get_autosupply_settings(state).await
 }
 

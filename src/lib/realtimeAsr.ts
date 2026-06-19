@@ -38,8 +38,16 @@ export class RealtimeAsr {
   async start(onResult: (text: string, isFinal: boolean) => void): Promise<void> {
     const md = navigator.mediaDevices;
     if (!md?.getUserMedia) throw new Error('当前环境不支持麦克风');
-    this.stream = await md.getUserMedia({ audio: true });
-    this.sessionId = await asrRealtimeStart();
+    // 并行：麦克风授权与后端建链（DashScope WS 握手）同时进行，缩短启动等待。
+    const sessP = asrRealtimeStart();
+    try {
+      this.stream = await md.getUserMedia({ audio: true });
+    } catch (e) {
+      // 麦克风失败：回收可能已建立的后端会话，避免悬挂。
+      void sessP.then((sid) => { if (sid) void asrRealtimeStop(sid); }).catch(() => {});
+      throw e;
+    }
+    this.sessionId = await sessP;
 
     this.unlisten = await listen('AutoForge://event', (e) => {
       const p = e.payload as { type?: string; session_id?: string; text?: string; is_final?: boolean };

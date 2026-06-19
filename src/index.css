@@ -1135,6 +1135,58 @@ button { font-family: inherit; cursor: pointer; }
   font-family: var(--font-sans); padding: 16px 12px; box-sizing: border-box;
 }
 
+/* 暂无需求时的「全量需求总账」放大快捷入口 */
+.ledger-empty-cta {
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  width: calc(100% - 24px); margin: 24px 12px 0; padding: 30px 20px 24px; box-sizing: border-box;
+  font-family: var(--font-sans); text-align: center; cursor: pointer;
+  background:
+    radial-gradient(120% 80% at 50% -10%, var(--ember-tint-strong), transparent 70%),
+    var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  transition: border-color .18s ease, transform .16s cubic-bezier(.2,.7,.3,1), box-shadow .18s ease;
+  animation: rise .34s cubic-bezier(.2,.7,.3,1) both;
+}
+.ledger-empty-cta::before {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: radial-gradient(90% 60% at 50% 0%, var(--ember-tint), transparent 60%);
+  opacity: 0; transition: opacity .18s ease;
+}
+.ledger-empty-cta:hover {
+  border-color: var(--ember); transform: translateY(-2px);
+  box-shadow: 0 8px 22px rgba(0,0,0,.10), 0 0 0 1px var(--ember-tint-strong);
+}
+.ledger-empty-cta:hover::before { opacity: 1; }
+.ledger-empty-cta:active { transform: translateY(0); }
+.ledger-empty-cta > * { position: relative; }
+.ledger-empty-cta-icon {
+  display: flex; align-items: center; justify-content: center;
+  width: 56px; height: 56px; border-radius: var(--radius);
+  background: linear-gradient(150deg, var(--ember-soft), var(--ember-deep));
+  color: #fff;
+  box-shadow: 0 6px 16px var(--ember-tint-strong), inset 0 1px 0 rgba(255,255,255,.22);
+  transition: transform .18s cubic-bezier(.2,.7,.3,1);
+}
+.ledger-empty-cta:hover .ledger-empty-cta-icon { transform: scale(1.06) rotate(-3deg); }
+.ledger-empty-cta-title {
+  font-size: var(--text-section); font-weight: 700; color: var(--text); letter-spacing: .01em;
+}
+.ledger-empty-cta-sub {
+  font-size: var(--text-control); color: var(--text-3); line-height: var(--leading-relaxed, 1.6); max-width: 240px;
+}
+.ledger-empty-cta-go {
+  display: inline-flex; align-items: center; gap: 3px; margin-top: 4px;
+  padding: 6px 14px; border-radius: 99px;
+  font-size: var(--text-label); font-weight: 600; color: #fff;
+  background: var(--ember);
+  box-shadow: 0 2px 8px var(--ember-tint-strong);
+  transition: gap .16s ease, background .16s ease;
+}
+.ledger-empty-cta:hover .ledger-empty-cta-go { gap: 7px; background: var(--ember-deep); }
+
 @keyframes rise { from { transform: translateY(9px); } to { transform: none; } }
 .rise { animation: rise .34s cubic-bezier(.2,.7,.3,1) both; }
 @media (prefers-reduced-motion: reduce) { .rise { animation: none; } }
@@ -1302,6 +1354,9 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .bubble a { color: var(--ember); text-decoration: none; border-bottom: 1px solid currentColor; }
 .bubble blockquote { margin: 8px 0; padding: 4px 0 4px 12px; border-left: 3px solid var(--ember-tint-strong); color: var(--text-2); }
 .bubble .mention { color: var(--ember); font-weight: 700; background: var(--ember-tint); padding: 1px 5px; border-radius: 6px; }
+/* 表格滚动壳：宽表格（th 不换行）自身横向滚动，不把文档气泡撑过可用宽度而压到右侧大纲上。
+   滚动容器的 min-content 收为 0，让 .msg-body 能正常在 .doc-toc 旁收缩、不再溢出重叠。 */
+.md-table-wrap { max-width: 100%; overflow-x: auto; }
 .bubble .md-table { width: 100%; border-collapse: collapse; font-size: var(--text-control); margin: 10px 0; }
 .bubble .md-table th { background: var(--bg-3); font-weight: 700; text-align: left; padding: 7px 11px; border: 1px solid var(--border); white-space: nowrap; }
 .bubble .md-table td { padding: 6px 11px; border: 1px solid var(--border); vertical-align: top; line-height: var(--leading-normal); }
@@ -1318,9 +1373,13 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
    长 markdown 消息跳出对话气泡：中性面板底 + 限定阅读行宽 + prose 行高，
    标题层级与段落留白更舒展，全文常显、无需展开。短消息仍用气泡。 */
 .msg.msg-doc { max-width: 100%; }
+/* --doc-wide 的「破栏」上限放在 .msg-body 上：有右侧大纲时本列会被 flex 收缩，
+   气泡须相对本列封顶（下面的 max-width:100%），绝不按 1240px 绝对值撑出列外压到大纲上。 */
+.msg.msg-doc .msg-body { max-width: var(--doc-wide); }
 .bubble.doc {
-  /* 面板收缩到内容宽度（短回复不会撑成大宽板），上限放宽到 --doc-wide 供宽内容破栏 */
-  width: fit-content; max-width: var(--doc-wide);
+  /* 面板收缩到内容宽度（短回复不会撑成大宽板），上限相对父列（.msg-body）封顶，
+     宽内容（表格/代码）破栏只吃满本列、超出自身横向滚动，不外溢到右侧大纲。 */
+  width: fit-content; max-width: 100%;
   background:
     radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 8px 8px,
     var(--bg-2);
@@ -1480,6 +1539,39 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
   border: 1px solid var(--ember-tint-strong); border-radius: 14px; overflow: hidden;
   margin: 8px 0; background: var(--bg-2); max-width: 380px;
 }
+/* 需求草稿是用户要逐条阅读并决策的卡片，不走 380px 紧凑卡宽，
+   而是吃满所在气泡宽度（与同气泡正文一致，封顶阅读行宽 --measure）。 */
+.artifact-draft { width: var(--measure); max-width: 100%; }
+
+/* artifact 正文按 Markdown 渲染，结构化排版让需求一目了然（schema 化分节）：
+   ## 小标题 → 带 ember 左条的段落标签；列表/代码/表格各归其位。仅用 CSS 变量。 */
+.artifact-body :where(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--font-display); font-weight: 700; color: var(--text);
+  font-size: var(--text-title); line-height: var(--leading-snug);
+  margin: 15px 0 7px; padding-left: 9px; border-left: 3px solid var(--ember);
+}
+.artifact-body :where(h4, h5, h6) { font-size: var(--text-body); color: var(--text-2); }
+.artifact-body > :first-child { margin-top: 0; }
+.artifact-body p { margin: 6px 0; }
+.artifact-body ul, .artifact-body ol { margin: 6px 0; padding-left: 20px; }
+.artifact-body li { margin: 3px 0; }
+.artifact-body li::marker { color: var(--ember); }
+.artifact-body strong { font-weight: 700; color: var(--text); }
+.artifact-body code {
+  font-family: var(--font-mono); font-size: .92em; color: var(--ember);
+  background: var(--bg-3); border: 1px solid var(--border);
+  padding: 1px 5px; border-radius: 6px;
+}
+.artifact-body blockquote {
+  margin: 8px 0; padding: 4px 0 4px 12px; color: var(--text-3);
+  border-left: 3px solid var(--ember-tint-strong);
+}
+.artifact-body hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.artifact-body .md-table-wrap { max-width: 100%; overflow-x: auto; }
+.artifact-body .md-table { width: 100%; border-collapse: collapse; font-size: var(--text-control); margin: 8px 0; }
+.artifact-body .md-table th { background: var(--bg-3); font-weight: 700; text-align: left; padding: 6px 10px; border: 1px solid var(--border); white-space: nowrap; }
+.artifact-body .md-table td { padding: 6px 10px; border: 1px solid var(--border); vertical-align: top; line-height: var(--leading-normal); }
+.artifact-body .codeblock { margin: 8px 0; }
 .artifact-head {
   display: flex; align-items: center; gap: 10px; padding: 11px 14px;
   background: linear-gradient(90deg, var(--ember-tint), transparent);
@@ -1780,7 +1872,7 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .req-item:hover { background: var(--surface-hover); }
 .req-item.active { background: var(--bg-3); border-color: var(--ember-tint-strong); }
 .req-item-top { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
-.req-id { font-family: var(--font-mono); font-size: var(--text-caption); color: var(--ember); font-weight: 700; }
+.req-id { font-family: var(--font-mono); font-size: var(--text-caption); color: var(--ember); font-weight: 700; white-space: nowrap; flex: none; }
 .req-time { margin-left: auto; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-3); white-space: nowrap; }
 .req-title { font-size: var(--text-body); font-weight: 600; line-height: var(--leading-normal); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 全量需求总账：宽弹窗下用单行密排，充分利用横向空间（编号 · 标题 · 整理 · 状态 · 时间）。 */
@@ -1799,7 +1891,13 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .audit-top { height: 60px; flex: none; display: flex; align-items: center; gap: 14px; padding: 0 22px; border-bottom: 1px solid var(--border); background: var(--titlebar); backdrop-filter: blur(16px); }
 /* 仅页头（含「启动项目」下拉）抬高层级，盖过下方 workspace 及详情区 audit-top */
 .audit-top.audit-head-main { position: relative; z-index: 60; }
-.audit-decide { margin-left: auto; display: flex; gap: 8px; }
+/* 详情页头左侧信息块：可收缩并让长标题省略，避免把右侧操作按钮挤到换行 */
+.audit-top-info { min-width: 0; flex: 1; }
+.audit-top-titlerow { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.audit-top-titlerow > * { flex: none; }
+.audit-top-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-decide { margin-left: auto; display: flex; gap: 8px; flex: none; }
+.audit-decide > * { flex: none; }
 .audit-split { flex: 1; display: flex; min-height: 0; transition: opacity 0.12s ease; }
 .audit-split.cr-loading { opacity: 0.45; pointer-events: none; }
 .audit-left { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: column; }
@@ -2034,6 +2132,8 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .csel-trigger:focus, .csel-trigger.open {
   border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint);
 }
+/* 紧凑尺寸：与 .btn-sm 同高（用于工具栏中与小按钮并排的下拉） */
+.csel.sm .csel-trigger { padding: 5px 10px; font-size: var(--text-label); border-radius: 8px; }
 .csel-ph { color: var(--text-3); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .csel-val { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .csel-arr { color: var(--text-3); flex: none; transition: transform .15s, color .15s; }

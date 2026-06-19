@@ -1359,7 +1359,7 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
               <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr 1.4fr auto', gap: 8, alignItems: 'center' }}>
                 <input value={r.table} onChange={e => setRow(i, { table: e.target.value })} placeholder="表名 users" style={{ fontFamily: 'var(--font-mono)' }} />
                 <input value={r.fields} onChange={e => setRow(i, { fields: e.target.value })} placeholder="字段，逗号分隔 email, phone" style={{ fontFamily: 'var(--font-mono)' }} />
-                <Select value={r.rule} onChange={v => setRow(i, { rule: v as MaskRule })} options={MASK_RULE_OPTS} />
+                <Select className="sm" value={r.rule} onChange={v => setRow(i, { rule: v as MaskRule })} options={MASK_RULE_OPTS} />
                 <button className="btn btn-sm btn-danger" onClick={() => delRow(i)} title="删除该行"><Icon name="trash" size={13} /></button>
               </div>
             ))}

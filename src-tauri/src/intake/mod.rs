@@ -4,6 +4,7 @@ pub mod github;
 pub mod proposer;
 pub mod ratelimit;
 pub mod scanner;
+pub mod triage;
 pub mod webhook;
 
 use serde::{Deserialize, Serialize};

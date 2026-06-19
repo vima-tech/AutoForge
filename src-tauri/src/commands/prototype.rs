@@ -2,6 +2,7 @@ use crate::models::issue::Issue;
 use crate::models::project::Project;
 use crate::models::prototype::PrototypePrompt;
 use crate::state::AppState;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
@@ -285,4 +286,138 @@ async fn llm_prompt(
     } else {
         Some(raw.trim().to_string())
     }
+}
+
+// ============================================================================
+// OpenDesign 本地服务：可配置「启动命令 + 访问 URL」（存 app_settings），
+// 一键拉起本地服务并由前端打开浏览器。命令/URL 来自用户设置，默认见下。
+// ============================================================================
+
+const OPENDESIGN_DEFAULT_COMMAND: &str = "npx opendesign";
+const OPENDESIGN_DEFAULT_URL: &str = "http://localhost:5173";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenDesignSettings {
+    /// 拉起本地 OpenDesign 服务的 shell 命令（为空表示「不启动、仅打开 URL」）。
+    pub command: String,
+    /// 服务就绪后要打开的浏览器地址。
+    pub url: String,
+}
+
+async fn read_setting(state: &AppState, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key=?")
+        .bind(key)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn write_setting(state: &AppState, key: &str, value: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn load_opendesign_settings(state: &AppState) -> OpenDesignSettings {
+    let command = read_setting(state, "opendesign.command")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OPENDESIGN_DEFAULT_COMMAND.to_string());
+    let url = read_setting(state, "opendesign.url")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OPENDESIGN_DEFAULT_URL.to_string());
+    OpenDesignSettings { command, url }
+}
+
+#[tauri::command]
+pub async fn get_opendesign_settings(
+    state: State<'_, AppState>,
+) -> Result<OpenDesignSettings, String> {
+    Ok(load_opendesign_settings(&state).await)
+}
+
+/// 保存 OpenDesign 启动配置。命令可为空（仅打开 URL）；URL 为空时回落到默认。
+#[tauri::command]
+pub async fn set_opendesign_settings(
+    command: String,
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<OpenDesignSettings, String> {
+    let url = {
+        let t = url.trim();
+        if t.is_empty() { OPENDESIGN_DEFAULT_URL } else { t }
+    };
+    write_setting(&state, "opendesign.command", command.trim()).await?;
+    write_setting(&state, "opendesign.url", url).await?;
+    Ok(load_opendesign_settings(&state).await)
+}
+
+/// 简单的 URL 可达性探测（与 dev_server 一致：2s 超时、容忍自签名证书）。
+async fn url_reachable(url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .danger_accept_invalid_certs(true)
+        .build()
+    else {
+        return false;
+    };
+    client.get(url).send().await.is_ok()
+}
+
+/// 拉起本地 OpenDesign 服务并返回要打开的 URL（浏览器打开交给前端 `open_url`，
+/// 保持本命令不依赖 Tauri opener）。
+///
+/// 行为：
+/// 1. 若 URL 已可达 → 直接返回（服务已在运行，避免重复启动）。
+/// 2. 否则执行配置的启动命令（detached 进程组，独立于桌面壳存活），
+///    再轮询等待服务就绪（最多 ~30s）。
+/// 3. 命令为空且 URL 不可达 → 报错提示去设置里配置启动命令。
+#[tauri::command]
+pub async fn launch_opendesign(state: State<'_, AppState>) -> Result<String, String> {
+    let cfg = load_opendesign_settings(&state).await;
+
+    if url_reachable(&cfg.url).await {
+        return Ok(cfg.url);
+    }
+
+    if cfg.command.is_empty() {
+        return Err(format!(
+            "OpenDesign 服务未运行（{}），且未配置启动命令。请在「设置」中填写启动命令。",
+            cfg.url
+        ));
+    }
+
+    // detached：让本地服务独立于桌面壳进程组存活，关闭/退出 AutoForge 不连带杀掉它。
+    let mut cmd = crate::core::platform::shell(&cfg.command);
+    crate::core::platform::detach_process_group(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _child = cmd
+        .spawn()
+        .map_err(|e| format!("启动 OpenDesign 失败：{e}（命令：{}）", cfg.command))?;
+    // 不持有 child 句柄：进程已 detach 成独立进程组，由用户自行管理生命周期。
+
+    // 轮询等待就绪（每 1s 探一次，最多 30 次）。
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if url_reachable(&cfg.url).await {
+            return Ok(cfg.url);
+        }
+    }
+
+    // 超时仍未就绪：返回 URL 让前端照常打开（服务可能仍在编译/慢启动）。
+    Ok(cfg.url)
 }

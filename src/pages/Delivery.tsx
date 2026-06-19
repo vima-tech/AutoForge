@@ -5,6 +5,7 @@ import Select from '../components/Select';
 import Toast, { type ToastData } from '../components/Toast';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
+  openUrl, launchOpenDesign,
   listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
   runProactiveScan, listTestSessions, getWidgetSnippet, getWebhookStatus,
   listDeliveryArtifacts, importDeliveryArtifact, deleteDeliveryArtifact, revealDeliveryArtifact, renameDeliveryArtifact,
@@ -92,6 +93,18 @@ const TOOL_OPTS = [
 const ENV_OPTS = [
   { value: 'production', label: '生产环境' },
   { value: 'staging', label: '预发环境' },
+];
+// 复制按钮旁的「在设计工具打开」下拉：主流 AI 原型/设计站点，在系统浏览器打开供直接粘贴提示词。
+const DESIGN_SITES = [
+  { id: 'v0', label: 'v0', url: 'https://v0.app' },
+  { id: 'lovable', label: 'Lovable', url: 'https://lovable.dev' },
+  { id: 'stitch', label: 'Stitch', url: 'https://stitch.withgoogle.com' },
+  { id: 'claude', label: 'Claude Design', url: 'https://claude.ai/design' },
+];
+// 下拉项 = 站点跳转 + OpenDesign 本地服务拉起（值 'opendesign' 特判）。
+const DESIGN_TOOL_OPTS = [
+  ...DESIGN_SITES.map(s => ({ value: s.id, label: s.label })),
+  { value: 'opendesign', label: 'OpenDesign（拉起本地）' },
 ];
 
 function ts(s: string | null): string {
@@ -193,6 +206,31 @@ export default function Delivery() {
       await navigator.clipboard?.writeText(text);
       setToast({ msg: '已复制到剪贴板', tone: 'success' });
     } catch { showError('复制失败，请手动选择文本复制'); }
+  };
+
+  // 在系统浏览器打开主流设计站点（先复制提示词，再跳转，方便直接粘贴）。
+  const openSite = async (url: string) => {
+    try { await openUrl(url); }
+    catch (e) { showError(String(e)); }
+  };
+
+  // 下拉分发：OpenDesign 走本地服务拉起，其余为站点浏览器跳转。
+  const handleDesignTool = (id: string) => {
+    if (id === 'opendesign') { launchOD(); return; }
+    const site = DESIGN_SITES.find(s => s.id === id);
+    if (site) openSite(site.url);
+  };
+
+  // 深度支持 OpenDesign：拉起本地服务（detached），就绪后在浏览器打开。
+  const launchOD = async () => {
+    setBusy('opendesign');
+    setToast({ msg: '正在拉起本地 OpenDesign 服务…', tone: 'info' });
+    try {
+      const url = await launchOpenDesign();
+      await openUrl(url);
+      setToast({ msg: `已打开 OpenDesign（${url}）`, tone: 'success' });
+    } catch (e) { showError(String(e)); }
+    finally { setBusy(''); }
   };
 
   const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -317,7 +355,7 @@ export default function Delivery() {
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div style={{ minWidth: 150 }}>
-                  <Select value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
+                  <Select className="sm" value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
                 </div>
                 <button className="btn btn-primary btn-sm" disabled={busy === 'proto'}
                   onClick={() => run('proto', () => generatePrototypePrompt(projectId, null, toolTarget))}>
@@ -334,8 +372,12 @@ export default function Delivery() {
                       <span className="chip violet">{p.tool_target}</span>
                       <span style={{ fontSize: 'var(--text-title)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.title}</span>
                     </div>
-                    <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                    <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'center', justifyContent: 'flex-end' }}>
                       <button className="btn btn-sm" onClick={() => copy(p.prompt)}><Icon name="copy" size={13} />复制</button>
+                      <div style={{ minWidth: 150 }}>
+                        <Select className="sm" value="" placeholder={busy === 'opendesign' ? '启动中…' : '在设计工具打开 ↗'}
+                          options={DESIGN_TOOL_OPTS} onChange={handleDesignTool} />
+                      </div>
                       <button className="btn btn-sm" onClick={() => setEditProto(editProto?.id === p.id ? null : { id: p.id, title: p.title, prompt: p.prompt })}><Icon name="edit" size={13} />完善</button>
                       <button className="btn btn-sm btn-danger" disabled={busy === 'delproto' + p.id} onClick={() => run('delproto' + p.id, async () => { await deletePrototypePrompt(p.id); if (editProto?.id === p.id) setEditProto(null); })}><Icon name="trash" size={13} /></button>
                     </div>
@@ -391,7 +433,7 @@ export default function Delivery() {
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div style={{ minWidth: 130 }}>
-                  <Select value={targetEnv} onChange={setTargetEnv} options={ENV_OPTS} />
+                  <Select className="sm" value={targetEnv} onChange={setTargetEnv} options={ENV_OPTS} />
                 </div>
                 <button className="btn btn-primary btn-sm" disabled={busy === 'deploy'}
                   onClick={() => run('deploy', () => generateDeployScript(projectId, targetEnv))}>
@@ -533,7 +575,7 @@ export default function Delivery() {
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div style={{ minWidth: 120 }}>
-                  <Select value={artNode} onChange={setArtNode} options={ART_NODE_OPTS} />
+                  <Select className="sm" value={artNode} onChange={setArtNode} options={ART_NODE_OPTS} />
                 </div>
                 <button className="btn btn-primary btn-sm" disabled={busy === 'upload'} onClick={() => fileRef.current?.click()}>
                   <Icon name="upload" size={14} />{busy === 'upload' ? '上传中…' : '上传产物'}

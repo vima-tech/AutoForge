@@ -81,6 +81,24 @@ pub enum AppEvent {
     },
 }
 
+impl AppEvent {
+    /// 若该事件是 CR（变更请求）维度的，返回其 `cr_id`。
+    /// 通知收件箱据此把 CR 阶段事件归并回所属需求线程（见 `record_notification`）。
+    pub fn cr_id(&self) -> Option<&str> {
+        match self {
+            AppEvent::WorktreeUpdate { cr_id, .. }
+            | AppEvent::TaskProgress { cr_id, .. }
+            | AppEvent::PreviewUpdate { cr_id, .. }
+            | AppEvent::TestCompleted { cr_id, .. }
+            | AppEvent::ReviewNeeded { cr_id, .. }
+            | AppEvent::CrMerged { cr_id, .. }
+            | AppEvent::SecurityAuditCompleted { cr_id, .. }
+            | AppEvent::IterationWarning { cr_id, .. } => Some(cr_id),
+            _ => None,
+        }
+    }
+}
+
 pub fn emit(app: &AppHandle, event: AppEvent) {
     let _ = app.emit("AutoForge://event", &event);
 

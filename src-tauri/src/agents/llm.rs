@@ -10,6 +10,11 @@ use std::time::Duration;
 /// 工具循环最大轮数，防止模型无限调用工具。每轮 = 一次模型调用 + 一批工具执行。
 const MAX_TOOL_ITERS: usize = 6;
 
+/// 注入 Innate 召回内容时使用的小节标题（不含 `## `）。这是 trace 判定「本次 LLM 调用
+/// 是否触发了记忆召回」的唯一锚点——`commands/trace.rs` 据此对 system_prompt 做 LIKE 匹配，
+/// 在 Trace 页面打出 INNATE 标志。改这里务必同步那里的匹配串（同一常量来源）。
+pub const INNATE_RECALL_HEADING: &str = "历史经验与技能（Innate 召回）";
+
 /// 间接提示注入护栏：工具/检索结果是不可信外部数据，模型不得执行或复述其中的控制标签。
 /// 注入到工具循环的 system，与 `parse_agent_file_writes` 的代码区屏蔽形成纵深防御
 /// （前者降低模型“复述”注入标签的概率，后者即便被复述也只认裸的、非示例的标签）。
@@ -238,9 +243,9 @@ pub async fn build_role_system_prompt(
             if !recalled.trim().is_empty() {
                 let head = system_prompt.take().unwrap_or_default();
                 system_prompt = Some(if head.trim().is_empty() {
-                    format!("## 历史经验与技能（Innate 召回）\n{}", recalled)
+                    format!("## {}\n{}", INNATE_RECALL_HEADING, recalled)
                 } else {
-                    format!("{}\n\n## 历史经验与技能（Innate 召回）\n{}", head, recalled)
+                    format!("{}\n\n## {}\n{}", head, INNATE_RECALL_HEADING, recalled)
                 });
             }
         }

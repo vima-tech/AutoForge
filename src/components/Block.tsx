@@ -3,7 +3,7 @@ import Icon from './Icon';
 import Markdown from './Markdown';
 import { highlightText } from './highlight';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, openAttachment, submitFromArtifact, writeWorkspaceFile } from '../services';
+import { attachmentDataUrl, decideRequirementDraft, openAttachment, writeWorkspaceFile } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -78,35 +78,33 @@ function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: s
 
 // ── ArtifactBlock ─────────────────────────────────────────────────────────────
 
-function ArtifactBlock({ b, projectId, highlight }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string; highlight?: string }) {
-  const [submitted, setSubmitted] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string; highlight?: string; messageId?: string; blockIndex?: number }) {
+  // 需求草稿的决策：优先用持久化在块上的 decided，其次本地乐观状态。
+  const [decision, setDecision] = useState<'confirmed' | 'rejected' | ''>(b.decided ?? '');
+  const [deciding, setDeciding] = useState<'confirm' | 'reject' | ''>('');
   const [submitErr, setSubmitErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
   const [saveErr, setSaveErr] = useState('');
 
-  const meta = (b as any)._meta as {
-    project_id?: string; title?: string; description?: string;
-    category?: string; severity?: string;
-  } | undefined;
+  const meta = b._meta;
   const isDraft = b.kind === 'requirement_draft';
   const effectiveProjectId = projectId || meta?.project_id;
 
-  const handleSubmitDraft = async () => {
-    if (!meta?.title || submitting) return;
-    setSubmitting(true); setSubmitErr('');
+  // 在对话 card 内直接确认/拒绝整理好的需求，让整理环节就地闭环。
+  const handleDecide = async (decideAs: 'confirm' | 'reject') => {
+    if (deciding || decision) return;
+    if (!messageId) { setSubmitErr('无法定位消息，请刷新后重试'); return; }
+    if (decideAs === 'confirm' && !effectiveProjectId) {
+      setSubmitErr('该群聊未绑定项目，无法确认入库');
+      return;
+    }
+    setDeciding(decideAs); setSubmitErr('');
     try {
-      await submitFromArtifact({
-        project_id: meta.project_id || '',
-        title: meta.title || b.title,
-        description: meta.description || b.body,
-        category: meta.category,
-        severity: meta.severity,
-      });
-      setSubmitted(true);
+      await decideRequirementDraft({ message_id: messageId, decision: decideAs, block_index: blockIndex });
+      setDecision(decideAs === 'confirm' ? 'confirmed' : 'rejected');
     } catch (e) { setSubmitErr(String(e)); }
-    finally { setSubmitting(false); }
+    finally { setDeciding(''); }
   };
 
   const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs') => {
@@ -130,7 +128,7 @@ function ArtifactBlock({ b, projectId, highlight }: { b: Extract<BlockType, { t:
   };
 
   return (
-    <div className="artifact">
+    <div className={'artifact' + (isDraft ? ' artifact-draft' : '')}>
       <div className="artifact-head">
         <div className="artifact-ic"><Icon name={isDraft ? 'inbox' : 'zap'} size={17} /></div>
         <div style={{ minWidth: 0 }}>
@@ -146,17 +144,24 @@ function ArtifactBlock({ b, projectId, highlight }: { b: Extract<BlockType, { t:
           </div>
         ))}
       </div>
-      <div className="artifact-body">{highlightText(b.body, highlight)}</div>
+      <div className="artifact-body"><Markdown md={b.body} highlight={highlight} /></div>
       <div className="artifact-foot">
         {isDraft ? (
-          submitted ? (
+          decision === 'confirmed' ? (
             <span className="chip green" style={{ padding: '3px 10px' }}>
-              <Icon name="check" size={12} style={{ marginRight: 4 }} />已提交入队
+              <Icon name="check" size={12} style={{ marginRight: 4 }} />已确认 · 进入流水线
+            </span>
+          ) : decision === 'rejected' ? (
+            <span className="chip" style={{ padding: '3px 10px', color: 'var(--text-3)' }}>
+              <Icon name="x" size={12} style={{ marginRight: 4 }} />已拒绝
             </span>
           ) : (
             <>
-              <button className="btn btn-sm btn-primary" disabled={submitting} onClick={handleSubmitDraft}>
-                <Icon name="arrowUp" size={13} />{submitting ? '提交中…' : '提交到流水线'}
+              <button className="btn btn-sm btn-primary" disabled={!!deciding} onClick={() => handleDecide('confirm')}>
+                <Icon name="check" size={13} />{deciding === 'confirm' ? '确认中…' : '确认需求'}
+              </button>
+              <button className="btn btn-sm btn-danger" disabled={!!deciding} onClick={() => handleDecide('reject')}>
+                <Icon name="x" size={13} />{deciding === 'reject' ? '拒绝中…' : '拒绝需求'}
               </button>
               {submitErr && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--red)' }}>{submitErr}</span>}
             </>
@@ -219,7 +224,7 @@ function FileWrittenBlock({ b, highlight }: { b: Extract<BlockType, { t: 'file_w
 
 // ── Main Block ────────────────────────────────────────────────────────────────
 
-export default function Block({ b, projectId, highlight }: { b: BlockType; projectId?: string; highlight?: string }) {
+export default function Block({ b, projectId, highlight, messageId, blockIndex }: { b: BlockType; projectId?: string; highlight?: string; messageId?: string; blockIndex?: number }) {
   const [previewUrl, setPreviewUrl] = useState('');
   const [attachmentError, setAttachmentError] = useState('');
 
@@ -271,7 +276,7 @@ export default function Block({ b, projectId, highlight }: { b: BlockType; proje
       )}
     </div>
   );
-  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} highlight={highlight} />;
+  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} highlight={highlight} messageId={messageId} blockIndex={blockIndex} />;
   if (b.t === 'file_written') return <FileWrittenBlock b={b} highlight={highlight} />;
   return null;
 }

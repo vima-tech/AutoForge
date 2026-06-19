@@ -215,21 +215,7 @@ pub async fn run(
         &format!("{} {}", issue.title, issue.description),
     )
     .await;
-    if let Some(trace_id) = recall.trace_id.as_deref() {
-        let _ = sqlx::query(
-            "INSERT INTO kb_traces (change_request_id, project_id, trace_id, used_ids, created_at)
-             VALUES (?, ?, ?, ?, datetime('now'))
-             ON CONFLICT(change_request_id) DO UPDATE SET
-                 project_id=excluded.project_id, trace_id=excluded.trace_id,
-                 used_ids=excluded.used_ids, created_at=excluded.created_at",
-        )
-        .bind(cr_id)
-        .bind(&cr.project_id)
-        .bind(trace_id)
-        .bind(recall.used_ids.join(","))
-        .execute(db)
-        .await;
-    }
+    crate::knowledge::store_recall_trace(db, "change_request", cr_id, &cr.project_id, &recall).await;
     let analysis_summary = if recall.text.trim().is_empty() {
         analysis_summary
     } else {
@@ -493,6 +479,11 @@ pub async fn run(
                 message: Some(reason.chars().take(200).collect()),
             },
         );
+        // Innate: close the code recall trace on terminal failure so it doesn't
+        // leak. Outcome is "fail" but feedback is None — a commit failure (often
+        // "no changes produced") is too ambiguous to demote the recalled chunks;
+        // we record the negative outcome for evolution without yanking confidence.
+        crate::knowledge::consume_recall_trace(db, "change_request", cr_id, "fail", None).await;
         return Err(anyhow!("commit failed for {}: {}", cr_id, commit_err));
     }
 

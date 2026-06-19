@@ -93,8 +93,29 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
         push("环境", &issue.environment);
         push("期望结果", &issue.expected);
         push("实际结果", &issue.actual);
+        // 审核 1 管理员补充意见：上一轮分析后人工提出，需据此重新评估该需求。
+        // 作为高优先输入并入描述，引导本轮分析。消费后下方清空，保证一次性。
+        push("管理员补充意见（请据此重新评估本需求）", &issue.review_feedback);
         d
     };
+    // 一次性消费补充意见：本轮已并入分析输入，立即清空，避免后续重试重复注入。
+    if issue.review_feedback.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+        let _ = sqlx::query("UPDATE issues SET review_feedback=NULL WHERE id=?")
+            .bind(issue_id)
+            .execute(db)
+            .await;
+    }
+    // Innate: traced recall of past analysis experience (project ⊕ shared). Keyed
+    // by issue → its outcome is written back at review_1 (approve = up / reject =
+    // down), closing the analysis calibration loop. Injected into the analysis
+    // prompt below; the trace is stashed only when analysis actually reaches
+    // review_1 (success path), so a failed analysis doesn't leave a dangling row.
+    let recall = crate::knowledge::kb_recall_traced(
+        &issue.project_id,
+        &format!("{} {}", issue.title, enriched_desc),
+    )
+    .await;
+    let recalled = Some(recall.text.as_str()).filter(|s| !s.trim().is_empty());
     let result = match crate::core::trace::with_tags(
         trace_tags,
         crate::agents::analysis::analyze(
@@ -103,6 +124,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
             &enriched_desc,
             project_context.as_deref(),
             Some(issue.project_id.as_str()),
+            recalled,
         ),
     )
     .await
@@ -148,6 +170,10 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
             return Err(anyhow!("analysis failed for issue {}: {}", issue_id, err));
         }
     };
+
+    // Analysis succeeded and will land at review_1 — stash the recall trace so its
+    // human verdict (approve/reject) calibrates the recalled analysis chunks.
+    crate::knowledge::store_recall_trace(db, "issue", issue_id, &issue.project_id, &recall).await;
 
     // Persist analysis
     let analysis_id = Uuid::new_v4().to_string();

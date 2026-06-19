@@ -601,6 +601,7 @@ pub async fn analyze(
     description: &str,
     project_context: Option<&str>,
     project_id: Option<&str>,
+    recalled: Option<&str>,
 ) -> Result<AnalysisResult> {
     let prompt = match project_context.filter(|c| !c.trim().is_empty()) {
         Some(ctx) => format!(
@@ -618,11 +619,22 @@ pub async fn analyze(
     // is assigned, so a fresh install still works.
     let (raw, trace_id) = match resolve_analysis_agent(db).await {
         Some(agent) => {
-            let sys = crate::agents::roles::compose_system_prompt(
+            let mut sys = crate::agents::roles::compose_system_prompt(
                 Some("analysis"),
                 &agent.prompt_mode,
                 &agent.system_prompt,
             );
+            // Inject the traced Innate recall under the shared heading so the
+            // analysis Agent reasons with past experience — and the Trace page's
+            // INNATE flag lights up for analysis too (same marker as run_system_role_text).
+            if let Some(r) = recalled.map(str::trim).filter(|s| !s.is_empty()) {
+                sys = format!(
+                    "{}\n\n## {}\n{}",
+                    sys,
+                    crate::agents::llm::INNATE_RECALL_HEADING,
+                    r
+                );
+            }
             // 走工具循环：分析 Agent 可按需读取/检索项目真实源码（绑定项目时），
             // 让评估基于实际代码而非仅需求文本。未开启工具/无项目时自动回退单轮。
             let ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
@@ -638,7 +650,18 @@ pub async fn analyze(
             })
             .await?
         }
-        None => (local_claude::run_text(&prompt, Some(SYSTEM_PROMPT)).await?, None),
+        None => {
+            let sys = match recalled.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(r) => format!(
+                    "{}\n\n## {}\n{}",
+                    SYSTEM_PROMPT,
+                    crate::agents::llm::INNATE_RECALL_HEADING,
+                    r
+                ),
+                None => SYSTEM_PROMPT.to_string(),
+            };
+            (local_claude::run_text(&prompt, Some(&sys)).await?, None)
+        }
     };
 
     // Parse into the full structured spec (with legacy fallback); keep raw for audit.

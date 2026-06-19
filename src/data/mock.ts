@@ -35,7 +35,9 @@ export type BlockType =
   | { t: 'file'; id?: string; name: string; meta: string; color: string; mime?: string; size?: number }
   | { t: 'image'; id?: string; label: string; meta: string; color: string; mime?: string; size?: number }
   | { t: 'quote_ref'; message_id: string; author: string; text: string; created_at: string }
-  | { t: 'artifact'; kind: string; title: string; rows: [string, string][]; body: string }
+  | { t: 'artifact'; kind: string; title: string; rows: [string, string][]; body: string;
+      decided?: 'confirmed' | 'rejected';
+      _meta?: { project_id?: string; title?: string; description?: string; category?: string; severity?: string } }
   | { t: 'file_written'; path: string; name: string; preview: string; size_bytes: number; error?: boolean };
 
 export interface Message {

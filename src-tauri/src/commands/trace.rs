@@ -1,10 +1,21 @@
 //! LLM trace 查询命令：列表（按 trace 汇总）+ 详情（trace 内全部 span）+ 清理。
 //! 薄包装：取 state → 调 sqlx → 返回，业务无 Tauri 类型耦合。
 
+use crate::agents::llm::INNATE_RECALL_HEADING;
 use crate::models::llm_trace::{LlmTrace, LlmTraceSummary};
 use crate::state::AppState;
 use serde::Deserialize;
 use tauri::State;
+
+/// SQL 片段：判定给定 system_prompt 列是否注入了 Innate 召回小节，产出 0/1 → `innate_triggered`。
+/// `col` 为列引用（如 `r.system_prompt` / `system_prompt`）。锚点常量在 `agents/llm.rs`，单一来源；
+/// 标题不含单引号，内联进 SQL 安全。
+fn innate_expr(col: &str) -> String {
+    format!(
+        "(COALESCE({col},'') LIKE '%{}%') AS innate_triggered",
+        INNATE_RECALL_HEADING
+    )
+}
 
 /// trace 列表筛选条件（均可选，留空即不限）。
 #[derive(Debug, Default, Deserialize)]
@@ -34,16 +45,19 @@ pub async fn list_llm_traces(
 ) -> Result<Vec<LlmTraceSummary>, String> {
     let limit = filter.limit.unwrap_or(200).clamp(1, 1000);
 
-    // root 行汇总；span_count/total_tokens 由子查询按 trace_id 聚合。
-    let mut sql = String::from(
+    // root 行汇总；span_count/total_tokens 由子查询按 trace_id 聚合；innate_triggered 由 root 的
+    // system_prompt 是否含 Innate 召回小节派生。
+    let mut sql = format!(
         "SELECT
             r.trace_id, r.agent_id, r.agent_role, r.agent_name,
             r.project_id, r.issue_id, r.conversation_id, r.task_id,
             r.status, r.error, r.input, r.output, r.latency_ms, r.created_at,
             (SELECT COUNT(*) FROM llm_traces s WHERE s.trace_id = r.trace_id) AS span_count,
-            (SELECT COALESCE(SUM(s.total_tokens),0) FROM llm_traces s WHERE s.trace_id = r.trace_id) AS total_tokens
+            (SELECT COALESCE(SUM(s.total_tokens),0) FROM llm_traces s WHERE s.trace_id = r.trace_id) AS total_tokens,
+            {}
          FROM llm_traces r
          WHERE r.kind = 'agent'",
+        innate_expr("r.system_prompt"),
     );
     let mut binds: Vec<String> = Vec::new();
     if let Some(v) = filter.issue_id.as_deref().filter(|s| !s.is_empty()) {
@@ -97,9 +111,10 @@ pub async fn get_llm_trace(
     trace_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<LlmTrace>, String> {
-    sqlx::query_as::<_, LlmTrace>(
-        "SELECT * FROM llm_traces WHERE trace_id = ? ORDER BY seq ASC, created_at ASC",
-    )
+    sqlx::query_as::<_, LlmTrace>(&format!(
+        "SELECT *, {} FROM llm_traces WHERE trace_id = ? ORDER BY seq ASC, created_at ASC",
+        innate_expr("system_prompt"),
+    ))
     .bind(&trace_id)
     .fetch_all(&state.db)
     .await

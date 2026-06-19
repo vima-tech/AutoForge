@@ -217,6 +217,10 @@ pub async fn review_1(
         )
         .await?;
 
+        // Innate: the analysis a human approved at review_1 was a good call —
+        // reinforce the experience that fed it (positive calibration signal).
+        crate::knowledge::consume_recall_trace(&state.db, "issue", &issue_id, "ok", Some("up")).await;
+
         // Update issue
         sqlx::query(
             "UPDATE issues SET status='pending_execution', updated_at=datetime('now') WHERE id=?",
@@ -264,6 +268,10 @@ pub async fn review_1(
             decision.suggestions.as_deref(),
         )
         .await?;
+
+        // Innate: a human rejected this analysis at review_1 — demote the recalled
+        // experience that fed it (negative calibration signal).
+        crate::knowledge::consume_recall_trace(&state.db, "issue", &issue_id, "fail", Some("down")).await;
 
         // Rejected
         sqlx::query("UPDATE issues SET status='rejected', updated_at=datetime('now') WHERE id=?")
@@ -390,7 +398,7 @@ pub async fn review_2(
 
         // Innate: close the recall feedback loop with a negative signal — the
         // recalled knowledge fed code a human rejected at review 2.
-        crate::knowledge::consume_trace_outcome(&state.db, &cr_id, "fail", Some("down")).await;
+        crate::knowledge::consume_recall_trace(&state.db, "change_request", &cr_id, "fail", Some("down")).await;
 
         crate::core::event::emit(
             &app,

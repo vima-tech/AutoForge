@@ -506,6 +506,24 @@ async fn build_plan(
         }
     }
 
+    // 需求录入意图：用户想把内容「加进系统 / 沉淀为需求」，而不是展开讨论。
+    // 走专门的需求捕获路径——只派一个 Agent 产出 requirement_draft 草稿块（前端可一键
+    // 「提交到流水线」），激活原本休眠的 requirement_draft 链路；单 Agent 也避免并行
+    // 多 Agent 各说各话、结论不一致。仅当群聊已绑定项目（草稿才能提交）时启用。
+    if conversation.project_id.is_some() && asks_to_capture_requirement(instruction) {
+        let target = route_by_relevance(instruction, members)
+            .or_else(|| members.first().map(|a| a.id.clone()));
+        if let Some(agent_id) = target {
+            return Ok(ConversationPlan {
+                steps: vec![ConversationPlanStep {
+                    step_type: "single".to_string(),
+                    agents: vec![agent_id],
+                    instruction: capture_requirement_instruction(instruction),
+                }],
+            });
+        }
+    }
+
     let mentioned: Vec<String> = mentioned_agent_ids
         .iter()
         .filter(|id| members.iter().any(|a| &a.id == *id))
@@ -1013,7 +1031,22 @@ async fn run_agent_for_step(
     // 检测 LLM 输出中是否嵌入了 requirement_draft artifact JSON
     let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text_after_writes);
     let mut blocks = vec![serde_json::json!({ "t": "md", "md": clean_text })];
-    if let Some(artifact) = draft_artifact {
+    if let Some(mut artifact) = draft_artifact {
+        // LLM 只产出 requirement_draft 的业务字段，这里补齐前端渲染/提交所需：
+        // 1) 打上 block 类型 t=artifact，否则 Block.tsx 不会渲染成 artifact 块；
+        // 2) 用已知会话项目 id 覆盖 _meta.project_id（不信任 LLM 自填），
+        //    使「提交到流水线」按钮真正可用。
+        if let Some(obj) = artifact.as_object_mut() {
+            obj.insert("t".to_string(), serde_json::json!("artifact"));
+            if let Some(pid) = project_id.as_deref() {
+                let meta = obj
+                    .entry("_meta")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(meta_obj) = meta.as_object_mut() {
+                    meta_obj.insert("project_id".to_string(), serde_json::json!(pid));
+                }
+            }
+        }
         blocks.push(artifact);
     }
     for wb in write_blocks {
@@ -1604,6 +1637,73 @@ fn asks_for_sequence(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+/// 用户意图：把当前内容「录入系统 / 沉淀为正式需求」，而非聊一聊。命中后走需求
+/// 捕获路径，让 Agent 产出可一键入流水线的 requirement_draft 草稿，而不是讨论。
+fn asks_to_capture_requirement(text: &str) -> bool {
+    [
+        "加到系统",
+        "增加到系统",
+        "加入系统",
+        "录入系统",
+        "录入需求",
+        "提交需求",
+        "沉淀为需求",
+        "沉淀成需求",
+        "提交到流水线",
+        "加入流水线",
+        "加到流水线",
+        "登记需求",
+        "记录这个需求",
+        "建一个需求",
+        "新建需求",
+        "创建需求",
+        "立项",
+        // 「重提 / 重新发起」：之前草稿被拒或丢失后想重新生成一张可入流水线的草稿卡。
+        // 不补这些，重提消息会落到普通对话路径，Agent 只会输出纯文本草稿、无法一键提交。
+        "重新提",
+        "重新发起",
+        "重新录入",
+        "重新登记",
+        "重新生成需求",
+        "再提一",
+        "再次提交",
+        "重提",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// 需求捕获指令：要求 Agent 先核实现状（避免重复造轮子），再以固定 JSON 结构产出
+/// requirement_draft 产物。`extract_requirement_draft_artifact` 会解析该 JSON，
+/// `run_agent_for_step` 再补上 `t:"artifact"` 与真实 `project_id`，前端即可一键提交。
+fn capture_requirement_instruction(user_text: &str) -> String {
+    format!(
+        "用户希望把下面这条内容**录入系统、沉淀为一条正式需求**，而不是展开讨论：\n\n{}\n\n\
+请按以下步骤处理：\n\
+1. 若你有代码检索工具（list_files / search_code / read_file），**先检索当前项目仓库**，\
+确认该需求与既有功能是否重叠，判断现状（已实现 / 部分实现 / 全新），避免提出重复造轮子的需求；\
+**没有检索工具或无法核实时，必须如实说明「现状未经核实」，不得凭空臆断。**\n\
+2. 用一句话给出清晰的需求标题；\n\
+3. 正文写明：背景与现状、目标、范围（做 / 不做）、关键约束、验收要点；\n\
+4. **最后必须输出一个 requirement_draft 产物 JSON**（用 ```json 代码块包裹），结构如下，供用户一键提交到流水线：\n\
+```json\n\
+{{\n\
+  \"kind\": \"requirement_draft\",\n\
+  \"title\": \"需求标题\",\n\
+  \"rows\": [[\"状态\", \"草案\"], [\"现状\", \"已实现/部分实现/全新/未核实\"], [\"类别\", \"feature\"]],\n\
+  \"body\": \"需求正文（Markdown）\",\n\
+  \"_meta\": {{\n\
+    \"title\": \"需求标题\",\n\
+    \"description\": \"完整需求描述（含现状结论）\",\n\
+    \"category\": \"feature\",\n\
+    \"severity\": \"medium\"\n\
+  }}\n\
+}}\n\
+```",
+        user_text.trim()
+    )
 }
 
 fn asks_for_synthesis(text: &str) -> bool {

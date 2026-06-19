@@ -34,6 +34,165 @@ pub async fn get_issue(id: String, state: State<'_, AppState>) -> Result<Option<
         .map_err(|e| e.to_string())
 }
 
+/// 一页需求 + 该筛选条件下的总数。前端「全量需求总账」滚动动态加载用，
+/// 避免需求量增长后一次性把全部需求拉进内存/渲染。
+#[derive(serde::Serialize)]
+pub struct IssuePage {
+    pub items: Vec<Issue>,
+    pub total: i64,
+}
+
+/// 分页查询需求：按项目 + 状态 + 关键字（标题/编号）过滤，按 updated_at 倒序。
+/// status 为空或 "all" 表示不过滤状态；search 为空表示不过滤关键字。
+/// exclude_merged 为 true 时排除「已合并」需求（与功能审计页「显示已合并需求」开关共享，默认隐藏）；
+/// 当显式按 merged 状态筛选时该排除自然失效（status 优先）。
+#[tauri::command]
+pub async fn list_issues_page(
+    project_id: Option<String>,
+    status: Option<String>,
+    search: Option<String>,
+    exclude_merged: Option<bool>,
+    limit: i64,
+    offset: i64,
+    state: State<'_, AppState>,
+) -> Result<IssuePage, String> {
+    use sqlx::{QueryBuilder, Sqlite};
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
+    let status = status.filter(|s| !s.is_empty() && s != "all");
+    // 仅当未显式筛选 merged 时才生效（显式选 merged 说明用户主动想看，不再隐藏）。
+    let exclude_merged =
+        exclude_merged.unwrap_or(false) && status.as_deref() != Some("merged");
+    // LIKE 通配串作为局部变量，确保在两次 query 构建期间存活。
+    let like = search
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s));
+
+    let total: i64 = {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT COUNT(*) FROM issues WHERE 1=1");
+        if let Some(pid) = &project_id {
+            qb.push(" AND project_id = ").push_bind(pid);
+        }
+        if let Some(st) = &status {
+            qb.push(" AND status = ").push_bind(st);
+        }
+        if exclude_merged {
+            qb.push(" AND status != 'merged'");
+        }
+        if let Some(l) = &like {
+            qb.push(" AND (title LIKE ")
+                .push_bind(l)
+                .push(" OR id LIKE ")
+                .push_bind(l)
+                .push(")");
+        }
+        qb.build_query_scalar()
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let items = {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT * FROM issues WHERE 1=1");
+        if let Some(pid) = &project_id {
+            qb.push(" AND project_id = ").push_bind(pid);
+        }
+        if let Some(st) = &status {
+            qb.push(" AND status = ").push_bind(st);
+        }
+        if exclude_merged {
+            qb.push(" AND status != 'merged'");
+        }
+        if let Some(l) = &like {
+            qb.push(" AND (title LIKE ")
+                .push_bind(l)
+                .push(" OR id LIKE ")
+                .push_bind(l)
+                .push(")");
+        }
+        qb.push(" ORDER BY updated_at DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        qb.build_query_as::<Issue>()
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    Ok(IssuePage { items, total })
+}
+
+/// 某项目下出现过的所有状态（去重），用于总账的状态筛选 chip——
+/// 不依赖已加载的那一页，仍能列出全部可筛选状态。
+#[tauri::command]
+pub async fn list_issue_statuses(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    sqlx::query_scalar::<_, String>("SELECT DISTINCT status FROM issues WHERE project_id=?")
+        .bind(&project_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 按状态集合取需求（完整字段），用于「审核 1」队列等有界子集，
+/// 替代为拿少量在产需求而全量加载 issues。
+#[tauri::command]
+pub async fn list_issues_by_statuses(
+    project_id: String,
+    statuses: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Issue>, String> {
+    use sqlx::{QueryBuilder, Sqlite};
+    if statuses.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT * FROM issues WHERE project_id = ");
+    qb.push_bind(&project_id).push(" AND status IN (");
+    let mut sep = qb.separated(", ");
+    for s in &statuses {
+        sep.push_bind(s);
+    }
+    qb.push(") ORDER BY created_at DESC");
+    qb.build_query_as::<Issue>()
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 需求标题（轻量），按 id 批量取，用于变更请求列表解析标题，
+/// 无需把全部需求载入内存。
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct IssueTitle {
+    pub id: String,
+    pub title: String,
+}
+
+#[tauri::command]
+pub async fn list_issue_titles(
+    ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<IssueTitle>, String> {
+    use sqlx::{QueryBuilder, Sqlite};
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT id, title FROM issues WHERE id IN (");
+    let mut sep = qb.separated(", ");
+    for id in &ids {
+        sep.push_bind(id);
+    }
+    qb.push(")");
+    qb.build_query_as::<IssueTitle>()
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_issue_analysis(
     issue_id: String,
@@ -111,6 +270,49 @@ pub async fn retry_analysis(
     .map_err(|e| e.to_string())?;
     if updated.rows_affected() == 0 {
         return Err("仅「分析失败」或「待审核 1」状态的需求可重新分析".to_string());
+    }
+    crate::tasks::runner::enqueue(
+        &state.db,
+        &state.job_tx,
+        "analysis",
+        &format!("analysis:{}", issue_id),
+        JobPayload::Analysis {
+            issue_id: issue_id.clone(),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 审核 1 补充意见重评：管理员在「待需求审核」阶段提交补充意见，需求带着该意见
+/// 重新分析，再回到审核 1。意见落库到 issues.review_feedback（一次性，被分析任务
+/// 消费后清空）。意见为人工输入，入库前过 has_obvious_injection 防注入。
+#[tauri::command]
+pub async fn reanalyze_with_feedback(
+    issue_id: String,
+    feedback: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let feedback = feedback.trim().to_string();
+    if feedback.is_empty() {
+        return Err("补充意见不能为空".to_string());
+    }
+    if crate::core::security::has_obvious_injection(&feedback) {
+        return Err("补充意见包含可疑指令，已拦截".to_string());
+    }
+    // 仅「待需求审核」或「分析失败」状态可带意见重评，避免影响在产/已完结需求。
+    let updated = sqlx::query(
+        "UPDATE issues SET review_feedback=?, status='pending_analysis', updated_at=datetime('now')
+         WHERE id=? AND status IN ('pending_review_1', 'analysis_failed')",
+    )
+    .bind(&feedback)
+    .bind(&issue_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err("仅「待需求审核」或「分析失败」状态的需求可提交补充意见重新评估".to_string());
     }
     crate::tasks::runner::enqueue(
         &state.db,

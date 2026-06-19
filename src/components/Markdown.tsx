@@ -92,7 +92,9 @@ export default function Markdown({ md, highlight }: { md: string; highlight?: st
         html += '<tr>' + cells.map(c => `<${tag}>${renderCell(c)}</${tag}>`).join('') + '</tr>';
       }
       html += bodyStarted ? '</tbody></table>' : '</thead></table>';
-      blocks.push({ tag: 'div', html });
+      // 包一层可横向滚动容器：宽表格（th 不换行）在文档流里自身滚动，
+      // 不会把气泡撑过可用宽度而压到右侧大纲（.doc-toc）上。
+      blocks.push({ tag: 'div', cls: 'md-table-wrap', html });
     } else if (/^>\s?/.test(ln)) {
       const buf: string[] = [];
       while (i < lines.length && /^>\s?/.test(lines[i])) {

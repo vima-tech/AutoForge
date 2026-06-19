@@ -16,6 +16,16 @@ const KIND_LABEL: Record<string, string> = {
   agent: 'AGENT', llm: 'LLM', tool: 'TOOL', mcp: 'MCP',
 };
 
+// Innate 记忆召回命中标志：本次调用的 system_prompt 注入了「历史经验与技能」小节时显示。
+// 用 violet（次级分类语义色）+ brain 图标，区别于 kind 语义色，表达「带着记忆在思考」。
+function InnateChip({ size = 10 }: { size?: number }) {
+  return (
+    <span className="chip violet" style={{ fontSize: 'var(--text-micro)' }} title="本次调用注入了 Innate 记忆召回">
+      <Icon name="brain" size={size} />INNATE
+    </span>
+  );
+}
+
 function fmtMs(ms: number | null): string {
   if (ms == null) return '—';
   if (ms < 1000) return `${ms}ms`;
@@ -48,6 +58,7 @@ function buildTraceText(spans: LlmTrace[]): string {
   L.push(`- project_id: ${root.project_id ?? '-'}`);
   L.push(`- task_id: ${root.task_id ?? '-'}`);
   L.push(`- status: ${root.status}`);
+  L.push(`- innate_recall: ${spans.some(s => s.innate_triggered) ? 'on' : 'off'}`);
   L.push(`- total_latency_ms: ${root.latency_ms ?? '-'}`);
   L.push(`- spans: ${spans.length}`);
   L.push(`- created_at: ${root.created_at}`);
@@ -67,6 +78,7 @@ function buildTraceText(spans: LlmTrace[]): string {
     if (s.total_tokens != null) facts.push(`total_tokens=${s.total_tokens}`);
     if (s.latency_ms != null) facts.push(`latency_ms=${s.latency_ms}`);
     if (meta?.iteration != null) facts.push(`iteration=${meta.iteration}`);
+    if (s.innate_triggered) facts.push('innate_recall=on');
     L.push(facts.join(' · '));
     if (s.error) { L.push(''); L.push('### ERROR'); L.push('```'); L.push(s.error); L.push('```'); }
     if (s.system_prompt) { L.push(''); L.push('### SYSTEM'); L.push('```'); L.push(s.system_prompt); L.push('```'); }
@@ -93,6 +105,7 @@ function SpanRow({ span }: { span: LlmTrace }) {
             {span.name ?? span.model ?? span.agent_name ?? span.kind}
           </span>
           {span.status === 'error' && <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}><Icon name="alert" size={10} />error</span>}
+          {span.innate_triggered && <InnateChip />}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
           {span.total_tokens != null && <span title="tokens">{span.total_tokens} tok</span>}
@@ -420,6 +433,7 @@ export default function TracePage() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{t.agent_name || t.agent_role || 'agent'}</span>
                   {t.status === 'error' && <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}>error</span>}
+                  {t.innate_triggered && <InnateChip />}
                   <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)' }}>{fmtMs(t.latency_ms)}</span>
                 </div>
                 <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)', margin: '6px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -448,6 +462,7 @@ export default function TracePage() {
               <div className="panel" style={{ marginBottom: 12 }}>
                 <div className="panel-head">
                   <div className="panel-title"><Icon name="log" size={16} style={{ color: 'var(--ember)' }} />Trace 概览</div>
+                  {spans.some(s => s.innate_triggered) && <span style={{ marginLeft: 8 }}><InnateChip size={11} /></span>}
                   <button className="btn btn-sm" style={{ marginLeft: 'auto' }} onClick={copyTrace}
                     title="复制完整 trace（Markdown），用于粘贴给 Claude 等工具分析优化">
                     <Icon name={copied ? 'check' : 'copy'} size={13} />{copied ? '已复制' : '复制完整 trace'}

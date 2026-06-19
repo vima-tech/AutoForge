@@ -3,7 +3,12 @@ import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
 import Select from '../components/Select';
-import { THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode, type ThemeMode, type ThemeSelection, type RailMode } from '../theme';
+import {
+  THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode,
+  QUICK_CAPTURE_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, DEFAULT_QUICK_CAPTURE_SHORTCUT,
+  parseQuickCaptureShortcut, formatCombo, isModifierCode, comboHasModifier,
+  type ThemeMode, type ThemeSelection, type RailMode, type QuickCaptureShortcut, type ShortcutCombo,
+} from '../theme';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
   listAgents, createAgent, updateAgent, deleteAgent,
@@ -18,6 +23,7 @@ import {
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   getWebSearchSettings, setWebSearchSettings,
+  getOpenDesignSettings, setOpenDesignSettings, type OpenDesignSettings,
   getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
   getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, type AutosupplySettings as AutosupplyT,
   getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
@@ -380,7 +386,7 @@ function AsrSettings() {
 
 // ── 工厂自喂料（autosupply）设置 ──────────────────────────────────────────────
 function AutosupplySettings() {
-  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20 });
+  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20, analyze_enabled: true, triage_enabled: true });
   const [level, setLevel] = useState<AutonomyLevel>('strict');
   const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
@@ -446,7 +452,15 @@ function AutosupplySettings() {
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
             <Switch on={cfg.scan_enabled} onToggle={() => save({ ...cfg, scan_enabled: !cfg.scan_enabled })} />
-            <span>代码扫描（TODO / cargo audit / npm audit）</span>
+            <span>代码扫描（TODO / cargo · npm · pip · go 依赖审计）</span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.analyze_enabled} onToggle={() => save({ ...cfg, analyze_enabled: !cfg.analyze_enabled })} />
+            <span>静态代码分析<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（按栈跑 clippy / ruff / go vet / eslint，发现真实代码问题；编译型较耗时）</span></span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.triage_enabled} onToggle={() => save({ ...cfg, triage_enabled: !cfg.triage_enabled })} />
+            <span>前置整理（自动滤噪）<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（入池即跑 triage 滤掉噪音、归一化，幸存条目仍候人工闸口）</span></span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
             <Switch on={cfg.proposer_enabled} onToggle={() => save({ ...cfg, proposer_enabled: !cfg.proposer_enabled })} />
@@ -465,21 +479,24 @@ function AutosupplySettings() {
 }
 
 function ToolsSettings() {
-  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false });
+  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false, fetch_content: false });
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
 
   useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
 
+  // 生效 provider：未配置/配置不全一律退回免 Key 的 DuckDuckGo，故默认始终可用。
+  const eff = ws.provider || 'duckduckgo';
   const enabled =
-    (ws.provider === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
-    (ws.provider === 'searxng' && ws.endpoint.trim().length > 0);
+    eff === 'duckduckgo' ||
+    (eff === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
+    (eff === 'searxng' && ws.endpoint.trim().length > 0);
 
   const save = async () => {
     setBusy(true);
     try {
-      const r = await setWebSearchSettings(ws.provider, ws.endpoint, ws.max_results, apiKey.trim() || undefined);
+      const r = await setWebSearchSettings(ws.provider || 'duckduckgo', ws.endpoint, ws.max_results, apiKey.trim() || undefined, ws.fetch_content);
       setWs(r); setApiKey(''); setStatus('已保存');
     } catch (e) { setStatus(String(e)); }
     finally { setBusy(false); }
@@ -497,18 +514,18 @@ function ToolsSettings() {
             <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>TOOL</span>
             </div>
-            <div className="cfg-sub">检索互联网并把标题/链接/摘要回灌给 Agent</div>
+            <div className="cfg-sub">原生免 Key 联网搜索（DuckDuckGo），可选搜索后自动读取正文</div>
           </div>
           <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
         </div>
 
         <div className="cfg-fields rise" style={{ marginTop: 14 }}>
           <div className="field"><label>搜索 Provider</label>
-            <Select value={ws.provider || 'off'} onChange={val => setWs(w => ({ ...w, provider: val === 'off' ? '' : val }))}
+            <Select value={ws.provider || 'duckduckgo'} onChange={val => setWs(w => ({ ...w, provider: val }))}
               options={[
-                { value: 'off', label: '关闭' },
-                { value: 'tavily', label: 'Tavily（需 API Key）' },
+                { value: 'duckduckgo', label: 'DuckDuckGo（免 Key · 默认）' },
                 { value: 'searxng', label: 'SearXNG（自托管，无需 Key）' },
+                { value: 'tavily', label: 'Tavily（需 API Key）' },
               ]} />
           </div>
           <div className="field"><label>返回结果数</label>
@@ -529,18 +546,80 @@ function ToolsSettings() {
             </div>
           )}
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button type="button" className={`switch${ws.fetch_content ? ' on' : ''}`} role="switch" aria-checked={ws.fetch_content}
+              onClick={() => setWs(w => ({ ...w, fetch_content: !w.fetch_content }))}><i /></button>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--text-control)' }}>搜索后自动读取正文</div>
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>命中后自动抓取前几条结果的正文摘录一并回灌（更慢但更省往返；Agent 也可按需用 web_fetch 抓取单个链接）</div>
+            </div>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存工具配置</button>
             {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
           </div>
           <div className="field full">
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
-              启用后，在「角色 Agent / 自定义 Agent」的能力中勾选 web_search 的 Agent 才会实际调用此工具。
+              默认走 DuckDuckGo，无需任何配置即可联网搜索。需在「角色 Agent / 自定义 Agent」能力中勾选 web_search / web_fetch 的 Agent 才会实际调用对应工具。
             </span>
           </div>
         </div>
       </div>
 
+      <OpenDesignSettingsCard />
+
       <McpServers />
+    </div>
+  );
+}
+
+// OpenDesign 本地服务：可配置启动命令 + 访问 URL，交付页一键拉起并打开浏览器。
+function OpenDesignSettingsCard() {
+  const [od, setOd] = useState<OpenDesignSettings>({ command: '', url: '' });
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getOpenDesignSettings().then(setOd).catch(e => setStatus(String(e))); }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await setOpenDesignSettings(od.command, od.url);
+      setOd(r); setStatus('已保存');
+    } catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="cfg-card" style={{ marginTop: 14 }}>
+      <div className="cfg-top" style={{ gap: 10 }}>
+        <div className="cfg-logo" style={{ background: 'var(--violet)', width: 28, height: 28 }}><Icon name="palette" size={15} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="cfg-name cfg-name-line"><span className="cfg-name-text">OpenDesign · 本地服务</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>DESIGN</span>
+          </div>
+          <div className="cfg-sub">交付流水线「原型设计提示词」可一键拉起本地 OpenDesign 服务并打开浏览器</div>
+        </div>
+      </div>
+
+      <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+        <div className="field full"><label>启动命令</label>
+          <input type="text" className="mono" value={od.command} placeholder="npx opendesign（留空则仅打开 URL，不启动）"
+            onChange={e => setOd(o => ({ ...o, command: e.target.value }))} />
+        </div>
+        <div className="field full"><label>访问 URL</label>
+          <input type="text" className="mono" value={od.url} placeholder="http://localhost:5173"
+            onChange={e => setOd(o => ({ ...o, url: e.target.value }))} />
+        </div>
+        <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存 OpenDesign 配置</button>
+          {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+        </div>
+        <div className="field full">
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+            点击交付页的「OpenDesign」按钮时：若服务已在运行则直接打开；否则执行启动命令（独立进程组，关闭 AutoForge 不连带退出），等待就绪后在系统浏览器打开上述 URL。
+          </span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1235,6 +1314,76 @@ function KnowledgeSettings() {
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
             {result && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{result}</span>}
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ShortcutSettings() {
+  // 速录念头快捷键：纯前端偏好，落 localStorage 并派发事件让 App 实时重读。
+  const [shortcut, setShortcut] = useState<QuickCaptureShortcut>(
+    () => parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)),
+  );
+  const [recording, setRecording] = useState(false);
+  const persistShortcut = (s: QuickCaptureShortcut) => {
+    setShortcut(s);
+    localStorage.setItem(QUICK_CAPTURE_SHORTCUT_KEY, JSON.stringify(s));
+    window.dispatchEvent(new Event(SHORTCUT_CHANGED_EVENT));
+  };
+
+  // 录制模式：捕获下一组「修饰键 + 主键」的组合并保存。Esc 取消，单纯修饰键忽略。
+  useEffect(() => {
+    if (!recording) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') { setRecording(false); return; }
+      if (isModifierCode(e.code)) return; // 等待主键
+      const combo: ShortcutCombo = { ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey, shift: e.shiftKey, code: e.code };
+      if (!comboHasModifier(combo)) return; // 必须配合至少一个修饰键
+      persistShortcut({ enabled: true, combo });
+      setRecording(false);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [recording]);
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">快捷键</div>
+      <div className="set-desc">为常用操作绑定键盘快捷键。组合键需配合至少一个修饰键（Ctrl / Alt / Shift / ⌘），在应用内任意位置生效。</div>
+
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head"><div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />速录念头</div></div>
+        <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>启用全局快捷键</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+              在应用内任意位置按下快捷键即可弹出「速录念头」，随手把念头丢进待整理池。
+            </div>
+          </div>
+          <Switch on={shortcut.enabled} onToggle={() => persistShortcut({ ...shortcut, enabled: !shortcut.enabled })} />
+        </div>
+        <div style={{ padding: '0 18px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.06em',
+            background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8,
+            padding: '5px 10px', color: shortcut.enabled ? 'var(--ember-soft)' : 'var(--text-3)',
+          }}>
+            {formatCombo(shortcut.combo)}
+          </span>
+          <button className="btn btn-sm" onClick={() => setRecording(r => !r)} disabled={!shortcut.enabled}>
+            <Icon name="edit" size={13} />{recording ? '按下组合键…' : '录制'}
+          </button>
+          <button className="btn btn-sm btn-ghost" onClick={() => persistShortcut(DEFAULT_QUICK_CAPTURE_SHORTCUT)} disabled={!shortcut.enabled}>
+            恢复默认
+          </button>
+          {recording && (
+            <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+              需配合 Ctrl / Alt / Shift / ⌘ · Esc 取消
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -2051,6 +2200,7 @@ const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string
     group: '系统',
     items: [
       { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+      { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
       { id: 'theme',       name: '主题设置',     ic: 'palette' },
       { id: 'about',       name: '关于 AutoForge', ic: 'box' },
     ],
@@ -2123,6 +2273,7 @@ export default function SettingsPage({
         </div>
         <div className="set-body scroll">
           {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
+          {sec === 'shortcuts'   && <ShortcutSettings />}
           {sec === 'llm'         && <LLMSettings />}
           {sec === 'tools'       && <ToolsSettings />}
           {sec === 'roles'       && <RolesPage />}
@@ -2136,7 +2287,7 @@ export default function SettingsPage({
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','tools','roles','concurrency','selfupdate','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','shortcuts','llm','tools','roles','concurrency','selfupdate','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

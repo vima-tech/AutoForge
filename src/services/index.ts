@@ -8,15 +8,20 @@ import { invoke } from '@tauri-apps/api/core';
 // Tracks how many IPC calls are currently in-flight per command.
 const _inFlight: Record<string, number> = {};
 
+// 高频/流式命令：每帧音频都会触发，逐条打日志会刷爆控制台且 args 含大体积 base64。
+// 这类命令跳过 debug 日志（错误仍会上报）。
+const _quietCmds = new Set<string>(['asr_realtime_feed']);
+
 function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const t0 = performance.now();
   _inFlight[cmd] = (_inFlight[cmd] ?? 0) + 1;
-  console.debug(`[IPC] → ${cmd} (in-flight: ${_inFlight[cmd]})`, args ?? '');
+  const quiet = _quietCmds.has(cmd);
+  if (!quiet) console.debug(`[IPC] → ${cmd} (in-flight: ${_inFlight[cmd]})`, args ?? '');
   return invoke<T>(cmd, args)
     .then(result => {
       const ms = (performance.now() - t0).toFixed(1);
       _inFlight[cmd]--;
-      console.debug(`[IPC] ✓ ${cmd} ${ms}ms (in-flight: ${_inFlight[cmd]})`);
+      if (!quiet) console.debug(`[IPC] ✓ ${cmd} ${ms}ms (in-flight: ${_inFlight[cmd]})`);
       return result;
     })
     .catch(err => {
@@ -342,6 +347,31 @@ export const aiGenerateRunConfig = (projectId: string) =>
 // ── Issues ───────────────────────────────────────────────────────────────────
 export const listIssues = (projectId?: string) =>
   ipc<Issue[]>('list_issues', { projectId: projectId ?? null });
+// 分页查询需求（总账滚动动态加载）：按状态/关键字过滤，updated_at 倒序，返回当前页 + 总数。
+export interface IssuePage { items: Issue[]; total: number }
+export const listIssuesPage = (
+  projectId: string | undefined,
+  status: string | undefined,
+  search: string | undefined,
+  limit: number,
+  offset: number,
+  excludeMerged?: boolean,   // 与功能审计页「显示已合并需求」开关共享：true 时隐藏已合并需求
+) => ipc<IssuePage>('list_issues_page', {
+  projectId: projectId || null,
+  status: status && status !== 'all' ? status : null,
+  search: search?.trim() || null,
+  excludeMerged: excludeMerged ?? false,
+  limit, offset,
+});
+// 某项目出现过的全部需求状态（去重），用于总账筛选 chip。
+export const listIssueStatuses = (projectId: string) =>
+  ipc<string[]>('list_issue_statuses', { projectId });
+// 按状态集合取需求（有界子集，如审核 1 队列），替代全量加载。
+export const listIssuesByStatuses = (projectId: string, statuses: string[]) =>
+  ipc<Issue[]>('list_issues_by_statuses', { projectId, statuses });
+// 批量取需求标题（轻量），用于变更请求列表解析标题。
+export const listIssueTitles = (ids: string[]) =>
+  ipc<{ id: string; title: string }[]>('list_issue_titles', { ids });
 export const getIssue = (id: string) => ipc<Issue>('get_issue', { id });
 export const getIssueAnalysis = (issueId: string) =>
   ipc<IssueAnalysis | null>('get_issue_analysis', { issueId });
@@ -354,6 +384,10 @@ export const submitIssue = (payload: {
 // 分析失败/卡住时重新触发需求分析（回到分析队列）。
 export const retryAnalysis = (issueId: string) =>
   ipc<void>('retry_analysis', { issueId });
+
+// 审核 1 补充意见重评：带管理员补充意见重新分析当前需求，之后重回审核 1。
+export const reanalyzeWithFeedback = (issueId: string, feedback: string) =>
+  ipc<void>('reanalyze_with_feedback', { issueId, feedback });
 
 // 人审改 AI 生成的验收标准（acceptance_json，JSON 数组字符串）。
 export const updateIssueAcceptance = (issueId: string, acceptanceJson: string) =>
@@ -527,13 +561,13 @@ export const updateLlmConfig = (id: string, payload: Partial<{
 
 // ── Settings — Web 搜索工具 ───────────────────────────────────────────────────
 export interface WebSearchSettings {
-  provider: string; endpoint: string; max_results: number; api_key_set: boolean;
+  provider: string; endpoint: string; max_results: number; api_key_set: boolean; fetch_content: boolean;
 }
 export const getWebSearchSettings = () =>
   ipc<WebSearchSettings>('get_web_search_settings');
 export const setWebSearchSettings = (
-  provider: string, endpoint: string, max_results: number, api_key?: string,
-) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key });
+  provider: string, endpoint: string, max_results: number, api_key?: string, fetch_content = false,
+) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key, fetchContent: fetch_content });
 
 // ── 操作者身份卡（rail-me）────────────────────────────────────────────────────
 export interface OperatorProfile {
@@ -658,6 +692,7 @@ export interface LlmTraceSummary {
   input: string | null; output: string | null;
   total_tokens: number | null; latency_ms: number | null;
   span_count: number; created_at: string;
+  innate_triggered: boolean; // root span 是否注入了 Innate 记忆召回（派生字段）
 }
 export interface LlmTrace {
   id: string; trace_id: string; parent_id: string | null; seq: number;
@@ -669,6 +704,7 @@ export interface LlmTrace {
   prompt_tokens: number | null; completion_tokens: number | null; total_tokens: number | null;
   latency_ms: number | null; metadata_json: string | null;
   started_at: string | null; ended_at: string | null; created_at: string;
+  innate_triggered: boolean; // 本 span 是否注入了 Innate 记忆召回（派生字段）
 }
 export interface TraceFilter {
   issue_id?: string; conversation_id?: string; agent_name?: string; agent_role?: string;
@@ -796,6 +832,12 @@ export const submitFromArtifact = (payload: {
   category?: string; severity?: string; source_ref?: string;
 }) => ipc<Issue>('submit_from_artifact', { payload });
 
+// 在会议室对话 card 内直接确认/拒绝一条整理好的需求草稿。
+// confirm → 入流水线并返回创建的 Issue；reject → 返回 null。决策持久化到该消息。
+export const decideRequirementDraft = (payload: {
+  message_id: string; decision: 'confirm' | 'reject'; block_index?: number;
+}) => ipc<Issue | null>('decide_requirement_draft', { payload });
+
 // ── Triage（待整理池）─────────────────────────────────────────────────────────
 export interface RefineResult { refined: number; discarded: number; errors: number; }
 export const listTriageIssues = (projectId?: string) =>
@@ -812,12 +854,14 @@ export const rejectIssues = (issueIds: string[]) =>
 export interface AutosupplySettings {
   enabled: boolean; interval_min: number; scan_enabled: boolean;
   proposer_enabled: boolean; max_per_run: number;
+  analyze_enabled: boolean; triage_enabled: boolean;
 }
 export const getAutosupplySettings = () => ipc<AutosupplySettings>('get_autosupply_settings');
 export const setAutosupplySettings = (s: AutosupplySettings) =>
   ipc<AutosupplySettings>('set_autosupply_settings', {
     enabled: s.enabled, intervalMin: s.interval_min, scanEnabled: s.scan_enabled,
     proposerEnabled: s.proposer_enabled, maxPerRun: s.max_per_run,
+    analyzeEnabled: s.analyze_enabled, triageEnabled: s.triage_enabled,
   });
 export const runProposer = (projectId: string, max?: number) =>
   ipc<ScanResult>('run_proposer', { projectId, max: max ?? null });
@@ -849,6 +893,8 @@ export interface CrPreviewStatus {
   frontend_only: boolean;
   /** kind 由项目文件自动识别（config_yaml 未显式声明 dev.kind） */
   auto_detected: boolean;
+  /** launch_cr_app 启动的桌面应用进程仍存活 —— UI 据此把「启动」切为「停止」 */
+  app_running: boolean;
 }
 export const getCrPreview = (crId: string) =>
   ipc<CrPreviewStatus>('get_cr_preview', { crId });
@@ -1059,6 +1105,15 @@ export const deletePrototypePrompt = (id: string) =>
   ipc<void>('delete_prototype_prompt', { id });
 export const updatePrototypePrompt = (id: string, title: string, prompt: string) =>
   ipc<PrototypePrompt>('update_prototype_prompt', { id, title, prompt });
+
+// OpenDesign 本地服务：可配置启动命令 + 访问 URL，一键拉起并打开浏览器
+export interface OpenDesignSettings { command: string; url: string }
+export const getOpenDesignSettings = () =>
+  ipc<OpenDesignSettings>('get_opendesign_settings');
+export const setOpenDesignSettings = (command: string, url: string) =>
+  ipc<OpenDesignSettings>('set_opendesign_settings', { command, url });
+/** 拉起本地 OpenDesign 服务（detached），返回就绪后应打开的 URL（浏览器打开走 openUrl）。 */
+export const launchOpenDesign = () => ipc<string>('launch_opendesign');
 
 // Delivery node artifacts (persisted to .autoforge/deliverables/<node>/)
 export interface DeliveryArtifact {

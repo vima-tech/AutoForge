@@ -69,6 +69,9 @@ pub struct DetectedStack {
     pub dep_cache_dirs: Vec<String>,
     /// 适用的内置安全扫描器标识（供 intake 扫描调度）。
     pub scanners: Vec<&'static str>,
+    /// 适用的内置**静态代码分析器**标识（clippy/ruff/go_vet/eslint…），
+    /// 供自喂料/扫描发现真实代码问题——区别于 `scanners`（只查依赖漏洞）。
+    pub analyzers: Vec<&'static str>,
 }
 
 impl DetectedStack {
@@ -89,6 +92,7 @@ impl DetectedStack {
             security: None,
             dep_cache_dirs: Vec::new(),
             scanners: Vec::new(),
+            analyzers: Vec::new(),
         }
     }
 }
@@ -199,6 +203,7 @@ fn detect_node(dir: &Path) -> Option<DetectedStack> {
         s.security = Some(format!("{pm} audit")).filter(|_| pm == "npm");
         s.dep_cache_dirs = vec!["node_modules".to_string()];
         s.scanners = vec!["npm_audit"];
+        s.analyzers = vec!["eslint"];
         return Some(s);
     }
 
@@ -215,6 +220,7 @@ fn detect_node(dir: &Path) -> Option<DetectedStack> {
     s.security = if pm == "npm" { Some("npm audit".to_string()) } else { None };
     s.dep_cache_dirs = vec!["node_modules".to_string()];
     s.scanners = vec!["npm_audit"];
+    s.analyzers = vec!["eslint"];
     Some(s)
 }
 
@@ -271,6 +277,7 @@ fn detect_tauri(dir: &Path) -> Option<DetectedStack> {
     s.security = Some("cargo audit --file src-tauri/Cargo.lock".to_string());
     s.dep_cache_dirs = vec!["node_modules".to_string()];
     s.scanners = vec!["npm_audit", "cargo_audit"];
+    s.analyzers = vec!["clippy", "eslint"];
     Some(s)
 }
 
@@ -286,6 +293,7 @@ fn detect_rust(dir: &Path) -> Option<DetectedStack> {
     s.lint = Some("cargo clippy --all-targets".to_string());
     s.security = Some("cargo audit".to_string());
     s.scanners = vec!["cargo_audit"];
+    s.analyzers = vec!["clippy"];
     Some(s)
 }
 
@@ -357,6 +365,7 @@ fn detect_go(dir: &Path) -> Option<DetectedStack> {
     s.lint = Some("go vet ./...".to_string());
     s.security = Some("govulncheck ./...".to_string());
     s.scanners = vec!["govulncheck"];
+    s.analyzers = vec!["go_vet"];
     Some(s)
 }
 
@@ -400,6 +409,7 @@ fn detect_python(dir: &Path) -> Option<DetectedStack> {
     s.lint = Some(format!("{run}ruff check ."));
     s.security = Some("pip-audit".to_string());
     s.scanners = vec!["pip_audit"];
+    s.analyzers = vec!["ruff"];
     Some(s)
 }
 
@@ -472,6 +482,20 @@ pub fn security_scanners(dir: &Path) -> Vec<&'static str> {
         for sc in s.scanners {
             if !seen.contains(&sc) {
                 seen.push(sc);
+            }
+        }
+    }
+    seen
+}
+
+/// 适用于该仓库的内置**静态代码分析器**标识（去重）——clippy/ruff/go_vet/eslint。
+/// 供自喂料/扫描发现真实代码问题（区别于只查依赖漏洞的 [`security_scanners`]）。
+pub fn code_analyzers(dir: &Path) -> Vec<&'static str> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    for s in detect_stacks(dir) {
+        for a in s.analyzers {
+            if !seen.contains(&a) {
+                seen.push(a);
             }
         }
     }

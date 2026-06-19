@@ -15,7 +15,7 @@ import QuickCapture from './components/QuickCapture';
 import OperatorPanel from './components/OperatorPanel';
 import { loadOperator } from './operator';
 import { getSystemHealth, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, type SystemHealth } from './services';
-import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
+import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, parseQuickCaptureShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
 
 type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
 
@@ -104,6 +104,9 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 
 export default function App() {
   const [showQuick, setShowQuick] = useState(false);
+  const [quickShortcut, setQuickShortcut] = useState<QuickCaptureShortcut>(
+    () => parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)),
+  );
   const [showOperator, setShowOperator] = useState(false);
   const [notifUnread, setNotifUnread] = useState(0);
   const [page,  setPage]  = useState<Page>(() => {
@@ -166,6 +169,27 @@ export default function App() {
   useEffect(() => {
     applyRailMode(parseRailMode(localStorage.getItem(RAIL_STORAGE_KEY)));
   }, []);
+
+  // Re-read the quick-capture shortcut whenever Settings changes it (live, no reload).
+  useEffect(() => {
+    const reread = () => setQuickShortcut(parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)));
+    window.addEventListener(SHORTCUT_CHANGED_EVENT, reread);
+    return () => window.removeEventListener(SHORTCUT_CHANGED_EVENT, reread);
+  }, []);
+
+  // Global hotkey → open 速录念头. Modifier-guarded combos won't collide with plain
+  // typing, so it fires regardless of focus (the expected "quick capture" behavior).
+  useEffect(() => {
+    if (!quickShortcut.enabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (!comboMatchesEvent(quickShortcut.combo, e)) return;
+      e.preventDefault();
+      setShowQuick(true);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [quickShortcut]);
 
   // Auth check intentionally removed: spawning the claude Electron subprocess
   // at any point while WebKitGTK is active delivers SIGTRAP to our process,
@@ -330,7 +354,7 @@ export default function App() {
           })}
           <button
             className="rail-item rail-zap"
-            title="速录念头（随手记，入待整理池）"
+            title={quickShortcut.enabled ? `速录念头（${formatCombo(quickShortcut.combo)}）` : '速录念头（随手记，入待整理池）'}
             onClick={() => setShowQuick(true)}
           >
             <span className="rail-ic"><Icon name="zap" size={23} /></span>

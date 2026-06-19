@@ -30,6 +30,11 @@ pub struct NotificationDraft {
     pub body: String,
     pub link_page: Option<&'static str>,
     pub link_ref: Option<String>,
+    /// 「需求线程」键：同一条需求的各阶段事件共享同一键，写入层据此 UPSERT 折叠为一行。
+    /// 录入/分析阶段天然是 `issue_id`；CR 阶段（审核/测试/合并/审计）先填 `cr_id`，
+    /// 由持久化层（`record_notification`）查 `change_requests` 解析回所属 `issue_id`，
+    /// 使整条需求的全部阶段最终归并到同一线程。
+    pub thread_key: Option<String>,
 }
 
 impl NotificationDraft {
@@ -49,6 +54,7 @@ impl NotificationDraft {
                 body: format!("需求 {issue_id} 已进入流水线"),
                 link_page: Some("audit"),
                 link_ref: Some(issue_id.clone()),
+                thread_key: Some(issue_id.clone()),
             }),
             AppEvent::AnalysisCompleted { issue_id } => Some(NotificationDraft {
                 category: "progress",
@@ -57,6 +63,7 @@ impl NotificationDraft {
                 body: format!("需求 {issue_id} 分析就绪，等待审核 1"),
                 link_page: Some("audit"),
                 link_ref: Some(issue_id.clone()),
+                thread_key: Some(issue_id.clone()),
             }),
             AppEvent::ReviewNeeded {
                 cr_id,
@@ -69,6 +76,7 @@ impl NotificationDraft {
                 body: issue_title.clone(),
                 link_page: Some("audit"),
                 link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
             }),
             AppEvent::IterationWarning {
                 cr_id,
@@ -81,6 +89,7 @@ impl NotificationDraft {
                 body: format!("{cr_id} 已迭代 {iteration} 轮（软上限 {soft_limit}），建议人工介入"),
                 link_page: Some("audit"),
                 link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
             }),
             AppEvent::TestCompleted {
                 cr_id,
@@ -102,6 +111,7 @@ impl NotificationDraft {
                 },
                 link_page: Some("audit"),
                 link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
             }),
             AppEvent::CrMerged { cr_id, .. } => Some(NotificationDraft {
                 category: "result",
@@ -110,6 +120,7 @@ impl NotificationDraft {
                 body: cr_id.clone(),
                 link_page: Some("delivery"),
                 link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
             }),
             AppEvent::SecurityAuditCompleted {
                 cr_id,
@@ -127,6 +138,7 @@ impl NotificationDraft {
                 },
                 link_page: Some("audit"),
                 link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
             }),
             // 心跳 / 高频 / 已有独立角标覆盖 —— 不入收件箱。
             AppEvent::WorktreeUpdate { .. }

@@ -27,6 +27,7 @@ export default function QuickCapture({ onClose }: { onClose: () => void }) {
   const [err, setErr] = useState('');
   const [ok, setOk] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -48,7 +49,9 @@ export default function QuickCapture({ onClose }: { onClose: () => void }) {
 
   // 实时语音（阿里 DashScope 流式）：边说边把结果写进文本框。
   const startRealtime = async () => {
+    if (streaming || connecting) return;
     setErr('');
+    setConnecting(true); // 点击即给反馈，不等建链完成（麦克风授权 + DashScope WS 握手有延迟）。
     baseRef.current = text ? text + (text.endsWith(' ') ? '' : ' ') : '';
     committedRef.current = ''; partialRef.current = '';
     const rt = new RealtimeAsr();
@@ -63,6 +66,8 @@ export default function QuickCapture({ onClose }: { onClose: () => void }) {
     } catch (e) {
       rtRef.current = null;
       setErr(String(e) + '；可改用「音频文件」');
+    } finally {
+      setConnecting(false);
     }
   };
   const stopRealtime = async () => {
@@ -88,6 +93,8 @@ export default function QuickCapture({ onClose }: { onClose: () => void }) {
   };
 
   const submit = async () => {
+    // 录音进行中点速录：先停掉实时识别（落定最后一句），再入池。
+    if (streaming || rtRef.current) await stopRealtime();
     if (!text.trim()) return;
     if (!projectId) { setErr('请先选择归属项目'); return; }
     setBusy(true); setErr('');
@@ -149,18 +156,19 @@ export default function QuickCapture({ onClose }: { onClose: () => void }) {
         {/* 语音录入（实时优先：阿里 DashScope 流式，边说边出字） */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
           {!streaming ? (
-            <button className="btn btn-sm" onClick={startRealtime} disabled={transcribing} title="实时语音录入（边说边转写）">
-              <Icon name="mic" size={13} />实时语音
+            <button className="btn btn-sm" onClick={startRealtime} disabled={transcribing || connecting} title="实时语音录入（边说边转写）">
+              <Icon name="mic" size={13} />{connecting ? '连接中…' : '实时语音'}
             </button>
           ) : (
             <button className="btn btn-sm btn-danger" onClick={stopRealtime}>
               <Icon name="pause" size={13} />停止
             </button>
           )}
-          <button className="btn btn-sm btn-ghost" onClick={() => fileRef.current?.click()} disabled={streaming || transcribing} title="选择音频文件转写">
+          <button className="btn btn-sm btn-ghost" onClick={() => fileRef.current?.click()} disabled={streaming || connecting || transcribing} title="选择音频文件转写">
             <Icon name="paperclip" size={13} />音频文件
           </button>
           <input ref={fileRef} type="file" accept="audio/*" style={{ display: 'none' }} onChange={onPickFile} />
+          {connecting && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}><span className="dot amber" />连接中…</span>}
           {streaming && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 'var(--text-label)', color: 'var(--red)', fontFamily: 'var(--font-mono)' }}><span className="dot amber" />聆听中…</span>}
           {transcribing && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>转写中…</span>}
           {!streaming && !transcribing && err && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={err}>{err}</span>}

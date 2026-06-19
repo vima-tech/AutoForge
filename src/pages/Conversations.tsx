@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import { Avatar, MeAvatar } from '../components/Avatar';
@@ -8,7 +8,7 @@ import {
   listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
-  toggleMessageContext, startConversationTask, compressConversationContext,
+  toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
@@ -32,6 +32,49 @@ interface PendingAttachment {
   id: string;
   file: File;
   mode: 'file' | 'image';
+}
+
+// ── 输入框草稿：按会话窗口隔离、跨页面切换不丢失 ──
+// 每个会话各自保存一份草稿，互不共享：
+//  · 内存 Map 保留完整草稿（含 File 附件与 @/# 内联标签），跨「切换页面→组件卸载→返回」
+//    与会话切换都不丢失（SPA 内模块常驻，卸载组件不清空它）；
+//  · 纯文本（html）另存 sessionStorage，使整页刷新后文字仍能恢复（File 无法序列化，
+//    刷新后附件不保留，但文字不丢）。
+interface ComposerDraft {
+  html: string;
+  pending: PendingAttachment[];
+}
+const composerDrafts = new Map<string, ComposerDraft>();
+const DRAFT_SS_PREFIX = 'AutoForge:draft:';
+
+function loadComposerDraft(convId: string): ComposerDraft {
+  const mem = composerDrafts.get(convId);
+  if (mem) return mem;
+  try {
+    const html = sessionStorage.getItem(DRAFT_SS_PREFIX + convId) ?? '';
+    return { html, pending: [] };
+  } catch {
+    return { html: '', pending: [] };
+  }
+}
+
+function saveComposerDraft(convId: string, draft: ComposerDraft) {
+  if (!draft.html.trim() && draft.pending.length === 0) {
+    composerDrafts.delete(convId);
+  } else {
+    composerDrafts.set(convId, draft);
+  }
+  try {
+    if (draft.html.trim()) sessionStorage.setItem(DRAFT_SS_PREFIX + convId, draft.html);
+    else sessionStorage.removeItem(DRAFT_SS_PREFIX + convId);
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearComposerDraft(convId: string) {
+  composerDrafts.delete(convId);
+  try { sessionStorage.removeItem(DRAFT_SS_PREFIX + convId); } catch { /* ignore */ }
 }
 
 // 群聊 @快捷指令：`@所有人` 展开为全部可点名成员，让大家一起讨论并尽快达成一致。
@@ -365,7 +408,7 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
           onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
           style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
         >
-          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} highlight={searchTerm} />)}
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} highlight={searchTerm} messageId={m.id} blockIndex={i} />)}
           {m.excluded_from_context && (
             <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
               <Icon name="eye-off" size={11} />已从 AI 上下文排除
@@ -495,12 +538,32 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     sel?.addRange(range);
   };
 
-  useEffect(() => {
+  // pending 含 File，无法序列化；用 ref 镜像最新值供卸载时的保存闭包读取。
+  const pendingRef = useRef(pending);
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  // 会话切换 / 从其它页面返回时，恢复「该会话自己」的草稿；离开（会话切换或组件卸载）
+  // 前把当前草稿存回，保证每个会话窗口的输入内容互不共享、且切换页面不丢失。
+  // 用 useLayoutEffect 在绘制前完成 innerHTML 替换，避免短暂闪现上一个会话的内容。
+  useLayoutEffect(() => {
+    const id = conv.id;
+    const draft = loadComposerDraft(id);
+    if (editorRef.current) editorRef.current.innerHTML = draft.html;
+    setText(editorText());
+    setPending(draft.pending);
+    setShowMention(false);
+    setShowAttachmentPicker(false);
     const timer = setTimeout(() => {
       editorRef.current?.focus();
       setCaretToEnd();
     }, 0);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      saveComposerDraft(id, {
+        html: editorRef.current?.innerHTML ?? '',
+        pending: pendingRef.current,
+      });
+    };
   }, [conv.id]);
 
   const findTextPosition = (editor: HTMLElement, target: number) => {
@@ -753,6 +816,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     if (editorRef.current) editorRef.current.innerHTML = '';
     setShowMention(false);
     setShowAttachmentPicker(false);
+    clearComposerDraft(conv.id);
     await onSend(outgoing, pendingItems, refs, mentions);
   };
 
@@ -1507,7 +1571,12 @@ export default function ConversationsPage() {
   const [convs,          setConvs]          = useState<Conversation[]>([]);
   const [agents,         setAgents]         = useState<Agent[]>([]);
   const [projects,       setProjects]       = useState<Project[]>([]);
-  const [active,         setActive]         = useState('');
+  // 会议室是「条件渲染」页面：切到其它页时整个组件卸载。把当前会话 id 持久化到
+//  sessionStorage，回到会议室时落回同一个会话（而非默认首个群聊），保证后台仍在
+//  进行的对话回到前端就能看见。
+  const [active,         setActive]         = useState(() => {
+    try { return sessionStorage.getItem('AutoForge:active-conv') || ''; } catch { return ''; }
+  });
   const [msgs,           setMsgs]           = useState<Message[]>([]);
   const [showNew,        setShowNew]        = useState(false);
   const [editGroup,      setEditGroup]      = useState<Conversation | null>(null);
@@ -1582,9 +1651,11 @@ export default function ConversationsPage() {
     setConvs(cs);
     setAgents(as);
     setProjects(ps);
-    // Only set active when it is still empty (first load).
-    // Prefer first group conversation to match the UI order (groups listed before directs).
-    setActive(cur => cur || cs.find(c => c.conv_type === 'group')?.id || cs[0]?.id || '');
+    // Keep the current/persisted conversation if it still exists; otherwise fall back
+    // to the first group conversation (groups listed before directs in the UI).
+    setActive(cur => (cur && cs.some(c => c.id === cur))
+      ? cur
+      : (cs.find(c => c.conv_type === 'group')?.id || cs[0]?.id || ''));
   }, []);
 
   const loadMsgs = useCallback(async (cid: string) => {
@@ -1615,6 +1686,7 @@ export default function ConversationsPage() {
   //    with the list_messages response that unblocks the chat panel.
   useEffect(() => {
     if (!active) { setMsgs([]); setContextAttachments([]); return; }
+    try { sessionStorage.setItem('AutoForge:active-conv', active); } catch { /* ignore */ }
 
     let alive = true;
     Promise.all([loadMsgs(active), loadContextAttachments(active)]).then(() => {
@@ -1623,6 +1695,12 @@ export default function ConversationsPage() {
       setLoadError('');
     }).catch(e => { if (alive) setLoadError(String(e)); });
 
+    // 恢复在途任务指示：切换会话或重新进入会议室页时，若该会话仍有 running 的后台任务，
+    // 重新点亮「正在思考」气泡——后台任务本就 detached 持续执行，这里让前端忠实反映它。
+    listConversationTasks(active).then(tasks => {
+      if (alive && tasks[0]?.status === 'running') flashActivity('running', 'Agent 正在思考…');
+    }).catch(() => {});
+
     const readTimer = setTimeout(() => {
       markConversationRead(active)
         .then(() => window.dispatchEvent(new Event('AutoForge:badges-refresh')))
@@ -1630,7 +1708,7 @@ export default function ConversationsPage() {
     }, 500);
 
     return () => { alive = false; clearTimeout(readTimer); };
-  }, [active, loadMsgs, loadContextAttachments]);
+  }, [active, loadMsgs, loadContextAttachments, flashActivity]);
 
   // 3. Reset search state when switching conversations.
   useEffect(() => {
@@ -1823,12 +1901,14 @@ export default function ConversationsPage() {
     setBubbleMenu(null);
   };
 
-  // 会话即入口：把一条消息「沉淀为需求」，入待整理池（triage），交 AI 炼成正经需求。
+  // 会话即入口：把一条消息「沉淀为需求」，直接走 flow 模式自动分析，
+  // 与「需求草稿 card → 确认需求」一致——立即入库并进入分析 → 审核 1，
+  // 而非落入待整理池（triage）需人工再整理。
   const distillBubbleToIssue = async () => {
     if (!bubbleMenu || !conv?.project_id) return;
     const text = msgText(bubbleMenu.message).trim();
     setBubbleMenu(null);
-    if (!text) return;
+    if (!text) { flashActivity('error', '这条消息没有可沉淀的文本'); return; }
     try {
       const first = text.split(/[\n。.!?！？]/)[0]?.trim() ?? text;
       await submitIssue({
@@ -1836,9 +1916,13 @@ export default function ConversationsPage() {
         title: first.length > 30 ? first.slice(0, 30) : first,
         description: text,
         source_type: 'conversation',
-        mode: 'triage',
+        mode: 'flow',
       });
       setLoadError('');
+      // 成功无任何提示会让用户以为「没反应」：沉淀走 flow 模式，需求立即开始分析，
+      // 不会在当前会议室出现，必须显式回馈一次，并指引去哪里看。
+      // 审核 1 / 全量需求总账都在「功能审计」页（Audit.tsx），不是「交付流水线」。
+      flashActivity('done', '已沉淀为需求，开始分析（功能审计 → 审核 1）');
     } catch (e) { setLoadError(String(e)); }
   };
 
@@ -2487,16 +2571,16 @@ export default function ConversationsPage() {
           onPointerDown={e => e.stopPropagation()}
           onContextMenu={e => e.preventDefault()}
         >
-          <button onClick={openReader}><Icon name="maximize" size={14} />阅读模式</button>
           <button onClick={copyBubbleMessage}><Icon name="copy" size={14} />复制</button>
           <button onClick={quoteBubbleMessage}><Icon name="quote" size={14} />引用</button>
-          {conv?.project_id && (
-            <button onClick={distillBubbleToIssue}><Icon name="inbox" size={14} />沉淀为需求</button>
-          )}
           <button onClick={toggleContextBubbleMessage} title={bubbleMenu.message.excluded_from_context ? '恢复：重新加入上下文' : '排除：不进入 AI 上下文'}>
             <Icon name={bubbleMenu.message.excluded_from_context ? 'eye' : 'eye-off'} size={14} />
             {bubbleMenu.message.excluded_from_context ? '恢复' : '排除'}
           </button>
+          <button onClick={openReader}><Icon name="maximize" size={14} />阅读模式</button>
+          {conv?.project_id && (
+            <button onClick={distillBubbleToIssue}><Icon name="inbox" size={14} />沉淀为需求</button>
+          )}
         </div>
       )}
       {reader && (
@@ -2524,7 +2608,7 @@ export default function ConversationsPage() {
           <div className="reader-scroll scroll">
             <div className="bubble doc reader-doc" style={{ ['--rs' as string]: String(readerScale) }}>
               {visibleMessageBlocks(reader.message).map((b, i) => (
-                <Block key={i} b={b} projectId={conv?.project_id ?? undefined} />
+                <Block key={i} b={b} projectId={conv?.project_id ?? undefined} messageId={reader.message.id} blockIndex={i} />
               ))}
             </div>
           </div>

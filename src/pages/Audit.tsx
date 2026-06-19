@@ -6,8 +6,9 @@ import IntakePanel from '../components/IntakePanel';
 import { ConfirmModal } from '../components/ProjectDialogs';
 import {
   listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, getCrGrade,
-  retryChangeRequest, deleteChangeRequest, retryAnalysis,
-  openUrl, listIssues, getIssueAnalysis, review1, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
+  retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
+  openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
+  getIssueAnalysis, review1, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
@@ -254,10 +255,11 @@ function LiveLogModal({ title, load, onClose }: {
 
 // ── BranchLauncher（页头：启动项目 + 运行中分支）────────────────────────────────
 
-function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, onOpenIntake, onOpenLedger }: {
+function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, onOpenIntake, onOpenLedger, showMerged, onToggleMerged, mergedCount }: {
   branches: BranchInfo[]; branchPreviews: BranchPreviewStatus[];
   onStart: (b: string) => void; onStop: (b: string) => void; onShowLog: (b: string) => void;
   onOpenIntake: () => void; onOpenLedger: () => void;
+  showMerged: boolean; onToggleMerged: () => void; mergedCount: number;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -296,6 +298,16 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
           ))}
         </div>
       )}
+      <button
+        className={'icon-btn' + (showMerged ? ' on' : '')}
+        style={{ flexShrink: 0, position: 'relative' }}
+        onClick={onToggleMerged}
+        title={showMerged ? `隐藏已合并需求（${mergedCount}）` : `显示已合并需求（${mergedCount}）`}>
+        <Icon name={showMerged ? 'eye' : 'eye-off'} size={16} />
+        {!showMerged && mergedCount > 0 && (
+          <span className="dot green" style={{ position: 'absolute', top: 4, right: 4 }} />
+        )}
+      </button>
       <button className="icon-btn" style={{ flexShrink: 0 }} onClick={onOpenLedger} title="全量需求总账（全屏查看所有状态需求）">
         <Icon name="list" size={16} />
       </button>
@@ -338,12 +350,12 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
-  onSelectCr, onSelectIssue,
+  onSelectCr, onSelectIssue, onOpenLedger,
   width }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
   issueTitles: Record<string, string>; sel: Sel | null;
-  onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void;
+  onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void; onOpenLedger: () => void;
   width: number;
 }) {
   const [open, setOpen] = useState(false);
@@ -405,7 +417,14 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       </div>
 
       <div className="list-body scroll" style={{ paddingTop: 0 }}>
-        {crs.length === 0 && pendingIssues.length === 0 && <div className="empty-compact">暂无需求</div>}
+        {crs.length === 0 && pendingIssues.length === 0 && (
+          <button className="ledger-empty-cta" onClick={onOpenLedger} title="打开全量需求总账（全屏查看所有状态需求）">
+            <div className="ledger-empty-cta-icon"><Icon name="list" size={26} /></div>
+            <div className="ledger-empty-cta-title">暂无待审需求</div>
+            <div className="ledger-empty-cta-sub">打开「全量需求总账」<br />全屏查看并管理所有状态需求</div>
+            <span className="ledger-empty-cta-go">进入总账<Icon name="chevRight" size={15} /></span>
+          </button>
+        )}
 
         {/* 审核 1：待需求审核（Issue，尚未生成 CR） */}
         {pendingIssues.length > 0 && (
@@ -480,45 +499,102 @@ function LedgerCheck({ on }: { on: boolean }) {
   );
 }
 
-function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage, onRejectIssues }: {
-  allIssues: Issue[]; sel: Sel | null; onSelectIssue: (id: string) => void;
+const LEDGER_PAGE = 50;   // 总账每次滚动加载的条数
+
+function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage, onRejectIssues, showMerged, onToggleMerged, mergedCount }: {
+  projectId: string; refreshKey: number; sel: Sel | null; onSelectIssue: (id: string) => void;
   onRefineTriage: (ids: string[]) => Promise<void> | void;
   onRejectIssues: (ids: string[]) => Promise<void> | void;
+  // 与功能审计页共享的「显示已合并需求」开关（默认隐藏）。
+  showMerged: boolean; onToggleMerged: () => void; mergedCount: number;
 }) {
   const [search, setSearch] = useState('');
+  const [dq, setDq] = useState('');            // 防抖后的查询串（喂给后端）
   const [statusFilter, setStatusFilter] = useState('all');
+  const [statuses, setStatuses] = useState<string[]>([]);
+  const [items, setItems] = useState<Issue[]>([]);   // 已加载的页（累加）
+  const [total, setTotal] = useState(0);             // 当前筛选下的总数
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+  // 待确认的拒绝操作：行内单条 / 批量都先弹二次确认，避免误删（triage 碎片为硬删除不可恢复）。
+  const [confirmReject, setConfirmReject] = useState<null | { ids: string[]; clear: boolean }>(null);
   // 正在整理中的碎片 id：点击「整理」即时置入，用于行/按钮显示 spinner + 「整理中…」，
   // 消除 triage Agent 调用期间「点了没反应」的感知。
   const [refiningIds, setRefiningIds] = useState<Set<string>>(new Set());
-  const statuses = useMemo(() => Array.from(new Set(allIssues.map(i => i.status))), [allIssues]);
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return allIssues
-      .filter(i => statusFilter === 'all' || i.status === statusFilter)
-      .filter(i => !q || i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q))
-      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
-  }, [allIssues, search, statusFilter]);
+  // 单调令牌：项目/筛选/刷新变化即自增，丢弃在途的过期分页响应，并区分「重置」与「追加」。
+  const reqRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
-  // 数据刷新后剔除已不存在的选中项，避免对幽灵 id 批量操作。
+  // 搜索防抖：停顿 250ms 再打后端，避免逐字查询。
+  useEffect(() => {
+    const t = setTimeout(() => setDq(search.trim()), 250);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // 状态筛选 chip：取该项目出现过的全部状态（不受当前页限制）。
+  useEffect(() => {
+    let alive = true;
+    listIssueStatuses(projectId).then(s => { if (alive) setStatuses(s); }).catch(() => { if (alive) setStatuses([]); });
+    return () => { alive = false; };
+  }, [projectId, refreshKey]);
+
+  // 「显示已合并需求」关闭时（默认）：若当前正按 merged 状态筛选，回退到「全部」，避免空列表。
+  useEffect(() => {
+    if (!showMerged && statusFilter === 'merged') setStatusFilter('all');
+  }, [showMerged, statusFilter]);
+
+  // 项目/筛选/刷新/合并开关变化 → 重置并加载第一页。
+  useEffect(() => {
+    const token = ++reqRef.current;
+    setLoading(true);
+    listIssuesPage(projectId, statusFilter, dq, LEDGER_PAGE, 0, !showMerged)
+      .then(p => { if (reqRef.current === token) { setItems(p.items); setTotal(p.total); } })
+      .catch(() => { if (reqRef.current === token) { setItems([]); setTotal(0); } })
+      .finally(() => { if (reqRef.current === token) setLoading(false); });
+  }, [projectId, statusFilter, dq, refreshKey, showMerged]);
+
+  const hasMore = items.length < total;
+  const loadMore = useCallback(() => {
+    if (loading || items.length >= total) return;
+    const token = reqRef.current;  // 与当前重置同批；期间若发生重置则丢弃本次追加
+    setLoading(true);
+    listIssuesPage(projectId, statusFilter, dq, LEDGER_PAGE, items.length, !showMerged)
+      .then(p => { if (reqRef.current === token) { setItems(prev => [...prev, ...p.items]); setTotal(p.total); } })
+      .catch(() => {})
+      .finally(() => { if (reqRef.current === token) setLoading(false); });
+  }, [loading, items.length, total, projectId, statusFilter, dq, showMerged]);
+
+  // 触底哨兵进入视口即加载下一页（提前 240px 预取）。
+  useEffect(() => {
+    const el = sentinelRef.current;
+    const root = scrollRef.current;
+    if (!el || !root) return;
+    const io = new IntersectionObserver(es => { if (es[0].isIntersecting) loadMore(); }, { root, rootMargin: '240px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [loadMore]);
+
+  // 数据刷新后剔除已不在已加载集合中的选中项，避免对幽灵 id 批量操作。
   useEffect(() => {
     setSelected(prev => {
-      const valid = new Set(allIssues.map(i => i.id));
+      const valid = new Set(items.map(i => i.id));
       const next = new Set([...prev].filter(id => valid.has(id)));
       return next.size === prev.size ? prev : next;
     });
-  }, [allIssues]);
+  }, [items]);
 
-  const selectedTriage = useMemo(() => filtered.filter(i => selected.has(i.id) && i.status === 'triage').map(i => i.id), [filtered, selected]);
-  const selectedRejectable = useMemo(() => filtered.filter(i => selected.has(i.id) && canReject(i.status)).map(i => i.id), [filtered, selected]);
-  const allFilteredSelected = filtered.length > 0 && filtered.every(i => selected.has(i.id));
+  const selectedTriage = useMemo(() => items.filter(i => selected.has(i.id) && i.status === 'triage').map(i => i.id), [items, selected]);
+  const selectedRejectable = useMemo(() => items.filter(i => selected.has(i.id) && canReject(i.status)).map(i => i.id), [items, selected]);
+  // 「全选」作用于已加载的行（未加载的不在内存里，无法纳入批量操作）。
+  const allLoadedSelected = items.length > 0 && items.every(i => selected.has(i.id));
 
   const toggle = (id: string) => setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const toggleAll = () => setSelected(prev => {
     const n = new Set(prev);
-    if (allFilteredSelected) filtered.forEach(i => n.delete(i.id));
-    else filtered.forEach(i => n.add(i.id));
+    if (allLoadedSelected) items.forEach(i => n.delete(i.id));
+    else items.forEach(i => n.add(i.id));
     return n;
   });
   const run = (fn: () => Promise<void> | void, clear: boolean) => {
@@ -538,14 +614,26 @@ function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage, onRejectIss
     });
   };
 
+  // 拒绝确认里区分 triage（硬删除）与其余（软归档），让用户清楚不可恢复的部分。
+  const rejTriageCount = confirmReject ? confirmReject.ids.filter(id => items.find(i => i.id === id)?.status === 'triage').length : 0;
+
   return (
+    <>
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
-      <div className="list-body scroll" style={{ paddingTop: 0, flex: 1 }}>
+      <div className="list-body scroll" ref={scrollRef} style={{ paddingTop: 0, flex: 1 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 12px' }}>
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
-            style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
+              style={{ flex: 1, minWidth: 0, boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+            {/* 「显示已合并需求」开关：与功能审计页共享同一状态，默认隐藏。 */}
+            <button className={'icon-btn' + (showMerged ? ' on' : '')} style={{ flexShrink: 0 }}
+              onClick={onToggleMerged}
+              title={showMerged ? `隐藏已合并需求（${mergedCount}）` : `显示已合并需求（${mergedCount}）`}>
+              <Icon name={showMerged ? 'eye' : 'eye-off'} size={16} />
+            </button>
+          </div>
           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-            {['all', ...statuses].map(s => (
+            {['all', ...statuses.filter(s => showMerged || s !== 'merged')].map(s => (
               <button key={s} onClick={() => setStatusFilter(s)}
                 className={'filter-chip' + (statusFilter === s ? ' on' : '')}
                 style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>
@@ -554,17 +642,17 @@ function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage, onRejectIss
             ))}
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '0 12px 6px' }}>
-          <button onClick={toggleAll} disabled={!filtered.length}
-            style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', cursor: filtered.length ? 'pointer' : 'default', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)' }}>
-            <LedgerCheck on={allFilteredSelected} /> 全选
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '0 14px 6px' }}>
+          <button onClick={toggleAll} disabled={!items.length} title="全选已加载的需求"
+            style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'none', border: 'none', cursor: items.length ? 'pointer' : 'default', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)' }}>
+            <LedgerCheck on={allLoadedSelected} /> 全选
           </button>
           <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
-            {filtered.length} 条{selected.size ? ` · 已选 ${selected.size}` : ''}
+            {total} 条{hasMore ? `（已载 ${items.length}）` : ''}{selected.size ? ` · 已选 ${selected.size}` : ''}
           </span>
         </div>
-        {filtered.length === 0 && <div className="empty-compact">无匹配需求</div>}
-        {filtered.map(i => (
+        {items.length === 0 && !loading && <div className="empty-compact">无匹配需求</div>}
+        {items.map(i => (
           <div key={i.id} className={'req-item ledger-row' + (sel?.kind === 'issue' && sel.id === i.id ? ' active' : '')} onClick={() => onSelectIssue(i.id)}>
             <span onClick={e => { e.stopPropagation(); toggle(i.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择">
               <LedgerCheck on={selected.has(i.id)} />
@@ -582,7 +670,7 @@ function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage, onRejectIss
             )}
             {canReject(i.status) && (
               <button className="btn btn-sm btn-ghost" style={{ padding: '2px 6px', color: 'var(--red)' }} disabled={busy}
-                onClick={e => { e.stopPropagation(); run(() => onRejectIssues([i.id]), false); }}
+                onClick={e => { e.stopPropagation(); setConfirmReject({ ids: [i.id], clear: false }); }}
                 title={i.status === 'triage' ? '拒绝（删除碎片）' : '拒绝（归档为已拒绝）'}>
                 <Icon name="x" size={13} />
               </button>
@@ -591,6 +679,12 @@ function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage, onRejectIss
             <span className="req-time">{new Date(i.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
           </div>
         ))}
+        {/* 触底哨兵：进入视口即拉下一页 */}
+        <div ref={sentinelRef} style={{ height: 1 }} />
+        {loading && <div className="empty-compact" style={{ padding: '10px 0' }}>加载中…</div>}
+        {!hasMore && !loading && items.length > 0 && (
+          <div style={{ textAlign: 'center', padding: '8px 0 12px', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>— 已到末尾 · 共 {total} 条 —</div>
+        )}
       </div>
       {selected.size > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: '1px solid var(--border)', background: 'var(--bg-2)' }}>
@@ -603,13 +697,27 @@ function LedgerView({ allIssues, sel, onSelectIssue, onRefineTriage, onRejectIss
               : <><Icon name="inbox" size={13} />批量整理{selectedTriage.length ? ` (${selectedTriage.length})` : ''}</>}
           </button>
           <button className="btn btn-sm btn-danger" disabled={busy || !selectedRejectable.length}
-            onClick={() => run(() => onRejectIssues(selectedRejectable), true)} title="批量拒绝（triage 删除 / 其余归档）">
+            onClick={() => setConfirmReject({ ids: selectedRejectable, clear: true })} title="批量拒绝（triage 删除 / 其余归档）">
             <Icon name="x" size={13} />批量拒绝{selectedRejectable.length ? ` (${selectedRejectable.length})` : ''}
           </button>
           <button className="btn btn-sm btn-ghost" disabled={busy} onClick={() => setSelected(new Set())}>清空</button>
         </div>
       )}
     </div>
+    {confirmReject && (
+      <ConfirmModal
+        msg={confirmReject.ids.length > 1 ? `确定拒绝选中的 ${confirmReject.ids.length} 条需求？` : '确定拒绝该需求？'}
+        sub={rejTriageCount > 0
+          ? (rejTriageCount === confirmReject.ids.length
+              ? '待整理碎片将被彻底删除，不可恢复。'
+              : `其中 ${rejTriageCount} 条待整理碎片将被彻底删除（不可恢复），其余归档为「已拒绝」。`)
+          : '将归档为「已拒绝」，不再进入流水线。'}
+        okLabel="拒绝"
+        onOk={() => { const c = confirmReject; setConfirmReject(null); run(() => onRejectIssues(c.ids), c.clear); }}
+        onCancel={() => setConfirmReject(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -638,13 +746,25 @@ const liStyle: React.CSSProperties = { fontSize: 'var(--text-control)', color: '
 const monoPath: React.CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text)' };
 
 function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
-  const [briefOpen, setBriefOpen] = useState(false);
+  // 精简审核视图：默认只显示「关键核心」（需求理解 / 影响文件 / 待澄清），
+  // 其余区块（根因·实现计划·验收·约束·风险·执行工单）统一收进可展开的「完整分析」。
+  // 注意：仅折叠展示，不删除任何生成内容——完整 spec 仍原样喂给 Claude Code 执行。
+  const [fullOpen, setFullOpen] = useState(false);
   const u = spec.understanding, rc = spec.root_cause, sc = spec.scope;
   const plan = spec.implementation_plan, b = spec.claude_code_brief;
   const steps = [...plan.steps].sort((a, z) => a.order - z.order);
 
+  const hasRoot = !!(rc && rc.hypothesis);
+  const hasPlan = !!plan.approach || steps.length > 0;
+  const hasAcceptance = spec.acceptance_criteria.length > 0;
+  const hasConstraints = spec.constraints.must.length > 0 || spec.constraints.must_not.length > 0;
+  const hasRisks = spec.risks.length > 0;
+  const hasBrief = !!(b.objective || b.instructions.length > 0);
+  const hasFull = hasRoot || hasPlan || hasAcceptance || hasConstraints || hasRisks || hasBrief;
+
   return (
     <>
+      {/* ── 关键核心：默认可见 ── */}
       {(u.restated_requirement || u.reproduction_steps.length > 0) && (
         <>
           <SpecH2 icon="search" color="var(--blue)">需求理解</SpecH2>
@@ -656,23 +776,6 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
             <ol style={{ paddingLeft: 18, margin: '6px 0', display: 'flex', flexDirection: 'column', gap: 3 }}>
               {u.reproduction_steps.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
             </ol>
-          )}
-        </>
-      )}
-
-      {rc && rc.hypothesis && (
-        <>
-          <SpecH2 icon="alert" color="var(--amber)">根因分析</SpecH2>
-          <p style={{ whiteSpace: 'pre-line' }}>{rc.hypothesis}</p>
-          {rc.suspected_locations.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }}>
-              {rc.suspected_locations.map((l, i) => (
-                <div key={i} style={liStyle}>
-                  <span style={monoPath}>{l.file}{l.symbol ? ` :: ${l.symbol}` : ''}</span>
-                  <span style={{ color: 'var(--text-3)' }}> — {l.reason}</span>
-                </div>
-              ))}
-            </div>
           )}
         </>
       )}
@@ -706,63 +809,6 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
         </>
       )}
 
-      {(plan.approach || steps.length > 0) && (
-        <>
-          <SpecH2 icon="layers" color="var(--ember)">实现计划</SpecH2>
-          {plan.approach && <p style={{ whiteSpace: 'pre-line' }}>{plan.approach}</p>}
-          {steps.length > 0 && (
-            <ol style={{ paddingLeft: 18, margin: '6px 0', display: 'flex', flexDirection: 'column', gap: 5 }}>
-              {steps.map((s, i) => (
-                <li key={i} style={liStyle}>
-                  {s.action}
-                  {s.target_files.length > 0 && <span style={{ ...monoPath, color: 'var(--text-3)' }}> （{s.target_files.join(', ')}）</span>}
-                  {s.details && <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{s.details}</div>}
-                </li>
-              ))}
-            </ol>
-          )}
-          {plan.data_model_changes.filter(d => d.kind !== 'none' && d.description).map((d, i) => (
-            <p key={i} style={liStyle}><span className="chip violet" style={{ fontSize: 'var(--text-micro)' }}>{d.kind}</span> {d.description}</p>
-          ))}
-          {plan.new_dependencies.length > 0 && <p style={liStyle}><b style={{ color: 'var(--amber)' }}>新增依赖：</b>{plan.new_dependencies.join(', ')}</p>}
-        </>
-      )}
-
-      {spec.acceptance_criteria.length > 0 && (
-        <>
-          <SpecH2 icon="check" color="var(--green)">验收标准</SpecH2>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-            {spec.acceptance_criteria.map((ac, i) => (
-              <div key={i} style={liStyle}><span style={{ fontFamily: 'var(--font-mono)', color: 'var(--green)', fontSize: 'var(--text-caption)' }}>{ac.id}</span> {ac.statement}</div>
-            ))}
-          </div>
-        </>
-      )}
-
-      {(spec.constraints.must.length > 0 || spec.constraints.must_not.length > 0) && (
-        <>
-          <SpecH2 icon="shield" color="var(--blue)">约束</SpecH2>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {spec.constraints.must.map((m, i) => <div key={'m' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {m}</div>)}
-            {spec.constraints.must_not.map((m, i) => <div key={'n' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {m}</div>)}
-          </div>
-        </>
-      )}
-
-      {spec.risks.length > 0 && (
-        <>
-          <SpecH2 icon="alert" color="var(--red)">风险</SpecH2>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-            {spec.risks.map((r, i) => (
-              <div key={i} style={liStyle}>
-                <span className={'chip ' + (RISK_CHIP[r.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{r.severity}</span> {r.description}
-                {r.mitigation && <span style={{ color: 'var(--text-3)' }}>（缓解：{r.mitigation}）</span>}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-
       {spec.open_questions.length > 0 && (
         <div className="iter-warn" style={{ marginTop: 14 }}>
           <Icon name="alert" size={20} />
@@ -775,23 +821,105 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
         </div>
       )}
 
-      {(b.objective || b.instructions.length > 0) && (
+      {/* ── 完整分析：默认折叠，一个按钮展开全部细节（不删除生成内容）── */}
+      {hasFull && (
         <div style={{ marginTop: 14 }}>
-          <button className="btn btn-sm" onClick={() => setBriefOpen(o => !o)}>
-            <Icon name={briefOpen ? 'eye-off' : 'eye'} size={13} />{briefOpen ? '收起' : '查看'} Claude Code 执行工单
+          <button className="btn btn-sm" onClick={() => setFullOpen(o => !o)}>
+            <Icon name={fullOpen ? 'eye-off' : 'eye'} size={13} />{fullOpen ? '收起完整分析' : '展开完整分析（根因 · 计划 · 验收 · 约束 · 风险 · 执行工单）'}
           </button>
-          {briefOpen && (
-            <div className="panel" style={{ marginTop: 8, padding: '12px 14px' }}>
-              {b.objective && <p style={{ margin: '0 0 8px' }}><b>目标：</b>{b.objective}</p>}
-              {b.instructions.length > 0 && (
-                <ol style={{ paddingLeft: 18, margin: '0 0 8px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-                  {b.instructions.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
-                </ol>
+          {fullOpen && (
+            <div style={{ marginTop: 8 }}>
+              {hasRoot && (
+                <>
+                  <SpecH2 icon="alert" color="var(--amber)">根因分析</SpecH2>
+                  <p style={{ whiteSpace: 'pre-line' }}>{rc!.hypothesis}</p>
+                  {rc!.suspected_locations.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }}>
+                      {rc!.suspected_locations.map((l, i) => (
+                        <div key={i} style={liStyle}>
+                          <span style={monoPath}>{l.file}{l.symbol ? ` :: ${l.symbol}` : ''}</span>
+                          <span style={{ color: 'var(--text-3)' }}> — {l.reason}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
-              {b.do.map((d, i) => <div key={'d' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {d}</div>)}
-              {b.dont.map((d, i) => <div key={'x' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {d}</div>)}
-              {b.definition_of_done.length > 0 && (
-                <p style={{ ...liStyle, marginTop: 8 }}><b>完成判定：</b>{b.definition_of_done.join('；')}</p>
+
+              {hasPlan && (
+                <>
+                  <SpecH2 icon="layers" color="var(--ember)">实现计划</SpecH2>
+                  {plan.approach && <p style={{ whiteSpace: 'pre-line' }}>{plan.approach}</p>}
+                  {steps.length > 0 && (
+                    <ol style={{ paddingLeft: 18, margin: '6px 0', display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {steps.map((s, i) => (
+                        <li key={i} style={liStyle}>
+                          {s.action}
+                          {s.target_files.length > 0 && <span style={{ ...monoPath, color: 'var(--text-3)' }}> （{s.target_files.join(', ')}）</span>}
+                          {s.details && <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{s.details}</div>}
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                  {plan.data_model_changes.filter(d => d.kind !== 'none' && d.description).map((d, i) => (
+                    <p key={i} style={liStyle}><span className="chip violet" style={{ fontSize: 'var(--text-micro)' }}>{d.kind}</span> {d.description}</p>
+                  ))}
+                  {plan.new_dependencies.length > 0 && <p style={liStyle}><b style={{ color: 'var(--amber)' }}>新增依赖：</b>{plan.new_dependencies.join(', ')}</p>}
+                </>
+              )}
+
+              {hasAcceptance && (
+                <>
+                  <SpecH2 icon="check" color="var(--green)">验收标准</SpecH2>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                    {spec.acceptance_criteria.map((ac, i) => (
+                      <div key={i} style={liStyle}><span style={{ fontFamily: 'var(--font-mono)', color: 'var(--green)', fontSize: 'var(--text-caption)' }}>{ac.id}</span> {ac.statement}</div>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {hasConstraints && (
+                <>
+                  <SpecH2 icon="shield" color="var(--blue)">约束</SpecH2>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {spec.constraints.must.map((m, i) => <div key={'m' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {m}</div>)}
+                    {spec.constraints.must_not.map((m, i) => <div key={'n' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {m}</div>)}
+                  </div>
+                </>
+              )}
+
+              {hasRisks && (
+                <>
+                  <SpecH2 icon="alert" color="var(--red)">风险</SpecH2>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                    {spec.risks.map((r, i) => (
+                      <div key={i} style={liStyle}>
+                        <span className={'chip ' + (RISK_CHIP[r.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{r.severity}</span> {r.description}
+                        {r.mitigation && <span style={{ color: 'var(--text-3)' }}>（缓解：{r.mitigation}）</span>}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {hasBrief && (
+                <>
+                  <SpecH2 icon="code" color="var(--text-3)">Claude Code 执行工单</SpecH2>
+                  <div className="panel" style={{ padding: '12px 14px' }}>
+                    {b.objective && <p style={{ margin: '0 0 8px' }}><b>目标：</b>{b.objective}</p>}
+                    {b.instructions.length > 0 && (
+                      <ol style={{ paddingLeft: 18, margin: '0 0 8px', display: 'flex', flexDirection: 'column', gap: 3 }}>
+                        {b.instructions.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
+                      </ol>
+                    )}
+                    {b.do.map((d, i) => <div key={'d' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {d}</div>)}
+                    {b.dont.map((d, i) => <div key={'x' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {d}</div>)}
+                    {b.definition_of_done.length > 0 && (
+                      <p style={{ ...liStyle, marginTop: 8 }}><b>完成判定：</b>{b.definition_of_done.join('；')}</p>
+                    )}
+                  </div>
+                </>
               )}
             </div>
           )}
@@ -883,12 +1011,13 @@ function AcceptancePanel({ issue }: { issue: Issue }) {
   );
 }
 
-function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide, onRetryAnalysis }: {
+function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide, onRetryAnalysis, onReanalyze }: {
   issue: Issue; analysis: IssueAnalysis | null; analysisLoading: boolean;
   submitting: boolean; decided: string | null;
   advice: string; setAdvice: (v: string) => void;
   onDecide: (decision: 'approved' | 'rejected') => void;
   onRetryAnalysis: () => void;
+  onReanalyze: () => void;
 }) {
   const canReview = issue.status === 'pending_review_1' && !decided;
   const analysisFailed = issue.status === 'analysis_failed';
@@ -900,11 +1029,11 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
   return (
     <>
       <div className="audit-top">
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div className="audit-top-info">
+          <div className="audit-top-titlerow">
             <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{issue.id.slice(0, 10)}</span>
             <CopyIdButton value={issue.id} title="复制需求编号" />
-            <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>{issue.title}</span>
+            <span className="audit-top-title" style={{ fontWeight: 700, fontSize: 'var(--text-title)' }} title={issue.title}>{issue.title}</span>
             <span className={'chip ' + (analysisFailed ? 'red' : 'amber')}>{analysisFailed ? '分析失败' : '审核 1 · 需求审核'}</span>
           </div>
           <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8 }}>
@@ -995,15 +1124,27 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
             <div className="empty-compact" style={{ padding: '20px 0' }}>暂无分析结果</div>
           )}
 
-          <div style={{ marginTop: 18 }}>
-            <div className="advice-label" style={{ marginBottom: 6 }}>管理员建议 → 编码 Agent（可选）</div>
+        </div>
+      </div>
+
+      {/* 底部悬浮 dock：单一管理员意见输入框，支持两种操作——
+          「批准 · 进入编码」时作为给编码 Agent 的实现建议随同提交；
+          「重新评估」时作为补充意见让需求带其重新分析并回到审核 1。 */}
+      <div className="audit-dock">
+        <div className="dock-advice">
+          <span className="dock-label">管理员意见（批准时给编码 Agent / 重新评估时给分析）</span>
+          <div className="dock-advice-row">
             <textarea
               value={advice}
               onChange={e => setAdvice(e.target.value)}
-              placeholder={canReview ? '批准时附带的实现指引、约束或注意事项…' : '只读状态'}
-              disabled={!canReview}
-              style={{ width: '100%', boxSizing: 'border-box', minHeight: 80, background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 9, padding: '10px 12px', color: 'var(--text)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-control)', resize: 'vertical', outline: 'none' }}
+              placeholder={(canReview || analysisFailed) ? '填写实现建议或补充意见，再选择下方操作…' : '只读状态'}
+              disabled={!canReview && !analysisFailed}
             />
+            <button className="btn btn-sm" onClick={onReanalyze}
+              disabled={(!canReview && !analysisFailed) || submitting || !advice.trim()}
+              title={(canReview || analysisFailed) ? '带此补充意见重新分析，完成后回到审核 1' : '仅「待需求审核」或「分析失败」可重新评估'}>
+              <Icon name="refresh" size={14} />重新评估
+            </button>
           </div>
         </div>
       </div>
@@ -1023,9 +1164,12 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [crs, setCrs] = useState<ChangeRequest[]>([]);
+  // 默认隐藏已合并需求，开关在 audit-launch 区域控制。
+  const [showMerged, setShowMerged] = useState(false);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
-  const [allIssues, setAllIssues] = useState<Issue[]>([]);
   const [showLedger, setShowLedger] = useState(false);
+  // 总账刷新信号：整理/拒绝后自增，触发总账重载首页（背景事件刷新不动它，避免浏览中被重置）。
+  const [ledgerRefresh, setLedgerRefresh] = useState(0);
   // 通知导航请求时自动打开总账弹窗，并立即消费该意图（避免再次进入本页时重复弹出）。
   useEffect(() => {
     if (openLedger) { setShowLedger(true); onLedgerConsumed?.(); }
@@ -1049,6 +1193,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [decided, setDecided] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // 审核 1 / 审核 2 的「拒绝」均为不可逆决策，弹二次确认避免误点。
+  const [confirmReject, setConfirmReject] = useState<null | 'review1' | 'review2'>(null);
   const [crLoading, setCrLoading] = useState(false);
   // 任务进度心跳：cr_id → 最近一次阶段说明，用于在编码/合并期间显示「活着」的进度。
   const [crProgress, setCrProgress] = useState<Record<string, { phase: string; note?: string }>>({});
@@ -1070,6 +1216,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const loadReqRef = useRef(0);
   // web 预览：startCrPreview 后服务还在 starting，置位以便就绪时自动打开浏览器
   const autoOpenRef = useRef(false);
+  // tauri 桌面应用：spawn 即返回但窗口需编译后才出现，置位给「启动中…」即时反馈
+  const [crAppLaunching, setCrAppLaunching] = useState(false);
 
   const activeCr = sel?.kind === 'cr' ? sel.id : '';
   const activeIssueId = sel?.kind === 'issue' ? sel.id : '';
@@ -1115,16 +1263,22 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   }, [hasBranchPreviews, activeProject]);
 
   const loadList = useCallback(async (projectId: string) => {
-    const [allCrs, allIssues] = await Promise.all([
+    // 不再全量加载 issues：左栏只需在产 CR + 待审需求（有界子集）；总账自带分页滚动加载。
+    // 审核 1 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
+    const [allCrs, pending] = await Promise.all([
       listChangeRequests(projectId),
-      listIssues(projectId),
+      listIssuesByStatuses(projectId, ['pending_review_1', 'analysis_failed']),
     ]);
     setCrs(allCrs);
-    setAllIssues(allIssues);
-    // 审核 1 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
-    setPendingIssues(allIssues.filter(i => i.status === 'pending_review_1' || i.status === 'analysis_failed'));
-    setIssueTitles(Object.fromEntries(allIssues.map(i => [i.id, i.title])));
-    setIssuesById(Object.fromEntries(allIssues.map(i => [i.id, i])));
+    setPendingIssues(pending);
+    // 标题映射：只取列表里实际出现的需求（CR 关联 + 待审），批量取轻量标题，避免全量加载。
+    const titleIds = Array.from(new Set([...allCrs.map(c => c.issue_id), ...pending.map(i => i.id)]));
+    const titleRows = titleIds.length ? await listIssueTitles(titleIds) : [];
+    const titleMap: Record<string, string> = Object.fromEntries(titleRows.map(t => [t.id, t.title]));
+    pending.forEach(i => { titleMap[i.id] = i.title; });  // 兜底
+    setIssueTitles(titleMap);
+    // 待审需求完整字段进 issuesById 缓存；报告页「需求原文」所需的选中 CR 原始需求按需补拉。
+    setIssuesById(prev => ({ ...prev, ...Object.fromEntries(pending.map(i => [i.id, i])) }));
     setLoadedProjectId(projectId);
   }, []);
 
@@ -1141,6 +1295,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         showOk(`整理完成：转入流水线 ${r.refined} · 判为噪音丢弃 ${r.discarded}` + (r.errors ? ` · 失败 ${r.errors}` : ''));
       }
     } catch (e) { showError('整理失败：' + String(e)); }
+    setLedgerRefresh(v => v + 1);
     if (activeProject) await loadList(activeProject.id);
   }, [activeProject, loadList, showError, showOk, showInfo]);
 
@@ -1155,6 +1310,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       if (r.skipped) parts.push(`跳过 ${r.skipped}（运行中/已合并）`);
       showOk('已拒绝：' + (parts.join(' · ') || '无可操作项'));
     } catch (e) { showError('拒绝失败：' + String(e)); }
+    setLedgerRefresh(v => v + 1);
     if (activeProject) await loadList(activeProject.id);
   }, [activeProject, loadList, showError, showOk]);
 
@@ -1164,13 +1320,17 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   useEffect(() => {
     if (target) return;
     if (loadedProjectId !== activeProject?.id) return;
+    // 默认选中只能落在左栏「可见」的 CR 上：默认隐藏已合并需求，否则会出现
+    // 列表为空（暂无待审需求）但 .content 仍自动选中并展示某条已合并 CR 的错位。
+    // 已有选择若仍存在于全量 crs（含已合并，如刚批准合并/手动开启显示已合并查看）则保留。
+    const visibleCrs = showMerged ? crs : crs.filter(c => c.status !== 'merged');
     const stillValid = sel && (sel.kind === 'cr' ? crs.some(c => c.id === sel.id) : pendingIssues.some(i => i.id === sel.id));
     if (stillValid) return;
     if (pendingIssues.length) setSel({ kind: 'issue', id: pendingIssues[0].id });
-    else if (crs.length) setSel({ kind: 'cr', id: sortedCrs(crs)[0].id });
+    else if (visibleCrs.length) setSel({ kind: 'cr', id: sortedCrs(visibleCrs)[0].id });
     else setSel(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [crs, pendingIssues, loadedProjectId, activeProject, target]);
+  }, [crs, pendingIssues, loadedProjectId, activeProject, target, showMerged]);
 
   // 跨页跳转：切到目标项目
   useEffect(() => {
@@ -1186,21 +1346,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   useEffect(() => {
     if (!target) return;
     if (loadedProjectId !== target.projectId) return;
-    const issue = pendingIssues.find(i => i.id === target.issueId);
-    if (issue) setSel({ kind: 'issue', id: issue.id });
-    else {
-      const cr = crs.find(c => c.issue_id === target.issueId);
-      if (cr) setSel({ kind: 'cr', id: cr.id });
-      else if (allIssues.some(i => i.id === target.issueId)) {
-        // 非审核阶段需求（如待整理 triage）：主列表里没有，自动打开全量需求总账并在其中选中
-        setSel({ kind: 'issue', id: target.issueId });
-        setShowLedger(true);
-      }
+    const tid = target.issueId;
+    const pending = pendingIssues.find(i => i.id === tid);
+    const cr = crs.find(c => c.issue_id === tid);
+    if (pending) {
+      setSel({ kind: 'issue', id: pending.id });
+      setDecided(null); onTargetConsumed();
+    } else if (cr) {
+      setSel({ kind: 'cr', id: cr.id });
+      setDecided(null); onTargetConsumed();
+    } else {
+      // 非审核阶段需求（如待整理 triage / 已合并）：主列表里没有，确认存在后自动打开总账并选中
+      getIssue(tid).then(iss => {
+        if (iss) { setSel({ kind: 'issue', id: tid }); setShowLedger(true); }
+      }).finally(() => { setDecided(null); onTargetConsumed(); });
     }
-    setDecided(null);
-    onTargetConsumed();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target, loadedProjectId, crs, pendingIssues, allIssues]);
+  }, [target, loadedProjectId, crs, pendingIssues]);
 
   useEffect(() => {
     if (!activeCr) {
@@ -1216,20 +1378,25 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
     autoOpenRef.current = false;  // 切换 CR 时取消上一条未完成的自动打开
+    setCrAppLaunching(false);     // 切换 CR 时清掉上一条桌面应用「启动中」反馈
     setTimeout(() => adviceRef.current?.focus(), 120);
 
+    // 报告页「需求原文」所需的原始需求：不再全量缓存，选中 CR 时按需补拉进 issuesById。
+    const origIssueId = crs.find(c => c.id === crId)?.issue_id;
     (async () => {
-      const [s, d, g, pv] = await Promise.all([
+      const [s, d, g, pv, origIssue] = await Promise.all([
         getWorktreeSession(crId),
         getCodeDiff(crId),
         getCrGrade(crId).catch(() => null),
         getCrPreview(crId).catch(() => null),
+        origIssueId ? getIssue(origIssueId).catch(() => null) : Promise.resolve(null),
       ]);
       if (loadReqRef.current !== reqId) return;
       setSession(s);
       setCrPreview(pv);
       setDiff(d);
       setGrade(g);
+      if (origIssue) setIssuesById(prev => ({ ...prev, [origIssue.id]: origIssue }));
       setCrLoading(false);
     })();
     // activeCrUpdatedAt 入依赖：同一 CR 修改/重新执行后 updated_at 变化即重新拉取
@@ -1253,6 +1420,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     }, 2000);
     return () => clearInterval(id);
   }, [crPreview?.status, activeCr]);
+
+  // 桌面应用（tauri）启动监听：spawn 后进程存活（编译中/运行中）即 app_running=true，
+  // 据此把按钮从「启动中…」翻成「停止程序」；进程退出（如端口冲突快速失败）则复位。
+  // 启动中或运行中都持续探测：运行中是为了在程序被外部关闭后让按钮自动复位。
+  useEffect(() => {
+    if (!crAppLaunching && !crPreview?.app_running) return;
+    const crId = activeCr;
+    if (!crId) return;
+    const id = setInterval(() => {
+      getCrPreview(crId).then(p => {
+        if (!loadReqRef.current || activeCr !== crId) return;
+        setCrPreview(p);
+        if (p.app_running) setCrAppLaunching(false);  // 进程已起，结束「启动中」反馈
+      }).catch(() => {});
+    }, 2000);
+    return () => clearInterval(id);
+  }, [crAppLaunching, crPreview?.app_running, activeCr]);
 
   // 审核 1：选中 Issue 时加载其分析结果
   useEffect(() => {
@@ -1347,6 +1531,21 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setSubmitting(false); }
   };
 
+  // 审核 1 补充意见重评：带管理员补充意见重新分析当前需求，完成后重回审核 1。
+  const doReanalyze = async () => {
+    if (!activeIssueId || submitting || !advice.trim()) return;
+    setSubmitting(true);
+    try {
+      await reanalyzeWithFeedback(activeIssueId, advice.trim());
+      setAdvice('');
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      showError('提交补充意见失败：' + String(e));
+    } finally { setSubmitting(false); }
+  };
+
   // 审核 1：批准 → 创建 CR 进入编码；拒绝 → 归档（后端按设计返回 Err）。
   const doReview1 = async (decision: 'approved' | 'rejected') => {
     if (!activeIssueId || submitting) return;
@@ -1425,15 +1624,29 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     if (!activeCr) return;
     try {
       await stopCrPreview(activeCr);
-      setCrPreview(p => p ? { ...p, status: 'stopped', url: null } : null);
+      setCrAppLaunching(false);
+      setCrPreview(p => p ? { ...p, status: 'stopped', url: null, app_running: false } : null);
     } catch (e) { showError('停止失败：' + String(e)); }
   }, [activeCr]);
 
   const doLaunchCrApp = useCallback(async () => {
     if (!activeCr) return;
-    try { await launchCrApp(activeCr); }
-    catch (e) { showError('启动桌面应用失败：' + String(e)); }
-  }, [activeCr, showError]);
+    const id = activeCr;
+    // 即时反馈：桌面应用首次启动需编译 Rust（数十秒），后端 spawn 即返回、窗口稍后才出现。
+    // 立刻置「启动中」防重复点击、弹出实时日志看编译进度、给一条提示说明等待。
+    setCrAppLaunching(true);
+    showInfo('正在启动桌面应用，首次编译可能需要数十秒，下方日志可跟踪进度…');
+    setLogModal({ title: '启动日志 · 桌面应用', sig: `cr:${id}`, load: () => getCrPreviewLog(id) });
+    try {
+      await launchCrApp(id);
+    } catch (e) {
+      setCrAppLaunching(false);
+      showError('启动桌面应用失败：' + String(e));
+      return;
+    }
+    // 无「窗口已打开」信号，维持一段「启动中」反馈窗口；真实进度以日志为准。
+    setTimeout(() => setCrAppLaunching(false), 12000);
+  }, [activeCr, showError, showInfo]);
 
   const showCrPreviewLog = useCallback(() => {
     if (!activeCr) return;
@@ -1452,7 +1665,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   // 「本次改动」预览的启动动作：web → 起 dev server 并自动开浏览器；tauri → 直接启动桌面程序
   const renderCrLaunch = () => {
     if (!crPreview || crPreview.kind === 'none') return null;
-    const { kind, status, url, can_launch_app } = crPreview;
+    const { kind, status, url, can_launch_app, app_running } = crPreview;
     if (status === 'no_session') return null;
     if (status === 'starting') {
       return (
@@ -1462,12 +1675,21 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       );
     }
     if (kind === 'tauri') {
-      // tauri：直接启动桌面程序（可访问完整 IPC），无需 iframe
+      // tauri：直接启动桌面程序（可访问完整 IPC），无需 iframe。
+      // 进程已存活（编译中/运行中）→ 显示「停止程序」；启动中 → 旋转态；否则可启动。
       return (
         <>
-          <button className="btn btn-sm" disabled={!can_launch_app} onClick={doLaunchCrApp}>
-            <Icon name="box" size={14} />启动 Tauri 程序
-          </button>
+          {app_running ? (
+            <button className="btn btn-sm" onClick={doStopCrPreview} title="停止运行中的桌面应用">
+              <span className="dot green" style={{ marginRight: 4 }} />停止程序
+            </button>
+          ) : (
+            <button className="btn btn-sm" disabled={!can_launch_app || crAppLaunching} onClick={doLaunchCrApp}>
+              {crAppLaunching
+                ? <><span className="dot amber" style={{ marginRight: 4 }} />启动中…</>
+                : <><Icon name="box" size={14} />启动 Tauri 程序</>}
+            </button>
+          )}
           <button className="btn btn-sm btn-ghost" onClick={showCrPreviewLog} title="查看启动日志">
             <Icon name="log" size={14} />
           </button>
@@ -1513,6 +1735,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             branches={branches} branchPreviews={branchPreviews}
             onStart={doStartBranch} onStop={doStopBranch} onShowLog={showBranchLog}
             onOpenIntake={() => setIntakeOpen(true)} onOpenLedger={() => setShowLedger(true)}
+            showMerged={showMerged} onToggleMerged={() => setShowMerged(v => !v)}
+            mergedCount={crs.filter(c => c.status === 'merged').length}
           />
         )}
       </div>
@@ -1522,9 +1746,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         <AuditList
           projects={projects} activeProject={activeProject}
           setActiveProject={p => { setActiveProject(p); setSel(null); }}
-          projectReviewCounts={projectReviewCounts} crs={crs} pendingIssues={pendingIssues} issueTitles={issueTitles} sel={sel}
+          projectReviewCounts={projectReviewCounts} crs={showMerged ? crs : crs.filter(c => c.status !== 'merged')} pendingIssues={pendingIssues} issueTitles={issueTitles} sel={sel}
           onSelectCr={id => { setSel({ kind: 'cr', id }); setDecided(null); }}
           onSelectIssue={id => { setSel({ kind: 'issue', id }); setDecided(null); }}
+          onOpenLedger={() => setShowLedger(true)}
           width={listWidth}
         />
         <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
@@ -1534,18 +1759,19 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             <IssueReviewView
               issue={selectedIssue} analysis={issueAnalysis} analysisLoading={analysisLoading}
               submitting={submitting} decided={decided}
-              advice={advice} setAdvice={setAdvice} onDecide={doReview1}
-              onRetryAnalysis={doRetryAnalysis}
+              advice={advice} setAdvice={setAdvice}
+              onDecide={d => d === 'rejected' ? setConfirmReject('review1') : doReview1('approved')}
+              onRetryAnalysis={doRetryAnalysis} onReanalyze={doReanalyze}
             />
           ) : cr ? (
             <>
               {/* 顶部标题栏 */}
               <div className="audit-top">
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className="audit-top-info">
+                  <div className="audit-top-titlerow">
                     <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{cr.id.slice(0, 10)}</span>
                     <CopyIdButton value={cr.id} title="复制变更编号" />
-                    <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>{issueTitles[cr.issue_id] || 'Change Request'}</span>
+                    <span className="audit-top-title" style={{ fontWeight: 700, fontSize: 'var(--text-title)' }} title={issueTitles[cr.issue_id] || 'Change Request'}>{issueTitles[cr.issue_id] || 'Change Request'}</span>
                     {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
                     {grade && <span className={'chip ' + (grade.tier === 'T3' ? 'red' : grade.tier === 'T2' ? 'amber' : grade.tier === 'T1' ? 'blue' : 'green')} title={grade.rationale}>风险 {grade.tier} · {grade.change_class}</span>}
                   </div>
@@ -1577,7 +1803,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                           {decided === 'approved' ? '已批准 · 合并到 dev' : decided === 'rejected' ? '已拒绝' : '已退回 · 重新执行'}
                         </span>
                       : <>
-                          <button className="btn btn-danger" onClick={() => doReview('rejected')} disabled={submitting}><Icon name="x" size={15} />拒绝</button>
+                          <button className="btn btn-danger" onClick={() => setConfirmReject('review2')} disabled={submitting}><Icon name="x" size={15} />拒绝</button>
                           <button className="btn btn-primary" onClick={() => doReview('approved')} disabled={submitting}><Icon name="check" size={15} />批准合并</button>
                         </>}
                 </div>
@@ -1778,9 +2004,17 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               <button className="icon-btn" onClick={() => setShowLedger(false)}><Icon name="x" size={18} /></button>
             </div>
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-              <LedgerView allIssues={allIssues} sel={sel}
-                onSelectIssue={id => { setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false); }}
-                onRefineTriage={refineTriageItems} onRejectIssues={rejectIssuesItems} />
+              <LedgerView projectId={activeProject?.id ?? ''} refreshKey={ledgerRefresh} sel={sel}
+                onSelectIssue={id => {
+                  // 下钻到该需求：有变更请求(已编码及之后状态)就选中其 CR，否则选审核1阶段需求；
+                  // triage/分析中等无可下钻目标的状态保持总账打开（行内整理/拒绝即可）。
+                  const cr = crs.find(c => c.issue_id === id);
+                  if (cr) { setSel({ kind: 'cr', id: cr.id }); setDecided(null); setShowLedger(false); }
+                  else if (pendingIssues.some(i => i.id === id)) { setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false); }
+                }}
+                onRefineTriage={refineTriageItems} onRejectIssues={rejectIssuesItems}
+                showMerged={showMerged} onToggleMerged={() => setShowMerged(v => !v)}
+                mergedCount={crs.filter(c => c.status === 'merged').length} />
             </div>
           </div>
         </div>
@@ -1797,6 +2031,18 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           okLabel="删除需求"
           onOk={doDelete}
           onCancel={() => setConfirmDelete(false)}
+        />
+      )}
+
+      {confirmReject && (
+        <ConfirmModal
+          msg={confirmReject === 'review1' ? '确定拒绝该需求？' : '确定拒绝该变更？'}
+          sub={confirmReject === 'review1'
+            ? '需求将归档为「已拒绝」，不再进入编码阶段。'
+            : '本次代码变更将被拒绝，不会合并到 dev 分支。'}
+          okLabel="拒绝"
+          onOk={() => { const k = confirmReject; setConfirmReject(null); k === 'review1' ? doReview1('rejected') : doReview('rejected'); }}
+          onCancel={() => setConfirmReject(null)}
         />
       )}
 
