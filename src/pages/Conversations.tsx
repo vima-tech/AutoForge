@@ -13,13 +13,14 @@ import {
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
   listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
-  runConversationCommand, INNATE_SENDER, submitIssue,
+  runConversationCommand, INNATE_SENDER, submitIssue, getAsrSettings,
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
   type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
 } from '../services';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
+import { RealtimeAsr } from '../lib/realtimeAsr';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -409,6 +410,13 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const editorRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  // 实时语音录入（复用已有 RealtimeAsr / asrRealtime* IPC）：识别结果写进一个专用文本节点，
+  // 保留编辑器内已有文本与 @ 标签；committed 为已定句、partial 为当前增量句。
+  const [asrRecording, setAsrRecording] = useState(false);
+  const asrRef = useRef<RealtimeAsr | null>(null);
+  const asrNodeRef = useRef<Text | null>(null);
+  const asrCommittedRef = useRef('');
+  const asrPartialRef = useRef('');
   const isG = conv.conv_type === 'group';
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const members  = useMemo(
@@ -594,6 +602,78 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     syncEditor();
   };
 
+  // 语音录入：把 getUserMedia / 后端启动失败翻译成对用户友好的中文提示。
+  const asrErrorText = (e: unknown): string => {
+    const name = (e as { name?: string } | null)?.name;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      return '麦克风权限被拒绝，请在系统设置中允许 AutoForge 使用麦克风后重试';
+    }
+    if (name === 'NotFoundError') return '未检测到麦克风设备，请检查录音设备';
+    const msg = (e as { message?: string } | null)?.message;
+    return '语音识别启动失败：' + String(msg ?? e);
+  };
+
+  const stopAsr = async () => {
+    setAsrRecording(false);
+    const rt = asrRef.current;
+    asrRef.current = null;
+    asrNodeRef.current = null;
+    await rt?.stop();
+    setTimeout(() => { editorRef.current?.focus(); setCaretToEnd(); }, 30);
+  };
+
+  const startAsr = async () => {
+    const editor = editorRef.current;
+    if (!editor || busy || asrRecording) return;
+    // 未配置 ASR（无 API Key）→ 友好引导，且不触发麦克风权限弹窗。
+    try {
+      const cfg = await getAsrSettings();
+      if (!cfg.api_key_set) {
+        onError('尚未配置语音识别，请前往「设置 → 语音录入」配置 API Key 后再试');
+        return;
+      }
+    } catch (e) {
+      onError('读取语音识别配置失败：' + String(e));
+      return;
+    }
+    // 在光标处插入专用文本节点承载识别结果（保留已有文本与 @ 标签）。
+    editor.focus();
+    let sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !editor.contains(sel.getRangeAt(0).startContainer)) setCaretToEnd();
+    sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const node = document.createTextNode('');
+    range.insertNode(node);
+    asrNodeRef.current = node;
+    asrCommittedRef.current = '';
+    asrPartialRef.current = '';
+    const rt = new RealtimeAsr();
+    asrRef.current = rt;
+    onError('');
+    try {
+      await rt.start((t, isFinal) => {
+        if (isFinal) { asrCommittedRef.current += t; asrPartialRef.current = ''; }
+        else asrPartialRef.current = t;
+        const n = asrNodeRef.current;
+        if (!n || !editorRef.current?.contains(n)) return;
+        n.data = asrCommittedRef.current + asrPartialRef.current;
+        setCaretAfter(n);
+        setText(editorText());
+      });
+      setAsrRecording(true);
+    } catch (e) {
+      asrRef.current = null;
+      asrNodeRef.current = null;
+      try { node.remove(); } catch { /* ignore */ }
+      onError(asrErrorText(e));
+    }
+  };
+
+  // 卸载或切换会话时停止录音（已识别文本保留在编辑器草稿中）。
+  useEffect(() => () => { if (asrRef.current) void stopAsr(); }, [conv.id]);
+
   const insertMentionTag = (className: string, agentId: string, label: string) => {
     const editor = editorRef.current;
     const sel = window.getSelection();
@@ -748,6 +828,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const refs = contextRefs();
     const mentions = mentionedAgentIds();
     if (!outgoing && pendingItems.length === 0 && refs.length === 0) return;
+    if (asrRef.current) void stopAsr();
     setText('');
     setPending([]);
     if (editorRef.current) editorRef.current.innerHTML = '';
@@ -870,6 +951,18 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
         <input ref={imageInputRef} type="file" multiple accept={IMAGE_ACCEPT} hidden onChange={pickFiles('image')} />
         <button className="icon-btn" title="添加附件" disabled={busy} onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={18} /></button>
         <button className="icon-btn" title="添加图片" disabled={busy} onClick={() => imageInputRef.current?.click()}><Icon name="image" size={18} /></button>
+        <button
+          className={'icon-btn' + (asrRecording ? ' composer-mic-on' : '')}
+          title={asrRecording ? '停止语音录入' : '语音输入（边说边转写）'}
+          disabled={busy}
+          onMouseDown={e => e.stopPropagation()}
+          onClick={() => { if (asrRecording) void stopAsr(); else void startAsr(); }}
+        >
+          <Icon name={asrRecording ? 'pause' : 'mic'} size={18} />
+        </button>
+        {asrRecording && (
+          <span className="composer-asr-live"><span className="composer-asr-dot" />聆听中…</span>
+        )}
         {isG && (
           <button className="icon-btn" title="@ 指定 Agent" onClick={() => insertPlainText('@')}>
             <Icon name="at" size={18} />
