@@ -228,9 +228,11 @@ pub async fn self_update_pull(
         });
     }
 
-    // Fast-forward only: never create a merge commit and never rewrite the
-    // user's uncommitted edits. If local work conflicts, git refuses and we
-    // surface that instead of risking data loss — the user commits/stashes first.
+    let ahead = count_range(&git, &format!("{}..HEAD", remote)).await;
+    info!("self_update_pull: behind={} ahead={}", behind, ahead);
+
+    // First try the conservative fast-forward: a clean repo with no local
+    // commits updates with zero risk of rewriting history or losing edits.
     let (code, _, err) = git
         .run(&["pull", "--ff-only", "origin", &project.branch_dev])
         .await
@@ -258,14 +260,88 @@ pub async fn self_update_pull(
         code,
         err.trim()
     );
+
+    // ff-only failed. If the local branch carries its own commits (ahead>0) the
+    // self-managed repo is *diverged* and can never fast-forward — replay those
+    // local commits onto the new remote tip via rebase instead. `--autostash`
+    // shelves uncommitted edits before the rebase and restores them after, so
+    // dirty working trees don't block the update.
+    if ahead > 0 {
+        info!(
+            "self_update_pull: 检测到分叉(本地领先 {} 个提交)，改用 rebase 拉取",
+            ahead
+        );
+        let (rcode, _rout, rerr) = git
+            .run(&[
+                "pull",
+                "--rebase",
+                "--autostash",
+                "origin",
+                &project.branch_dev,
+            ])
+            .await
+            .unwrap_or((-1, String::new(), "git not available".to_string()));
+        info!(
+            "self_update_pull: git pull --rebase --autostash origin {} 退出码={}",
+            project.branch_dev, rcode
+        );
+
+        if rcode == 0 {
+            info!(
+                "self_update_pull: rebase 拉取成功，合入 {} 个远端提交，重放 {} 个本地提交",
+                behind, ahead
+            );
+            return Ok(SelfUpdateResult {
+                ok: true,
+                pulled: behind,
+                message: format!(
+                    "检测到本地有 {} 个提交，已用 rebase 拉取 {} 个远端提交（本地提交已重放到最新之上）。源码已更新，开发模式将自动重新编译并重启以生效。",
+                    ahead, behind
+                ),
+                restart_required: true,
+            });
+        }
+
+        // Rebase hit a conflict (or otherwise failed): git leaves the repo
+        // mid-rebase. Abort to restore the exact pre-pull state — `--autostash`
+        // is re-applied on abort, so uncommitted edits are not lost.
+        let (acode, _, aerr) = git
+            .run(&["rebase", "--abort"])
+            .await
+            .unwrap_or((-1, String::new(), String::new()));
+        warn!(
+            "self_update_pull: rebase 拉取失败 (code={})，已 rebase --abort (code={}): {}{}",
+            rcode,
+            acode,
+            rerr.trim(),
+            if aerr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" | abort: {}", aerr.trim())
+            }
+        );
+        let detail: String = rerr.chars().take(500).collect();
+        return Ok(SelfUpdateResult {
+            ok: false,
+            pulled: 0,
+            message: format!(
+                "本地与 origin/{} 已分叉，自动 rebase 拉取时发生冲突，已回滚到拉取前状态（你的改动未丢失）。请手动 rebase 解决冲突后重试。\n\n{}",
+                project.branch_dev, detail
+            ),
+            restart_required: false,
+        });
+    }
+
+    // ff-only failed without divergence (ahead==0): almost always uncommitted
+    // changes that the update would overwrite. Surface git's own reason.
     let lowered = err.to_lowercase();
     let hint = if lowered.contains("local changes")
         || lowered.contains("would be overwritten")
         || lowered.contains("unstaged")
+        || err.contains("覆盖")
+        || err.contains("未提交")
     {
         "本地有未提交改动会被覆盖，已阻止拉取。请先提交或暂存(git stash)你的改动后重试，以免丢失。"
-    } else if lowered.contains("non-fast-forward") || lowered.contains("diverge") {
-        "本地与 origin/dev 已分叉，无法快进合并。请手动处理分叉后重试。"
     } else {
         "拉取失败。"
     };

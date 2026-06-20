@@ -115,12 +115,19 @@ interface Hunk { file: string; hunk: string; lines: DiffLine[] }
 function parseDiff(raw: string): Hunk[] {
   const hunks: Hunk[] = [];
   let curFile = '';
+  let oldPath = '';
   let curHunk: Hunk | null = null;
   let n1 = 0, n2 = 0;
   for (const line of raw.split('\n')) {
-    if (line.startsWith('diff --git ')) { curFile = ''; continue; }
-    if (line.startsWith('--- ')) { curFile = line.slice(4).replace(/^a\//, ''); continue; }
-    if (line.startsWith('+++ ')) continue;
+    if (line.startsWith('diff --git ')) { curFile = ''; oldPath = ''; continue; }
+    // 新增文件的 `--- ` 行是 `/dev/null`，真实路径在 `+++ b/...` 行；
+    // 删除文件反之。优先用新路径，删除时回退旧路径，避免显示 /dev/null。
+    if (line.startsWith('--- ')) { oldPath = line.slice(4).replace(/^a\//, ''); curFile = oldPath; continue; }
+    if (line.startsWith('+++ ')) {
+      const newPath = line.slice(4).replace(/^b\//, '');
+      curFile = newPath === '/dev/null' ? oldPath : newPath;
+      continue;
+    }
     if (line.startsWith('@@ ')) {
       const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
       n1 = m ? parseInt(m[1]) : 0;

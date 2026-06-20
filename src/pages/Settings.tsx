@@ -2401,7 +2401,7 @@ function SelfUpdateSettings() {
       <div className="set-h">同步更新（自更新）</div>
       <div className="set-desc">
         当 AutoForge 用自身作为项目运行时，交付合并会在隔离 worktree 中完成并<strong>推送到 origin/dev</strong>，不改动正在运行的工作区。
-        在此一键拉取最新代码（仅快进，git 自身会拒绝覆盖未提交改动以防丢失）。
+        在此一键拉取最新代码（优先快进；当本地有自己的提交、与远端分叉时自动改用 rebase 把本地提交重放到最新之上，未提交改动会自动暂存/恢复，冲突则回滚不丢失）。
         <br /><strong>注意</strong>：拉取会改动源码，开发模式将<strong>自动重新编译并重启</strong>，请先确认无未保存/未提交的工作。
       </div>
       <div className="cfg-card">
