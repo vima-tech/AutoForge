@@ -120,6 +120,9 @@ struct Hit {
     snippet: String,
 }
 
+/// DuckDuckGo 端点 HTML 解析函数：`(html, limit) -> 命中列表`。
+type DdgParser = fn(&str, u32) -> Vec<Hit>;
+
 /// 内置 Web 搜索工具。
 pub struct WebSearchTool {
     cfg: WebSearchConfig,
@@ -278,7 +281,7 @@ impl WebSearchTool {
     async fn search_duckduckgo(&self, query: &str, limit: u32) -> Result<(String, Vec<Hit>)> {
         let client = search_client()?;
         let q = urlencode(query);
-        let endpoints: [(String, fn(&str, u32) -> Vec<Hit>); 2] = [
+        let endpoints: [(String, DdgParser); 2] = [
             (format!("https://lite.duckduckgo.com/lite/?q={q}"), parse_ddg_lite),
             (format!("https://html.duckduckgo.com/html/?q={q}"), parse_ddg_html),
         ];
