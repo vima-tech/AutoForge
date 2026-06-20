@@ -4,6 +4,7 @@
 //! （`core/asr_realtime.rs`）：
 //!   - `asr_realtime_*`：实时麦克风边说边出字（事件回推）；
 //!   - `transcribe_recording_segment`：会议录音整段转写（收集模式，返回完整文本）。
+//!
 //! 密钥不出 webview，留在后端配置里。转写文本是不可信外部输入，过 `has_obvious_injection`。
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
