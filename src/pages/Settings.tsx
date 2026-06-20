@@ -2293,6 +2293,7 @@ function BackupSettings() {
   const [importResult, setImportResult] = useState<BackupSummary | null>(null);
   const [importErr, setImportErr] = useState('');
   const [pickedName, setPickedName] = useState('');
+  const [pickedWarn, setPickedWarn] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
   const pickedContent = useRef<string>('');
 
@@ -2319,10 +2320,14 @@ function BackupSettings() {
     const f = e.target.files?.[0];
     e.target.value = ''; // 允许再次选择同一文件
     if (!f) return;
-    setImportErr(''); setImportResult(null);
+    setImportErr(''); setImportResult(null); setPickedWarn('');
     try {
       pickedContent.current = await f.text();
       setPickedName(f.name);
+      // 后缀不符仅提示、不阻断：读取不依赖扩展名，但提醒用户可能选错文件
+      if (!f.name.toLowerCase().endsWith('.afbackup')) {
+        setPickedWarn('该文件后缀不是 .afbackup，可能不是备份文件——请确认无误后再导入。');
+      }
     } catch {
       setImportErr('读取文件失败');
       setPickedName('');
@@ -2378,7 +2383,7 @@ function BackupSettings() {
           {exportErr && <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>{exportErr}</span>}
         </div>
         {exportResult && (
-          <div className="chip green" style={{ display: 'block', marginTop: 12, padding: '10px 12px', lineHeight: 1.6 }}>
+          <div className="chip green" style={{ display: 'block', marginTop: 12, padding: '10px 12px', lineHeight: 1.6, borderRadius: 10 }}>
             <div>已导出：{summaryLine(exportResult.summary)}</div>
             <div style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', wordBreak: 'break-all', marginTop: 4 }}>{exportResult.path}</div>
             <button className="btn btn-sm" style={{ marginTop: 8 }} onClick={() => revealBackup(exportResult.path).catch(() => {})}>
@@ -2392,13 +2397,19 @@ function BackupSettings() {
       <div className="cfg-card" style={{ padding: 16, marginTop: 14 }}>
         <div className="cfg-name" style={{ marginBottom: 4 }}><Icon name="upload" size={15} style={{ verticalAlign: -2, marginRight: 6 }} />导入恢复</div>
         <div className="cfg-sub" style={{ marginBottom: 12 }}>选择 .afbackup 备份文件并输入当时的口令。按主键合并恢复，不会删除现有未涉及的配置。</div>
-        <input ref={fileRef} type="file" accept=".afbackup,application/json" style={{ display: 'none' }} onChange={onPick} />
+        {/* 不设 accept 过滤：Linux WebKitGTK 按 MIME 匹配，会把未注册 MIME 的 .afbackup 文件过滤掉，导致选不到备份文件 */}
+        <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={onPick} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <button className="btn" onClick={() => fileRef.current?.click()}>
             <Icon name="folderOpen" size={14} />选择备份文件
           </button>
           {pickedName && <span className="chip" style={{ fontFamily: 'var(--font-mono)' }}>{pickedName}</span>}
         </div>
+        {pickedWarn && (
+          <div className="chip amber" style={{ marginTop: 10 }}>
+            <Icon name="alert" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />{pickedWarn}
+          </div>
+        )}
         <div className="field" style={{ marginTop: 12, maxWidth: 320 }}><label>解密口令</label>
           <input type="password" autoComplete="off" value={importPass}
             onChange={e => setImportPass(e.target.value)} placeholder="导出时设置的口令" /></div>
