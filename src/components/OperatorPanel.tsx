@@ -26,6 +26,13 @@ const CAT_META: Record<NotificationCategory, { label: string; color: string; ico
   intake:    { label: '录入',   color: 'var(--blue)', icon: 'inbox' },
 };
 
+// 通知 link_ref 的两种语义：CR 阶段事件携带 cr_id，其余（录入/分析）携带 issue_id。
+// 与 src-tauri/src/models/notification.rs 的 from_event 映射保持一致。
+const CR_REF_KINDS = new Set<string>([
+  'review_needed', 'iteration_warning', 'test_completed',
+  'cr_merged', 'security_audit_completed', 'merge_conflict',
+]);
+
 const FILTERS: { key: 'all' | NotificationCategory; label: string }[] = [
   { key: 'all', label: '全部' },
   { key: 'intervene', label: '需介入' },
@@ -51,7 +58,10 @@ function relativeTime(iso: string): string {
 
 interface Props {
   onClose: () => void;
-  onNavigate: (page: 'audit' | 'delivery' | 'chat', opts?: { openLedger?: boolean }) => void;
+  onNavigate: (
+    page: 'audit' | 'delivery' | 'chat',
+    opts?: { openLedger?: boolean; ref?: { kind: 'cr' | 'issue'; id: string } },
+  ) => void;
   /** 标记已读后通知父级刷新角标。 */
   onUnreadChange: () => void;
 }
@@ -97,9 +107,16 @@ export default function OperatorPanel({ onClose, onNavigate, onUnreadChange }: P
       setItems(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x));
       onUnreadChange();
     }
-    if (n.link_page && (n.link_page === 'audit' || n.link_page === 'delivery' || n.link_page === 'chat')) {
+    // 已合并通知统一跳功能审计页（兼容历史记录中残留的 link_page='delivery'）。
+    const page = n.kind === 'cr_merged' ? 'audit' : n.link_page;
+    if (page === 'audit' || page === 'delivery' || page === 'chat') {
+      // link_ref 据 kind 分两类：CR 阶段事件携带 cr_id，录入/分析事件携带 issue_id。
+      // 传给父级解析为 { projectId, issueId }，驱动审计页自动切换审核需求/代码闸口并选中该需求。
+      const ref = n.link_ref
+        ? { kind: CR_REF_KINDS.has(n.kind) ? 'cr' as const : 'issue' as const, id: n.link_ref }
+        : undefined;
       // 新需求录入：跳到功能审计后自动打开「全量需求总账」弹窗。
-      onNavigate(n.link_page, { openLedger: n.kind === 'issue_created' });
+      onNavigate(page, { openLedger: n.kind === 'issue_created', ref });
       onClose();
     }
   };

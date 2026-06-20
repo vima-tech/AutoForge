@@ -14,7 +14,7 @@ import TracePage from './pages/Trace';
 import QuickCapture from './components/QuickCapture';
 import OperatorPanel from './components/OperatorPanel';
 import { loadOperator } from './operator';
-import { getSystemHealth, getSystemResources, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, type SystemHealth, type SystemResources } from './services';
+import { getSystemHealth, getSystemResources, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, getChangeRequest, getIssue, type SystemHealth, type SystemResources } from './services';
 import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseResMonitor, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
 import { triggerVoiceInput } from './lib/voiceInput';
 
@@ -149,6 +149,28 @@ export default function App() {
     setPage('audit');
     sessionStorage.setItem('AutoForge:page', 'audit');
   }, []);
+
+  // 通知收件箱跳转：切到目标页；若带 ref（CR/需求），解析为 { projectId, issueId }
+  // 设进 auditTarget，由审计页 target effect 自动切换审核需求/代码闸口并选中该需求。
+  const navigateFromNotification = useCallback(
+    async (p: 'audit' | 'delivery' | 'chat', opts?: { openLedger?: boolean; ref?: { kind: 'cr' | 'issue'; id: string } }) => {
+      setPage(p);
+      sessionStorage.setItem('AutoForge:page', p);
+      if (opts?.openLedger) setAuditOpenLedger(true);
+      if (p === 'audit' && opts?.ref) {
+        try {
+          if (opts.ref.kind === 'cr') {
+            const cr = await getChangeRequest(opts.ref.id);
+            setAuditTarget({ projectId: cr.project_id, issueId: cr.issue_id });
+          } else {
+            const iss = await getIssue(opts.ref.id);
+            if (iss) setAuditTarget({ projectId: iss.project_id, issueId: iss.id });
+          }
+        } catch { /* 解析失败则仅停在审计页，不强制选中 */ }
+      }
+    },
+    [],
+  );
 
   const refreshNotifUnread = useCallback(() => {
     unreadNotificationCount().then(setNotifUnread).catch(() => { /* keep stale */ });
@@ -497,7 +519,7 @@ export default function App() {
       {showOperator && (
         <OperatorPanel
           onClose={() => setShowOperator(false)}
-          onNavigate={(p, opts) => { setPage(p); sessionStorage.setItem('AutoForge:page', p); if (opts?.openLedger) setAuditOpenLedger(true); }}
+          onNavigate={navigateFromNotification}
           onUnreadChange={refreshNotifUnread}
         />
       )}

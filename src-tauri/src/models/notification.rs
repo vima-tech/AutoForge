@@ -118,7 +118,7 @@ impl NotificationDraft {
                 kind: "cr_merged",
                 title: "已合并到 dev".into(),
                 body: cr_id.clone(),
-                link_page: Some("delivery"),
+                link_page: Some("audit"),
                 link_ref: Some(cr_id.clone()),
                 thread_key: Some(cr_id.clone()),
             }),

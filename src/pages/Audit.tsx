@@ -1623,12 +1623,16 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       setDecided(null); onTargetConsumed();
     } else if (cr) {
       setGate('code');
+      if (cr.status === 'merged') setShowMerged(true);  // 已合并 CR 需开启显示才会出现在左栏
       setSel({ kind: 'cr', id: cr.id });
       setDecided(null); onTargetConsumed();
     } else {
       // 非审核阶段需求（如待整理 triage / 已合并）：主列表里没有，确认存在后自动打开总账并选中
       getIssue(tid).then(iss => {
-        if (iss) { setSel({ kind: 'issue', id: tid }); setShowLedger(true); }
+        if (iss) {
+          if (iss.status === 'merged') setShowMerged(true);  // 已合并需求需开启显示才在总账可见
+          setSel({ kind: 'issue', id: tid }); setShowLedger(true);
+        }
       }).finally(() => { setDecided(null); onTargetConsumed(); });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
