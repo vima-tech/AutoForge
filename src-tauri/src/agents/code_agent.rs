@@ -90,13 +90,13 @@ fn render_spec_brief(spec: &crate::agents::analysis::IssueAnalysisSpec) -> Strin
     let mut s = String::new();
 
     let u = &spec.understanding;
-    if !u.restated_requirement.is_empty() || !u.problem_type.is_empty() {
+    if !u.restated_issue.is_empty() || !u.problem_type.is_empty() {
         s.push_str("\n## 需求理解\n");
         if !u.problem_type.is_empty() {
             let _ = writeln!(s, "- 类型：{}", u.problem_type);
         }
-        if !u.restated_requirement.is_empty() {
-            let _ = writeln!(s, "- 重述：{}", u.restated_requirement);
+        if !u.restated_issue.is_empty() {
+            let _ = writeln!(s, "- 重述：{}", u.restated_issue);
         }
         if let Some(cur) = u.current_behavior.as_deref().filter(|v| !v.is_empty()) {
             let _ = writeln!(s, "- 当前行为：{}", cur);

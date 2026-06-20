@@ -154,7 +154,7 @@ pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, S
             .await
             .unwrap_or((pipeline_status.active_slots as i64,));
     let (pending_review,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2'")
+        sqlx::query_as("SELECT COUNT(*) FROM change_requests WHERE status='pending_code_review'")
             .fetch_one(&state.db)
             .await
             .unwrap_or((pipeline_status.pending_review as i64,));
@@ -251,11 +251,11 @@ pub async fn get_badge_counts(state: State<'_, AppState>) -> Result<BadgeCounts,
     .await
     .map_err(|e| e.to_string())?;
 
-    // 功能审计页统一管理两个审核节点：审核 1（issues.pending_review_1）+ 审核 2（change_requests.pending_review_2）
+    // 功能审计页统一管理两个审核节点：需求审核（issues.pending_issue_review）+ 代码审核（change_requests.pending_code_review）
     let (audit_pending,): (i64,) = sqlx::query_as(
         "SELECT
-           (SELECT COUNT(*) FROM change_requests WHERE status='pending_review_2')
-         + (SELECT COUNT(*) FROM issues WHERE status='pending_review_1')",
+           (SELECT COUNT(*) FROM change_requests WHERE status='pending_code_review')
+         + (SELECT COUNT(*) FROM issues WHERE status='pending_issue_review')",
     )
     .fetch_one(&state.db)
     .await
@@ -289,7 +289,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         "SELECT
            SUM(CASE WHEN status='triage'             THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='pending_analysis'  THEN 1 ELSE 0 END),
-           SUM(CASE WHEN status='pending_review_1'  THEN 1 ELSE 0 END),
+           SUM(CASE WHEN status='pending_issue_review'  THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='executing'          THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='rejected'           THEN 1 ELSE 0 END),
            SUM(CASE WHEN status != 'triage'          THEN 1 ELSE 0 END)
@@ -304,7 +304,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         sqlx::query_as(
             "SELECT
                SUM(CASE WHEN status='executing'          THEN 1 ELSE 0 END),
-               SUM(CASE WHEN status='pending_review_2'   THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status='pending_code_review'   THEN 1 ELSE 0 END),
                SUM(CASE WHEN status='merged'             THEN 1 ELSE 0 END),
                SUM(CASE WHEN status='rejected'           THEN 1 ELSE 0 END)
              FROM change_requests",
@@ -340,7 +340,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         "SELECT cr.project_id, cr.id, cr.status
          FROM change_requests cr
          JOIN projects p ON p.id = cr.project_id
-         WHERE p.status='active' AND cr.status IN ('executing', 'pending_review_2')
+         WHERE p.status='active' AND cr.status IN ('executing', 'pending_code_review')
          ORDER BY cr.updated_at DESC",
     )
     .fetch_all(&state.db)
@@ -359,7 +359,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         "SELECT project_id,
                 SUM(CASE WHEN status='triage' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='pending_analysis' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN status='pending_review_1' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='pending_issue_review' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='executing' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status != 'triage' THEN 1 ELSE 0 END)
@@ -373,7 +373,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
     let cr_pipeline_rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
         "SELECT project_id,
                 SUM(CASE WHEN status='executing' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN status='pending_review_2' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='pending_code_review' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='merged' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END)
          FROM change_requests
@@ -429,7 +429,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
                 .count();
             let pending_review_slots = occupants
                 .iter()
-                .filter(|slot| slot.status == "pending_review_2")
+                .filter(|slot| slot.status == "pending_code_review")
                 .count();
 
             ProjectSlotStats {

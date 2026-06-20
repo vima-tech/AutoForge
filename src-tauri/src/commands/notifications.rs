@@ -105,35 +105,35 @@ async fn prune(db: &Db) -> Result<(), String> {
 /// 仅触碰「会持续提醒」的 kind（analysis_completed / review_needed / iteration_warning）；
 /// result/intake 类是终态事实，不在此清理。全部为集合式 UPDATE，开销极小。
 async fn reconcile_stale(db: &Db) -> Result<(), String> {
-    // 1) 「分析完成·待审核 1」：issue 已离开 pending_review_1（已审核1或被拒）即失效。
+    // 1) 「分析完成·待需求审核」：issue 已离开 pending_issue_review（已需求审核或被拒）即失效。
     sqlx::query(
         "UPDATE notifications SET read = 1
          WHERE read = 0 AND kind = 'analysis_completed'
            AND link_ref IS NOT NULL AND link_ref <> ''
-           AND link_ref NOT IN (SELECT id FROM issues WHERE status = 'pending_review_1')",
+           AND link_ref NOT IN (SELECT id FROM issues WHERE status = 'pending_issue_review')",
     )
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
 
-    // 2) 「需要审核·节点 2」：绑定了具体 CR，CR 不再处于 pending_review_2 即失效。
+    // 2) 「需要审核·节点 2」：绑定了具体 CR，CR 不再处于 pending_code_review 即失效。
     sqlx::query(
         "UPDATE notifications SET read = 1
          WHERE read = 0 AND kind = 'review_needed'
            AND link_ref IN (SELECT id FROM change_requests)
-           AND link_ref NOT IN (SELECT id FROM change_requests WHERE status = 'pending_review_2')",
+           AND link_ref NOT IN (SELECT id FROM change_requests WHERE status = 'pending_code_review')",
     )
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
 
     // 3) 「需要审核·节点 1」：无具体 CR（link_ref 空/非 CR，stage 1 折叠成单行），
-    //    全局已无任何待审核 1 的 issue 即失效。
+    //    全局已无任何待需求审核 的 issue 即失效。
     sqlx::query(
         "UPDATE notifications SET read = 1
          WHERE read = 0 AND kind = 'review_needed'
            AND (link_ref IS NULL OR link_ref = '' OR link_ref NOT IN (SELECT id FROM change_requests))
-           AND NOT EXISTS (SELECT 1 FROM issues WHERE status = 'pending_review_1')",
+           AND NOT EXISTS (SELECT 1 FROM issues WHERE status = 'pending_issue_review')",
     )
     .execute(db)
     .await

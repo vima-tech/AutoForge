@@ -22,6 +22,7 @@ import {
 } from '../services';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
+import { toggleMaximizeOnDoubleClick } from '../lib/window';
 import { RealtimeAsr } from '../lib/realtimeAsr';
 import { registerVoiceSurface } from '../lib/voiceInput';
 
@@ -2044,7 +2045,7 @@ export default function ConversationsPage() {
   };
 
   // 会话即入口：把一条消息「沉淀为需求」，直接走 flow 模式自动分析，
-  // 与「需求草稿 card → 确认需求」一致——立即入库并进入分析 → 审核 1，
+  // 与「需求草稿 card → 确认需求」一致——立即入库并进入分析 → 需求审核，
   // 而非落入待整理池（triage）需人工再整理。
   const distillBubbleToIssue = async () => {
     if (!bubbleMenu || !conv?.project_id) return;
@@ -2063,7 +2064,7 @@ export default function ConversationsPage() {
       setLoadError('');
       // 成功无任何提示会让用户以为「没反应」：沉淀走 flow 模式，需求立即开始分析，
       // 不会在当前会议室出现，必须显式回馈一次，并指引去哪里看。
-      // 审核 1 / 全量需求总账都在「功能审计」页（Audit.tsx），不是「交付流水线」。
+      // 需求审核 / 全量需求总账都在「功能审计」页（Audit.tsx），不是「交付流水线」。
       flashActivity('done', '已沉淀为需求，开始分析（功能审计 → 需求审核）');
     } catch (e) { setLoadError(String(e)); }
   };
@@ -2727,7 +2728,7 @@ export default function ConversationsPage() {
       )}
       {reader && (
         <div className="reader-overlay" onClick={e => { if (e.target === e.currentTarget) setReader(null); }}>
-          <div className="reader-bar">
+          <div className="reader-bar" onDoubleClick={toggleMaximizeOnDoubleClick}>
             <div className="reader-bar-info">
               <Icon name="maximize" size={15} />
               <span className="reader-bar-title">{reader.author}</span>

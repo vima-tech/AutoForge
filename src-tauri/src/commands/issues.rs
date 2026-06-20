@@ -139,7 +139,7 @@ pub async fn list_issue_statuses(
         .map_err(|e| e.to_string())
 }
 
-/// 按状态集合取需求（完整字段），用于「审核 1」队列等有界子集，
+/// 按状态集合取需求（完整字段），用于「需求审核」队列等有界子集，
 /// 替代为拿少量在产需求而全量加载 issues。
 #[tauri::command]
 pub async fn list_issues_by_statuses(
@@ -262,14 +262,14 @@ pub async fn retry_analysis(
 ) -> Result<(), String> {
     let updated = sqlx::query(
         "UPDATE issues SET status='pending_analysis', updated_at=datetime('now')
-         WHERE id=? AND status IN ('analysis_failed', 'pending_review_1')",
+         WHERE id=? AND status IN ('analysis_failed', 'pending_issue_review')",
     )
     .bind(&issue_id)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
     if updated.rows_affected() == 0 {
-        return Err("仅「分析失败」或「待审核 1」状态的需求可重新分析".to_string());
+        return Err("仅「分析失败」或「待需求审核」状态的需求可重新分析".to_string());
     }
     crate::tasks::runner::enqueue(
         &state.db,
@@ -285,8 +285,8 @@ pub async fn retry_analysis(
     Ok(())
 }
 
-/// 审核 1 补充意见重评：管理员在「待需求审核」阶段提交补充意见，需求带着该意见
-/// 重新分析，再回到审核 1。意见落库到 issues.review_feedback（一次性，被分析任务
+/// 需求审核 补充意见重评：管理员在「待需求审核」阶段提交补充意见，需求带着该意见
+/// 重新分析，再回到需求审核。意见落库到 issues.review_feedback（一次性，被分析任务
 /// 消费后清空）。意见为人工输入，入库前过 has_obvious_injection 防注入。
 #[tauri::command]
 pub async fn reanalyze_with_feedback(
@@ -304,7 +304,7 @@ pub async fn reanalyze_with_feedback(
     // 仅「待需求审核」或「分析失败」状态可带意见重评，避免影响在产/已完结需求。
     let updated = sqlx::query(
         "UPDATE issues SET review_feedback=?, status='pending_analysis', updated_at=datetime('now')
-         WHERE id=? AND status IN ('pending_review_1', 'analysis_failed')",
+         WHERE id=? AND status IN ('pending_issue_review', 'analysis_failed')",
     )
     .bind(&feedback)
     .bind(&issue_id)

@@ -25,7 +25,7 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
   },
   "understanding": {
     "problem_type": "<bug|feature|enhancement|refactor|tech_debt|question>",
-    "restated_requirement": "<用实现视角重述需求，消除歧义>",
+    "restated_issue": "<用实现视角重述需求，消除歧义>",
     "user_story": <字符串或 null>,
     "current_behavior": <bug 的当前错误行为，非 bug 为 null>,
     "expected_behavior": <期望行为，可 null>,
@@ -58,7 +58,7 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
   "risks": [{"description": "<风险>", "severity": "<low|medium|high>", "mitigation": <缓解或 null>}],
   "constraints": {"must": ["<必须遵守，来自项目规范>"], "must_not": ["<禁止事项>"]},
   "assumptions": ["<分析所做假设>"],
-  "open_questions": ["<需人工在审核1澄清的问题>"],
+  "open_questions": ["<需人工在需求审核澄清的问题>"],
   "estimate": {"complexity": "<xs|s|m|l|xl>", "confidence": <0.0-1.0>, "rationale": <理由或 null>},
   "claude_code_brief": {
     "objective": "<一句话目标>",
@@ -136,8 +136,8 @@ impl Default for Triage {
 pub struct Understanding {
     #[serde(default)]
     pub problem_type: String,
-    #[serde(default)]
-    pub restated_requirement: String,
+    #[serde(default, alias = "restated_requirement")]
+    pub restated_issue: String,
     #[serde(default)]
     pub user_story: Option<String>,
     #[serde(default)]

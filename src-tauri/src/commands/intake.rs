@@ -366,24 +366,24 @@ pub struct DecideDraftPayload {
 ///   `decided="confirmed"`；
 /// - reject：仅把该块标记 `decided="rejected"`，不入库。
 /// 决策写回 `messages.content_json` 持久化，刷新后按钮不再重现、不可重复操作。
-/// 命令保持薄包装，逻辑下沉到 `decide_requirement_draft_inner`（不含 Tauri 类型，事件除外）。
+/// 命令保持薄包装，逻辑下沉到 `decide_issue_draft_inner`（不含 Tauri 类型，事件除外）。
 #[tauri::command]
-pub async fn decide_requirement_draft(
+pub async fn decide_issue_draft(
     payload: DecideDraftPayload,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<Issue>, String> {
     let db = state.db.clone();
     let job_tx = state.job_tx.clone();
-    decide_requirement_draft_inner(&db, &job_tx, &app, payload).await
+    decide_issue_draft_inner(&db, &job_tx, &app, payload).await
 }
 
-fn is_requirement_draft(v: &serde_json::Value) -> bool {
+fn is_issue_draft(v: &serde_json::Value) -> bool {
     v.get("t").and_then(|t| t.as_str()) == Some("artifact")
-        && v.get("kind").and_then(|k| k.as_str()) == Some("requirement_draft")
+        && matches!(v.get("kind").and_then(|k| k.as_str()), Some("issue_draft") | Some("requirement_draft"))
 }
 
-async fn decide_requirement_draft_inner(
+async fn decide_issue_draft_inner(
     db: &crate::db::Db,
     job_tx: &crate::tasks::runner::JobSender,
     app: &AppHandle,
@@ -406,8 +406,8 @@ async fn decide_requirement_draft_inner(
     // 定位 requirement_draft 块：优先用前端给的下标，否则取首个匹配块。
     let idx = payload
         .block_index
-        .filter(|&i| blocks.get(i).map(is_requirement_draft).unwrap_or(false))
-        .or_else(|| blocks.iter().position(is_requirement_draft))
+        .filter(|&i| blocks.get(i).map(is_issue_draft).unwrap_or(false))
+        .or_else(|| blocks.iter().position(is_issue_draft))
         .ok_or_else(|| "该消息中没有需求草稿".to_string())?;
 
     if let Some(d) = blocks[idx].get("decided").and_then(|v| v.as_str()) {

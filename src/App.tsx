@@ -133,7 +133,7 @@ export default function App() {
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
   // Window maximize state drives the .os-window shadow gutter (collapse it when maximized).
   const [maximized, setMaximized] = useState(false);
-  // Cross-page jump target: Dashboard → Audit (a requirement to open in 功能审计).
+  // Cross-page jump target: Dashboard → Audit (an issue to open in 功能审计).
   const [auditTarget, setAuditTarget] = useState<{ projectId: string; issueId: string } | null>(null);
   // 通知导航请求自动打开「全量需求总账」弹窗（新需求录入）。
   const [auditOpenLedger, setAuditOpenLedger] = useState(false);

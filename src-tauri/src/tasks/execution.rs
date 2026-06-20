@@ -582,19 +582,19 @@ pub async fn run(
 
     // Standard path: stop for human review 2.
     sqlx::query(
-        "UPDATE change_requests SET status='pending_review_2', updated_at=datetime('now') WHERE id=?",
+        "UPDATE change_requests SET status='pending_code_review', updated_at=datetime('now') WHERE id=?",
     )
     .bind(cr_id)
     .execute(db)
     .await?;
     sqlx::query(
-        "UPDATE issues SET status='pending_review_2', updated_at=datetime('now') WHERE id=?",
+        "UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?",
     )
     .bind(&issue.id)
     .execute(db)
     .await?;
 
-    crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待审核 2").await;
+    crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待代码审核").await;
 
     event::emit(
         app,

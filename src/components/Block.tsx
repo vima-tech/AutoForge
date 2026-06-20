@@ -3,7 +3,7 @@ import Icon from './Icon';
 import Markdown from './Markdown';
 import { highlightText } from './highlight';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, decideRequirementDraft, openAttachment, writeWorkspaceFile } from '../services';
+import { attachmentDataUrl, decideIssueDraft, openAttachment, writeWorkspaceFile } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -88,7 +88,7 @@ function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: 
   const [saveErr, setSaveErr] = useState('');
 
   const meta = b._meta;
-  const isDraft = b.kind === 'requirement_draft';
+  const isDraft = b.kind === 'issue_draft' || b.kind === 'requirement_draft';
   const effectiveProjectId = projectId || meta?.project_id;
 
   // 在对话 card 内直接确认/拒绝整理好的需求，让整理环节就地闭环。
@@ -101,7 +101,7 @@ function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: 
     }
     setDeciding(decideAs); setSubmitErr('');
     try {
-      await decideRequirementDraft({ message_id: messageId, decision: decideAs, block_index: blockIndex });
+      await decideIssueDraft({ message_id: messageId, decision: decideAs, block_index: blockIndex });
       setDecision(decideAs === 'confirm' ? 'confirmed' : 'rejected');
     } catch (e) { setSubmitErr(String(e)); }
     finally { setDeciding(''); }

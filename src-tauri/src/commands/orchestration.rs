@@ -510,7 +510,7 @@ async fn build_plan(
     // 走专门的需求捕获路径——只派一个 Agent 产出 requirement_draft 草稿块（前端可一键
     // 「提交到流水线」），激活原本休眠的 requirement_draft 链路；单 Agent 也避免并行
     // 多 Agent 各说各话、结论不一致。仅当群聊已绑定项目（草稿才能提交）时启用。
-    if conversation.project_id.is_some() && asks_to_capture_requirement(instruction) {
+    if conversation.project_id.is_some() && asks_to_capture_issue(instruction) {
         let target = route_by_relevance(instruction, members)
             .or_else(|| members.first().map(|a| a.id.clone()));
         if let Some(agent_id) = target {
@@ -518,7 +518,7 @@ async fn build_plan(
                 steps: vec![ConversationPlanStep {
                     step_type: "single".to_string(),
                     agents: vec![agent_id],
-                    instruction: capture_requirement_instruction(instruction),
+                    instruction: capture_issue_instruction(instruction),
                 }],
             });
         }
@@ -1032,7 +1032,7 @@ async fn run_agent_for_step(
         .await;
 
     // 检测 LLM 输出中是否嵌入了 requirement_draft artifact JSON
-    let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text_after_writes);
+    let (clean_text, draft_artifact) = extract_issue_draft_artifact(&text_after_writes);
     let mut blocks = vec![serde_json::json!({ "t": "md", "md": clean_text })];
     if let Some(mut artifact) = draft_artifact {
         // LLM 只产出 requirement_draft 的业务字段，这里补齐前端渲染/提交所需：
@@ -1707,7 +1707,7 @@ fn asks_for_sequence(text: &str) -> bool {
 
 /// 用户意图：把当前内容「录入系统 / 沉淀为正式需求」，而非聊一聊。命中后走需求
 /// 捕获路径，让 Agent 产出可一键入流水线的 requirement_draft 草稿，而不是讨论。
-fn asks_to_capture_requirement(text: &str) -> bool {
+fn asks_to_capture_issue(text: &str) -> bool {
     [
         "加到系统",
         "增加到系统",
@@ -1742,9 +1742,9 @@ fn asks_to_capture_requirement(text: &str) -> bool {
 }
 
 /// 需求捕获指令：要求 Agent 先核实现状（避免重复造轮子），再以固定 JSON 结构产出
-/// requirement_draft 产物。`extract_requirement_draft_artifact` 会解析该 JSON，
+/// requirement_draft 产物。`extract_issue_draft_artifact` 会解析该 JSON，
 /// `run_agent_for_step` 再补上 `t:"artifact"` 与真实 `project_id`，前端即可一键提交。
-fn capture_requirement_instruction(user_text: &str) -> String {
+fn capture_issue_instruction(user_text: &str) -> String {
     format!(
         "用户希望把下面这条内容**录入系统、沉淀为一条正式需求**，而不是展开讨论：\n\n{}\n\n\
 请按以下步骤处理：\n\
@@ -1756,7 +1756,7 @@ fn capture_requirement_instruction(user_text: &str) -> String {
 4. **最后必须输出一个 requirement_draft 产物 JSON**（用 ```json 代码块包裹），结构如下，供用户一键提交到流水线：\n\
 ```json\n\
 {{\n\
-  \"kind\": \"requirement_draft\",\n\
+  \"kind\": \"issue_draft\",\n\
   \"title\": \"需求标题\",\n\
   \"rows\": [[\"状态\", \"草案\"], [\"现状\", \"已实现/部分实现/全新/未核实\"], [\"类别\", \"feature\"]],\n\
   \"body\": \"需求正文（Markdown）\",\n\
@@ -1938,8 +1938,8 @@ fn parse_plan_json(raw: &str) -> Result<ConversationPlan, String> {
 
 /// 从 LLM 输出中提取 requirement_draft artifact JSON block。
 /// 若找到，返回 (清理后的文本, Some(artifact值))，否则返回 (原文本, None)。
-fn extract_requirement_draft_artifact(text: &str) -> (String, Option<serde_json::Value>) {
-    if !text.contains("requirement_draft") {
+fn extract_issue_draft_artifact(text: &str) -> (String, Option<serde_json::Value>) {
+    if !text.contains("issue_draft") && !text.contains("requirement_draft") {
         return (text.to_string(), None);
     }
 
@@ -1969,9 +1969,9 @@ fn extract_requirement_draft_artifact(text: &str) -> (String, Option<serde_json:
         }
         if let Some(end_pos) = end {
             let candidate = &text[pos..end_pos];
-            if candidate.contains("requirement_draft") {
+            if candidate.contains("issue_draft") || candidate.contains("requirement_draft") {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
-                    if val.get("kind").and_then(|k| k.as_str()) == Some("requirement_draft") {
+                    if matches!(val.get("kind").and_then(|k| k.as_str()), Some("issue_draft") | Some("requirement_draft")) {
                         // 移除 JSON 及周围的 markdown 代码围栏
                         let before = text[..pos]
                             .trim_end()

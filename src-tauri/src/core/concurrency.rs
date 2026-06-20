@@ -18,7 +18,7 @@ pub struct ConcurrencyManager {
     max_slots: Mutex<usize>,
     /// CRs currently in the `executing` phase.
     active: Mutex<usize>,
-    /// CRs sitting in `pending_review_2` awaiting human review.
+    /// CRs sitting in `pending_code_review` awaiting human review.
     pending_review: Mutex<usize>,
     pause_threshold: Mutex<usize>,
     queue_strategy: Mutex<String>,

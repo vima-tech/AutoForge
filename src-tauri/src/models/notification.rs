@@ -60,7 +60,7 @@ impl NotificationDraft {
                 category: "progress",
                 kind: "analysis_completed",
                 title: "需求分析完成".into(),
-                body: format!("需求 {issue_id} 分析就绪，等待审核 1"),
+                body: format!("需求 {issue_id} 分析就绪，等待需求审核"),
                 link_page: Some("audit"),
                 link_ref: Some(issue_id.clone()),
                 thread_key: Some(issue_id.clone()),

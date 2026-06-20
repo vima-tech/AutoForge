@@ -22,7 +22,7 @@ use crate::state::AppState;
 const MAX_TRANSCRIPT_CHARS: usize = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct MeetingRequirement {
+pub struct MeetingIssue {
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -37,8 +37,8 @@ pub struct MeetingRequirement {
 pub struct MeetingAnalysis {
     #[serde(default)]
     pub summary_md: String,
-    #[serde(default)]
-    pub requirements: Vec<MeetingRequirement>,
+    #[serde(default, alias = "requirements")]
+    pub issues: Vec<MeetingIssue>,
 }
 
 /// 解析会议转写：产出纪要 + 需求列表（纯逻辑，无 Tauri 依赖）。
@@ -68,8 +68,8 @@ pub async fn analyze_meeting_transcript(db: &Db, transcript: &str) -> Result<Mee
         .ok_or_else(|| "会议分析返回的内容无法解析为结构化结果，请重试".to_string())?;
 
     // 清洗：丢弃空标题条目，归一化分类/严重度到合法枚举。
-    let requirements = parsed
-        .requirements
+    let issues = parsed
+        .issues
         .into_iter()
         .filter(|r| !r.title.trim().is_empty())
         .map(|mut r| {
@@ -81,7 +81,7 @@ pub async fn analyze_meeting_transcript(db: &Db, transcript: &str) -> Result<Mee
 
     Ok(MeetingAnalysis {
         summary_md: parsed.summary_md.trim().to_string(),
-        requirements,
+        issues,
     })
 }
 

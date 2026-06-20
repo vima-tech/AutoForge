@@ -5,15 +5,16 @@ import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
 import { ConfirmModal } from '../components/ProjectDialogs';
 import { ReaderToc } from '../components/ReaderToc';
+import { toggleMaximizeOnDoubleClick } from '../lib/window';
 import { fmtShort, fmtFull } from '../utils/datetime';
 import {
-  listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
+  listActiveProjects, listChangeRequests, listChangeRequestsPage, getChangeRequestByIssue, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
-  getMergeConflict, retryMerge, aiResolveMergeConflict,
+  getMergeConflict, retryMerge, aiResolveMergeConflict, getCustomMergeMessageEnabled,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
   type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
   type BranchInfo, type BranchPreviewStatus, type MergeConflictView,
@@ -46,10 +47,10 @@ function CopyIdButton({ value, title = '复制编号' }: { value: string; title?
 
 const STATUS_LABEL: Record<string, string> = {
   analysis_failed: '分析失败',
-  pending_review_1: '待需求审核',
+  pending_issue_review: '待需求审核',
   pending_execution: '待执行',
   executing: 'AI 执行中',
-  pending_review_2: '待代码审核',
+  pending_code_review: '待代码审核',
   pending_merge: '待合并',
   execution_failed: '执行失败',
   merge_failed: '合并失败',
@@ -60,10 +61,10 @@ const STATUS_LABEL: Record<string, string> = {
 };
 const STATUS_COLOR: Record<string, string> = {
   analysis_failed: 'red',
-  pending_review_1: 'amber',
+  pending_issue_review: 'amber',
   pending_execution: 'amber',
   executing: 'blue',
-  pending_review_2: 'ember',
+  pending_code_review: 'ember',
   pending_merge: 'blue',
   execution_failed: 'red',
   merge_failed: 'red',
@@ -73,7 +74,7 @@ const STATUS_COLOR: Record<string, string> = {
   rejected: 'red',
 };
 // Failed states float to the top so abnormal requirements are easy to find and resolve.
-const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_review_2', 'executing', 'pending_execution', 'pending_merge', 'pending_review_1', 'no_change_needed', 'merged', 'rejected'];
+const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_code_review', 'executing', 'pending_execution', 'pending_merge', 'pending_issue_review', 'no_change_needed', 'merged', 'rejected'];
 
 // Stuck/abnormal CR states that the user can recover (retry) or remove (delete).
 const FAILED_STATUSES = ['execution_failed', 'merge_failed', 'merge_conflict'];
@@ -373,33 +374,56 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
   onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, gate,
-  width }: {
+  width, hasMoreMerged, mergedLoading, onLoadMoreMerged }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
   issueTitles: Record<string, string>; sel: Sel | null;
   onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void; onOpenLedger: () => void;
-  // 批量审核 1：通过选中的待审核需求，返回 Promise 供调用方等待刷新。
+  // 批量需求审核：通过选中的待审核需求，返回 Promise 供调用方等待刷新。
   onBatchApprove: (ids: string[]) => Promise<void> | void;
-  // 批量审核 2：通过选中的待审核 2 变更请求（各自排队合并）。
+  // 批量代码审核：通过选中的待代码审核 变更请求（各自排队合并）。
   onBatchApproveCrs: (ids: string[]) => Promise<void> | void;
-  // 当前审核闸口：'requirement' 只显示待需求审核，'code' 只显示变更请求各态。
-  gate: 'requirement' | 'code';
+  // 当前审核闸口：'issue' 只显示待需求审核，'code' 只显示变更请求各态。
+  gate: 'issue' | 'code';
   width: number;
+  // 已合并 CR 分批加载：是否还有下一页 / 正在加载 / 触发加载下一页。
+  hasMoreMerged: boolean; mergedLoading: boolean; onLoadMoreMerged: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const menuRef = React.useRef<HTMLDivElement>(null);
-  // 批量审核选区：审核需求闸作用于 pending_review_1 需求，审核代码闸作用于 pending_review_2 CR。
+  // 已合并 CR 滚动加载：滚动容器 + 触底哨兵。
+  const listScrollRef = React.useRef<HTMLDivElement>(null);
+  const mergedSentinelRef = React.useRef<HTMLDivElement>(null);
+  // 批量审核选区：审核需求闸作用于 pending_issue_review 需求，审核代码闸作用于 pending_code_review CR。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [batching, setBatching] = useState(false);
 
-  // 仅 pending_review_1 可批量通过（analysis_failed 需先重分析，不可直接过审）。
-  const selectablePending = useMemo(() => pendingIssues.filter(i => i.status === 'pending_review_1'), [pendingIssues]);
-  // 仅 pending_review_2 的 CR 可批量通过（执行中/已合并等态不可直接过审）。
-  const selectableCrs = useMemo(() => crs.filter(r => r.status === 'pending_review_2'), [crs]);
+  // 列表模糊过滤：按标题或需求编号（短/全 id）筛选当前闸口列表。
+  const [search, setSearch] = useState('');
+  const filteredIssues = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return pendingIssues;
+    return pendingIssues.filter(i => i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q));
+  }, [pendingIssues, search]);
+  const filteredCrs = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return crs;
+    return crs.filter(r =>
+      (issueTitles[r.issue_id] || '').toLowerCase().includes(q) ||
+      r.id.toLowerCase().includes(q) ||
+      r.issue_id.toLowerCase().includes(q));
+  }, [crs, issueTitles, search]);
+  // 切换闸口时清空搜索，避免跨闸口残留筛选词。
+  useEffect(() => { setSearch(''); }, [gate]);
+
+  // 仅 pending_issue_review 可批量通过（analysis_failed 需先重分析，不可直接过审）；批量仅作用于当前筛选可见集。
+  const selectablePending = useMemo(() => filteredIssues.filter(i => i.status === 'pending_issue_review'), [filteredIssues]);
+  // 仅 pending_code_review 的 CR 可批量通过（执行中/已合并等态不可直接过审）。
+  const selectableCrs = useMemo(() => filteredCrs.filter(r => r.status === 'pending_code_review'), [filteredCrs]);
   // 当前闸口下可批量操作的目标 id 集合。
   const selectableIds = useMemo(
-    () => (gate === 'requirement' ? selectablePending.map(i => i.id) : selectableCrs.map(r => r.id)),
+    () => (gate === 'issue' ? selectablePending.map(i => i.id) : selectableCrs.map(r => r.id)),
     [gate, selectablePending, selectableCrs],
   );
   // 列表刷新后剔除已离开队列的选中项，避免对幽灵 id 批量操作。
@@ -412,6 +436,17 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   }, [selectableIds]);
   // 切换闸口时清空批量选区，避免跨闸口选区残留与底部操作条错位。
   useEffect(() => { setSelected(new Set()); }, [gate]);
+
+  // 已合并 CR 触底哨兵进入视口即加载下一页（仅代码闸 + 还有更多时；提前 240px 预取）。
+  useEffect(() => {
+    if (gate !== 'code' || !hasMoreMerged) return;
+    const el = mergedSentinelRef.current;
+    const root = listScrollRef.current;
+    if (!el || !root) return;
+    const io = new IntersectionObserver(es => { if (es[0].isIntersecting) onLoadMoreMerged(); }, { root, rootMargin: '240px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [gate, hasMoreMerged, onLoadMoreMerged]);
   const allSelectableSelected = selectableIds.length > 0 && selectableIds.every(id => selected.has(id));
   const toggleSel = (id: string) => setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const toggleAllSelectable = () => setSelected(prev => {
@@ -423,7 +458,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   const runBatch = () => {
     if (batching || selected.size === 0) return;
     setBatching(true);
-    const fn = gate === 'requirement' ? onBatchApprove : onBatchApproveCrs;
+    const fn = gate === 'issue' ? onBatchApprove : onBatchApproveCrs;
     Promise.resolve(fn([...selected]))
       .finally(() => { setBatching(false); setConfirmBatch(false); setSelected(new Set()); });
   };
@@ -484,21 +519,36 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         </div>
       </div>
 
-      <div className="list-body scroll" style={{ paddingTop: 0 }}>
-        {(gate === 'requirement' ? pendingIssues.length === 0 : crs.length === 0) && (
+      {/* 顶部固定搜索框：置于滚动容器外，不随列表滚动 */}
+      {(gate === 'issue' ? pendingIssues.length > 0 : crs.length > 0) && (
+        <div style={{ padding: '8px 12px 4px', flexShrink: 0 }}>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 需求编号…"
+            style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+        </div>
+      )}
+
+      <div className="list-body scroll" ref={listScrollRef} style={{ paddingTop: 0 }}>
+        {(gate === 'issue' ? pendingIssues.length === 0 : crs.length === 0) && (
           <button className="ledger-empty-cta" onClick={onOpenLedger} title="打开全量需求总账（全屏查看所有状态需求）">
             <div className="ledger-empty-cta-icon"><Icon name="list" size={26} /></div>
-            <div className="ledger-empty-cta-title">{gate === 'requirement' ? '暂无待审需求' : '暂无待审代码'}</div>
+            <div className="ledger-empty-cta-title">{gate === 'issue' ? '暂无待审需求' : '暂无待审代码'}</div>
             <div className="ledger-empty-cta-sub">打开「全量需求总账」<br />全屏查看并管理所有状态需求</div>
             <span className="ledger-empty-cta-go">进入总账<Icon name="chevRight" size={15} /></span>
           </button>
         )}
 
-        {/* 审核 1：待需求审核（Issue，尚未生成 CR） */}
-        {gate === 'requirement' && pendingIssues.length > 0 && (
+        {/* 搜索无匹配提示：原始列表有内容但筛选后为空 */}
+        {search.trim() && (gate === 'issue' ? (pendingIssues.length > 0 && filteredIssues.length === 0) : (crs.length > 0 && filteredCrs.length === 0)) && (
+          <div className="empty-compact" style={{ padding: '14px 12px', textAlign: 'center', color: 'var(--text-faint)', fontSize: 'var(--text-caption)' }}>
+            无匹配「{search.trim()}」的{gate === 'issue' ? '需求' : '变更'}
+          </div>
+        )}
+
+        {/* 需求审核：待需求审核（Issue，尚未生成 CR） */}
+        {gate === 'issue' && filteredIssues.length > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
-            <span>{STATUS_LABEL.pending_review_1}</span>
-            <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{pendingIssues.length}</span>
+            <span>{STATUS_LABEL.pending_issue_review}</span>
+            <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{filteredIssues.length}</span>
             {/* 批量审核：全选 / 取消全选可批量通过的待审核需求 */}
             {selectablePending.length > 0 && (
               <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选待审核需求'}
@@ -508,8 +558,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             )}
           </div>
         )}
-        {gate === 'requirement' && pendingIssues.map(issue => {
-          const canSelect = issue.status === 'pending_review_1';
+        {gate === 'issue' && filteredIssues.map(issue => {
+          const canSelect = issue.status === 'pending_issue_review';
           return (
             <div key={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
               <div className="req-item-top">
@@ -527,9 +577,9 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           );
         })}
 
-        {/* 审核 2 及其它 CR 状态 */}
+        {/* 代码审核 及其它 CR 状态 */}
         {gate === 'code' && (() => {
-          const sorted = sortedCrs(crs);
+          const sorted = sortedCrs(filteredCrs);
           const statusCounts = sorted.reduce<Record<string, number>>((acc, r) => {
             acc[r.status] = (acc[r.status] ?? 0) + 1;
             return acc;
@@ -544,8 +594,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
                     <span>{STATUS_LABEL[r.status] ?? r.status}</span>
                     <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{statusCounts[r.status]}</span>
-                    {/* 批量审核 2：仅 pending_review_2 分组显示全选，可批量通过进入合并 */}
-                    {r.status === 'pending_review_2' && selectableCrs.length > 0 && (
+                    {/* 批量代码审核：仅 pending_code_review 分组显示全选，可批量通过进入合并 */}
+                    {r.status === 'pending_code_review' && selectableCrs.length > 0 && (
                       <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选待审核代码'}
                         style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
                         <LedgerCheck on={allSelectableSelected} /> 全选
@@ -555,7 +605,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                 )}
                 <div className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
                   <div className="req-item-top">
-                    {r.status === 'pending_review_2' && (
+                    {r.status === 'pending_code_review' && (
                       <span onClick={e => { e.stopPropagation(); toggleSel(r.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
                         <LedgerCheck on={selected.has(r.id)} />
                       </span>
@@ -570,6 +620,14 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             );
           });
         })()}
+
+        {/* 已合并 CR 触底哨兵 + 加载态：仅代码闸、且开启「显示已合并」后还有更多时出现 */}
+        {gate === 'code' && (
+          <>
+            <div ref={mergedSentinelRef} style={{ height: 1 }} />
+            {mergedLoading && <div className="empty-compact" style={{ padding: '10px 0' }}>加载已合并…</div>}
+          </>
+        )}
       </div>
 
       {/* 批量审核操作条：选中后出现，一键全部通过（需求→编码 / 代码→合并） */}
@@ -578,7 +636,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>已选 {selected.size}</span>
           <span style={{ flex: 1 }} />
           <button className="btn btn-sm" disabled={batching} onClick={() => setConfirmBatch(true)}
-            title={gate === 'requirement' ? '批量通过选中的待审核需求（进入编码）' : '批量通过选中的待审核代码（进入合并）'}
+            title={gate === 'issue' ? '批量通过选中的待审核需求（进入编码）' : '批量通过选中的待审核代码（进入合并）'}
             style={{ color: 'var(--green)' }}>
             <Icon name={batching ? 'brain' : 'check'} size={13} className={batching ? 'spin' : undefined} />
             {batching ? '通过中…' : `批量通过 (${selected.size})`}
@@ -589,10 +647,10 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     </div>
     {confirmBatch && (
       <ConfirmModal
-        msg={gate === 'requirement'
+        msg={gate === 'issue'
           ? `确定批量通过选中的 ${selected.size} 条需求？`
           : `确定批量通过选中的 ${selected.size} 条变更请求？`}
-        sub={gate === 'requirement'
+        sub={gate === 'issue'
           ? '通过后将各自生成变更请求并进入 AI 编码，无法撤销。'
           : '通过后将各自执行测试并进入自动合并，无法撤销。'}
         okLabel="批量通过"
@@ -608,13 +666,13 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 // 只「看 / 下钻 / 整理」：所有状态可见 + 筛选搜索；状态只读、优先级不可拖；无拖拽/改状态/指派。
 const LEDGER_STATUS_LABEL: Record<string, string> = {
   triage: '待整理', pending_analysis: '分析中', analysis_failed: '分析失败',
-  pending_review_1: '需求审核', pending_execution: '待编码', executing: '编码中',
-  pending_review_2: '代码审核', pending_merge: '待合并', merged: '已合并',
+  pending_issue_review: '需求审核', pending_execution: '待编码', executing: '编码中',
+  pending_code_review: '代码审核', pending_merge: '待合并', merged: '已合并',
   rejected: '已拒绝', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
 };
 const LEDGER_STATUS_CHIP: Record<string, string> = {
-  triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_review_1: 'amber',
-  executing: 'blue', pending_review_2: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
+  triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_issue_review: 'amber',
+  executing: 'blue', pending_code_review: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
   merge_conflict: 'amber', no_change_needed: 'blue',
 };
 // 不可拒绝的状态：运行中 / 待合并 / 已合并 / 已拒绝（与后端 reject_issues 跳过集一致）。
@@ -630,6 +688,9 @@ function LedgerCheck({ on }: { on: boolean }) {
 }
 
 const LEDGER_PAGE = 50;   // 总账每次滚动加载的条数
+// 功能审计代码闸的分批加载：活动集（非合并）天然有界，一次取够；已合并历史按页滚动加载。
+const CR_ACTIVE_CAP = 500;   // 活动集（非合并 CR）单次上限——远超工作流可能的在产数
+const CR_MERGED_PAGE = 50;   // 已合并 CR 每次滚动加载的条数
 
 function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage, onRejectIssues, showMerged, onToggleMerged, mergedCount, initialStatus }: {
   projectId: string; refreshKey: number; sel: Sel | null; onSelectIssue: (id: string) => void;
@@ -856,7 +917,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   );
 }
 
-// ── IssueReviewView (审核 1：需求审核) ─────────────────────────────────────────
+// ── IssueReviewView (需求审核：需求审核) ─────────────────────────────────────────
 
 function ScorePill({ label, value }: { label: string; value: number | null }) {
   if (value === null || value === undefined) return null;
@@ -901,11 +962,11 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
   return (
     <>
       {/* ── 关键核心：默认可见 ── */}
-      {(u.restated_requirement || u.reproduction_steps.length > 0) && (
+      {((u.restated_issue || u.restated_requirement) || u.reproduction_steps.length > 0) && (
         <>
           <SpecH2 icon="search" color="var(--blue)">需求理解</SpecH2>
           {u.problem_type && <p style={{ margin: '0 0 8px' }}><span className="chip">{u.problem_type}</span></p>}
-          {u.restated_requirement && <p style={{ whiteSpace: 'pre-line' }}>{u.restated_requirement}</p>}
+          {(u.restated_issue || u.restated_requirement) && <p style={{ whiteSpace: 'pre-line' }}>{u.restated_issue || u.restated_requirement}</p>}
           {u.current_behavior && <p style={liStyle}><b>当前行为：</b>{u.current_behavior}</p>}
           {u.expected_behavior && <p style={liStyle}><b>期望行为：</b>{u.expected_behavior}</p>}
           {u.reproduction_steps.length > 0 && (
@@ -1155,7 +1216,7 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
   onRetryAnalysis: () => void;
   onReanalyze: () => void;
 }) {
-  const canReview = issue.status === 'pending_review_1' && !decided;
+  const canReview = issue.status === 'pending_issue_review' && !decided;
   const analysisFailed = issue.status === 'analysis_failed';
   const spec = parseAnalysisSpec(analysis?.analysis_json);
   // Analysis concluded the requirement needs no code change (misjudgment /
@@ -1163,7 +1224,7 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
   // demote 批准 from the primary action and surface the reason. Human still decides.
   const notRecommended = spec?.triage?.needs_changes === false;
 
-  // 全屏阅读模式（与审核 2 / 会议室阅读模式风格一致）：衬线字体 + 报纸波点底纹
+  // 全屏阅读模式（与代码审核 / 会议室阅读模式风格一致）：衬线字体 + 报纸波点底纹
   const [fsReader, setFsReader] = useState(false);
   const reqReaderScrollRef = useRef<HTMLDivElement>(null);
   const [readerScale, setReaderScale] = useState(() => {
@@ -1300,7 +1361,7 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
       {/* 全屏阅读：单栏文档铺开，衬线字体 + 报纸波点底纹（对齐会议室阅读模式） */}
       {fsReader && (
         <div className="reader-overlay diff-reader req-reader" style={{ ['--rs' as string]: String(readerScale) }}>
-          <div className="reader-bar">
+          <div className="reader-bar" onDoubleClick={toggleMaximizeOnDoubleClick}>
             <div className="reader-bar-info">
               <Icon name="maximize" size={15} />
               <span className="reader-bar-title">{issue.title}</span>
@@ -1329,7 +1390,7 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
 
       {/* 底部悬浮 dock：单一管理员意见输入框，支持两种操作——
           「批准 · 进入编码」时作为给编码 Agent 的实现建议随同提交；
-          「重新评估」时作为补充意见让需求带其重新分析并回到审核 1。 */}
+          「重新评估」时作为补充意见让需求带其重新分析并回到需求审核。 */}
       <div className="audit-dock">
         <div className="dock-advice">
           <span className="dock-label">管理员意见（批准时给编码 Agent / 重新评估时给分析）</span>
@@ -1366,7 +1427,17 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
 }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
+  // crs 持有「活动集（非合并 CR，有界）」+「已加载的已合并历史页」。
+  // 已合并 CR 随项目生命周期无限累积，故不全量加载——默认仅取首页，按需滚动追加。
   const [crs, setCrs] = useState<ChangeRequest[]>([]);
+  // 当前项目的已合并 CR 总数（供「已合并」徽标计数 + 判断是否还有下一页）。
+  const [mergedTotal, setMergedTotal] = useState(0);
+  // 已通过分页拉取的已合并 CR 行数 = 下一页 offset。单独计数而非由 crs 推导，
+  // 这样从总账下钻按需补拉的「乱序」单条 CR 不会污染分页 offset、造成跳页漏行。
+  const [mergedLoaded, setMergedLoaded] = useState(0);
+  const [mergedLoading, setMergedLoading] = useState(false);
+  // 单调令牌：切项目/重载即自增，丢弃在途的过期 CR 分页响应。
+  const crReqRef = useRef(0);
   // 默认隐藏已合并需求，开关在 audit-launch 区域控制。
   const [showMerged, setShowMerged] = useState(false);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
@@ -1383,9 +1454,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [issuesById, setIssuesById] = useState<Record<string, Issue>>({});
   const [origReqOpen, setOrigReqOpen] = useState(false);
   const [sel, setSel] = useState<Sel | null>(null);
-  // 审核闸口：'requirement'=审核需求（review 1）/ 'code'=审核代码（review 2）。
+  // 审核闸口：'issue'=审核需求（review 1）/ 'code'=审核代码（review 2）。
   // 列表与详情都随它切换，把两步审核分开，互不干扰。
-  const [gate, setGate] = useState<'requirement' | 'code'>('requirement');
+  const [gate, setGate] = useState<'issue' | 'code'>('issue');
   // 已按项目初始化过 gate 的 projectId（每项目只自动落位一次，不覆盖用户手动切换）。
   const gateInitRef = useRef<string>('');
   const [loadedProjectId, setLoadedProjectId] = useState('');
@@ -1418,10 +1489,12 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     return next;
   });
   const [advice, setAdvice] = useState('');
+  const [commitMsg, setCommitMsg] = useState('');  // 合并提交信息（人审可改，空则后端回退默认模板）
+  const [customMsgOn, setCustomMsgOn] = useState(false);  // Settings「自定义合并提交信息」开关，默认关
   const [decided, setDecided] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // 审核 1 / 审核 2 的「拒绝」均为不可逆决策，弹二次确认避免误点。
+  // 需求审核 / 代码审核 的「拒绝」均为不可逆决策，弹二次确认避免误点。
   const [confirmReject, setConfirmReject] = useState<null | 'review1' | 'review2'>(null);
   const [crLoading, setCrLoading] = useState(false);
   // 任务进度心跳：cr_id → 最近一次阶段说明，用于在编码/合并期间显示「活着」的进度。
@@ -1473,13 +1546,13 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const activeCr = sel?.kind === 'cr' ? sel.id : '';
   const activeIssueId = sel?.kind === 'issue' ? sel.id : '';
   // 两闸口的待办计数，喂给页头分段控件的徽标。
-  const reqPendingCount = pendingIssues.filter(i => i.status === 'pending_review_1').length;
-  const codePendingCount = crs.filter(c => c.status === 'pending_review_2').length;
+  const reqPendingCount = pendingIssues.filter(i => i.status === 'pending_issue_review').length;
+  const codePendingCount = crs.filter(c => c.status === 'pending_code_review').length;
   // 选中 CR 的 updated_at：修改/重新执行后会变化，用作 diff 重新拉取的信号
   const activeCrUpdatedAt = sel?.kind === 'cr' ? crs.find(c => c.id === sel.id)?.updated_at : undefined;
 
   const loadProjectReviewCounts = useCallback(async () => {
-    const pending = await listChangeRequests(undefined, 'pending_review_2');
+    const pending = await listChangeRequests(undefined, 'pending_code_review');
     setProjectReviewCounts(pending.reduce<Record<string, number>>((acc, cr) => {
       acc[cr.project_id] = (acc[cr.project_id] ?? 0) + 1;
       return acc;
@@ -1517,24 +1590,79 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   }, [hasBranchPreviews, activeProject]);
 
   const loadList = useCallback(async (projectId: string) => {
-    // 不再全量加载 issues：左栏只需在产 CR + 待审需求（有界子集）；总账自带分页滚动加载。
-    // 审核 1 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
-    const [allCrs, pending] = await Promise.all([
-      listChangeRequests(projectId),
-      listIssuesByStatuses(projectId, ['pending_review_1', 'analysis_failed']),
+    // 不再全量加载 issues / CR：左栏只需「活动集 CR（非合并，有界）+ 待审需求（有界子集）」；
+    // 已合并 CR 会随项目生命周期无限累积，只取首页、按需滚动追加；总账自带分页滚动加载。
+    // 需求审核 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
+    const token = ++crReqRef.current;
+    const [activePage, mergedPage, pending] = await Promise.all([
+      listChangeRequestsPage(projectId, undefined, true, CR_ACTIVE_CAP, 0),
+      listChangeRequestsPage(projectId, 'merged', false, CR_MERGED_PAGE, 0),
+      listIssuesByStatuses(projectId, ['pending_issue_review', 'analysis_failed']),
     ]);
+    if (crReqRef.current !== token) return;  // 期间已切项目/重载，丢弃本次结果
+    const allCrs = [...activePage.items, ...mergedPage.items];
     setCrs(allCrs);
+    setMergedTotal(mergedPage.total);
+    setMergedLoaded(mergedPage.items.length);
+    setMergedLoading(false);  // 重置：避免切项目时在途 loadMoreMerged 的 loading 卡住新项目
     setPendingIssues(pending);
     // 标题映射：只取列表里实际出现的需求（CR 关联 + 待审），批量取轻量标题，避免全量加载。
     const titleIds = Array.from(new Set([...allCrs.map(c => c.issue_id), ...pending.map(i => i.id)]));
     const titleRows = titleIds.length ? await listIssueTitles(titleIds) : [];
+    if (crReqRef.current !== token) return;
     const titleMap: Record<string, string> = Object.fromEntries(titleRows.map(t => [t.id, t.title]));
     pending.forEach(i => { titleMap[i.id] = i.title; });  // 兜底
-    setIssueTitles(titleMap);
+    setIssueTitles(prev => ({ ...prev, ...titleMap }));
     // 待审需求完整字段进 issuesById 缓存；报告页「需求原文」所需的选中 CR 原始需求按需补拉。
     setIssuesById(prev => ({ ...prev, ...Object.fromEntries(pending.map(i => [i.id, i])) }));
     setLoadedProjectId(projectId);
   }, []);
+
+  // 已合并 CR 滚动加载下一页：以已分页拉取的条数为 offset，去重追加。
+  const loadMoreMerged = useCallback(async () => {
+    if (mergedLoading || !activeProject) return;
+    if (mergedLoaded >= mergedTotal) return;
+    const token = crReqRef.current;  // 与当前重置同批；期间若发生重置则丢弃本次追加
+    setMergedLoading(true);
+    try {
+      const p = await listChangeRequestsPage(activeProject.id, 'merged', false, CR_MERGED_PAGE, mergedLoaded);
+      if (crReqRef.current !== token) return;
+      setCrs(prev => {
+        const have = new Set(prev.map(c => c.id));
+        return [...prev, ...p.items.filter(c => !have.has(c.id))];
+      });
+      setMergedTotal(p.total);
+      setMergedLoaded(prev => prev + p.items.length);
+      // 补这些已合并 CR 的需求标题（仅缺失的）。
+      const missing = Array.from(new Set(p.items.map(c => c.issue_id))).filter(id => !(id in issueTitles));
+      if (missing.length) {
+        const rows = await listIssueTitles(missing);
+        if (crReqRef.current !== token) return;
+        setIssueTitles(prev => ({ ...prev, ...Object.fromEntries(rows.map(t => [t.id, t.title])) }));
+      }
+    } finally {
+      if (crReqRef.current === token) setMergedLoading(false);
+    }
+  }, [mergedLoading, mergedLoaded, activeProject, mergedTotal, issueTitles]);
+
+  // 从总账下钻到某需求的 CR：先查已载入集合，未命中再按需补拉单条并并入 crs，
+  // 恢复「分批加载前全量在内存」时的下钻能力（如下钻到较早的已合并 CR）。
+  const resolveCr = useCallback(async (issueId: string): Promise<ChangeRequest | undefined> => {
+    const inMem = crs.find(c => c.issue_id === issueId);
+    if (inMem) return inMem;
+    try {
+      const fetched = await getChangeRequestByIssue(issueId);
+      if (fetched) {
+        setCrs(prev => prev.some(c => c.id === fetched.id) ? prev : [...prev, fetched]);
+        if (!(fetched.issue_id in issueTitles)) {
+          const rows = await listIssueTitles([fetched.issue_id]);
+          setIssueTitles(prev => ({ ...prev, ...Object.fromEntries(rows.map(t => [t.id, t.title])) }));
+        }
+        return fetched;
+      }
+    } catch { /* 取不到就按「无 CR」处理，交给调用方兜底 */ }
+    return undefined;
+  }, [crs, issueTitles]);
 
   // 整理待整理池条目：triage Agent 炼成正经需求并转入流水线。
   // triage Agent 炼成正经需求并转入流水线；反馈整理/丢弃/出错数。
@@ -1581,14 +1709,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     let g = gate;
     if (gateInitRef.current !== loadedProjectId) {
       gateInitRef.current = loadedProjectId;
-      g = reqPendingCount === 0 && codePendingCount > 0 ? 'code' : 'requirement';
+      g = reqPendingCount === 0 && codePendingCount > 0 ? 'code' : 'issue';
       if (g !== gate) setGate(g);
     }
 
     // 默认选中只能落在左栏「可见」的 CR 上：默认隐藏已合并需求，否则会出现
     // 列表为空但 .content 仍自动展示某条已合并 CR 的错位。
     const visibleCrs = showMerged ? crs : crs.filter(c => c.status !== 'merged');
-    if (g === 'requirement') {
+    if (g === 'issue') {
       if (sel?.kind === 'issue' && pendingIssues.some(i => i.id === sel.id)) return;
       setSel(pendingIssues.length ? { kind: 'issue', id: pendingIssues[0].id } : null);
     } else {
@@ -1613,28 +1741,37 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     if (!target) return;
     if (loadedProjectId !== target.projectId) return;
     const tid = target.issueId;
-    const pending = pendingIssues.find(i => i.id === tid);
-    const cr = crs.find(c => c.issue_id === tid);
     // 标记本项目 gate 已定，避免默认落位 effect 把跳转目标的闸口覆盖掉。
     gateInitRef.current = loadedProjectId;
+    const pending = pendingIssues.find(i => i.id === tid);
     if (pending) {
-      setGate('requirement');
+      setGate('issue');
       setSel({ kind: 'issue', id: pending.id });
       setDecided(null); onTargetConsumed();
-    } else if (cr) {
-      setGate('code');
-      if (cr.status === 'merged') setShowMerged(true);  // 已合并 CR 需开启显示才会出现在左栏
-      setSel({ kind: 'cr', id: cr.id });
-      setDecided(null); onTargetConsumed();
-    } else {
-      // 非审核阶段需求（如待整理 triage / 已合并）：主列表里没有，确认存在后自动打开总账并选中
-      getIssue(tid).then(iss => {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      // 分批加载下 CR 可能未载入，resolveCr 命中内存则直接用、否则按需补拉单条。
+      const cr = await resolveCr(tid);
+      if (cancelled) return;
+      if (cr) {
+        setGate('code');
+        if (cr.status === 'merged') setShowMerged(true);  // 已合并 CR 需开启显示才会出现在左栏
+        setSel({ kind: 'cr', id: cr.id });
+        setDecided(null); onTargetConsumed();
+      } else {
+        // 非审核阶段需求（如待整理 triage / 已合并且无 CR）：确认存在后自动打开总账并选中
+        const iss = await getIssue(tid).catch(() => null);
+        if (cancelled) return;
         if (iss) {
           if (iss.status === 'merged') setShowMerged(true);  // 已合并需求需开启显示才在总账可见
           setSel({ kind: 'issue', id: tid }); setShowLedger(true);
         }
-      }).finally(() => { setDecided(null); onTargetConsumed(); });
-    }
+        setDecided(null); onTargetConsumed();
+      }
+    })();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target, loadedProjectId, crs, pendingIssues]);
 
@@ -1649,7 +1786,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   }, [stageTarget, projects]);
 
   // 流水线节点跳转：目标项目数据就绪后，按环节定位到对应视图。
-  //   审核 1 → 审核需求闸口；审核 2 / 执行中 → 审核代码闸口；
+  //   需求审核 → 审核需求闸口；代码审核 / 执行中 → 审核代码闸口；
   //   待整理 / 分析中 / 已合并 → 打开总账并预置状态筛选（这些是只读/非审核态）。
   useEffect(() => {
     if (!stageTarget) return;
@@ -1657,9 +1794,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     const stage = stageTarget.stage;
     // 标记本项目 gate 已定，避免默认落位 effect 覆盖跳转意图。
     gateInitRef.current = loadedProjectId;
-    if (stage === 'pending_review_1') {
-      setShowLedger(false); setGate('requirement');
-    } else if (stage === 'pending_review_2' || stage === 'executing') {
+    if (stage === 'pending_issue_review') {
+      setShowLedger(false); setGate('issue');
+    } else if (stage === 'pending_code_review' || stage === 'executing') {
       setShowLedger(false); setGate('code');
     } else {
       // triage / pending_analysis / merged：总账按状态筛选浏览。
@@ -1673,6 +1810,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   // 总账关闭后清掉预置筛选，下次从常规入口打开时回到「全部」。
   useEffect(() => { if (!showLedger) setLedgerStatus(undefined); }, [showLedger]);
 
+  // 读取「自定义合并提交信息」开关（Settings 门控降级面板）；关闭时审核页不显示输入框。
+  useEffect(() => { getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {}); }, []);
+
   useEffect(() => {
     if (!activeCr) {
       setCrPreview(null);  // clear stale preview when no CR is selected
@@ -1684,6 +1824,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     setDecided(null);
     setGrade(null);
     setAdvice('');
+    // 预填默认合并信息（与后端回退模板一致），人审可改后随「批准合并」提交
+    setCommitMsg(`AutoForge merge: ${crId}`);
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
     setConflict(null);  // 清掉上一条 CR 的冲突现场
@@ -1752,7 +1894,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     return () => clearInterval(id);
   }, [crAppLaunching, crPreview?.app_running, activeCr]);
 
-  // 审核 1：选中 Issue 时加载其分析结果
+  // 需求审核：选中 Issue 时加载其分析结果
   useEffect(() => {
     if (!activeIssueId) { setIssueAnalysis(null); return; }
     const issueId = activeIssueId;
@@ -1793,7 +1935,12 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     if (!activeCr || submitting) return;
     setSubmitting(true);
     try {
-      await review2(activeCr, { decision, suggestions: advice || undefined });
+      await review2(activeCr, {
+        decision,
+        suggestions: advice || undefined,
+        // 仅在功能开启且批准合并时带上人审填写的提交信息；修改/拒绝不涉及合并
+        commit_message: customMsgOn && decision === 'approved' ? (commitMsg.trim() || undefined) : undefined,
+      });
       setDecided(decision);
       if (activeProject) await loadList(activeProject.id);
       await loadProjectReviewCounts();
@@ -1828,7 +1975,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setConflictBusy(false); }
   };
 
-  // 合并冲突闭环：交 AI 自动解冲突（解完回审核 2 复审，不直接落 dev）。
+  // 合并冲突闭环：交 AI 自动解冲突（解完回代码审核 复审，不直接落 dev）。
   const doAiResolve = async () => {
     if (!activeCr || conflictBusy) return;
     setConflictBusy(true);
@@ -1870,7 +2017,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setSubmitting(false); }
   };
 
-  // 审核 1 补充意见重评：带管理员补充意见重新分析当前需求，完成后重回审核 1。
+  // 需求审核 补充意见重评：带管理员补充意见重新分析当前需求，完成后重回需求审核。
   const doReanalyze = async () => {
     if (!activeIssueId || submitting || !advice.trim()) return;
     setSubmitting(true);
@@ -1885,7 +2032,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setSubmitting(false); }
   };
 
-  // 审核 1：批准 → 创建 CR 进入编码；拒绝 → 归档（后端按设计返回 Err）。
+  // 需求审核：批准 → 创建 CR 进入编码；拒绝 → 归档（后端按设计返回 Err）。
   const doReview1 = async (decision: 'approved' | 'rejected') => {
     if (!activeIssueId || submitting) return;
     setSubmitting(true);
@@ -1904,7 +2051,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     }
   };
 
-  // 审核 1（批量）：一键通过选中的待审核需求，快速清空审核 1 队列。
+  // 需求审核（批量）：一键通过选中的待审核需求，快速清空需求审核 队列。
   const doBatchReview1 = async (ids: string[]) => {
     if (!ids.length) return;
     try {
@@ -1921,7 +2068,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     }
   };
 
-  // 审核 2（批量）：一键通过选中的待审核 2 变更请求，各自排队合并，快速清空审核 2 队列。
+  // 代码审核（批量）：一键通过选中的待代码审核 变更请求，各自排队合并，快速清空代码审核 队列。
   const doBatchReview2 = async (ids: string[]) => {
     if (!ids.length) return;
     try {
@@ -2053,7 +2200,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const selectedIssue = activeIssueId ? pendingIssues.find(i => i.id === activeIssueId) : undefined;
   const report = session?.report_content ? parseReport(session.report_content) : null;
   const hunks = diff ? parseDiff(diff) : [];
-  const canRevise = cr?.status === 'pending_review_2' && !decided;
+  const canRevise = cr?.status === 'pending_code_review' && !decided;
 
   // 「本次改动」预览的启动动作：web → 起 dev server 并自动开浏览器；tauri → 直接启动桌面程序
   const renderCrLaunch = () => {
@@ -2286,7 +2433,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         </div>
         {activeProject && (
           <div className="seg" style={{ marginLeft: 6 }}>
-            <button className={gate === 'requirement' ? 'on' : ''} onClick={() => setGate('requirement')} title="审核需求：决定要不要做（review 1）">
+            <button className={gate === 'issue' ? 'on' : ''} onClick={() => setGate('issue')} title="审核需求：决定要不要做（review 1）">
               审核需求
               {reqPendingCount > 0 && <span className="chip amber" style={{ marginLeft: 6, padding: '0 6px', fontSize: 'var(--text-micro)' }}>{reqPendingCount}</span>}
             </button>
@@ -2302,7 +2449,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             onStart={doStartBranch} onStop={doStopBranch} onShowLog={showBranchLog}
             onOpenIntake={() => setIntakeOpen(true)} onOpenLedger={() => setShowLedger(true)}
             showMerged={showMerged} onToggleMerged={() => setShowMerged(v => !v)}
-            mergedCount={crs.filter(c => c.status === 'merged').length}
+            mergedCount={mergedTotal}
           />
         )}
       </div>
@@ -2320,6 +2467,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           onBatchApproveCrs={doBatchReview2}
           gate={gate}
           width={listWidth}
+          hasMoreMerged={showMerged && mergedLoaded < mergedTotal}
+          mergedLoading={mergedLoading}
+          onLoadMoreMerged={loadMoreMerged}
         />
         <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
 
@@ -2362,7 +2512,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                         <button className="btn btn-danger" onClick={() => setConfirmDelete(true)} disabled={submitting}><Icon name="trash" size={15} />删除需求</button>
                         <button className="btn btn-primary" onClick={doRetry} disabled={submitting}><Icon name="refresh" size={15} />重新执行</button>
                       </>
-                    : cr.status !== 'pending_review_2'
+                    : cr.status !== 'pending_code_review'
                     ? <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
                         {STATUS_LABEL[cr.status] ?? cr.status}
                       </span>
@@ -2420,6 +2570,19 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                         <div className="dock-preview-actions">{renderCrLaunch()}</div>
                       </div>
                     )}
+                    {customMsgOn && cr.status === 'pending_code_review' && !decided && (
+                      <div className="dock-advice">
+                        <span className="dock-label">合并提交信息</span>
+                        <div className="dock-advice-row">
+                          <input
+                            value={commitMsg}
+                            onChange={e => setCommitMsg(e.target.value)}
+                            placeholder="留空则使用默认 AutoForge merge: <编号>"
+                            title="批准合并时作为 merge --no-ff 的提交信息"
+                          />
+                        </div>
+                      </div>
+                    )}
                     <div className="dock-advice">
                       <span className="dock-label">管理员建议 → Claude Code</span>
                       <div className="dock-advice-row">
@@ -2450,7 +2613,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       {/* 全屏阅读模式：报告 + 代码 Diff 双栏并排，铺满整窗，可调字号（风格对齐会议室阅读模式） */}
       {fsReader && cr && (
         <div className="reader-overlay diff-reader" style={{ ['--rs' as string]: String(diffScale) }}>
-          <div className="reader-bar">
+          <div className="reader-bar" onDoubleClick={toggleMaximizeOnDoubleClick}>
             <div className="reader-bar-info">
               <Icon name="maximize" size={15} />
               <span className="reader-bar-title">{issueTitles[cr.issue_id] || issuesById[cr.issue_id]?.title || '变更详情'}</span>
@@ -2520,23 +2683,24 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             </div>
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
               <LedgerView projectId={activeProject?.id ?? ''} refreshKey={ledgerRefresh} sel={sel}
-                onSelectIssue={id => {
+                onSelectIssue={async id => {
                   // 下钻到该需求并对齐审核闸口：有变更请求(已进入代码阶段，含已合并)→切「审核代码」选中其 CR；
                   // 否则仍在需求阶段→切「审核需求」选中该需求；triage/分析中等无可下钻目标的状态保持总账打开。
                   // 标记 gate 已定，避免默认落位 effect 覆盖此次跳转意图。
-                  const cr = crs.find(c => c.issue_id === id);
+                  // 分批加载下 CR 可能未载入，resolveCr 命中内存则直接用、否则按需补拉单条。
+                  const cr = await resolveCr(id);
                   if (cr) {
                     gateInitRef.current = loadedProjectId;
                     if (cr.status === 'merged') setShowMerged(true);  // 已合并 CR 需开启显示才会出现在左栏
                     setGate('code'); setSel({ kind: 'cr', id: cr.id }); setDecided(null); setShowLedger(false);
                   } else if (pendingIssues.some(i => i.id === id)) {
                     gateInitRef.current = loadedProjectId;
-                    setGate('requirement'); setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false);
+                    setGate('issue'); setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false);
                   }
                 }}
                 onRefineTriage={refineTriageItems} onRejectIssues={rejectIssuesItems}
                 showMerged={showMerged} onToggleMerged={() => setShowMerged(v => !v)}
-                mergedCount={crs.filter(c => c.status === 'merged').length}
+                mergedCount={mergedTotal}
                 initialStatus={ledgerStatus} />
             </div>
           </div>

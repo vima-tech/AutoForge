@@ -73,9 +73,9 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     // Run analysis (uses the analysis Agent's bound custom LLM; CLI only as fallback).
     // Distinguish a *genuine failure* (LLM transport error or an empty response)
     // from a real low-score result. A failure used to be silently swallowed by
-    // `unwrap_or_default()`, parking the issue at pending_review_1 with a blank,
+    // `unwrap_or_default()`, parking the issue at pending_issue_review with a blank,
     // misleading 0.5/0.5 analysis. Instead we now surface it: park the issue at
-    // `analysis_failed` so 审核1 shows the raw error + a "重新分析" entry point.
+    // `analysis_failed` so 需求审核 shows the raw error + a "重新分析" entry point.
     let trace_tags = crate::core::trace::TraceTags {
         issue_id: Some(issue_id.to_string()),
         project_id: Some(issue.project_id.clone()),
@@ -93,7 +93,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
         push("环境", &issue.environment);
         push("期望结果", &issue.expected);
         push("实际结果", &issue.actual);
-        // 审核 1 管理员补充意见：上一轮分析后人工提出，需据此重新评估该需求。
+        // 需求审核 管理员补充意见：上一轮分析后人工提出，需据此重新评估该需求。
         // 作为高优先输入并入描述，引导本轮分析。消费后下方清空，保证一次性。
         push("管理员补充意见（请据此重新评估本需求）", &issue.review_feedback);
         d
@@ -218,7 +218,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     // Update issue status and promote analysis suggestions into queue fields.
     sqlx::query(
         "UPDATE issues
-         SET status='pending_review_1',
+         SET status='pending_issue_review',
              priority=?,
              category=?,
              severity=?,
