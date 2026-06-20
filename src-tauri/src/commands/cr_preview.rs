@@ -14,7 +14,7 @@ use crate::core::git::GitProxy;
 use crate::models::change_request::ChangeRequest;
 use crate::models::project::Project;
 use crate::models::worktree::WorktreeSession;
-use crate::state::{worktrees_base, AppState, DevServerHandle};
+use crate::state::{worktrees_base, AppState, ChildHandle, DevServerHandle};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -326,7 +326,7 @@ pub async fn get_cr_preview(
     let key = format!("cr:{cr_id}");
 
     // If a server is already tracked for this CR, report its live status.
-    let handle_info: Option<(Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+    let handle_info: Option<(ChildHandle, String)> = {
         let servers = state.dev_servers.lock().await;
         servers.get(&key).map(|h| (h.child.clone(), h.url.clone()))
     };
@@ -752,7 +752,7 @@ pub async fn list_branch_previews(
         .unwrap_or_else(|| "web".to_string());
     let prefix = format!("branch:{project_id}:");
 
-    let entries: Vec<(String, Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+    let entries: Vec<(String, ChildHandle, String)> = {
         let servers = state.dev_servers.lock().await;
         servers
             .iter()
