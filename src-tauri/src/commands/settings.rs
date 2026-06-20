@@ -536,7 +536,7 @@ pub async fn create_agent(
     .bind(&initial)
     .bind(&payload.llm_id)
     .bind(&system_prompt)
-    .bind(&role_type)
+    .bind(role_type)
     .bind(&system_kind)
     .bind(&capabilities_json)
     .bind(max_concurrency)

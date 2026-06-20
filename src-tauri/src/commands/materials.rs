@@ -301,7 +301,7 @@ async fn get_or_create_material_folder(
     )
     .bind(&id)
     .bind(project_id)
-    .bind(&parent_id)
+    .bind(parent_id)
     .bind(name)
     .bind(&now)
     .bind(&now)
