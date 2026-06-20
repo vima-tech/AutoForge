@@ -5,8 +5,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// 可共享的子进程句柄：被开发预览服务器（dev_server / cr_preview）持有以便后续 kill。
+/// 抽取为 type alias 避免在多处裸写嵌套类型（消除 clippy::type_complexity）。
+pub type ChildHandle = Arc<Mutex<Option<tokio::process::Child>>>;
+
 pub struct DevServerHandle {
-    pub child: Arc<Mutex<Option<tokio::process::Child>>>,
+    pub child: ChildHandle,
     pub url: String,
 }
 

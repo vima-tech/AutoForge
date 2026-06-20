@@ -1,5 +1,5 @@
 use crate::models::project::Project;
-use crate::state::{AppState, DevServerHandle};
+use crate::state::{AppState, ChildHandle, DevServerHandle};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
@@ -184,7 +184,7 @@ pub async fn get_dev_server_status(
     state: State<'_, AppState>,
 ) -> Result<DevServerStatus, String> {
     // Clone what we need under the lock to avoid holding it across await
-    let handle_info: Option<(Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+    let handle_info: Option<(ChildHandle, String)> = {
         let servers = state.dev_servers.lock().await;
         servers
             .get(&project_id)
