@@ -53,6 +53,9 @@ typography:
   mono:
     fontFamily: '"JetBrains Mono", ui-monospace, "SFMono-Regular", monospace'
     usage: "代码、kicker/eyebrow、表单标签、chip、窗口标题等机械感文本"
+  reading:
+    fontFamily: '"Noto Serif SC", "Noto Sans SC", Georgia, serif'
+    usage: "仅会议室气泡正文（Markdown 段落/列表/引用/表格文字）——中文衬线营造报纸阅读质感，提升长文舒适度；标题仍用 display，代码仍用 mono"
   scale:
     micro: { fontSize: "10px" }      # 徽标、密集 chrome
     caption: { fontSize: "11px" }    # 元数据
@@ -316,12 +319,14 @@ AutoForge 是一个「Human-Lite-in-the-Loop」自主软件工厂的 Tauri 桌�
 - **Chip `.chip`**：mono 字 + pill 形 + caption 字号，语义变体 `.ember/.green/.blue/.violet/.red/.amber`（去边框 + tint 底）。
 - **Dot `.dot`**：状态小圆点，`.green/.amber` 带光环，`.gray` 用于离线/禁用。
 - **Card / Panel**：`.panel` = bg-2 + border + 16px 圆角 + `.panel-head`（带底分隔）。统计卡 `.stat` 用 icon|main|delta 网格。
-- **Segmented `.seg`**：分段切换，bg-3 容器，激活段 `.on` 提升到 bg 底 + shadow-sm。**用它替代 tab 切换**。
+- **Segmented `.seg`**：分段切换，bg-3 容器，激活段 `.on` 着 `--ember-tint-strong` 底 + `--ember-soft` 字 + shadow-sm + ember 内描边（呼应 rail 激活态，保证各主题下选中清晰可辨）。**用它替代 tab 切换**。
 - **Field `.field`**：纵向 label + 控件，label 为 mono 大写小字；输入 bg-3 + border-strong + 9px 圆角，focus 转 ember 边 + 光环。
 - **Switch `.switch`**：42×24 pill 开关，开态 ember 底。
 - **下拉 / 提及 `.proj-select` + `.mention-pop` + `.mention-row`**：**唯一允许的下拉模式**，统一项目选择、@提及、菜单。
 - **Avatar `.av`** / **Window shell `.os-window/.os-titlebar/.traffic`** / **导航 `.rail/.rail-item`** / **空态 `.empty`**：见 `src/index.css`。
-- **消息块**（会议室）：`md / code / file / image / artifact / quote_ref / file_written`，渲染于 `src/components/Block.tsx`，气泡用 `--bubble-me`（熔岩）/ `--bubble-them`。
+- **消息块**（会议室）：`md / code / file / image / artifact / quote_ref / file_written`，渲染于 `src/components/Block.tsx`，气泡用 `--bubble-me`（熔岩）/ `--bubble-them`。气泡底叠加极淡「报纸波点」网点纹理（`--paper-dot` radial-gradient，7–8px 网格，随主题自适应），正文用 `--font-reading` 中文衬线，宽度上限 `max-width: 90%`。
+- **长文档流**（`.bubble.doc`）：长 Markdown 消息（Agent 发言 ≥600 字符或含 ≥2 标题）跳出气泡，改用中性 `--bg-2` 面板 + 波点纹理 + `--measure`（780px）阅读行宽 + `--leading-prose` 行高，标题分级带分隔线/ember 标记，全文常显无需展开。
+- **弹窗 / 模态**：遮罩用 `position:fixed` + `inset: var(--win-gutter,0)` + `border-radius:14px`（保护圆角窗留白槽），面板用 `--bg-2` + `--shadow-lg`。**禁止点击遮罩关闭弹窗**——关闭只走显式入口（右上角 `.icon-btn` ✕ 按钮 + `Esc` 键），避免误触丢失输入。遮罩层不挂 `onClick/onMouseDown={onClose}`。
 
 动效：入场 `.rise`（translateY 9px，.34s）、`typing` 三点、carousel 滚入。全部尊重
 `prefers-reduced-motion` 与 `[data-motion="off"]`。交互过渡统一 .08–.18s。
@@ -342,6 +347,7 @@ AutoForge 是一个「Human-Lite-in-the-Loop」自主软件工厂的 Tauri 桌�
 
 - ❌ 硬编码十六进制颜色或 px 字号（会破坏主题切换与一致性）。
 - ❌ 使用原生 `<select>` 控件。
+- ❌ 让弹窗/模态点击遮罩就关闭（遮罩层挂 `onClose`）；关闭只走 ✕ 按钮与 `Esc`。
 - ❌ 引入第二个品牌强调色，或把语义色（绿/蓝/紫）当装饰铺设。
 - ❌ 引入 MUI/Antd 等第三方 UI 框架（仅 React + 自有 CSS）。
 - ❌ 用纯灰/纯黑中性色（本系统中性色一律带暖橙倾向）。

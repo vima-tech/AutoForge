@@ -1221,15 +1221,36 @@ pub async fn agent_reply(
         image_paths.len(),
         t0.elapsed()
     );
-    // 构建该 Agent 的工具集：内置工具(capabilities 白名单) + 勾选了它的 MCP server 工具。
-    let registry = crate::agents::tools::build_registry_for_agent(&state.db, &agent).await;
-    let reply_text = crate::agents::llm::run_agent_text_with_tools(
-        &state.db,
-        &agent,
-        &prompt,
-        system_prompt,
-        &image_paths,
-        &registry,
+    // 构建该 Agent 的工具集：内置工具(capabilities 白名单) + 代码扫描(项目仓库) + 勾选的 MCP server 工具。
+    // 直聊可能未绑定项目（project_id 为 NULL），此时代码扫描工具不会注册。
+    let project_id: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM conversations WHERE id=?")
+            .bind(&conversation_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    let tool_ctx =
+        crate::agents::tools::ToolContext::resolve(&state.db, project_id.as_deref()).await;
+    let registry =
+        crate::agents::tools::build_registry_for_agent(&state.db, &agent, &tool_ctx).await;
+    // trace 关联标签：直聊回复的 LLM/工具 span 带上会议室/项目，便于按会议室筛选。
+    let trace_tags = crate::core::trace::TraceTags {
+        conversation_id: Some(conversation_id.clone()),
+        project_id: project_id.clone(),
+        ..Default::default()
+    };
+    let reply_text = crate::core::trace::with_tags(
+        trace_tags,
+        crate::agents::llm::run_agent_text_with_tools(
+            &state.db,
+            &agent,
+            &prompt,
+            system_prompt,
+            &image_paths,
+            &registry,
+        ),
     )
     .await
     .unwrap_or_else(|e| {

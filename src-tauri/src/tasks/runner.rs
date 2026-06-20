@@ -74,7 +74,7 @@ pub fn start(db: Db, app: tauri::AppHandle, concurrency: Arc<ConcurrencyManager>
                     // Execution slot is freed once the agent finishes.
                     concurrency2.slot_released();
                     // Count a review slot ONLY if the CR actually parked at
-                    // pending_review_2. The auto-merge path (gate downgrade) sends
+                    // pending_code_review. The auto-merge path (gate downgrade) sends
                     // it straight to pending_merge and never calls review_2, so
                     // counting it here would leak the counter upward forever and
                     // eventually trip the pause threshold.
@@ -87,7 +87,7 @@ pub fn start(db: Db, app: tauri::AppHandle, concurrency: Arc<ConcurrencyManager>
                         .await
                         .ok()
                         .flatten()
-                        .map(|(s,)| s == "pending_review_2")
+                        .map(|(s,)| s == "pending_code_review")
                         .unwrap_or(false);
                         if parked {
                             concurrency2.transition_to_pending_review();
@@ -164,9 +164,9 @@ async fn wait_for_execution_slot(
             "UPDATE change_requests SET status='executing', updated_at=datetime('now')
              WHERE id=? AND status='pending_execution'
                AND (SELECT COUNT(*) FROM change_requests
-                    WHERE project_id=? AND status IN ('executing','pending_review_2')) < ?
+                    WHERE project_id=? AND status IN ('executing','pending_code_review')) < ?
                AND (SELECT COUNT(*) FROM change_requests
-                    WHERE status='pending_review_2') < ?",
+                    WHERE status='pending_code_review') < ?",
         )
         .bind(cr_id)
         .bind(&project_id)

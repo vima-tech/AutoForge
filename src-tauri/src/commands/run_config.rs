@@ -117,6 +117,14 @@ pub async fn ai_generate_run_config(
         .map_err(|e| e.to_string())?
         .ok_or("项目不存在")?;
 
+    // 栈画像检测：先用 core::stack 给出一份**可靠的默认运行配置建议**，
+    // 既作为草稿底座（AI 留空也有合理默认），又作为 AI 的判断依据，避免空猜。
+    let suggestion = if project.repo_path.is_empty() {
+        crate::core::stack::RunConfigSuggestion::default()
+    } else {
+        crate::core::stack::suggest_run_config(std::path::Path::new(&project.repo_path))
+    };
+
     // 扫描仓库关键构建文件，给 AI 可靠依据（每个截前 1200 字）。
     let mut hints: Vec<String> = Vec::new();
     let mut is_tauri = false;
@@ -148,12 +156,32 @@ pub async fn ai_generate_run_config(
         hints.join("\n\n")
     };
 
+    // 把栈画像建议序列化进提示：AI 在此基础上确认/修正，而不是从零猜。
+    let suggested_json = serde_json::json!({
+        "dev_kind": suggestion.dev_kind,
+        "dev_command": suggestion.dev_command,
+        "app_command": suggestion.app_command,
+        "test_unit": suggestion.test_unit,
+        "test_integration": suggestion.test_integration,
+        "quality_lint": suggestion.lint,
+        "quality_typing": suggestion.typing,
+        "quality_security": suggestion.security,
+        "project_language": suggestion.language,
+        "project_framework": suggestion.framework,
+        "preview_build": suggestion.build_command,
+        "preview_start": suggestion.start_command,
+    });
+
     let prompt = format!(
         r#"根据项目信息与仓库构建文件，推断 AutoForge「运行配置」并输出 JSON。
 
 项目名称：{name}
 项目描述：{desc}
 检测到 Tauri 桌面项目：{tauri}
+
+自动栈检测：{stack_summary}
+基于栈检测的默认建议（合理则沿用，不合理则按仓库实际修正）：
+{suggested}
 
 仓库构建文件摘要：
 {hints}
@@ -174,6 +202,8 @@ pub async fn ai_generate_run_config(
         name = project.name,
         desc = project.description,
         tauri = is_tauri,
+        stack_summary = suggestion.summary,
+        suggested = serde_json::to_string_pretty(&suggested_json).unwrap_or_default(),
         hints = hints_text,
     );
 
@@ -190,7 +220,35 @@ pub async fn ai_generate_run_config(
 
     let start = raw.find('{').ok_or("AI 返回格式错误，未找到 JSON")?;
     let end = raw.rfind('}').ok_or("AI 返回 JSON 不完整")?;
-    let draft: RunConfigDraft =
+    let ai: RunConfigDraft =
         serde_json::from_str(&raw[start..=end]).map_err(|e| format!("解析 AI 输出失败: {}", e))?;
+
+    // 合并：以栈检测建议为底座，AI 给出的非空字段覆盖之。这样即便 AI 漏填，
+    // 检测出的可靠默认（如 `mvn -q test` / `go test ./...`）仍会保留。
+    let draft = merge_draft(&suggestion, ai);
     Ok(draft)
+}
+
+/// 用栈检测建议作底座，AI 非空字段覆盖之。脱敏/超时类字段只由 AI 给（建议里没有）。
+fn merge_draft(s: &crate::core::stack::RunConfigSuggestion, ai: RunConfigDraft) -> RunConfigDraft {
+    fn pick(ai: Option<String>, base: Option<String>) -> Option<String> {
+        ai.filter(|v| !v.trim().is_empty()).or(base)
+    }
+    RunConfigDraft {
+        dev_kind: pick(ai.dev_kind, s.dev_kind.clone()),
+        dev_command: pick(ai.dev_command, s.dev_command.clone()),
+        app_command: pick(ai.app_command, s.app_command.clone()),
+        test_unit: pick(ai.test_unit, s.test_unit.clone()),
+        test_unit_timeout: ai.test_unit_timeout,
+        test_integration: pick(ai.test_integration, s.test_integration.clone()),
+        test_integration_timeout: ai.test_integration_timeout,
+        quality_lint: pick(ai.quality_lint, s.lint.clone()),
+        quality_typing: pick(ai.quality_typing, s.typing.clone()),
+        quality_security: pick(ai.quality_security, s.security.clone()),
+        project_language: pick(ai.project_language, s.language.clone()),
+        project_framework: pick(ai.project_framework, s.framework.clone()),
+        preview_build: pick(ai.preview_build, s.build_command.clone()),
+        preview_start: pick(ai.preview_start, s.start_command.clone()),
+        deploy_command: ai.deploy_command,
+    }
 }

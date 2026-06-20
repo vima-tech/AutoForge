@@ -38,9 +38,19 @@ fn merge_secret_map(stored: &str, incoming: &str) -> String {
 }
 
 fn mask(mut s: McpServer) -> McpServer {
-    s.env_json = mask_map_values(&s.env_json);
-    s.headers_json = mask_map_values(&s.headers_json);
+    // env/headers 落库为密文：先解密回 JSON，再对 value 掩码出库。
+    let env = crate::core::secrets::decrypt(&s.env_json).unwrap_or_default();
+    let headers = crate::core::secrets::decrypt(&s.headers_json).unwrap_or_default();
+    s.env_json = mask_map_values(&env);
+    s.headers_json = mask_map_values(&headers);
     s
+}
+
+/// 合并旧密钥（库内密文）与前台明文 incoming，再整体加密落库。
+fn merge_and_encrypt(stored_ct: &str, incoming: &str) -> Result<String, String> {
+    let stored = crate::core::secrets::decrypt(stored_ct)?;
+    let merged = merge_secret_map(&stored, incoming);
+    crate::core::secrets::encrypt_field(&merged)
 }
 
 #[tauri::command]
@@ -62,6 +72,12 @@ pub async fn create_mcp_server(
         Some("http") => "http",
         _ => "stdio",
     };
+    // env/headers 可能含密钥：整体加密落库（见 core::secrets）。
+    let env_json =
+        crate::core::secrets::encrypt_field(&payload.env_json.unwrap_or_else(|| "{}".to_string()))?;
+    let headers_json = crate::core::secrets::encrypt_field(
+        &payload.headers_json.unwrap_or_else(|| "{}".to_string()),
+    )?;
     sqlx::query(
         "INSERT INTO mcp_servers
          (id, name, transport, command, args_json, env_json, url, headers_json, agent_ids_json, enabled)
@@ -72,9 +88,9 @@ pub async fn create_mcp_server(
     .bind(transport)
     .bind(payload.command.unwrap_or_default())
     .bind(payload.args_json.unwrap_or_else(|| "[]".to_string()))
-    .bind(payload.env_json.unwrap_or_else(|| "{}".to_string()))
+    .bind(&env_json)
     .bind(payload.url.unwrap_or_default())
-    .bind(payload.headers_json.unwrap_or_else(|| "{}".to_string()))
+    .bind(&headers_json)
     .bind(payload.agent_ids_json.unwrap_or_else(|| "[]".to_string()))
     .bind(payload.enabled.unwrap_or(true))
     .execute(&state.db)
@@ -118,7 +134,7 @@ pub async fn update_mcp_server(
     }
     if let Some(v) = payload.env_json {
         sets.push("env_json=?");
-        values.push(merge_secret_map(&existing.env_json, &v));
+        values.push(merge_and_encrypt(&existing.env_json, &v)?);
     }
     if let Some(v) = payload.url {
         sets.push("url=?");
@@ -126,7 +142,7 @@ pub async fn update_mcp_server(
     }
     if let Some(v) = payload.headers_json {
         sets.push("headers_json=?");
-        values.push(merge_secret_map(&existing.headers_json, &v));
+        values.push(merge_and_encrypt(&existing.headers_json, &v)?);
     }
     if let Some(v) = payload.agent_ids_json {
         sets.push("agent_ids_json=?");

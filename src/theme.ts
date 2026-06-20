@@ -155,3 +155,115 @@ export function parseRailMode(value: string | null | undefined): RailMode {
 export function applyRailMode(mode: RailMode): void {
   document.documentElement.setAttribute('data-rail', mode);
 }
+
+// ---- 标题栏系统资源监视（CPU/内存占用）----
+// 纯前端偏好，沿用主题/导航栏模式落 localStorage。默认开启；关闭后标题栏不再轮询/显示。
+export const RES_MONITOR_KEY = 'AutoForge:resMonitor';
+export const RES_MONITOR_CHANGED_EVENT = 'AutoForge:res-monitor-changed';
+
+export function parseResMonitor(value: string | null | undefined): boolean {
+  // 缺省（从未设置）视为开启；仅显式存 'off' 才关闭。
+  return value !== 'off';
+}
+
+// ---- 速录念头全局快捷键 ----
+// 组合键基于 KeyboardEvent.code（与键盘布局无关的物理键，如 'KeyN' / 'Space'），
+// 配合四个修饰键标志。存为 JSON 落 localStorage，沿用主题/导航栏的纯前端偏好模式。
+export interface ShortcutCombo {
+  ctrl: boolean;
+  meta: boolean;
+  alt: boolean;
+  shift: boolean;
+  code: string;
+}
+
+export interface QuickCaptureShortcut {
+  enabled: boolean;
+  combo: ShortcutCombo;
+}
+
+export const QUICK_CAPTURE_SHORTCUT_KEY = 'AutoForge:quickCaptureShortcut';
+// 快速语音录入快捷键：在任意含语音录入的界面（会议室 Composer、速录念头…）切换录音。
+export const VOICE_INPUT_SHORTCUT_KEY = 'AutoForge:voiceInputShortcut';
+// 配置变更后在 window 上派发，让 App 实时重读（无需刷新即生效）。
+export const SHORTCUT_CHANGED_EVENT = 'AutoForge:shortcut-changed';
+
+const isMac = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform);
+
+export const DEFAULT_QUICK_CAPTURE_SHORTCUT: QuickCaptureShortcut = {
+  enabled: true,
+  // macOS 上是 ⌥N，其余平台 Alt+N —— 避开 Ctrl/⌘+Shift+I/J/C 等 devtools 组合。
+  combo: { ctrl: false, meta: false, alt: true, shift: false, code: 'KeyN' },
+};
+
+export const DEFAULT_VOICE_INPUT_SHORTCUT: QuickCaptureShortcut = {
+  enabled: true,
+  // macOS 上是 ⌥M，其余平台 Alt+M（M = mic）—— 避开速录的 Alt+N 与 devtools 组合。
+  combo: { ctrl: false, meta: false, alt: true, shift: false, code: 'KeyM' },
+};
+
+// 通用快捷键反序列化：JSON 解析失败或缺主键时回退到给定默认值。
+export function parseShortcut(value: string | null | undefined, fallback: QuickCaptureShortcut): QuickCaptureShortcut {
+  if (!value) return fallback;
+  try {
+    const raw = JSON.parse(value) as { enabled?: unknown; combo?: Partial<ShortcutCombo> };
+    const c = raw.combo;
+    if (!c || typeof c.code !== 'string' || !c.code) return fallback;
+    return {
+      enabled: raw.enabled !== false,
+      combo: { ctrl: !!c.ctrl, meta: !!c.meta, alt: !!c.alt, shift: !!c.shift, code: c.code },
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+export function parseQuickCaptureShortcut(value: string | null | undefined): QuickCaptureShortcut {
+  return parseShortcut(value, DEFAULT_QUICK_CAPTURE_SHORTCUT);
+}
+
+export function parseVoiceInputShortcut(value: string | null | undefined): QuickCaptureShortcut {
+  return parseShortcut(value, DEFAULT_VOICE_INPUT_SHORTCUT);
+}
+
+// 该键本身只是修饰键（尚未按下主键时不应记录组合）。
+export function isModifierCode(code: string): boolean {
+  return /^(Control|Shift|Alt|Meta)(Left|Right)$/.test(code);
+}
+
+export function comboHasModifier(combo: ShortcutCombo): boolean {
+  return combo.ctrl || combo.meta || combo.alt || combo.shift;
+}
+
+function codeLabel(code: string): string {
+  if (code.startsWith('Key')) return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
+  if (code.startsWith('Numpad')) return 'Num' + code.slice(6);
+  const map: Record<string, string> = {
+    Space: 'Space', Enter: 'Enter', Tab: 'Tab', Backquote: '`',
+    Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']',
+    Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/', Backslash: '\\',
+    ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→',
+  };
+  return map[code] ?? code;
+}
+
+export function formatCombo(combo: ShortcutCombo): string {
+  const parts: string[] = [];
+  if (combo.ctrl) parts.push(isMac ? '⌃' : 'Ctrl');
+  if (combo.alt) parts.push(isMac ? '⌥' : 'Alt');
+  if (combo.shift) parts.push(isMac ? '⇧' : 'Shift');
+  if (combo.meta) parts.push(isMac ? '⌘' : 'Meta');
+  parts.push(codeLabel(combo.code));
+  return parts.join(isMac ? ' ' : ' + ');
+}
+
+export function comboMatchesEvent(combo: ShortcutCombo, e: KeyboardEvent): boolean {
+  return (
+    e.ctrlKey === combo.ctrl &&
+    e.metaKey === combo.meta &&
+    e.altKey === combo.alt &&
+    e.shiftKey === combo.shift &&
+    e.code === combo.code
+  );
+}

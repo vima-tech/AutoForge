@@ -1,22 +1,42 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, Fragment } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
+import { refreshAgents } from '../agents-store';
 import Select from '../components/Select';
-import { THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode, type ThemeMode, type ThemeSelection, type RailMode } from '../theme';
+import { fmtFull } from '../utils/datetime';
+import {
+  THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode,
+  RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, parseResMonitor,
+  QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT,
+  DEFAULT_QUICK_CAPTURE_SHORTCUT, DEFAULT_VOICE_INPUT_SHORTCUT,
+  parseQuickCaptureShortcut, parseVoiceInputShortcut, formatCombo, isModifierCode, comboHasModifier,
+  type ThemeMode, type ThemeSelection, type RailMode, type QuickCaptureShortcut, type ShortcutCombo,
+} from '../theme';
 import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
   getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
-  listPreviewEnvironments, listTestSessions, listAdminDecisions,
+  listPreviewEnvironments, listTestSessions, listAdminDecisions, listJobFailures,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
-  listNotifyChannels, createNotifyChannel, deleteNotifyChannel, testNotifyChannel,
+  listNotifyChannels, createNotifyChannel, updateNotifyChannel, deleteNotifyChannel, testNotifyChannel,
+  clawbotStartLogin, clawbotPollLogin,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
+  getAutoConflictResolveEnabled, setAutoConflictResolveEnabled,
+  getCustomMergeMessageEnabled, setCustomMergeMessageEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   getWebSearchSettings, setWebSearchSettings,
+  getOpenDesignSettings, setOpenDesignSettings, getOpenDesignLog, type OpenDesignSettings,
+  getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
+  getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, autosupplyIsRunning, type AutosupplySettings as AutosupplyT,
+  getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
+  listBuiltinTools, type BuiltinToolInfo,
+  getSecretBackendStatus, type SecretBackend,
+  exportConfig, importConfig, revealBackup, type BackupSummary, type ExportResult,
   listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
   type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
@@ -24,11 +44,24 @@ import {
   type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
   type WebSearchSettings,
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
+  type JobFailure,
+  listCodeAgents, upsertCodeAgent, deleteCodeAgent, setDefaultCodeAgent,
+  setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
-  return <button className={'switch' + (on ? ' on' : '')} onClick={onToggle}><i /></button>;
+  // type=button 避免默认 submit 行为；stopPropagation/preventDefault 杜绝 WebKitGTK 下
+  // <button> 内嵌 <label> 时父级 label 二次激活导致的“点了没反应/瞬间回弹”。
+  return (
+    <button
+      type="button"
+      className={'switch' + (on ? ' on' : '')}
+      onClick={e => { e.preventDefault(); e.stopPropagation(); onToggle(); }}
+    >
+      <i />
+    </button>
+  );
 }
 
 function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCancel: () => void }) {
@@ -104,9 +137,15 @@ function LLMSettings() {
   const [saving, setSaving] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [secretBackend, setSecretBackend] = useState<SecretBackend | null>(null);
+  // 切页会卸载本组件，但测试连接等异步 IPC 仍在飞行；用此 ref 拦截卸载后的 setState，
+  // 避免无效更新与告警。准确的模型信息已落库，重新进入页面时 useEffect 会重新拉取。
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   useEffect(() => {
-    listLlmConfigs().then(cs => { setConfigs(cs); setLoading(false); }).catch(() => setLoading(false));
+    listLlmConfigs().then(cs => { if (mounted.current) { setConfigs(cs); setLoading(false); } }).catch(() => { if (mounted.current) setLoading(false); });
+    getSecretBackendStatus().then(s => { if (mounted.current) setSecretBackend(s); }).catch(() => {});
   }, []);
 
   const setDraft = (id: string, field: string, val: unknown) =>
@@ -137,9 +176,19 @@ function LLMSettings() {
   const testConn = async (id: string) => {
     setTesting(id);
     setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
-    const result = await testLlmConnection(id, drafts[id]).catch(e => String(e));
-    setTestResult(r => ({ ...r, [id]: result }));
-    setTesting(null);
+    try {
+      // 测试连接同时刷新上下文窗口与多模态能力，回灌到配置展示。
+      const { message, config } = await testLlmConnection(id, drafts[id]);
+      if (!mounted.current) return; // 已切页：结果已落库，下次进页面会重新拉取
+      setTestResult(r => ({ ...r, [id]: message }));
+      setConfigs(cs => cs.map(c => c.id === id
+        ? { ...c, ctx_window: config.ctx_window, supports_vision: config.supports_vision }
+        : c));
+    } catch (e) {
+      if (mounted.current) setTestResult(r => ({ ...r, [id]: String(e) }));
+    } finally {
+      if (mounted.current) setTesting(null);
+    }
   };
 
   const doDelete = async (id: string) => {
@@ -164,6 +213,15 @@ function LLMSettings() {
       {confirmDel && <ConfirmModal msg="确认删除此 LLM 配置？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
       <div className="set-h">LLM 配置</div>
       <div className="set-desc">管理多个大模型连接。每个 Agent 可指派不同的 LLM。</div>
+      {secretBackend && (
+        <div className="chip" style={{ marginBottom: 12 }}
+          title={secretBackend === 'keychain'
+            ? 'API Key 经 AES-256-GCM 加密落库，主密钥保存在系统钥匙环'
+            : '未检测到系统钥匙环：主密钥退化保存为 0600 本地文件，安全性弱于钥匙环'}>
+          <Icon name={secretBackend === 'keychain' ? 'shield' : 'alert'} size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
+          {secretBackend === 'keychain' ? '密钥加密：系统钥匙环' : '密钥加密：文件兜底（无钥匙环）'}
+        </div>
+      )}
       {configs.map(c => {
         const d = drafts[c.id] ?? {};
         const v = (f: keyof LlmConfig) => (d as Record<string, unknown>)[f] !== undefined ? (d as Record<string, unknown>)[f] as string : c[f] as string;
@@ -193,11 +251,28 @@ function LLMSettings() {
                 <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />API Key</label>
                   <input className="mono" value={v('api_key')} onChange={e => setDraft(c.id, 'api_key', e.target.value)} type="password" />
                 </div>
-                <div className="field"><label>上下文窗口</label><input value={v('ctx_window')} onChange={e => setDraft(c.id, 'ctx_window', e.target.value)} /></div>
+                <div className="field"><label>上下文窗口 · 自动</label>
+                  <div className="mono" title="由后端按模型查表 + 接口探测自动得出；创建与修改模型/接口后自动刷新"
+                    style={{ padding: '9px 11px', color: 'var(--text-2)', fontSize: 'var(--text-control)',
+                      background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                    {v('ctx_window') || '未知'}
+                  </div>
+                </div>
                 <div className="field"><label>Temperature</label>
                   <input type="number" step="0.1" min="0" max="2"
                     value={d.temperature !== undefined ? String(d.temperature) : String(c.temperature)}
                     onChange={e => setDraft(c.id, 'temperature', parseFloat(e.target.value))} />
+                </div>
+                <div className="field full">
+                  <label><Icon name="image" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />多模态 · 图片识别 · 自动</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span className={'chip ' + (c.supports_vision ? 'green' : '')}>
+                      {c.supports_vision ? '● 支持' : '不支持'}
+                    </span>
+                    <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-3)', flex: 1 }}>
+                      由后端按模型名自动识别；创建与修改模型后自动更新。支持时，绑定此 LLM 的 Agent 可识别会议室中的图片附件。
+                    </span>
+                  </div>
                 </div>
                 <div className="field full" style={{ gap: 10, marginTop: 4 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -241,38 +316,223 @@ const AGENT_TEMPLATES: { label: string; prompt: string }[] = [
   { label: '分析', prompt: '你是分析师。基于事实拆解问题，给出选项、取舍与明确建议，必要时量化，并标注假设与不确定性。' },
 ];
 
-// capabilities_json 工具白名单读写：约定 {"tools":["web_search",...]}。
-function agentHasTool(capJson: string | undefined, tool: string): boolean {
+// capabilities_json 工具白名单：规范形状为 {"tools":[...]}（后端 allowed_tools_from_capabilities
+// 也只读 .tools）。但历史数据里它存的是扁平语义标签数组（如 ["planning","routing"]），
+// 这类数组从未被工具系统消费。下方读取时一律归一，写入时统一输出 {"tools":[...]}——
+// 这样首次切换即把旧数组迁移成对象形状，开关才真正生效。
+// 注意：旧实现 `obj.tools=[...]` 若 obj 是数组，JSON.stringify(数组) 会丢弃该属性 → 改动丢失（点了没反应）。
+function capTools(capJson: string | undefined): string[] {
   try {
-    const arr = (JSON.parse(capJson || '{}') as { tools?: unknown }).tools;
-    return Array.isArray(arr) && arr.includes(tool);
-  } catch { return false; }
+    const v = JSON.parse(capJson || '{}') as unknown;
+    if (Array.isArray(v)) return []; // 旧版扁平标签数组：不含任何工具
+    const arr = (v as { tools?: unknown })?.tools;
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
+  } catch { return []; }
+}
+function agentHasTool(capJson: string | undefined, tool: string): boolean {
+  return capTools(capJson).includes(tool);
 }
 function toggleAgentTool(capJson: string | undefined, tool: string, on: boolean): string {
-  let obj: Record<string, unknown> = {};
-  try { obj = (JSON.parse(capJson || '{}') as Record<string, unknown>) || {}; } catch { obj = {}; }
-  const set = new Set<string>(Array.isArray(obj.tools) ? (obj.tools as string[]) : []);
+  const set = new Set<string>(capTools(capJson));
   if (on) set.add(tool); else set.delete(tool);
-  obj.tools = [...set];
-  return JSON.stringify(obj);
+  return JSON.stringify({ tools: [...set] });
+}
+
+// 内置工具目录：进程内缓存一次，所有能力开关从后端目录动态渲染——后端新增工具自动出现。
+let _builtinToolsCache: BuiltinToolInfo[] | null = null;
+function useBuiltinTools(): BuiltinToolInfo[] {
+  const [tools, setTools] = useState<BuiltinToolInfo[]>(_builtinToolsCache ?? []);
+  useEffect(() => {
+    if (_builtinToolsCache) return;
+    listBuiltinTools().then(t => { _builtinToolsCache = t; setTools(t); }).catch(() => {});
+  }, []);
+  return tools;
+}
+
+// ── 语音录入（ASR）设置 ───────────────────────────────────────────────────────
+function AsrSettings() {
+  const [cfg, setCfg] = useState<AsrSettingsT>({ provider: 'aliyun', endpoint: '', model: '', language: 'zh', api_key_set: false });
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getAsrSettings().then(c => setCfg(c)).catch(e => setStatus(String(e))); }, []);
+
+  // 全部语音识别统一走阿里百炼 DashScope，只需 API Key。
+  const enabled = cfg.api_key_set || apiKey.trim().length > 0;
+
+  const save = async () => {
+    setBusy(true); setStatus('');
+    try {
+      // 收敛到百炼：provider 固定 aliyun、endpoint 不再使用。
+      const r = await setAsrSettings('aliyun', '', cfg.model, cfg.language, apiKey.trim() || undefined);
+      setCfg(r); setApiKey(''); setStatus('已保存');
+    } catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">语音录入</div>
+      <div className="set-desc">配置语音识别（ASR）。所有语音识别——<strong>实时麦克风口述</strong>（速录/会议室边说边出字）与<strong>会议录音上传</strong>（整场录音转写+拆需求）——统一走<strong>阿里百炼 ASR</strong>（DashScope 实时流式，模型默认 paraformer-realtime-v2），只需填百炼 API Key，无需 Endpoint。结果视为不可信外部输入，提交时自动过安全过滤。</div>
+
+      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-top" style={{ gap: 10 }}>
+          <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="mic" size={15} /></div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">语音转写 · ASR</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>INPUT</span>
+            </div>
+            <div className="cfg-sub">口述需求 → 转写文本 → 可改错别字后提交</div>
+          </div>
+          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未配置'}</span>
+        </div>
+
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field"><label>模型（可空，默认 paraformer-realtime-v2）</label>
+            <input type="text" className="mono" value={cfg.model} placeholder="paraformer-realtime-v2"
+              onChange={e => setCfg(c => ({ ...c, model: e.target.value }))} />
+          </div>
+          <div className="field"><label>语言（可空，自动检测）</label>
+            <input type="text" className="mono" value={cfg.language} placeholder="zh"
+              onChange={e => setCfg(c => ({ ...c, language: e.target.value }))} />
+          </div>
+          <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />API Key</label>
+            <input type="password" className="mono" value={apiKey}
+              placeholder={cfg.api_key_set ? '已设置（留空则不修改）' : 'sk-...'}
+              onChange={e => setApiKey(e.target.value)} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存语音配置</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── 工厂自喂料（autosupply）设置 ──────────────────────────────────────────────
+function AutosupplySettings() {
+  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20, analyze_enabled: true, triage_enabled: true });
+  const [level, setLevel] = useState<AutonomyLevel>('strict');
+  const [busy, setBusy] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => {
+    getAutosupplySettings().then(setCfg).catch(e => setStatus(String(e)));
+    getAutonomyLevel().then(setLevel).catch(() => {});
+    // 状态真源在后端：切页重挂载时查询当前是否有一轮在跑，恢复「运行中」回显，
+    // 并订阅 AutosupplyStatus 事件实时跟随开始/结束（手动或周期调度均覆盖）。
+    autosupplyIsRunning().then(setRunning).catch(() => {});
+    let unlisten: (() => void) | undefined;
+    listen<{ type?: string; running?: boolean }>('AutoForge://event', e => {
+      if (e.payload?.type === 'autosupply_status') setRunning(!!e.payload.running);
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  const changeLevel = async (l: AutonomyLevel) => {
+    setLevel(l);
+    try { await setAutonomyLevel(l); setCfg(await getAutosupplySettings()); setStatus('信任档位已应用'); }
+    catch (e) { setStatus(String(e)); }
+  };
+
+  const save = async (next: AutosupplyT) => {
+    setCfg(next); setBusy(true); setStatus('');
+    try { setCfg(await setAutosupplySettings(next)); setStatus('已保存'); }
+    catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+  const runNow = async () => {
+    setRunning(true); setStatus('');
+    try { const r = await runAutosupplyNow(); setStatus(`本轮入待整理池 ${r.new_issues} 条`); }
+    catch (e) { setStatus(String(e)); }
+    finally { setRunning(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">自动供料</div>
+      <div className="set-desc">让工厂自己找活干：周期性扫描代码 + proposer 主动提议改进，产物<strong>全部进「待整理池」，绝不自动进流水线</strong>，等你在功能审计里整理确认。两道人工审核闸在任何档位都保留。</div>
+
+      <div className="cfg-card" style={{ marginBottom: 14 }}>
+        <div className="field full" style={{ margin: 0 }}>
+          <label>信任档位（autonomy）</label>
+          <Select value={level} onChange={v => changeLevel(v as AutonomyLevel)}
+            options={[
+              { value: 'strict', label: 'Strict · 最紧（proposer 关 · 每轮 10 · 推荐）' },
+              { value: 'standard', label: 'Standard · 标准（proposer 关 · 每轮 20）' },
+              { value: 'loose', label: 'Loose · 放手（proposer 开 · 每轮 40）' },
+            ]} />
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 6 }}>档位应用预设到下方自喂料参数；不改变审核闸/并发/合并——裁决权始终在你手里。信任长出来再往上拧。</span>
+        </div>
+      </div>
+
+      <div className="cfg-card" style={{ borderColor: cfg.enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-fields rise" style={{ marginTop: 0 }}>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.enabled} onToggle={() => save({ ...cfg, enabled: !cfg.enabled })} />
+            <span style={{ fontWeight: 600 }}>启用周期自喂料</span>
+          </div>
+          <div className="field"><label>间隔（分钟）</label>
+            <input type="number" min="5" value={cfg.interval_min}
+              onChange={e => setCfg(c => ({ ...c, interval_min: Math.max(5, Number(e.target.value) || 1440) }))}
+              onBlur={() => save(cfg)} />
+          </div>
+          <div className="field"><label>每轮入池上限</label>
+            <input type="number" min="1" max="200" value={cfg.max_per_run}
+              onChange={e => setCfg(c => ({ ...c, max_per_run: Math.max(1, Math.min(200, Number(e.target.value) || 20)) }))}
+              onBlur={() => save(cfg)} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.scan_enabled} onToggle={() => save({ ...cfg, scan_enabled: !cfg.scan_enabled })} />
+            <span>代码扫描（TODO / cargo · npm · pip · go 依赖审计）</span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.analyze_enabled} onToggle={() => save({ ...cfg, analyze_enabled: !cfg.analyze_enabled })} />
+            <span>静态代码分析<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（按栈跑 clippy / ruff / go vet / eslint，发现真实代码问题；编译型较耗时）</span></span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.triage_enabled} onToggle={() => save({ ...cfg, triage_enabled: !cfg.triage_enabled })} />
+            <span>前置整理（自动滤噪）<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（入池即跑 triage 滤掉噪音、归一化，幸存条目仍候人工闸口）</span></span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
+            <Switch on={cfg.proposer_enabled} onToggle={() => save({ ...cfg, proposer_enabled: !cfg.proposer_enabled })} />
+            <span>proposer 工程提议<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（默认关，需绑定 proposer 角色 LLM）</span></span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 4 }}>
+            <button className="btn" disabled={running} onClick={runNow}>
+              <Icon name="refresh" size={14} style={{ animation: running ? 'spin 1s linear infinite' : undefined }} />{running ? '运行中…' : '立即跑一轮'}
+            </button>
+            {(busy || status) && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{busy ? '保存中…' : status}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ToolsSettings() {
-  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false });
+  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false, fetch_content: false });
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
 
   useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
 
+  // 生效 provider：未配置/配置不全一律退回免 Key 的 DuckDuckGo，故默认始终可用。
+  const eff = ws.provider || 'duckduckgo';
   const enabled =
-    (ws.provider === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
-    (ws.provider === 'searxng' && ws.endpoint.trim().length > 0);
+    eff === 'duckduckgo' ||
+    (eff === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
+    (eff === 'searxng' && ws.endpoint.trim().length > 0);
 
   const save = async () => {
     setBusy(true);
     try {
-      const r = await setWebSearchSettings(ws.provider, ws.endpoint, ws.max_results, apiKey.trim() || undefined);
+      const r = await setWebSearchSettings(ws.provider || 'duckduckgo', ws.endpoint, ws.max_results, apiKey.trim() || undefined, ws.fetch_content);
       setWs(r); setApiKey(''); setStatus('已保存');
     } catch (e) { setStatus(String(e)); }
     finally { setBusy(false); }
@@ -290,18 +550,18 @@ function ToolsSettings() {
             <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>TOOL</span>
             </div>
-            <div className="cfg-sub">检索互联网并把标题/链接/摘要回灌给 Agent</div>
+            <div className="cfg-sub">原生免 Key 联网搜索（DuckDuckGo），可选搜索后自动读取正文</div>
           </div>
           <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
         </div>
 
         <div className="cfg-fields rise" style={{ marginTop: 14 }}>
           <div className="field"><label>搜索 Provider</label>
-            <Select value={ws.provider || 'off'} onChange={val => setWs(w => ({ ...w, provider: val === 'off' ? '' : val }))}
+            <Select value={ws.provider || 'duckduckgo'} onChange={val => setWs(w => ({ ...w, provider: val }))}
               options={[
-                { value: 'off', label: '关闭' },
-                { value: 'tavily', label: 'Tavily（需 API Key）' },
+                { value: 'duckduckgo', label: 'DuckDuckGo（免 Key · 默认）' },
                 { value: 'searxng', label: 'SearXNG（自托管，无需 Key）' },
+                { value: 'tavily', label: 'Tavily（需 API Key）' },
               ]} />
           </div>
           <div className="field"><label>返回结果数</label>
@@ -322,18 +582,96 @@ function ToolsSettings() {
             </div>
           )}
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button type="button" className={`switch${ws.fetch_content ? ' on' : ''}`} role="switch" aria-checked={ws.fetch_content}
+              onClick={() => setWs(w => ({ ...w, fetch_content: !w.fetch_content }))}><i /></button>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--text-control)' }}>搜索后自动读取正文</div>
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>命中后自动抓取前几条结果的正文摘录一并回灌（更慢但更省往返；Agent 也可按需用 web_fetch 抓取单个链接）</div>
+            </div>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存工具配置</button>
             {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
           </div>
           <div className="field full">
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
-              启用后，在「角色 Agent / 自定义 Agent」的能力中勾选 web_search 的 Agent 才会实际调用此工具。
+              默认走 DuckDuckGo，无需任何配置即可联网搜索。需在「角色 Agent / 自定义 Agent」能力中勾选 web_search / web_fetch 的 Agent 才会实际调用对应工具。
             </span>
           </div>
         </div>
       </div>
 
+      <OpenDesignSettingsCard />
+
       <McpServers />
+    </div>
+  );
+}
+
+// OpenDesign 本地服务：默认自动模式（检测/克隆 nexu-io/open-design → 安装 → tools-dev 启动）。
+function OpenDesignSettingsCard() {
+  const [od, setOd] = useState<OpenDesignSettings>({ command: '', url: '', repo_path: '' });
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+  const [log, setLog] = useState('');
+
+  useEffect(() => { getOpenDesignSettings().then(setOd).catch(e => setStatus(String(e))); }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await setOpenDesignSettings(od.command, od.url, od.repo_path);
+      setOd(r); setStatus('已保存');
+    } catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const viewLog = async () => {
+    try { setLog((await getOpenDesignLog()) || '（暂无日志：尚未触发过自动启动）'); }
+    catch (e) { setLog(String(e)); }
+  };
+
+  return (
+    <div className="cfg-card" style={{ marginTop: 14 }}>
+      <div className="cfg-top" style={{ gap: 10 }}>
+        <div className="cfg-logo" style={{ background: 'var(--violet)', width: 28, height: 28 }}><Icon name="palette" size={15} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="cfg-name cfg-name-line"><span className="cfg-name-text">OpenDesign · 本地服务</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>DESIGN</span>
+          </div>
+          <div className="cfg-sub">默认自动拉起：检测本地 open-design 检出（无则克隆）→ pnpm install → tools-dev 启动，就绪后打开浏览器</div>
+        </div>
+      </div>
+
+      <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+        <div className="field full"><label>本地检出路径（可选）</label>
+          <input type="text" className="mono" value={od.repo_path} placeholder="留空则自动探测 ~/projects/open-design 等，找不到再克隆到自管目录"
+            onChange={e => setOd(o => ({ ...o, repo_path: e.target.value }))} />
+        </div>
+        <div className="field full"><label>自定义启动命令（高级 · 留空走自动模式）</label>
+          <input type="text" className="mono" value={od.command} placeholder="留空＝自动模式；填写则改为执行该命令并打开下方 URL"
+            onChange={e => setOd(o => ({ ...o, command: e.target.value }))} />
+        </div>
+        <div className="field full"><label>访问 URL（仅自定义模式需要）</label>
+          <input type="text" className="mono" value={od.url} placeholder="自动模式下由 tools-dev 解析，无需填写"
+            onChange={e => setOd(o => ({ ...o, url: e.target.value }))} />
+        </div>
+        <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存 OpenDesign 配置</button>
+          <button className="btn" onClick={viewLog}><Icon name="file" size={14} />查看启动日志</button>
+          {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+        </div>
+        {log && (
+          <div className="field full">
+            <pre className="mono" style={{ maxHeight: 240, overflow: 'auto', background: 'var(--code-bg)', padding: 10, borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{log}</pre>
+          </div>
+        )}
+        <div className="field full">
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+            自动模式需要本机有 Node 24 + pnpm（建议 corepack）。首次会克隆并 pnpm install（较慢），随后用 `pnpm tools-dev start web` 启动并轮询就绪。失败时点「查看启动日志」排查。
+          </span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -458,7 +796,7 @@ function McpServers() {
                     {agents.map(a => {
                       const on = scoped.includes(a.id);
                       return (
-                        <button key={a.id} className={'chip ' + (on ? 'ember' : '')} style={{ cursor: 'pointer', border: on ? undefined : '1px solid var(--border-strong)' }}
+                        <button key={a.id} className={'filter-chip' + (on ? ' on' : '')}
                           onClick={() => toggleAgent(s, d, a.id)}>
                           {on ? '✓ ' : ''}{a.name}
                         </button>
@@ -487,6 +825,7 @@ function McpServers() {
 }
 
 function CustomAgents({ onChanged }: { onChanged: () => void }) {
+  const builtinTools = useBuiltinTools();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hideIds, setHideIds] = useState<Set<string>>(new Set());
   const [llmNames, setLlmNames] = useState<LlmRef[]>([]);
@@ -515,6 +854,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
     try {
       const updated = await updateAgent(id, d);
       setAgents(as => as.map(a => a.id === id ? updated : a));
+      void refreshAgents();  // 同步全局 store：名称/可见性变更即时反映到 @提及与头像
       setDrafts(d2 => { const n = { ...d2 }; delete n[id]; return n; });
       setSaveStatus(s => ({ ...s, [id]: '已保存' }));
       setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
@@ -526,6 +866,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const doDelete = async (id: string) => {
     await deleteAgent(id);
     setAgents(as => as.filter(a => a.id !== id));
+    void refreshAgents();
     setConfirmDel(null);
     onChanged();
   };
@@ -533,6 +874,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const addNew = async () => {
     const a = await createAgent({ name: '新对话角色', system_prompt: AGENT_TEMPLATES[0].prompt, prompt_mode: 'custom', role_type: 'business' });
     setAgents(as => [...as, a]);
+    void refreshAgents();
     setExp(a.id);
     onChanged();
   };
@@ -601,14 +943,17 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                     <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
                       {(() => {
                         const cap = d.capabilities_json !== undefined ? String(d.capabilities_json ?? '') : a.capabilities_json;
-                        const on = agentHasTool(cap, 'web_search');
-                        return (
-                          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>
-                            <Switch on={on} onToggle={() => setDraft(a.id, 'capabilities_json', toggleAgentTool(cap, 'web_search', !on))} />联网搜索 web_search
-                          </label>
-                        );
+                        return builtinTools.map(t => {
+                          const on = agentHasTool(cap, t.name);
+                          return (
+                            <label key={t.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}
+                              title={t.needs_project ? '需对话/任务绑定项目才生效' : undefined}>
+                              <Switch on={on} onToggle={() => setDraft(a.id, 'capabilities_json', toggleAgentTool(cap, t.name, !on))} />{t.label} {t.name}
+                            </label>
+                          );
+                        });
                       })()}
-                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>需在「工具 & MCP」中先配置搜索 Provider；仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
+                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>工具在任何调用该 Agent LLM 的场景下都可用，由 LLM 自行决定是否调用（agent loop）。标注「需项目」的工具仅在关联了项目时装配；联网搜索需先在「工具 & MCP」配置 Provider。均仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
                     </div>
                   </div>
                   <div className="field full">
@@ -664,10 +1009,34 @@ function RoleSlotCard({ slot, llms, onApply }: {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(false);
   const dirty = supplement !== (h?.system_prompt ?? '');
+  const builtinTools = useBuiltinTools();
 
   const apply = async (payload: Parameters<typeof setRoleSlot>[1]) => {
     setBusy(true);
     try { await onApply(slot.kind, payload); } finally { setBusy(false); }
+  };
+
+  // 工具能力开关（所有系统角色通用，含 llm_only 角色）。开关从后端内置工具目录动态渲染。
+  // 运行时由后端按 capabilities 白名单 + 上下文决定是否真正加载；未开启则与原行为一致。
+  const toolCaps = () => {
+    const cap = h?.capabilities_json;
+    return (
+      <div className="field full">
+        <label>工具能力</label>
+        <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap', padding: '8px 0' }}>
+          {builtinTools.map(t => {
+            const on = agentHasTool(cap, t.name);
+            return (
+              <label key={t.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}
+                title={t.needs_project ? '需对话/任务绑定项目才生效' : undefined}>
+                <Switch on={on} onToggle={() => apply({ capabilities_json: toggleAgentTool(cap, t.name, !on) })} />{t.label} {t.name}
+              </label>
+            );
+          })}
+        </div>
+        <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>工具在任何调用该角色 LLM 的场景下都可用，由 LLM 自行决定是否调用（agent loop）。标注「需项目」的工具仅在关联了项目时装配；联网搜索需先在「工具 &amp; MCP」配置 Provider。均仅 OpenAI/Anthropic 规范的 LLM 生效。</span>
+      </div>
+    );
   };
 
   const llmState = llmBindingState(h?.llm_id, llms);
@@ -714,6 +1083,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             <Switch on={Boolean(h?.enabled)} onToggle={() => apply({ enabled: !(h?.enabled) })} />启用
           </label>
         </div>
+        {toolCaps()}
       </div>
       )}
       {open && !slot.llm_only && (
@@ -759,6 +1129,7 @@ function RoleSlotCard({ slot, llms, onApply }: {
             </label>
           </div>
         </div>
+        {toolCaps()}
       </div>
       )}
     </div>
@@ -852,7 +1223,7 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   }, []);
 
   const apply = async (kind: string, payload: Parameters<typeof setRoleSlot>[1]) => {
-    try { setSlots(await setRoleSlot(kind, payload)); onChanged(); }
+    try { setSlots(await setRoleSlot(kind, payload)); void refreshAgents(); onChanged(); }
     catch (e) { setErr(String(e)); }
   };
 
@@ -912,6 +1283,172 @@ function RolesPage() {
             <CustomAgents key={'ca' + bump} onChanged={onChanged} />
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+interface CodeAgentDraft { kind: string; label: string; program: string; model: string; extra: string; enabled: boolean; }
+const CODE_AGENT_KINDS = [
+  { value: 'claude', label: 'claude（Claude Code）' },
+  { value: 'codex', label: 'codex（Codex CLI）' },
+  { value: 'opencode', label: 'opencode' },
+];
+
+function CodeAgentSettings() {
+  const [agents, setAgents] = useState<CodeAgentT[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, CodeAgentDraft>>({});
+  const [auth, setAuth] = useState<Record<string, boolean | null | 'loading'>>({});
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState('');
+  // 默认全部折叠，只显示头部摘要；点击头部展开编辑。
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpand = (id: string) => setExpanded(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const toDraft = (a: CodeAgentT): CodeAgentDraft => {
+    let extra: string[] = [];
+    try { extra = JSON.parse(a.extra_args_json || '[]'); } catch { extra = []; }
+    return { kind: a.kind, label: a.label, program: a.program, model: a.model ?? '', extra: extra.join(' '), enabled: a.enabled };
+  };
+
+  const load = (autoCheck = false) => {
+    setLoading(true);
+    listCodeAgents()
+      .then(list => {
+        setAgents(list);
+        setDrafts(Object.fromEntries(list.map(a => [a.id, toDraft(a)])));
+        // 进入页面自动检测每个 agent 的可用性，避免一直停在「未检测」。
+        // 检测命令走进程组隔离（detach_process_group），可安全在此调用。
+        if (autoCheck) list.forEach(a => checkAuth(a.id));
+      })
+      .catch(() => setAgents([]))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { load(true); }, []);
+
+  const defaultId = agents.find(a => a.is_default)?.id ?? '';
+  const enabledOptions = agents.filter(a => a.enabled).map(a => ({ value: a.id, label: `${a.label}（${a.kind}）` }));
+
+  const setDraft = (id: string, patch: Partial<CodeAgentDraft>) =>
+    setDrafts(d => ({ ...d, [id]: { ...d[id], ...patch } }));
+
+  const save = async (a: CodeAgentT) => {
+    const d = drafts[a.id];
+    if (!d) return;
+    setMsg('');
+    try {
+      await upsertCodeAgent({
+        id: a.id, kind: d.kind, label: d.label.trim() || d.kind,
+        program: d.program.trim() || d.kind, model: d.model.trim() || null,
+        extra_args: d.extra.split(/\s+/).filter(Boolean), enabled: d.enabled,
+      });
+      setMsg(`已保存 ${d.label || a.kind}`);
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  const makeDefault = async (id: string) => { await setDefaultCodeAgent(id); load(); };
+
+  const remove = async (a: CodeAgentT) => {
+    if (!confirm(`删除代码 Agent「${a.label}」？引用它的项目将回落全局默认。`)) return;
+    try { await deleteCodeAgent(a.id); load(); } catch (e) { setMsg(String(e)); }
+  };
+
+  const checkAuth = async (id: string) => {
+    setAuth(s => ({ ...s, [id]: 'loading' }));
+    try { const ok = await checkCodeAgentAuth(id); setAuth(s => ({ ...s, [id]: ok })); }
+    catch { setAuth(s => ({ ...s, [id]: null })); }
+  };
+
+  const addCustom = async () => {
+    setMsg('');
+    try {
+      const created = await upsertCodeAgent({ kind: 'claude', label: '自定义 Agent', program: 'claude', enabled: true });
+      setExpanded(prev => new Set(prev).add(created.id)); // 新建即展开，便于立刻编辑
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">代码 Agent</div>
+      <div className="set-desc">
+        选择驱动「代码实现」与「AI 解冲突」的 CLI 编码 agent。所有 agent 都在隔离 worktree 内执行，
+        并被统一禁止 remote git 操作。项目可在「项目管理」单独覆盖；未覆盖时跟随这里的全局默认。
+      </div>
+
+      <div className="cfg-card" style={{ marginBottom: 16 }}>
+        <div className="field full">
+          <label>全局默认代码 Agent</label>
+          <Select value={defaultId} onChange={makeDefault} options={enabledOptions}
+            placeholder={loading ? '加载中…' : '选择默认 agent'} />
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="empty"><Icon name="code" /><div>加载中…</div></div>
+      ) : agents.map(a => {
+        const d = drafts[a.id]; if (!d) return null;
+        const st = auth[a.id];
+        const dotColor = st === true ? 'var(--green)' : st === false || st === null ? 'var(--red)' : 'var(--text-faint)';
+        const authText = st === 'loading' ? '检测中…' : st === true ? '可用' : st === false ? '未就绪' : st === null ? '检测失败' : '未检测';
+        const isOpen = expanded.has(a.id);
+        return (
+          <div className="panel" key={a.id} style={{ marginBottom: 12 }}>
+            <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', userSelect: 'none' }}
+              onClick={() => toggleExpand(a.id)}>
+              <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }} />
+              <span className="chip ember" style={{ fontFamily: 'var(--font-mono)' }}>{d.kind}</span>
+              <span style={{ fontWeight: 600 }}>{d.label || d.kind}</span>
+              {a.is_default && <span className="chip green">默认</span>}
+              {!isOpen && !d.enabled && <span className="chip" style={{ color: 'var(--text-faint)' }}>已停用</span>}
+              <span className="dot" style={{ background: dotColor, marginLeft: 'auto' }} />
+              <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{authText}</span>
+            </div>
+            {isOpen && (
+            <div className="cfg-fields" style={{ padding: '12px 14px' }}>
+              <div className="field"><label>类型（适配逻辑）</label>
+                <Select value={d.kind} onChange={val => {
+                  // 改类型时，若 program 仍是某个 kind 的默认名（未自定义路径），一并同步，
+                  // 避免出现「类型 codex 但程序仍指向 claude」的错配。
+                  const synced = ['claude', 'codex', 'opencode', ''].includes(d.program.trim());
+                  setDraft(a.id, synced ? { kind: val, program: val } : { kind: val });
+                }} options={CODE_AGENT_KINDS} />
+              </div>
+              <div className="field"><label>显示名</label>
+                <input value={d.label} onChange={e => setDraft(a.id, { label: e.target.value })} />
+              </div>
+              <div className="field"><label>可执行程序（PATH 名或绝对路径）</label>
+                <input value={d.program} onChange={e => setDraft(a.id, { program: e.target.value })} placeholder={d.kind} />
+              </div>
+              <div className="field"><label>模型（可空，{d.kind === 'opencode' ? 'provider/model' : '裸名'}）</label>
+                <input value={d.model} onChange={e => setDraft(a.id, { model: e.target.value })} placeholder="默认" />
+              </div>
+              <div className="field"><label>额外参数（空格分隔，可空）</label>
+                <input value={d.extra} onChange={e => setDraft(a.id, { extra: e.target.value })} placeholder="--flag value" />
+              </div>
+              <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Switch on={d.enabled} onToggle={() => setDraft(a.id, { enabled: !d.enabled })} />
+                  <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)' }}>启用</span>
+                </div>
+                <button className="btn btn-primary btn-sm" onClick={() => save(a)}><Icon name="check" size={13} />保存</button>
+                <button className="btn btn-sm" onClick={() => checkAuth(a.id)}><Icon name="shield" size={13} />检测可用性</button>
+                {!a.is_default && <button className="btn btn-sm btn-danger" style={{ marginLeft: 'auto' }} onClick={() => remove(a)}><Icon name="trash" size={13} />删除</button>}
+              </div>
+            </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+        <button className="btn" onClick={addCustom}><Icon name="plus" size={14} />新增自定义 Agent</button>
+        {msg && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{msg}</span>}
       </div>
     </div>
   );
@@ -1004,6 +1541,104 @@ function KnowledgeSettings() {
   );
 }
 
+// 单个快捷键绑定面板（启用开关 + 组合键展示 + 录制/恢复默认）。纯前端偏好，落 localStorage
+// 并派发 SHORTCUT_CHANGED_EVENT 让 App 实时重读。
+function ShortcutBinding({
+  storageKey, defaultShortcut, parse, icon, title, enableHint,
+}: {
+  storageKey: string;
+  defaultShortcut: QuickCaptureShortcut;
+  parse: (v: string | null | undefined) => QuickCaptureShortcut;
+  icon: string;
+  title: string;
+  enableHint: string;
+}) {
+  const [shortcut, setShortcut] = useState<QuickCaptureShortcut>(() => parse(localStorage.getItem(storageKey)));
+  const [recording, setRecording] = useState(false);
+  const persistShortcut = (s: QuickCaptureShortcut) => {
+    setShortcut(s);
+    localStorage.setItem(storageKey, JSON.stringify(s));
+    window.dispatchEvent(new Event(SHORTCUT_CHANGED_EVENT));
+  };
+
+  // 录制模式：捕获下一组「修饰键 + 主键」的组合并保存。Esc 取消，单纯修饰键忽略。
+  useEffect(() => {
+    if (!recording) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') { setRecording(false); return; }
+      if (isModifierCode(e.code)) return; // 等待主键
+      const combo: ShortcutCombo = { ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey, shift: e.shiftKey, code: e.code };
+      if (!comboHasModifier(combo)) return; // 必须配合至少一个修饰键
+      persistShortcut({ enabled: true, combo });
+      setRecording(false);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [recording]);
+
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel-head"><div className="panel-title"><Icon name={icon} size={16} style={{ color: 'var(--ember)' }} />{title}</div></div>
+      <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+        <div>
+          <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>启用全局快捷键</div>
+          <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>{enableHint}</div>
+        </div>
+        <Switch on={shortcut.enabled} onToggle={() => persistShortcut({ ...shortcut, enabled: !shortcut.enabled })} />
+      </div>
+      <div style={{ padding: '0 18px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.06em',
+          background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8,
+          padding: '5px 10px', color: shortcut.enabled ? 'var(--ember-soft)' : 'var(--text-3)',
+        }}>
+          {formatCombo(shortcut.combo)}
+        </span>
+        <button className="btn btn-sm" onClick={() => setRecording(r => !r)} disabled={!shortcut.enabled}>
+          <Icon name="edit" size={13} />{recording ? '按下组合键…' : '录制'}
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={() => persistShortcut(defaultShortcut)} disabled={!shortcut.enabled}>
+          恢复默认
+        </button>
+        {recording && (
+          <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+            需配合 Ctrl / Alt / Shift / ⌘ · Esc 取消
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ShortcutSettings() {
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">快捷键</div>
+      <div className="set-desc">为常用操作绑定键盘快捷键。组合键需配合至少一个修饰键（Ctrl / Alt / Shift / ⌘），在应用内任意位置生效。</div>
+
+      <ShortcutBinding
+        storageKey={QUICK_CAPTURE_SHORTCUT_KEY}
+        defaultShortcut={DEFAULT_QUICK_CAPTURE_SHORTCUT}
+        parse={parseQuickCaptureShortcut}
+        icon="zap"
+        title="速录念头"
+        enableHint="在应用内任意位置按下快捷键即可弹出「速录念头」，随手把念头丢进待整理池。"
+      />
+
+      <ShortcutBinding
+        storageKey={VOICE_INPUT_SHORTCUT_KEY}
+        defaultShortcut={DEFAULT_VOICE_INPUT_SHORTCUT}
+        parse={parseVoiceInputShortcut}
+        icon="mic"
+        title="快速语音录入"
+        enableHint="在任意含语音录入的界面（会议室、速录念头…）一键开/关录音；若当前无语音界面，则弹出「速录念头」并自动起录。"
+      />
+    </div>
+  );
+}
+
 function ThemeSettings({
   theme,
   onThemeChange,
@@ -1020,6 +1655,17 @@ function ThemeSettings({
     applyRailMode(railMode);
   }, [railMode]);
 
+  // 标题栏系统资源（CPU/内存）监视开关：默认开启，落 localStorage 并广播给 App 实时生效。
+  const [resMon, setResMon] = useState<boolean>(() => parseResMonitor(localStorage.getItem(RES_MONITOR_KEY)));
+  const toggleResMon = () => {
+    setResMon(prev => {
+      const next = !prev;
+      localStorage.setItem(RES_MONITOR_KEY, next ? 'on' : 'off');
+      window.dispatchEvent(new Event(RES_MONITOR_CHANGED_EVENT));
+      return next;
+    });
+  };
+
   return (
     <div className="set-inner set-inner-wide rise">
       <div className="set-h">主题设置</div>
@@ -1035,6 +1681,19 @@ function ThemeSettings({
             </div>
           </div>
           <Switch on={railMode === 'hover'} onToggle={() => setRailMode(m => (m === 'hover' ? 'locked' : 'hover'))} />
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head"><div className="panel-title"><Icon name="cpu" size={16} />标题栏</div></div>
+        <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>显示系统资源占用</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+              在标题栏右侧实时显示当前系统 CPU 与内存占用（每 3 秒刷新）。关闭后不再轮询。
+            </div>
+          </div>
+          <Switch on={resMon} onToggle={toggleResMon} />
         </div>
       </div>
 
@@ -1126,7 +1785,7 @@ function SecuritySettings() {
         <div style={{ padding: '12px 18px', display: 'grid', gap: 8, fontSize: 'var(--text-control)', color: 'var(--text-2)' }}>
           <div>输入消毒：拦截明显 prompt injection 片段</div>
           <div>Git 代理：阻止 push main/master、force push、remote set-url、global config</div>
-          <div>合并入口：只有审核 2 批准后可入队 merge</div>
+          <div>合并入口：只有代码审核批准后可入队 merge</div>
           <div>审计链：review_1 / review_2 决策写入 admin_decisions</div>
         </div>
       </div>
@@ -1139,7 +1798,7 @@ function SecuritySettings() {
             </div>
             <div style={{ flex: 1 }}>
               <div className="cfg-name">{d.stage} · {d.decision}</div>
-              <div className="cfg-sub">{d.issue_id.slice(0, 10)} · {new Date(d.created_at).toLocaleString('zh')}</div>
+              <div className="cfg-sub">{d.issue_id.slice(0, 10)} · {fmtFull(d.created_at)}</div>
             </div>
           </div>
           {d.suggestions && <div style={{ padding: '0 2px 2px', fontSize: 'var(--text-control)', color: 'var(--text-3)' }}>{d.suggestions}</div>}
@@ -1158,6 +1817,7 @@ function AboutSettings() {
   const [authLoading, setAuthLoading] = useState(true);
   const [previews, setPreviews] = useState<PreviewEnvironment[]>([]);
   const [tests, setTests] = useState<TestSession[]>([]);
+  const [failures, setFailures] = useState<JobFailure[]>([]);
 
   const loadHealth = () => {
     setHealthLoading(true);
@@ -1173,12 +1833,14 @@ function AboutSettings() {
       .then(ok => setAuth(ok))
       .catch(() => setAuth(null))
       .finally(() => setAuthLoading(false));
+    listJobFailures(30).then(setFailures).catch(() => setFailures([]));
   };
 
   useEffect(() => {
     loadHealth();
     listPreviewEnvironments().then(setPreviews).catch(() => setPreviews([]));
     listTestSessions().then(setTests).catch(() => setTests([]));
+    listJobFailures(30).then(setFailures).catch(() => setFailures([]));
   }, []);
 
   const dbVal   = healthLoading ? '…' : health?.db_ok ? 'OK' : healthError ? '错误' : '—';
@@ -1224,11 +1886,26 @@ function AboutSettings() {
           {previews.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无预览环境</div>}
         </div>
       </div>
-      <div className="panel">
+      <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-head"><div className="panel-title"><Icon name="flask" size={16} style={{ color: 'var(--green)' }} />测试会话</div><span className="sec-kicker">{tests.length}</span></div>
         <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 8 }}>
           {tests.slice(0, 8).map(t => <div key={t.id} style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>{t.status} · {t.summary || t.id}</div>)}
           {tests.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无测试会话</div>}
+        </div>
+      </div>
+      <div className="panel">
+        <div className="panel-head"><div className="panel-title"><Icon name="alert" size={16} style={{ color: 'var(--red)' }} />错误历史</div><span className="sec-kicker">{failures.length}</span></div>
+        <div style={{ padding: '8px 18px 14px', display: 'grid', gap: 10 }}>
+          {failures.slice(0, 20).map(f => (
+            <div key={f.id} style={{ display: 'grid', gap: 3, paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}>{f.job_type}</span>
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>第 {f.attempt} 次 · {fmtFull(f.updated_at)}</span>
+              </div>
+              {f.last_error && <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 'var(--leading-snug)' }}>{f.last_error.slice(0, 400)}</div>}
+            </div>
+          ))}
+          {failures.length === 0 && <div className="empty-compact" style={{ padding: '0' }}>暂无失败任务</div>}
         </div>
       </div>
     </div>
@@ -1242,14 +1919,52 @@ const notifyInputStyle: React.CSSProperties = {
   padding: '8px 10px', color: 'var(--text)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-control)',
 };
 
+// 各通道类型的展示文案与目标/密钥占位提示。
+const NOTIFY_KINDS: { value: string; label: string; targetPh: string; secretLabel?: string; secretPh?: string }[] = [
+  { value: 'slack', label: 'Slack', targetPh: 'Slack Incoming Webhook URL' },
+  { value: 'wecom', label: '企业微信群机器人', targetPh: '企业微信群机器人 Webhook URL' },
+  { value: 'feishu', label: '飞书 (Lark) 机器人', targetPh: '飞书自定义机器人 Webhook URL', secretLabel: '签名密钥', secretPh: '加签 secret（可选，启用签名时填）' },
+  { value: 'dingtalk', label: '钉钉机器人', targetPh: '钉钉自定义机器人 Webhook URL', secretLabel: '加签密钥', secretPh: 'SECxxxx 加签密钥（可选）' },
+  { value: 'ntfy', label: 'ntfy', targetPh: 'topic URL，如 https://ntfy.sh/your-topic', secretLabel: '访问 Token', secretPh: 'Bearer Token（可选，私有 topic）' },
+  { value: 'clawbot', label: '微信ClawBot', targetPh: '扫码绑定后自动填充', secretLabel: 'Bearer Token', secretPh: '扫码绑定后自动填充' },
+  { value: 'email', label: 'Email (SMTP)', targetPh: 'smtp://user:pass@host:port?from=a@b&to=c@d' },
+  { value: 'webhook', label: '通用 Webhook', targetPh: '通用 Webhook URL' },
+];
+
+// 流水线会发出的事件（与后端 dispatch 调用点一致）。空选择 = 订阅全部。
+const NOTIFY_EVENTS: { value: string; label: string }[] = [
+  { value: 'review_needed', label: '待审核' },
+  { value: 'auto_merged', label: '自动合并' },
+  { value: 'cr_merged', label: '已合并' },
+  { value: 'test_failed', label: '测试失败' },
+  { value: 'analysis_failed', label: '分析失败' },
+  { value: 'security_high', label: '安全高危' },
+];
+
+const emptyNotifyForm = { name: '', kind: 'slack', target: '', secret: '', events: [] as string[], enabled: true };
+
 function NotifySettings() {
   const [channels, setChannels] = useState<NotifyChannel[]>([]);
-  const [form, setForm] = useState({ name: '', kind: 'slack', target: '' });
+  const [form, setForm] = useState(emptyNotifyForm);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
   const [err, setErr] = useState('');
+  // 微信 ClawBot 扫码绑定态
+  const [bind, setBind] = useState<{ qrSvg: string; qrUrl: string; status: string; bound: boolean } | null>(null);
+  const bindCancel = useRef(false);
+  const codeRef = useRef('');
+  const [needCode, setNeedCode] = useState(false);
 
   const reload = () => { listNotifyChannels().then(setChannels).catch(() => setChannels([])); };
   useEffect(() => { reload(); }, []);
+  useEffect(() => () => { bindCancel.current = true; }, []);
+
+  const CLAW_STATUS_MSG: Record<string, string> = {
+    starting: '正在申请二维码…', wait: '用手机微信扫描二维码以绑定', scaned: '已扫描，请在手机上确认',
+    need_verifycode: '请输入手机微信显示的数字验证码后继续', scaned_but_redirect: '正在切换接入节点…',
+    expired: '二维码已过期，请重新获取', verify_code_blocked: '验证码多次错误，请稍后重试',
+    binded_redirect: '该微信已绑定过此 OpenClaw（无新凭据）', confirmed: '绑定成功',
+  };
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setErr(''); setBusy(key);
@@ -1258,37 +1973,174 @@ function NotifySettings() {
     finally { setBusy(''); }
   };
 
+  const kindMeta = NOTIFY_KINDS.find(k => k.value === form.kind);
+  const resetForm = () => { setForm(emptyNotifyForm); setEditingId(null); };
+
+  const toggleEvent = (ev: string) => setForm(f => ({
+    ...f, events: f.events.includes(ev) ? f.events.filter(e => e !== ev) : [...f.events, ev],
+  }));
+
+  const startEdit = (c: NotifyChannel) => {
+    setEditingId(c.id);
+    setForm({
+      name: c.name, kind: c.kind, target: c.target, secret: '',
+      events: c.events.split(',').map(s => s.trim()).filter(Boolean), enabled: c.enabled,
+    });
+  };
+
+  const save = () => run('save', async () => {
+    const payload = {
+      name: form.name, kind: form.kind, target: form.target,
+      events: form.events.join(','), enabled: form.enabled,
+      ...(form.secret.trim() ? { secret: form.secret } : {}),
+    };
+    if (editingId) await updateNotifyChannel(editingId, payload);
+    else await createNotifyChannel(payload);
+    resetForm();
+  });
+
+  const toggleEnabled = (c: NotifyChannel) => run('en' + c.id, () => updateNotifyChannel(c.id, {
+    name: c.name, kind: c.kind, target: c.target, events: c.events, enabled: !c.enabled,
+  }));
+
+  const stopBind = () => { bindCancel.current = true; setBind(null); setNeedCode(false); codeRef.current = ''; };
+
+  const startClawbotBind = async () => {
+    setErr(''); bindCancel.current = false; codeRef.current = ''; setNeedCode(false);
+    setBind({ qrSvg: '', qrUrl: '', status: 'starting', bound: false });
+    try {
+      const s = await clawbotStartLogin();
+      if (bindCancel.current) return;
+      setBind({ qrSvg: s.qr_svg, qrUrl: s.qr_url, status: 'wait', bound: false });
+      let baseUrl = s.base_url;
+      const deadline = Date.now() + 5 * 60_000;
+      while (!bindCancel.current && Date.now() < deadline) {
+        const r = await clawbotPollLogin(s.qrcode, baseUrl, codeRef.current || undefined);
+        if (bindCancel.current) return;
+        baseUrl = r.base_url;
+        setNeedCode(r.status === 'need_verifycode');
+        setBind(b => (b ? { ...b, status: r.status } : b));
+        if (r.status === 'confirmed' && r.target && r.bot_token) {
+          await createNotifyChannel({
+            name: form.name.trim() || '微信ClawBot', kind: 'clawbot', target: r.target,
+            secret: r.bot_token, events: form.events.join(','), enabled: form.enabled,
+          });
+          setBind(b => (b ? { ...b, status: 'confirmed', bound: true } : b));
+          resetForm(); reload();
+          return;
+        }
+        if (r.status === 'expired' || r.status === 'verify_code_blocked' || r.status === 'binded_redirect') {
+          return; // 终态：保留面板与提示，由用户「重新获取」
+        }
+        await new Promise(res => setTimeout(res, 1200));
+      }
+    } catch (e) { setErr(String(e)); setBind(null); }
+  };
+
+  const kindLabel = (k: string) => NOTIFY_KINDS.find(x => x.value === k)?.label ?? k;
+
   return (
     <div className="set-inner rise">
       <div className="set-h">通知通道</div>
-      <div className="set-desc">全局通知通道，用于推送流水线事件（审核、部署、安全告警等）。所有项目共享。</div>
+      <div className="set-desc">全局通知通道，用于推送流水线事件（审核、部署、安全告警等）。所有项目共享。签名密钥 / Token 加密存储，不回显。</div>
       {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
       <div className="panel">
         <div className="panel-head">
-          <div className="panel-title"><Icon name="bell" size={16} style={{ color: 'var(--ember)' }} />通知通道</div>
+          <div className="panel-title"><Icon name="bell" size={16} style={{ color: 'var(--ember)' }} />{editingId ? '编辑通道' : '通知通道'}</div>
           <span className="sec-kicker">全局 · {channels.length} 个</span>
         </div>
-        <div style={{ display: 'flex', gap: 8, padding: '12px 16px', borderTop: '1px solid var(--border)', alignItems: 'center', flexWrap: 'wrap' }}>
-          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="名称" style={{ ...notifyInputStyle, width: 120 }} />
-          <div style={{ minWidth: 130 }}>
-            <Select value={form.kind} onChange={v => setForm(f => ({ ...f, kind: v }))}
-              options={[{ value: 'slack', label: 'Slack' }, { value: 'wecom', label: '企业微信' }, { value: 'webhook', label: '通用 Webhook' }]} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 16px', borderTop: '1px solid var(--border)' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="名称" style={{ ...notifyInputStyle, width: 140 }} />
+            <div style={{ minWidth: 180 }}>
+              <Select value={form.kind} onChange={v => { setForm(f => ({ ...f, kind: v })); stopBind(); }}
+                options={NOTIFY_KINDS.map(k => ({ value: k.value, label: k.label }))} />
+            </div>
+            {form.kind !== 'clawbot' && (
+              <input value={form.target} onChange={e => setForm(f => ({ ...f, target: e.target.value }))} placeholder={kindMeta?.targetPh ?? 'URL'} style={{ ...notifyInputStyle, flex: 1, minWidth: 220 }} />
+            )}
+            {form.kind === 'clawbot' && editingId && (
+              <span style={{ flex: 1, minWidth: 220, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{form.target || '（已绑定）'}</span>
+            )}
           </div>
-          <input value={form.target} onChange={e => setForm(f => ({ ...f, target: e.target.value }))} placeholder="Webhook URL" style={{ ...notifyInputStyle, flex: 1, minWidth: 200 }} />
-          <button className="btn btn-primary btn-sm" disabled={!form.name.trim() || !form.target.trim() || busy === 'add'}
-            onClick={() => run('add', async () => { await createNotifyChannel(form); setForm({ name: '', kind: 'slack', target: '' }); })}>
-            <Icon name="plus" size={14} />添加
-          </button>
+          {kindMeta?.secretLabel && form.kind !== 'clawbot' && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', width: 80 }}>{kindMeta.secretLabel}</span>
+              <input type="password" autoComplete="new-password" value={form.secret} onChange={e => setForm(f => ({ ...f, secret: e.target.value }))}
+                placeholder={editingId ? (kindMeta.secretPh + '（留空保留原值）') : kindMeta.secretPh} style={{ ...notifyInputStyle, flex: 1 }} />
+            </div>
+          )}
+          {form.kind === 'clawbot' && !editingId && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '12px', borderRadius: 9, background: 'var(--bg-3)', border: '1px solid var(--border)' }}>
+              {!bind && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <button className="btn btn-primary btn-sm" disabled={!form.name.trim()} onClick={startClawbotBind}>
+                    <Icon name="bot" size={14} />扫码绑定
+                  </button>
+                  <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>先填名称，点击后用手机微信扫码绑定 ClawBot</span>
+                </div>
+              )}
+              {bind && (
+                <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                  <div style={{ width: 160, height: 160, borderRadius: 9, background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    {bind.qrSvg
+                      ? <img src={bind.qrSvg} alt="ClawBot 绑定二维码" style={{ width: 152, height: 152 }} />
+                      : <span className="typing" style={{ color: 'var(--bg)' }} />}
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minWidth: 200 }}>
+                    <div style={{ fontSize: 'var(--text-control)', color: bind.bound ? 'var(--green)' : 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {bind.bound && <Icon name="check" size={14} />}{CLAW_STATUS_MSG[bind.status] ?? bind.status}
+                    </div>
+                    {needCode && !bind.bound && (
+                      <input autoFocus placeholder="输入手机上显示的数字" onChange={e => { codeRef.current = e.target.value.trim(); }}
+                        style={{ ...notifyInputStyle, width: 200 }} />
+                    )}
+                    {bind.qrUrl && !bind.bound && (
+                      <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', wordBreak: 'break-all' }}>二维码无法显示？也可在手机打开：{bind.qrUrl}</span>
+                    )}
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {(bind.status === 'expired' || bind.status === 'verify_code_blocked' || bind.status === 'binded_redirect') && !bind.bound && (
+                        <button className="btn btn-sm" onClick={startClawbotBind}><Icon name="refresh" size={13} />重新获取</button>
+                      )}
+                      {!bind.bound && <button className="btn btn-sm btn-ghost" onClick={stopBind}>取消</button>}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginRight: 4 }}>订阅事件</span>
+            {NOTIFY_EVENTS.map(ev => (
+              <button key={ev.value} type="button" className={`filter-chip${form.events.includes(ev.value) ? ' on' : ''}`}
+                onClick={() => toggleEvent(ev.value)}>{ev.label}</button>
+            ))}
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{form.events.length === 0 ? '（全部）' : ''}</span>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {!(form.kind === 'clawbot' && !editingId) && (
+              <button className="btn btn-primary btn-sm" disabled={!form.name.trim() || !form.target.trim() || busy === 'save'}
+                onClick={save}>
+                <Icon name={editingId ? 'check' : 'plus'} size={14} />{editingId ? '保存' : '添加'}
+              </button>
+            )}
+            {editingId && <button className="btn btn-sm btn-ghost" onClick={resetForm}>取消</button>}
+          </div>
         </div>
         {channels.map(c => (
-          <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)' }}>
+          <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 16px', borderTop: '1px solid var(--border)', opacity: c.enabled ? 1 : 0.55 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-              <span className="chip">{c.kind}</span>
+              <button type="button" className={`switch${c.enabled ? ' on' : ''}`} aria-checked={c.enabled} role="switch"
+                onClick={() => toggleEnabled(c)} disabled={busy === 'en' + c.id}><i /></button>
+              <span className="chip">{kindLabel(c.kind)}</span>
               <span style={{ fontWeight: 600 }}>{c.name}</span>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>{c.target}</span>
+              {c.has_secret && <Icon name="lock" size={12} style={{ color: 'var(--text-faint)' }} />}
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>{c.target}</span>
+              {c.events.trim() && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>· {c.events.split(',').filter(Boolean).length} 事件</span>}
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              <button className="btn btn-sm" disabled={busy === 'test' + c.id} onClick={() => run('test' + c.id, () => testNotifyChannel(c.kind, c.target))}><Icon name="send" size={13} />测试</button>
+              <button className="btn btn-sm" disabled={busy === 'test' + c.id} onClick={() => run('test' + c.id, () => testNotifyChannel(c.id))}><Icon name="send" size={13} />测试</button>
+              <button className="btn btn-sm" onClick={() => startEdit(c)}><Icon name="edit" size={13} /></button>
               <button className="btn btn-sm btn-danger" onClick={() => run('del' + c.id, () => deleteNotifyChannel(c.id))}><Icon name="trash" size={13} /></button>
             </div>
           </div>
@@ -1302,12 +2154,16 @@ function NotifySettings() {
 function GatingSettings() {
   const [policies, setPolicies] = useState<AutoPassPolicy[]>([]);
   const [autoPassOn, setAutoPassOn] = useState(false);
+  const [autoConflictOn, setAutoConflictOn] = useState(false);
+  const [customMsgOn, setCustomMsgOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
   const reload = () => {
     listAutoPassPolicy().then(setPolicies).catch(() => setPolicies([]));
     getAutoPassEnabled().then(setAutoPassOn).catch(() => {});
+    getAutoConflictResolveEnabled().then(setAutoConflictOn).catch(() => {});
+    getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {});
   };
   useEffect(() => { reload(); }, []);
 
@@ -1318,10 +2174,24 @@ function GatingSettings() {
     finally { setBusy(false); }
   };
 
+  const toggleConflict = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !autoConflictOn; await setAutoConflictResolveEnabled(next); setAutoConflictOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const toggleCustomMsg = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !customMsgOn; await setCustomMergeMessageEnabled(next); setCustomMsgOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="set-inner rise">
       <div className="set-h">门控降级</div>
-      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过审核 2 自动合并。</div>
+      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过代码审核自动合并。</div>
       {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
       <div className="panel">
         <div className="panel-head">
@@ -1334,7 +2204,7 @@ function GatingSettings() {
           </div>
         </div>
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过审核 2 直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
+          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过代码审核直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
         </div>
         {policies.length === 0
           ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
@@ -1348,6 +2218,34 @@ function GatingSettings() {
             </div>
           ))}
       </div>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />冲突自动解决（AI）</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (autoConflictOn ? 'green' : '')}>{autoConflictOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggleConflict}>
+              <Icon name={autoConflictOn ? 'pause' : 'play'} size={13} />{autoConflictOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，合并前自动把 dev 并入分支若发生代码冲突，将直接交由 AI 自动解冲突；解完仍会回到代码审核复审，不直接落 dev。关闭时冲突停在「合并冲突」态，可在审核页手动重试或点 AI 解冲突。
+        </div>
+      </div>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />自定义合并提交信息</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (customMsgOn ? 'green' : '')}>{customMsgOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggleCustomMsg}>
+              <Icon name={customMsgOn ? 'pause' : 'play'} size={13} />{customMsgOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>AutoForge merge: &lt;编号&gt;</code>，审核页不显示输入框。批量审核始终走默认模板。
+        </div>
+      </div>
     </div>
   );
 }
@@ -1355,7 +2253,7 @@ function GatingSettings() {
 function WebhookSettings() {
   const [cfg, setCfg]     = useState<IntakeConfig | null>(null);
   const [status, setStatus] = useState<WebhookStatus | null>(null);
-  const [form, setForm]   = useState({ enabled: false, port: '27182', token: '' });
+  const [form, setForm]   = useState({ enabled: false, port: '27182' });
   const [saving, setSaving]   = useState(false);
   const [copied, setCopied]   = useState(false);
   const [saveOk, setSaveOk]   = useState<boolean | null>(null);
@@ -1366,7 +2264,7 @@ function WebhookSettings() {
       .then(([c, s]) => {
         setCfg(c);
         setStatus(s);
-        setForm({ enabled: c.webhook_enabled, port: String(c.webhook_port), token: c.webhook_token });
+        setForm({ enabled: c.webhook_enabled, port: String(c.webhook_port) });
       })
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -1378,7 +2276,6 @@ function WebhookSettings() {
       const updated = await updateIntakeConfig({
         webhook_enabled: form.enabled,
         webhook_port: parseInt(form.port) || 27182,
-        webhook_token: form.token,
       });
       setCfg(updated);
       setSaveOk(true);
@@ -1388,16 +2285,11 @@ function WebhookSettings() {
     finally { setSaving(false); }
   };
 
-  const genToken = () => {
-    const bytes = new Uint8Array(24);
-    crypto.getRandomValues(bytes);
-    setForm(f => ({ ...f, token: btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '') }));
-  };
-
+  // token 不再全局设置：项目级 webhook token 在「项目管理 → 需求入口 → Webhook」签发。
   const curlExample = `curl -X POST http://127.0.0.1:${form.port}/webhook/issues \\
-  -H "Authorization: Bearer ${form.token || '<token>'}" \\
+  -H "Authorization: Bearer <项目 webhook token>" \\
   -H "Content-Type: application/json" \\
-  -d '{"project_id":"<uuid>","title":"需求标题","description":"详细描述"}'`;
+  -d '{"title":"需求标题","description":"详细描述"}'`;
 
   if (loading) return <div className="set-inner" style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>;
 
@@ -1438,21 +2330,11 @@ function WebhookSettings() {
             <label>监听端口</label>
             <input value={form.port} onChange={e => setForm(f => ({ ...f, port: e.target.value }))} placeholder="27182" />
           </div>
-          <div className="field" style={{ margin: 0 }}>
-            <label>访问 Token</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input value={form.token} onChange={e => setForm(f => ({ ...f, token: e.target.value }))}
-                placeholder="Bearer 令牌" style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }} />
-              <button className="btn btn-sm" onClick={genToken} style={{ flexShrink: 0 }}>
-                <Icon name="refresh" size={13} />生成
-              </button>
-            </div>
-          </div>
         </div>
 
         <div style={{ background: 'rgba(139,122,216,.08)', border: '1px solid rgba(139,122,216,.22)', borderRadius: 10, padding: '10px 14px', fontSize: 'var(--text-label)', color: 'var(--text-2)', display: 'flex', gap: 8, marginBottom: 14 }}>
           <Icon name="bell" size={13} style={{ flexShrink: 0, marginTop: 1, color: 'var(--violet)' }} />
-          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)' }}>127.0.0.1</code>（本机），不暴露公网。更改配置后点击「保存并应用」以重启服务。</div>
+          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)' }}>127.0.0.1</code>（本机），不暴露公网。接入凭证已改为<strong>项目级 token</strong>——每个项目在「项目管理 → 需求入口 → Webhook」各自签发、可独立吊销；请求落到哪个项目由 token 决定。更改端口/开关后点击「保存并应用」以重启服务。</div>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -1589,24 +2471,196 @@ function SelfUpdateSettings() {
   );
 }
 
-const SET_ITEMS = [
-  // —— AI 核心：搭建智能体的地基（模型 → 能力 → 角色 → 记忆）——
-  { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-  { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
-  { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
-  { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
-  // —— 运行与流控 ——
-  { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
-  { id: 'gating',      name: '门控降级',     ic: 'sliders' },
-  { id: 'security',    name: '安全与权限',   ic: 'shield' },
-  // —— 集成与通知 ——
-  { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
-  { id: 'notify',      name: '通知通道',     ic: 'bell' },
-  // —— 系统 ——
-  { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
-  { id: 'theme',       name: '主题设置',     ic: 'palette' },
-  { id: 'about',       name: '关于 AutoForge', ic: 'box' },
+// ── 配置备份：口令加密导出 / 一键导入 ─────────────────────────────────────────
+function BackupSettings() {
+  const [secretBackend, setSecretBackend] = useState<SecretBackend | null>(null);
+  const [exportPass, setExportPass] = useState('');
+  const [exportPass2, setExportPass2] = useState('');
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [exportErr, setExportErr] = useState('');
+
+  const [importPass, setImportPass] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<BackupSummary | null>(null);
+  const [importErr, setImportErr] = useState('');
+  const [pickedName, setPickedName] = useState('');
+  const [pickedWarn, setPickedWarn] = useState('');
+  const fileRef = useRef<HTMLInputElement>(null);
+  const pickedContent = useRef<string>('');
+
+  useEffect(() => { getSecretBackendStatus().then(setSecretBackend).catch(() => {}); }, []);
+
+  const summaryLine = (s: BackupSummary) =>
+    `${s.llm_configs} 个 LLM · ${s.agents} 个 Agent · ${s.mcp_servers} 个 MCP · ${s.notify_channels} 个通知 · ${s.app_settings} 项系统设置`;
+
+  const doExport = async () => {
+    setExportErr(''); setExportResult(null);
+    if (exportPass.length < 6) { setExportErr('口令至少 6 位'); return; }
+    if (exportPass !== exportPass2) { setExportErr('两次输入的口令不一致'); return; }
+    setExporting(true);
+    try {
+      const r = await exportConfig(exportPass);
+      setExportResult(r);
+      setExportPass(''); setExportPass2('');
+    } catch (e) {
+      setExportErr(String(e));
+    } finally { setExporting(false); }
+  };
+
+  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = ''; // 允许再次选择同一文件
+    if (!f) return;
+    setImportErr(''); setImportResult(null); setPickedWarn('');
+    try {
+      pickedContent.current = await f.text();
+      setPickedName(f.name);
+      // 后缀不符仅提示、不阻断：读取不依赖扩展名，但提醒用户可能选错文件
+      if (!f.name.toLowerCase().endsWith('.afbackup')) {
+        setPickedWarn('该文件后缀不是 .afbackup，可能不是备份文件——请确认无误后再导入。');
+      }
+    } catch {
+      setImportErr('读取文件失败');
+      setPickedName('');
+      pickedContent.current = '';
+    }
+  };
+
+  const doImport = async () => {
+    setImportErr(''); setImportResult(null);
+    if (!pickedContent.current) { setImportErr('请先选择备份文件'); return; }
+    if (importPass.length < 6) { setImportErr('请输入导出时设置的口令'); return; }
+    setImporting(true);
+    try {
+      const s = await importConfig(pickedContent.current, importPass);
+      setImportResult(s);
+      setImportPass('');
+    } catch (e) {
+      setImportErr(String(e));
+    } finally { setImporting(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">配置备份</div>
+      <div className="set-desc">
+        把 LLM 配置、角色 Agent、工具 / MCP、通知通道与系统设置（含 API Key 等密钥）整包口令加密导出。
+        换机或重装后用同一口令一键导入，快速进入生产。
+      </div>
+      {secretBackend && (
+        <div className="chip" style={{ marginBottom: 14 }}
+          title="导出会用本机主密钥还原密钥明文，再以你设置的口令重新加密；导出文件不含本机主密钥，仅口令可解。">
+          <Icon name={secretBackend === 'keychain' ? 'shield' : 'alert'} size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
+          密钥随包加密 · 仅凭口令可解
+        </div>
+      )}
+
+      {/* 导出 */}
+      <div className="cfg-card" style={{ padding: 16 }}>
+        <div className="cfg-name" style={{ marginBottom: 4 }}><Icon name="download" size={15} style={{ verticalAlign: -2, marginRight: 6 }} />加密导出</div>
+        <div className="cfg-sub" style={{ marginBottom: 12 }}>设置一个加密口令（至少 6 位）。请牢记口令——丢失则无法解开备份。</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div className="field"><label>加密口令</label>
+            <input type="password" autoComplete="new-password" value={exportPass}
+              onChange={e => setExportPass(e.target.value)} placeholder="至少 6 位" /></div>
+          <div className="field"><label>确认口令</label>
+            <input type="password" autoComplete="new-password" value={exportPass2}
+              onChange={e => setExportPass2(e.target.value)} placeholder="再次输入" /></div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
+          <button className="btn btn-primary" disabled={exporting} onClick={doExport}>
+            <Icon name="download" size={14} />{exporting ? '导出中…' : '加密导出'}
+          </button>
+          {exportErr && <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>{exportErr}</span>}
+        </div>
+        {exportResult && (
+          <div className="chip green" style={{ display: 'block', marginTop: 12, padding: '10px 12px', lineHeight: 1.6, borderRadius: 10 }}>
+            <div>已导出：{summaryLine(exportResult.summary)}</div>
+            <div style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', wordBreak: 'break-all', marginTop: 4 }}>{exportResult.path}</div>
+            <button className="btn btn-sm" style={{ marginTop: 8 }} onClick={() => revealBackup(exportResult.path).catch(() => {})}>
+              <Icon name="folderOpen" size={13} />在文件夹中显示
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* 导入 */}
+      <div className="cfg-card" style={{ padding: 16, marginTop: 14 }}>
+        <div className="cfg-name" style={{ marginBottom: 4 }}><Icon name="upload" size={15} style={{ verticalAlign: -2, marginRight: 6 }} />导入恢复</div>
+        <div className="cfg-sub" style={{ marginBottom: 12 }}>选择 .afbackup 备份文件并输入当时的口令。按主键合并恢复，不会删除现有未涉及的配置。</div>
+        {/* 不设 accept 过滤：Linux WebKitGTK 按 MIME 匹配，会把未注册 MIME 的 .afbackup 文件过滤掉，导致选不到备份文件 */}
+        <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={onPick} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => fileRef.current?.click()}>
+            <Icon name="folderOpen" size={14} />选择备份文件
+          </button>
+          {pickedName && <span className="chip" style={{ fontFamily: 'var(--font-mono)' }}>{pickedName}</span>}
+        </div>
+        {pickedWarn && (
+          <div className="chip amber" style={{ marginTop: 10 }}>
+            <Icon name="alert" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />{pickedWarn}
+          </div>
+        )}
+        <div className="field" style={{ marginTop: 12, maxWidth: 320 }}><label>解密口令</label>
+          <input type="password" autoComplete="off" value={importPass}
+            onChange={e => setImportPass(e.target.value)} placeholder="导出时设置的口令" /></div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
+          <button className="btn" disabled={importing || !pickedName} onClick={doImport}>
+            <Icon name="upload" size={14} />{importing ? '导入中…' : '导入并恢复'}
+          </button>
+          {importErr && <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>{importErr}</span>}
+        </div>
+        {importResult && (
+          <div className="chip green" style={{ display: 'block', marginTop: 12, padding: '10px 12px', lineHeight: 1.6 }}>
+            已恢复：{summaryLine(importResult)}。部分设置（并发等）将在下次启动后生效。
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string }[] }[] = [
+  {
+    group: 'AI 核心', // 搭建智能体的地基（模型 → 能力 → 角色 → 记忆）
+    items: [
+      { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
+      { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
+      { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
+      { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
+    ],
+  },
+  {
+    group: '运行与流控',
+    items: [
+      { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+      { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
+      { id: 'autosupply',  name: '自动供料',     ic: 'refresh' },
+      { id: 'gating',      name: '门控降级',     ic: 'sliders' },
+      { id: 'security',    name: '安全与权限',   ic: 'shield' },
+    ],
+  },
+  {
+    group: '集成与通知',
+    items: [
+      { id: 'asr',         name: '语音录入',     ic: 'mic' },
+      { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
+      { id: 'notify',      name: '通知通道',     ic: 'bell' },
+    ],
+  },
+  {
+    group: '系统',
+    items: [
+      { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+      { id: 'backup',      name: '配置备份',     ic: 'download' },
+      { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
+      { id: 'theme',       name: '主题设置',     ic: 'palette' },
+      { id: 'about',       name: '关于 AutoForge', ic: 'box' },
+    ],
+  },
 ];
+const SET_ITEMS = SET_GROUPS.flatMap(g => g.items);
 
 export default function SettingsPage({
   theme,
@@ -1617,6 +2671,18 @@ export default function SettingsPage({
 }) {
   const [sec, setSec] = useState('llm');
   const cur = SET_ITEMS.find(i => i.id === sec)!;
+
+  // 分组折叠：默认只展开当前激活项所在组，其余收起，避免一次铺开全部。
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+    const open = SET_GROUPS.find(g => g.items.some(it => it.id === sec))?.group;
+    return new Set(SET_GROUPS.map(g => g.group).filter(name => name !== open));
+  });
+  const toggleGroup = (name: string) =>
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      next.has(name) ? next.delete(name) : next.add(name);
+      return next;
+    });
 
   // 待拉取提交数角标：每分钟检查一次自管理仓库落后 origin/dev 的提交数。
   const [pendingBehind, setPendingBehind] = useState(0);
@@ -1636,29 +2702,48 @@ export default function SettingsPage({
       </div>
       <div className="set-wrap">
         <div className="set-nav">
-          {SET_ITEMS.map(it => (
-            <div key={it.id} className={'set-nav-item' + (sec === it.id ? ' active' : '')} onClick={() => setSec(it.id)}>
-              <Icon name={it.ic} size={18} />{it.name}
-              {it.id === 'selfupdate' && pendingBehind > 0 && (
-                <span className="set-nav-badge" title={`有 ${pendingBehind} 个提交待拉取`}>{pendingBehind}</span>
-              )}
-            </div>
-          ))}
+          {SET_GROUPS.map(g => {
+            const isCollapsed = collapsed.has(g.group);
+            // 折叠态仍有该组项被选中时，用角标提示当前位置不丢失。
+            const hasActive = g.items.some(it => it.id === sec);
+            return (
+              <Fragment key={g.group}>
+                <div className={'set-nav-group' + (isCollapsed ? ' collapsed' : '')} onClick={() => toggleGroup(g.group)}>
+                  {g.group}
+                  {isCollapsed && hasActive && <span className="dot ember" style={{ marginLeft: 4 }} />}
+                  <Icon name="chevron" size={14} className="set-nav-chevron" />
+                </div>
+                {!isCollapsed && g.items.map(it => (
+                  <div key={it.id} className={'set-nav-item' + (sec === it.id ? ' active' : '')} onClick={() => setSec(it.id)}>
+                    <Icon name={it.ic} size={18} />{it.name}
+                    {it.id === 'selfupdate' && pendingBehind > 0 && (
+                      <span className="set-nav-badge" title={`有 ${pendingBehind} 个提交待拉取`}>{pendingBehind}</span>
+                    )}
+                  </div>
+                ))}
+              </Fragment>
+            );
+          })}
         </div>
         <div className="set-body scroll">
           {sec === 'theme'       && <ThemeSettings theme={theme} onThemeChange={onThemeChange} />}
+          {sec === 'shortcuts'   && <ShortcutSettings />}
           {sec === 'llm'         && <LLMSettings />}
           {sec === 'tools'       && <ToolsSettings />}
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
+          {sec === 'codeagent'   && <CodeAgentSettings />}
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
+          {sec === 'backup'      && <BackupSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
+          {sec === 'asr'         && <AsrSettings />}
+          {sec === 'autosupply'  && <AutosupplySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','llm','tools','roles','concurrency','selfupdate','knowledge','security','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','shortcuts','llm','tools','roles','concurrency','codeagent','selfupdate','backup','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

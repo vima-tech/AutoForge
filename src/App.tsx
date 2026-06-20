@@ -10,13 +10,25 @@ import AuditPage from './pages/Audit';
 import ProjectsPage from './pages/Projects';
 import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
-import { getSystemHealth, checkClaudeAuth, getBadgeCounts, type SystemHealth } from './services';
-import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, type ThemeSelection } from './theme';
+import TracePage from './pages/Trace';
+import QuickCapture from './components/QuickCapture';
+import OperatorPanel from './components/OperatorPanel';
+import { loadOperator } from './operator';
+import { getSystemHealth, getSystemResources, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, getChangeRequest, getIssue, type SystemHealth, type SystemResources } from './services';
+import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseResMonitor, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
+import { triggerVoiceInput } from './lib/voiceInput';
 
-type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'settings';
+type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
+
+// 资源占用配色：高负载用语义状态色（≥90% 危险红 / ≥75% 进行中琥珀），其余沿用次要文本色。
+function resBadgeColor(pct: number): string {
+  if (pct >= 90) return 'var(--red)';
+  if (pct >= 75) return 'var(--amber)';
+  return 'var(--text-2)';
+}
 
 // ---- Traffic light buttons ----
 function TrafficLights({ maximized, setMaximized }: { maximized: boolean; setMaximized: (v: boolean) => void }) {
@@ -99,21 +111,69 @@ const NAV: { id: Page; name: string; ic: string }[] = [
 ];
 
 export default function App() {
+  const [showQuick, setShowQuick] = useState(false);
+  // 经语音快捷键兜底打开速录念头时置真，让速录面板挂载后自动起录。
+  const [quickAutoVoice, setQuickAutoVoice] = useState(false);
+  const [quickShortcut, setQuickShortcut] = useState<QuickCaptureShortcut>(
+    () => parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)),
+  );
+  const [voiceShortcut, setVoiceShortcut] = useState<QuickCaptureShortcut>(
+    () => parseVoiceInputShortcut(localStorage.getItem(VOICE_INPUT_SHORTCUT_KEY)),
+  );
+  const [showOperator, setShowOperator] = useState(false);
+  const [notifUnread, setNotifUnread] = useState(0);
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
     return saved && (['home', 'chat', 'projects', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [resMonEnabled, setResMonEnabled] = useState(() => parseResMonitor(localStorage.getItem(RES_MONITOR_KEY)));
+  const [resources, setResources] = useState<SystemResources | null>(null);
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
   // Window maximize state drives the .os-window shadow gutter (collapse it when maximized).
   const [maximized, setMaximized] = useState(false);
-  // Cross-page jump target: Dashboard → Audit (a requirement to open in 功能审计).
+  // Cross-page jump target: Dashboard → Audit (an issue to open in 功能审计).
   const [auditTarget, setAuditTarget] = useState<{ projectId: string; issueId: string } | null>(null);
+  // 通知导航请求自动打开「全量需求总账」弹窗（新需求录入）。
+  const [auditOpenLedger, setAuditOpenLedger] = useState(false);
+  // 主页完整流水线节点跳转：按项目 + 环节定位功能审计视图（gate 或总账筛选）。
+  const [auditStage, setAuditStage] = useState<{ projectId: string; stage: string } | null>(null);
   const goToAudit = useCallback((target: { projectId: string; issueId: string }) => {
     setAuditTarget(target);
     setPage('audit');
     sessionStorage.setItem('AutoForge:page', 'audit');
+  }, []);
+  const goToAuditStage = useCallback((projectId: string, stage: string) => {
+    setAuditStage({ projectId, stage });
+    setPage('audit');
+    sessionStorage.setItem('AutoForge:page', 'audit');
+  }, []);
+
+  // 通知收件箱跳转：切到目标页；若带 ref（CR/需求），解析为 { projectId, issueId }
+  // 设进 auditTarget，由审计页 target effect 自动切换审核需求/代码闸口并选中该需求。
+  const navigateFromNotification = useCallback(
+    async (p: 'audit' | 'delivery' | 'chat', opts?: { openLedger?: boolean; ref?: { kind: 'cr' | 'issue'; id: string } }) => {
+      setPage(p);
+      sessionStorage.setItem('AutoForge:page', p);
+      if (opts?.openLedger) setAuditOpenLedger(true);
+      if (p === 'audit' && opts?.ref) {
+        try {
+          if (opts.ref.kind === 'cr') {
+            const cr = await getChangeRequest(opts.ref.id);
+            setAuditTarget({ projectId: cr.project_id, issueId: cr.issue_id });
+          } else {
+            const iss = await getIssue(opts.ref.id);
+            if (iss) setAuditTarget({ projectId: iss.project_id, issueId: iss.id });
+          }
+        } catch { /* 解析失败则仅停在审计页，不强制选中 */ }
+      }
+    },
+    [],
+  );
+
+  const refreshNotifUnread = useCallback(() => {
+    unreadNotificationCount().then(setNotifUnread).catch(() => { /* keep stale */ });
   }, []);
 
   const badgeRefreshInFlight = useRef(false);
@@ -154,6 +214,71 @@ export default function App() {
     applyRailMode(parseRailMode(localStorage.getItem(RAIL_STORAGE_KEY)));
   }, []);
 
+  // Re-read the titlebar resource-monitor preference when Settings toggles it (live).
+  useEffect(() => {
+    const reread = () => setResMonEnabled(parseResMonitor(localStorage.getItem(RES_MONITOR_KEY)));
+    window.addEventListener(RES_MONITOR_CHANGED_EVENT, reread);
+    return () => window.removeEventListener(RES_MONITOR_CHANGED_EVENT, reread);
+  }, []);
+
+  // Poll CPU/memory usage for the titlebar monitor. CPU% is a delta between
+  // samples, so the first tick reads ~0 and subsequent ticks are accurate.
+  useEffect(() => {
+    if (!isTauri || !resMonEnabled) { setResources(null); return; }
+    let alive = true;
+    const tick = () => {
+      getSystemResources()
+        .then(r => { if (alive) setResources(r); })
+        .catch(() => { if (alive) setResources(null); });
+    };
+    tick();
+    const timer = setInterval(tick, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [resMonEnabled]);
+
+  // Re-read the quick-capture shortcut whenever Settings changes it (live, no reload).
+  useEffect(() => {
+    const reread = () => {
+      setQuickShortcut(parseQuickCaptureShortcut(localStorage.getItem(QUICK_CAPTURE_SHORTCUT_KEY)));
+      setVoiceShortcut(parseVoiceInputShortcut(localStorage.getItem(VOICE_INPUT_SHORTCUT_KEY)));
+    };
+    window.addEventListener(SHORTCUT_CHANGED_EVENT, reread);
+    return () => window.removeEventListener(SHORTCUT_CHANGED_EVENT, reread);
+  }, []);
+
+  // Global hotkey → open 速录念头. Modifier-guarded combos won't collide with plain
+  // typing, so it fires regardless of focus (the expected "quick capture" behavior).
+  useEffect(() => {
+    if (!quickShortcut.enabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (!comboMatchesEvent(quickShortcut.combo, e)) return;
+      e.preventDefault();
+      setQuickAutoVoice(false);
+      setShowQuick(true);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [quickShortcut]);
+
+  // Global hotkey → toggle voice input on whichever live-voice surface is active
+  // (会议室 Composer / 速录念头…). If none is mounted, fall back to opening 速录念头
+  // and auto-starting its recording, so the key always does *something* voice-related.
+  useEffect(() => {
+    if (!voiceShortcut.enabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (!comboMatchesEvent(voiceShortcut.combo, e)) return;
+      e.preventDefault();
+      if (!triggerVoiceInput()) {
+        setQuickAutoVoice(true);
+        setShowQuick(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [voiceShortcut]);
+
   // Auth check intentionally removed: spawning the claude Electron subprocess
   // at any point while WebKitGTK is active delivers SIGTRAP to our process,
   // triggering a NeedDebuggerBreak trap that permanently freezes IPC.
@@ -165,6 +290,12 @@ export default function App() {
     window.addEventListener('AutoForge:badges-refresh', onCustom);
     return () => window.removeEventListener('AutoForge:badges-refresh', onCustom);
   }, [refreshBadges]);
+
+  // Load operator profile + activity-inbox unread count on startup.
+  useEffect(() => {
+    void loadOperator();
+    refreshNotifUnread();
+  }, [refreshNotifUnread]);
 
   // Track maximize state so the window shadow gutter collapses when maximized.
   useEffect(() => {
@@ -199,6 +330,7 @@ export default function App() {
     // Debounce heavy refresh calls: collapse bursts within 500 ms into one call.
     let badgeTimer: ReturnType<typeof setTimeout> | null = null;
     let healthTimer: ReturnType<typeof setTimeout> | null = null;
+    let notifTimer: ReturnType<typeof setTimeout> | null = null;
     const debouncedBadges = () => {
       if (badgeTimer) clearTimeout(badgeTimer);
       badgeTimer = setTimeout(() => { badgeTimer = null; refreshBadges(); }, 500);
@@ -206,6 +338,13 @@ export default function App() {
     const debouncedHealth = () => {
       if (healthTimer) clearTimeout(healthTimer);
       healthTimer = setTimeout(() => { healthTimer = null; refreshHealth(); }, 500);
+    };
+    // Notifications are persisted by a task spawned *after* event::emit, so the
+    // row may not exist the instant the webview receives the event — wait 900 ms
+    // before re-counting unread to avoid racing the backend insert.
+    const debouncedNotif = () => {
+      if (notifTimer) clearTimeout(notifTimer);
+      notifTimer = setTimeout(() => { notifTimer = null; refreshNotifUnread(); }, 900);
     };
 
     let unlisten: (() => void) | undefined;
@@ -218,6 +357,7 @@ export default function App() {
       // Debounced IPC refreshes.
       debouncedBadges();
       debouncedHealth();
+      debouncedNotif();
 
       // Desktop notifications (only for actionable events).
       switch (ev?.type) {
@@ -249,9 +389,10 @@ export default function App() {
       clearTimeout(startupHealthTimer);
       if (badgeTimer) clearTimeout(badgeTimer);
       if (healthTimer) clearTimeout(healthTimer);
+      if (notifTimer) clearTimeout(notifTimer);
       unlisten?.();
     };
-  }, [refreshBadges, refreshHealth]);
+  }, [refreshBadges, refreshHealth, refreshNotifUnread]);
 
   const stageLabel = health
     ? health.stage === 'paused' ? '系统暂停'
@@ -267,6 +408,26 @@ export default function App() {
         <TrafficLights maximized={maximized} setMaximized={setMaximized} />
         <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
         <div className="tb-right">
+          {resMonEnabled && resources && (
+            <span
+              className="tb-res"
+              title={`CPU ${resources.cpu_pct.toFixed(0)}% · 内存 ${resources.mem_used_mb} / ${resources.mem_total_mb} MB`}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 10,
+                fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)',
+                color: 'var(--text-3)', letterSpacing: '.04em',
+              }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: 'var(--text-faint)' }}>CPU</span>
+                <span style={{ color: resBadgeColor(resources.cpu_pct) }}>{resources.cpu_pct.toFixed(0)}%</span>
+              </span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: 'var(--text-faint)' }}>MEM</span>
+                <span style={{ color: resBadgeColor(resources.mem_pct) }}>{resources.mem_pct.toFixed(0)}%</span>
+              </span>
+            </span>
+          )}
           <span className={'chip ' + (health?.stage === 'paused' ? 'red' : health?.stage === 'throttled' ? 'amber' : 'green')} style={{ padding: '3px 9px' }}>
             <span className={'dot ' + (health?.stage === 'paused' ? 'red' : 'green')} style={{ width: 6, height: 6, boxShadow: 'none' }} />
             {stageLabel}
@@ -299,6 +460,14 @@ export default function App() {
             </button>
             );
           })}
+          <button
+            className="rail-item rail-zap"
+            title={quickShortcut.enabled ? `速录念头（${formatCombo(quickShortcut.combo)}）` : '速录念头（随手记，入待整理池）'}
+            onClick={() => setShowQuick(true)}
+          >
+            <span className="rail-ic"><Icon name="zap" size={23} /></span>
+            <span className="rail-label">速录</span>
+          </button>
           <div className="rail-spacer" />
           <button
             className="rail-item"
@@ -309,6 +478,14 @@ export default function App() {
             <span className="rail-label">{theme.mode === 'dark' ? '浅色模式' : '深色模式'}</span>
           </button>
           <button
+            className={'rail-item' + (page === 'trace' ? ' active' : '')}
+            onClick={() => { setPage('trace'); sessionStorage.setItem('AutoForge:page', 'trace'); }}
+            title="LLM 调用链路追踪"
+          >
+            <span className="rail-ic"><Icon name="log" size={23} /></span>
+            <span className="rail-label">链路追踪</span>
+          </button>
+          <button
             className={'rail-item' + (page === 'settings' ? ' active' : '')}
             onClick={() => { setPage('settings'); sessionStorage.setItem('AutoForge:page', 'settings'); }}
             title="设置"
@@ -316,20 +493,36 @@ export default function App() {
             <span className="rail-ic"><Icon name="settings" size={23} /></span>
             <span className="rail-label">设置</span>
           </button>
-          <div className="rail-item rail-me">
-            <span className="rail-ic"><MeAvatar size={34} /></span>
+          <button
+            className={'rail-item rail-me' + (showOperator ? ' active' : '')}
+            title="我的账户 · 活动中心"
+            onClick={() => setShowOperator(v => !v)}
+          >
+            <span className="rail-ic">
+              <MeAvatar size={34} />
+              {notifUnread > 0 && !showOperator && <span className="rail-badge">{notifUnread}</span>}
+            </span>
             <span className="rail-label">我的账户</span>
-          </div>
+          </button>
           </div>
         </div>
 
-        {page === 'home'     && <Dashboard onOpenInAudit={goToAudit} />}
+        {page === 'home'     && <Dashboard onOpenInAudit={goToAudit} onOpenStage={goToAuditStage} />}
         {page === 'chat'     && <ConversationsPage />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'delivery' && <DeliveryPage />}
-        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} />}
+        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} openLedger={auditOpenLedger} onLedgerConsumed={() => setAuditOpenLedger(false)} stageTarget={auditStage} onStageConsumed={() => setAuditStage(null)} />}
+        {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>
+      {showQuick && <QuickCapture autoVoice={quickAutoVoice} onClose={() => { setShowQuick(false); setQuickAutoVoice(false); }} />}
+      {showOperator && (
+        <OperatorPanel
+          onClose={() => setShowOperator(false)}
+          onNavigate={navigateFromNotification}
+          onUnreadChange={refreshNotifUnread}
+        />
+      )}
     </div>
   );
 }

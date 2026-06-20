@@ -18,10 +18,14 @@ fn auth_cache() -> &'static AsyncMutex<Option<(bool, Instant)>> {
 /// cannot deliver signals (e.g. the SIGTRAP / NeedDebuggerBreak that the
 /// Electron-based claude CLI triggers in WebKitGTK) to our process.
 fn isolated_claude_cmd() -> Command {
-    let mut cmd = Command::new("claude");
-    // Run the child in its own process group (setpgid(0,0)).
-    // Any signals sent to the process group will not reach our GTK event loop.
-    cmd.process_group(0);
+    // Resolve `claude` via PATH so Windows can find the `claude.cmd` npm shim
+    // (`Command::new("claude")` only auto-appends `.exe`); no-op on unix.
+    let mut cmd = Command::new(crate::core::platform::program("claude"));
+    // Run the child in its own process group (unix: setpgid(0,0); windows:
+    // CREATE_NEW_PROCESS_GROUP). Any signals sent to the group won't reach our
+    // GTK event loop. `.process_group(0)` is unix-only, so route through the
+    // cross-platform helper to keep Windows building.
+    crate::core::platform::detach_process_group(&mut cmd);
     cmd
 }
 

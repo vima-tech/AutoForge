@@ -1,24 +1,30 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import { Avatar, MeAvatar } from '../components/Avatar';
+import { useOperator } from '../operator';
+import { primeAgents } from '../agents-store';
 import Block from '../components/Block';
+import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
-  toggleMessageContext, startConversationTask,
+  toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
   listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
-  runConversationCommand, INNATE_SENDER,
+  runConversationCommand, INNATE_SENDER, submitIssue, getAsrSettings,
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
   type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
 } from '../services';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
+import { toggleMaximizeOnDoubleClick } from '../lib/window';
+import { RealtimeAsr } from '../lib/realtimeAsr';
+import { registerVoiceSurface } from '../lib/voiceInput';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -33,6 +39,49 @@ interface PendingAttachment {
   mode: 'file' | 'image';
 }
 
+// ── 输入框草稿：按会话窗口隔离、跨页面切换不丢失 ──
+// 每个会话各自保存一份草稿，互不共享：
+//  · 内存 Map 保留完整草稿（含 File 附件与 @/# 内联标签），跨「切换页面→组件卸载→返回」
+//    与会话切换都不丢失（SPA 内模块常驻，卸载组件不清空它）；
+//  · 纯文本（html）另存 sessionStorage，使整页刷新后文字仍能恢复（File 无法序列化，
+//    刷新后附件不保留，但文字不丢）。
+interface ComposerDraft {
+  html: string;
+  pending: PendingAttachment[];
+}
+const composerDrafts = new Map<string, ComposerDraft>();
+const DRAFT_SS_PREFIX = 'AutoForge:draft:';
+
+function loadComposerDraft(convId: string): ComposerDraft {
+  const mem = composerDrafts.get(convId);
+  if (mem) return mem;
+  try {
+    const html = sessionStorage.getItem(DRAFT_SS_PREFIX + convId) ?? '';
+    return { html, pending: [] };
+  } catch {
+    return { html: '', pending: [] };
+  }
+}
+
+function saveComposerDraft(convId: string, draft: ComposerDraft) {
+  if (!draft.html.trim() && draft.pending.length === 0) {
+    composerDrafts.delete(convId);
+  } else {
+    composerDrafts.set(convId, draft);
+  }
+  try {
+    if (draft.html.trim()) sessionStorage.setItem(DRAFT_SS_PREFIX + convId, draft.html);
+    else sessionStorage.removeItem(DRAFT_SS_PREFIX + convId);
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearComposerDraft(convId: string) {
+  composerDrafts.delete(convId);
+  try { sessionStorage.removeItem(DRAFT_SS_PREFIX + convId); } catch { /* ignore */ }
+}
+
 // 群聊 @快捷指令：`@所有人` 展开为全部可点名成员，让大家一起讨论并尽快达成一致。
 const ALL_MENTION_ID = '__all__';
 type MentionItem = { kind: 'all' } | { kind: 'agent'; agent: Agent };
@@ -45,6 +94,23 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'evolve',   usage: '/evolve',          desc: '立即蒸馏整理（进化）',           icon: 'zap' },
   { name: 'innate',   usage: '/innate',          desc: '查看知识库健康度',               icon: 'flask' },
 ];
+// 群聊快捷指令 tag：放在 composer-tools 行，一键触发常用指令，省去重复打字。
+// 带 compress 的指令（总结内容/形成结论）会在生成摘要的同时压缩上下文：
+// 把当前窗口内的历史消息移出后续 Agent 上下文，让摘要成为新的上下文基线。
+interface QuickPrompt {
+  label: string;
+  icon: string;
+  /** 普通指令：作为用户消息发送并触发编排。 */
+  prompt?: string;
+  /** 压缩指令：summary=压缩摘要，conclusion=收敛结论；二者都会压缩上下文。 */
+  compress?: 'summary' | 'conclusion';
+}
+const QUICK_PROMPTS: QuickPrompt[] = [
+  { label: '总结内容', icon: 'log', compress: 'summary' },
+  { label: '形成结论', icon: 'check', compress: 'conclusion' },
+  { label: '列出待办', icon: 'quote', prompt: '请从以上讨论中提取所有待办事项，标注负责人（若有）与优先级。' },
+];
+
 /** 解析以 `/` 开头的输入；返回命令与参数，未知命令 name 为 null。 */
 function parseSlashCommand(text: string): { name: ConvCommandName | null; raw: string; arg: string } | null {
   const t = text.trimStart();
@@ -136,6 +202,37 @@ function visibleMessageBlocks(m: Message): BlockType[] {
   return parseMessageBlocks(m).filter(b => b.t !== 'quote_ref');
 }
 
+// 抽取文档流消息的 h1–h3 标题，生成右侧大纲（TOC）。跳过围栏代码块内的 # 行，
+// 仅收 1–3 级——与 DOM 中 querySelectorAll('h1,h2,h3') 的集合/顺序一致，索引可直接对应。
+function docHeadings(blocks: BlockType[]): { level: number; text: string }[] {
+  const md = blocks
+    .filter((b): b is Extract<BlockType, { t: 'md' }> => b.t === 'md')
+    .map(b => b.md)
+    .join('\n');
+  if (!md) return [];
+  const out: { level: number; text: string }[] = [];
+  let fenced = false;
+  for (const ln of md.split('\n')) {
+    if (/^\s*(```+|~~~+)/.test(ln)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const h = ln.match(/^(#{1,3})\s+(.+)$/);
+    if (h) out.push({ level: h[1].length, text: h[2].replace(/[*`]/g, '').trim() });
+  }
+  return out;
+}
+
+// 长文档右侧 sticky 大纲。点击平滑滚动到气泡内第 i 个标题。
+function DocToc({ headings, onJump }: { headings: { level: number; text: string }[]; onJump: (i: number) => void }) {
+  return (
+    <nav className="doc-toc" aria-label="文档大纲">
+      <div className="doc-toc-label">大纲</div>
+      {headings.map((h, i) => (
+        <a key={i} className={`lvl-${h.level}`} title={h.text} onClick={() => onJump(i)}>{h.text}</a>
+      ))}
+    </nav>
+  );
+}
+
 async function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -219,9 +316,10 @@ function ConvItem({ c, active, agentMap, onSelect }: {
   );
 }
 
-function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
+function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive, collapsed, onToggleCollapse }: {
   convs: Conversation[]; agents: Agent[];
   active: string; onSelect: (id: string) => void; onNew: () => void; onOpenArchive: () => void;
+  collapsed: boolean; onToggleCollapse: () => void;
 }) {
   const [q, setQ] = useState('');
   const chatAgents = useMemo(() => agents.filter(a => a.visible_in_chat && a.enabled), [agents]);
@@ -233,12 +331,16 @@ function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
     () => convs.filter(c => c.conv_type === 'direct' && c.members.some(id => !!agentMap[id])),
     [convs, agentMap],
   );
+  if (collapsed) return null;
   return (
     <div className="list-col">
       <div className="list-head">
         <div className="list-title-row">
           <span className="list-title">会议室</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <button className="icon-btn" title="收起对话列表" onClick={onToggleCollapse}>
+              <Icon name="columns" size={18} />
+            </button>
             <button className="icon-btn" title="归档区 · 检索回顾" onClick={onOpenArchive}>
               <Icon name="inbox" size={18} />
             </button>
@@ -262,21 +364,31 @@ function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive }: {
   );
 }
 
-function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMenu, projectId }: {
+function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBubbleContextMenu, projectId, receipt }: {
   m: Message; agents: Agent[]; isGroup: boolean;
-  highlighted?: boolean; rowRef?: (el: HTMLDivElement | null) => void;
+  highlighted?: boolean; searchTerm?: string; rowRef?: (el: HTMLDivElement | null) => void;
   onBubbleContextMenu?: (e: React.MouseEvent, message: Message, author: string) => void;
   projectId?: string;
+  receipt?: boolean;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
+  const op = useOperator();
   const isInnate = m.from_agent === INNATE_SENDER;
   const me = !m.from_agent;
   const a  = me || isInnate ? null : agentMap[m.from_agent!];
-  const author = me ? '我' : isInnate ? 'Innate' : (a?.name ?? 'Agent');
+  const author = me ? op.display_name : isInnate ? 'Innate' : (a?.name ?? 'Agent');
   const blocks = visibleMessageBlocks(m);
   const quote = messageQuote(m);
+  // Agent/Innate 回复一律用「文档流」（bubble doc）统一呈现；「我」的消息保持气泡右对齐。
+  const longDoc = !me;
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const headings = useMemo(() => (longDoc ? docHeadings(blocks) : []), [longDoc, blocks]);
+  const showToc = headings.length >= 3;
+  const jumpToHeading = (i: number) => {
+    bubbleRef.current?.querySelectorAll('h1,h2,h3')[i]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
   return (
-    <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
+    <div ref={rowRef} className={'msg' + (me ? ' me' : '') + (longDoc ? ' msg-doc' : '') + (highlighted ? ' search-hit' : '') + ' rise'}>
       {me
         ? <MeAvatar size={36} />
         : isInnate
@@ -296,11 +408,12 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
           </div>
         )}
         <div
-          className="bubble"
+          ref={bubbleRef}
+          className={'bubble' + (longDoc ? ' doc' : '')}
           onContextMenu={e => onBubbleContextMenu?.(e, m, author)}
           style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}
         >
-          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} highlight={searchTerm} messageId={m.id} blockIndex={i} />)}
           {m.excluded_from_context && (
             <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
               <Icon name="eye-off" size={11} />已从 AI 上下文排除
@@ -313,14 +426,19 @@ function MessageRow({ m, agents, isGroup, highlighted, rowRef, onBubbleContextMe
             <span className="quote-text">{quote.text}</span>
           </div>
         )}
+        {me && receipt && (
+          <div className="msg-receipt"><Icon name="check" size={11} />已送达</div>
+        )}
       </div>
+      {showToc && <DocToc headings={headings} onJump={jumpToHeading} />}
     </div>
   );
 }
 
-function Composer({ conv, agents, contextAttachments, onSend, onError, quote, onClearQuote, busy }: {
+function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
   onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
+  onCompress: (mode: 'summary' | 'conclusion') => Promise<boolean>;
   onError: (message: string) => void;
   quote: QuoteDraft | null;
   onClearQuote: () => void;
@@ -337,8 +455,21 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
   const attachmentPopRef = useRef<HTMLDivElement>(null);
   const attachmentTriggerRef = useRef<HTMLButtonElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  // IME（中文/日文）合成态。WebKitGTK(Tauri Linux) 上 KeyboardEvent.isComposing 在「上屏候选词的
+  // 那次 Enter」上报不可靠，故自己用 compositionstart/end 维护一份状态，作为 Enter 发送的权威闸门——
+  // 否则合成期 Enter 会被当成发送、preventDefault 掐断上屏，正在输入的文字直接丢失（气泡里没有文本）。
+  const composingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  // 实时语音录入（复用已有 RealtimeAsr / asrRealtime* IPC）：识别结果写进一个专用文本节点，
+  // 保留编辑器内已有文本与 @ 标签；committed 为已定句、partial 为当前增量句。
+  const [asrRecording, setAsrRecording] = useState(false);
+  // 点击后到麦克风/后端就绪前的过渡态，用于立刻给出「连接中…」反馈，消除点击空窗。
+  const [asrStarting, setAsrStarting] = useState(false);
+  const asrRef = useRef<RealtimeAsr | null>(null);
+  const asrNodeRef = useRef<Text | null>(null);
+  const asrCommittedRef = useRef('');
+  const asrPartialRef = useRef('');
   const isG = conv.conv_type === 'group';
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const members  = useMemo(
@@ -414,6 +545,17 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     sel?.addRange(range);
   };
 
+  // 把光标放进文本节点「内部」的末尾，而非节点之间的边界。紧跟 contentEditable=false 标签插入文字时，
+  // WebKitGTK 对「编辑器元素层的边界光标」会把 IME 合成结果丢弃；落在真实文本节点内部则能稳定追加。
+  const setCaretInsideEnd = (node: Text) => {
+    const range = document.createRange();
+    range.setStart(node, node.length);
+    range.collapse(true);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+  };
+
   const setCaretToEnd = () => {
     const editor = editorRef.current;
     if (!editor) return;
@@ -425,12 +567,32 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     sel?.addRange(range);
   };
 
-  useEffect(() => {
+  // pending 含 File，无法序列化；用 ref 镜像最新值供卸载时的保存闭包读取。
+  const pendingRef = useRef(pending);
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  // 会话切换 / 从其它页面返回时，恢复「该会话自己」的草稿；离开（会话切换或组件卸载）
+  // 前把当前草稿存回，保证每个会话窗口的输入内容互不共享、且切换页面不丢失。
+  // 用 useLayoutEffect 在绘制前完成 innerHTML 替换，避免短暂闪现上一个会话的内容。
+  useLayoutEffect(() => {
+    const id = conv.id;
+    const draft = loadComposerDraft(id);
+    if (editorRef.current) editorRef.current.innerHTML = draft.html;
+    setText(editorText());
+    setPending(draft.pending);
+    setShowMention(false);
+    setShowAttachmentPicker(false);
     const timer = setTimeout(() => {
       editorRef.current?.focus();
       setCaretToEnd();
     }, 0);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      saveComposerDraft(id, {
+        html: editorRef.current?.innerHTML ?? '',
+        pending: pendingRef.current,
+      });
+    };
   }, [conv.id]);
 
   const findTextPosition = (editor: HTMLElement, target: number) => {
@@ -524,6 +686,97 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     syncEditor();
   };
 
+  // 语音录入：把 getUserMedia / 后端启动失败翻译成对用户友好的中文提示。
+  const asrErrorText = (e: unknown): string => {
+    const name = (e as { name?: string } | null)?.name;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      return '麦克风权限被拒绝，请在系统设置中允许 AutoForge 使用麦克风后重试';
+    }
+    if (name === 'NotFoundError') return '未检测到麦克风设备，请检查录音设备';
+    const msg = (e as { message?: string } | null)?.message;
+    return '语音识别启动失败：' + String(msg ?? e);
+  };
+
+  const stopAsr = async () => {
+    setAsrRecording(false);
+    setAsrStarting(false);
+    const rt = asrRef.current;
+    asrRef.current = null;
+    asrNodeRef.current = null;
+    await rt?.stop();
+    setTimeout(() => { editorRef.current?.focus(); setCaretToEnd(); }, 30);
+  };
+
+  const startAsr = async () => {
+    const editor = editorRef.current;
+    if (!editor || busy || asrRecording || asrStarting) return;
+    // 立刻进入「连接中」态——在任何 await 前点亮，消除点击后到识别就绪的反馈空窗。
+    setAsrStarting(true);
+    // 未配置 ASR（无 API Key）→ 友好引导，且不触发麦克风权限弹窗。
+    try {
+      const cfg = await getAsrSettings();
+      if (!cfg.api_key_set) {
+        setAsrStarting(false);
+        onError('尚未配置语音识别，请前往「设置 → 语音录入」配置 API Key 后再试');
+        return;
+      }
+    } catch (e) {
+      setAsrStarting(false);
+      onError('读取语音识别配置失败：' + String(e));
+      return;
+    }
+    // 在光标处插入专用文本节点承载识别结果（保留已有文本与 @ 标签）。
+    editor.focus();
+    let sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !editor.contains(sel.getRangeAt(0).startContainer)) setCaretToEnd();
+    sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const node = document.createTextNode('');
+    range.insertNode(node);
+    asrNodeRef.current = node;
+    asrCommittedRef.current = '';
+    asrPartialRef.current = '';
+    const rt = new RealtimeAsr();
+    asrRef.current = rt;
+    onError('');
+    try {
+      await rt.start((t, isFinal) => {
+        if (isFinal) { asrCommittedRef.current += t; asrPartialRef.current = ''; }
+        else asrPartialRef.current = t;
+        const n = asrNodeRef.current;
+        if (!n || !editorRef.current?.contains(n)) return;
+        n.data = asrCommittedRef.current + asrPartialRef.current;
+        setCaretAfter(n);
+        setText(editorText());
+      }, () => {
+        // 麦克风就绪、开始收音（后端握手可能仍在进行）：立即切到「聆听中」。
+        setAsrStarting(false);
+        setAsrRecording(true);
+      });
+    } catch (e) {
+      setAsrStarting(false);
+      setAsrRecording(false);
+      asrRef.current = null;
+      asrNodeRef.current = null;
+      try { node.remove(); } catch { /* ignore */ }
+      onError(asrErrorText(e));
+    }
+  };
+
+  // 卸载或切换会话时停止录音（已识别文本保留在编辑器草稿中）。
+  useEffect(() => () => { if (asrRef.current) void stopAsr(); }, [conv.id]);
+
+  // 把开/关录音逻辑镜像进 ref，供全局语音快捷键调用最新闭包。
+  const toggleAsrRef = useRef<() => void>(() => {});
+  toggleAsrRef.current = () => {
+    if (busy) return;
+    if (asrRecording || asrStarting) void stopAsr(); else void startAsr();
+  };
+  // 登记为活跃语音面：会议室 Composer 挂载时，全局语音快捷键切换它的录音。
+  useEffect(() => registerVoiceSurface(() => toggleAsrRef.current()), []);
+
   const insertMentionTag = (className: string, agentId: string, label: string) => {
     const editor = editorRef.current;
     const sel = window.getSelection();
@@ -549,7 +802,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     const spacer = document.createTextNode('\u00a0');
     range.insertNode(spacer);
     range.insertNode(tag);
-    setCaretAfter(spacer);
+    setCaretInsideEnd(spacer);
     setShowMention(false);
     setText(editorText());
     editor.focus();
@@ -602,7 +855,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     const spacer = document.createTextNode('\u00a0');
     range.insertNode(spacer);
     range.insertNode(tag);
-    setCaretAfter(spacer);
+    setCaretInsideEnd(spacer);
     setShowAttachmentPicker(false);
     setAttachmentQuery('');
     setText(editorText());
@@ -678,15 +931,40 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
     const refs = contextRefs();
     const mentions = mentionedAgentIds();
     if (!outgoing && pendingItems.length === 0 && refs.length === 0) return;
+    if (asrRef.current) void stopAsr();
     setText('');
     setPending([]);
     if (editorRef.current) editorRef.current.innerHTML = '';
     setShowMention(false);
     setShowAttachmentPicker(false);
+    clearComposerDraft(conv.id);
     await onSend(outgoing, pendingItems, refs, mentions);
   };
 
+  // 快捷 tag：压缩类走 onCompress（生成摘要并压缩上下文），普通类直接发送预设指令。
+  // quickState 让被点击的 tag 在执行期间显示 spinner+「正在总结…」，完成后短暂回执「✓ 已完成」。
+  const [quickState, setQuickState] = useState<{ label: string; phase: 'run' | 'done' } | null>(null);
+  const handleQuick = async (q: QuickPrompt) => {
+    if (busy) return;
+    if (q.compress) {
+      setQuickState({ label: q.label, phase: 'run' });
+      const ok = await onCompress(q.compress);
+      if (ok) {
+        setQuickState({ label: q.label, phase: 'done' });
+        setTimeout(() => setQuickState(s => (s && s.label === q.label ? null : s)), 1800);
+      } else {
+        setQuickState(null);
+      }
+    } else if (q.prompt) {
+      await onSend(q.prompt, [], [], []);
+    }
+  };
+
   const onKey = (e: React.KeyboardEvent) => {
+    // 中文/日文等 IME 合成期间，Enter/Tab/方向键都属于输入法（上屏候选词、翻页）——
+    // 不能在此发送或操作弹窗，否则 preventDefault 会取消合成，导致正在输入的文字丢失。
+    // 以自维护的 composingRef 为权威闸门，再叠加浏览器原生 isComposing / keyCode 229 兜底。
+    if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (showMention && mentionItems.length > 0) {
       if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMentionItem(mentionItems[mentionSel]); return; }
       if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel(s => (s + 1) % mentionItems.length); return; }
@@ -781,6 +1059,20 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
         <input ref={imageInputRef} type="file" multiple accept={IMAGE_ACCEPT} hidden onChange={pickFiles('image')} />
         <button className="icon-btn" title="添加附件" disabled={busy} onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={18} /></button>
         <button className="icon-btn" title="添加图片" disabled={busy} onClick={() => imageInputRef.current?.click()}><Icon name="image" size={18} /></button>
+        <button
+          className={'icon-btn' + (asrRecording || asrStarting ? ' composer-mic-on' : '')}
+          title={asrRecording || asrStarting ? '停止语音录入' : '语音输入（边说边转写）'}
+          disabled={busy}
+          onMouseDown={e => e.stopPropagation()}
+          onClick={() => { if (asrRecording || asrStarting) void stopAsr(); else void startAsr(); }}
+        >
+          <Icon name={asrRecording || asrStarting ? 'pause' : 'mic'} size={18} />
+        </button>
+        {(asrRecording || asrStarting) && (
+          <span className="composer-asr-live">
+            <span className="composer-asr-dot" />{asrRecording ? '聆听中…' : '连接中…'}
+          </span>
+        )}
         {isG && (
           <button className="icon-btn" title="@ 指定 Agent" onClick={() => insertPlainText('@')}>
             <Icon name="at" size={18} />
@@ -804,6 +1096,31 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           <span>会议室上下文附件</span>
           <b>{contextAttachments.length}</b>
         </button>
+        {isG && QUICK_PROMPTS.map(q => {
+          const running = quickState?.phase === 'run' && quickState.label === q.label;
+          const done = quickState?.phase === 'done' && quickState.label === q.label;
+          const runLabel = q.compress === 'conclusion' ? '正在收敛…' : '正在总结…';
+          return (
+            <button
+              key={q.label}
+              type="button"
+              className={'composer-quick-tag' + (running ? ' active' : '') + (done ? ' done' : '')}
+              title={q.compress
+                ? (q.compress === 'conclusion' ? '收敛结论并压缩上下文（历史消息移出后续上下文）' : '总结内容并压缩上下文（历史消息移出后续上下文）')
+                : q.prompt}
+              disabled={busy}
+              onMouseDown={e => e.preventDefault()}
+              onClick={() => handleQuick(q)}
+            >
+              {running
+                ? <Icon name="refresh" size={13} className="spin" />
+                : done
+                  ? <Icon name="check" size={13} />
+                  : <Icon name={q.icon} size={13} />}
+              <span>{running ? runLabel : done ? '已完成' : q.label}</span>
+            </button>
+          );
+        })}
         {pending.map(item => (
           <div key={item.id} className="composer-pending-item">
             <Icon name={item.mode === 'image' ? 'image' : 'file'} size={15} />
@@ -872,7 +1189,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
               visibleContextAttachments.map((a, i) => (
                 <div
                   key={a.id}
-                  className={'mention-row attachment-row' + (i === attachmentSel ? ' sel' : '')}
+                  className={'mention-row attachment-row' + (i === attachmentSel ? ' mention-active' : '')}
                   onMouseDown={e => e.preventDefault()}
                   onMouseEnter={() => setAttachmentSel(i)}
                   onClick={() => pickContextAttachment(a)}
@@ -898,6 +1215,8 @@ function Composer({ conv, agents, contextAttachments, onSend, onError, quote, on
           suppressContentEditableWarning
           data-placeholder={isG ? '输入消息，@ 可指定 Agent 回答…' : `给 ${agentName} 发消息…`}
           onInput={syncEditor}
+          onCompositionStart={() => { composingRef.current = true; }}
+          onCompositionEnd={() => { composingRef.current = false; syncEditor(); }}
           onKeyDown={onKey}
           onPaste={e => {
             e.preventDefault();
@@ -1162,8 +1481,16 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
   };
   const blocks = visibleMessageBlocks(pseudo);
   const quote = messageQuote(pseudo);
+  // Agent/Innate 回复一律用「文档流」（bubble doc）统一呈现；「我」的消息保持气泡右对齐。
+  const longDoc = !m.is_me;
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const headings = useMemo(() => (longDoc ? docHeadings(blocks) : []), [longDoc, blocks]);
+  const showToc = headings.length >= 3;
+  const jumpToHeading = (i: number) => {
+    bubbleRef.current?.querySelectorAll('h1,h2,h3')[i]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
   return (
-    <div className={'msg' + (m.is_me ? ' me' : '')}>
+    <div className={'msg' + (m.is_me ? ' me' : '') + (longDoc ? ' msg-doc' : '')}>
       {m.is_me
         ? <MeAvatar size={36} />
         : m.is_innate
@@ -1181,7 +1508,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
             <span className="msg-time" title={fmtFull(m.created_at)}>{fmtMsgTime(m.created_at)}</span>
           </div>
         )}
-        <div className="bubble" style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
+        <div ref={bubbleRef} className={'bubble' + (longDoc ? ' doc' : '')} style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
           {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
         </div>
         {quote && (
@@ -1191,6 +1518,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
           </div>
         )}
       </div>
+      {showToc && <DocToc headings={headings} onJump={jumpToHeading} />}
     </div>
   );
 }
@@ -1384,7 +1712,12 @@ export default function ConversationsPage() {
   const [convs,          setConvs]          = useState<Conversation[]>([]);
   const [agents,         setAgents]         = useState<Agent[]>([]);
   const [projects,       setProjects]       = useState<Project[]>([]);
-  const [active,         setActive]         = useState('');
+  // 会议室是「条件渲染」页面：切到其它页时整个组件卸载。把当前会话 id 持久化到
+//  sessionStorage，回到会议室时落回同一个会话（而非默认首个群聊），保证后台仍在
+//  进行的对话回到前端就能看见。
+  const [active,         setActive]         = useState(() => {
+    try { return sessionStorage.getItem('AutoForge:active-conv') || ''; } catch { return ''; }
+  });
   const [msgs,           setMsgs]           = useState<Message[]>([]);
   const [showNew,        setShowNew]        = useState(false);
   const [editGroup,      setEditGroup]      = useState<Conversation | null>(null);
@@ -1392,6 +1725,7 @@ export default function ConversationsPage() {
   const [showContext,    setShowContext]     = useState(false);
   const [showSearch,     setShowSearch]     = useState(false);
   const [showHeadMore,   setShowHeadMore]   = useState(false);
+  const [idCopied,       setIdCopied]       = useState(false);
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
@@ -1403,13 +1737,47 @@ export default function ConversationsPage() {
   const [showArchive,    setShowArchive]    = useState(false);
   const [memberError,    setMemberError]    = useState('');
   const [sending,        setSending]        = useState(false);
+  // 任务活动态：驱动「正在思考」气泡 + 顶部状态条；running 常驻，done/error 短暂闪现后自动清除。
+  const [activity,       setActivity]       = useState<{ phase: 'running' | 'done' | 'error'; label: string } | null>(null);
+  const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 发送回执：刚发出的「我」消息短暂显示「已送达」。
+  const [justSentId,     setJustSentId]     = useState('');
+  const sentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [loadError,      setLoadError]      = useState('');
+
+  // 设置活动态；done/error 自动在 2.4s 后清除，running 常驻直到下一次状态变更。
+  const flashActivity = useCallback((phase: 'running' | 'done' | 'error', label: string) => {
+    if (activityTimer.current) { clearTimeout(activityTimer.current); activityTimer.current = null; }
+    setActivity({ phase, label });
+    // done/error 短暂闪现后清除；running 设一个较长的兜底，避免漏收 completed 事件时永久卡住。
+    activityTimer.current = setTimeout(() => setActivity(null), phase === 'running' ? 240000 : 2400);
+  }, []);
+  const markSent = useCallback((id: string) => {
+    setJustSentId(id);
+    if (sentTimer.current) clearTimeout(sentTimer.current);
+    sentTimer.current = setTimeout(() => setJustSentId(cur => (cur === id ? '' : cur)), 3500);
+  }, []);
+  useEffect(() => () => {
+    if (activityTimer.current) clearTimeout(activityTimer.current);
+    if (sentTimer.current) clearTimeout(sentTimer.current);
+  }, []);
+  // 思考气泡出现时滚到底，确保用户看到「Agent 正在思考」。
+  useEffect(() => {
+    if (activity?.phase === 'running') {
+      setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 60);
+    }
+  }, [activity?.phase]);
   const [quoteDraft,     setQuoteDraft]     = useState<QuoteDraft | null>(null);
   const [bubbleMenu,     setBubbleMenu]     = useState<BubbleMenuState | null>(null);
+  const [reader,         setReader]         = useState<{ message: Message; author: string } | null>(null);
+  const [readerScale,    setReaderScale]    = useState(() => Number(localStorage.getItem('conv.readerScale')) || 1.15);
   const [contextAttachments, setContextAttachments] = useState<ConversationAttachment[]>([]);
   const [windowSize,         setWindowSize]         = useState(20);
+  const [listCollapsed,  setListCollapsed]  = useState(() => localStorage.getItem('conv.listCollapsed') === '1');
+  const toggleList = () => setListCollapsed(v => { localStorage.setItem('conv.listCollapsed', v ? '0' : '1'); return !v; });
 
   const scrollRef       = useRef<HTMLDivElement>(null);
+  const readerScrollRef = useRef<HTMLDivElement>(null);
   const headerActionsRef= useRef<HTMLDivElement>(null);
   const searchInputRef  = useRef<HTMLInputElement>(null);
   const messageRefs     = useRef<Record<string, HTMLDivElement | null>>({});
@@ -1424,10 +1792,13 @@ export default function ConversationsPage() {
     const [cs, as, ps] = await Promise.all([listConversations(), listAgents(), listProjects()]);
     setConvs(cs);
     setAgents(as);
+    primeAgents(as);  // 同步全局 Agent store（Markdown @提及 / Avatar 查表的真源）
     setProjects(ps);
-    // Only set active when it is still empty (first load).
-    // Prefer first group conversation to match the UI order (groups listed before directs).
-    setActive(cur => cur || cs.find(c => c.conv_type === 'group')?.id || cs[0]?.id || '');
+    // Keep the current/persisted conversation if it still exists; otherwise fall back
+    // to the first group conversation (groups listed before directs in the UI).
+    setActive(cur => (cur && cs.some(c => c.id === cur))
+      ? cur
+      : (cs.find(c => c.conv_type === 'group')?.id || cs[0]?.id || ''));
   }, []);
 
   const loadMsgs = useCallback(async (cid: string) => {
@@ -1458,6 +1829,7 @@ export default function ConversationsPage() {
   //    with the list_messages response that unblocks the chat panel.
   useEffect(() => {
     if (!active) { setMsgs([]); setContextAttachments([]); return; }
+    try { sessionStorage.setItem('AutoForge:active-conv', active); } catch { /* ignore */ }
 
     let alive = true;
     Promise.all([loadMsgs(active), loadContextAttachments(active)]).then(() => {
@@ -1466,6 +1838,12 @@ export default function ConversationsPage() {
       setLoadError('');
     }).catch(e => { if (alive) setLoadError(String(e)); });
 
+    // 恢复在途任务指示：切换会话或重新进入会议室页时，若该会话仍有 running 的后台任务，
+    // 重新点亮「正在思考」气泡——后台任务本就 detached 持续执行，这里让前端忠实反映它。
+    listConversationTasks(active).then(tasks => {
+      if (alive && tasks[0]?.status === 'running') flashActivity('running', 'Agent 正在思考…');
+    }).catch(() => {});
+
     const readTimer = setTimeout(() => {
       markConversationRead(active)
         .then(() => window.dispatchEvent(new Event('AutoForge:badges-refresh')))
@@ -1473,7 +1851,7 @@ export default function ConversationsPage() {
     }, 500);
 
     return () => { alive = false; clearTimeout(readTimer); };
-  }, [active, loadMsgs, loadContextAttachments]);
+  }, [active, loadMsgs, loadContextAttachments, flashActivity]);
 
   // 3. Reset search state when switching conversations.
   useEffect(() => {
@@ -1483,6 +1861,8 @@ export default function ConversationsPage() {
     setQuoteDraft(null);
     setBubbleMenu(null);
     setEditGroup(null);
+    setActivity(null);
+    setJustSentId('');
   }, [active]);
 
   // 4. Auto-focus search input when panel opens.
@@ -1502,8 +1882,14 @@ export default function ConversationsPage() {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     listen<unknown>('AutoForge://event', e => {
-      const ev = e.payload as { type?: string; conversation_id?: string };
+      const ev = e.payload as { type?: string; conversation_id?: string; status?: string };
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
+      // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。
+      if (ev.type === 'conversation_task_updated' && !!activeRef.current && ev.conversation_id === activeRef.current) {
+        if (ev.status === 'running') flashActivity('running', 'Agent 正在思考…');
+        else if (ev.status === 'completed') flashActivity('done', '已完成');
+        else if (ev.status === 'failed') flashActivity('error', '处理失败');
+      }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
@@ -1532,7 +1918,7 @@ export default function ConversationsPage() {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [loadConvs, loadMsgs]); // stable callbacks — this effect runs once
+  }, [loadConvs, loadMsgs, flashActivity]); // stable callbacks — this effect runs once
 
   // 6. Close panels when clicking outside the header actions area.
   useEffect(() => {
@@ -1607,14 +1993,15 @@ export default function ConversationsPage() {
     });
   }, [msgs, showContext]);
 
+  const operator = useOperator();
   const normalizedQ = searchQuery.trim().toLowerCase();
   const visibleMsgCount = useMemo(() => msgs.filter(m => !m.id.startsWith('typing-')).length, [msgs]);
   const searchResults = useMemo(() => {
     if (!showSearch || !normalizedQ) return [];
     return msgs
       .filter(m => !m.id.startsWith('typing-') && msgText(m).toLowerCase().includes(normalizedQ))
-      .map(m => ({ message: m, text: msgText(m).replace(/\s+/g, ' ').trim(), sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : '我' }));
-  }, [msgs, showSearch, normalizedQ, agentMap]);
+      .map(m => ({ message: m, text: msgText(m).replace(/\s+/g, ' ').trim(), sender: m.from_agent ? (agentMap[m.from_agent]?.name ?? 'Agent') : operator.display_name }));
+  }, [msgs, showSearch, normalizedQ, agentMap, operator.display_name]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
 
@@ -1626,8 +2013,8 @@ export default function ConversationsPage() {
   const openBubbleMenu = (e: React.MouseEvent, message: Message, author: string) => {
     e.preventDefault();
     setBubbleMenu({
-      x: Math.min(e.clientX, window.innerWidth - 132),
-      y: Math.min(e.clientY, window.innerHeight - 96),
+      x: Math.min(e.clientX, window.innerWidth - 148),
+      y: Math.min(e.clientY, window.innerHeight - 168),
       message,
       author,
     });
@@ -1657,6 +2044,31 @@ export default function ConversationsPage() {
     setBubbleMenu(null);
   };
 
+  // 会话即入口：把一条消息「沉淀为需求」，直接走 flow 模式自动分析，
+  // 与「需求草稿 card → 确认需求」一致——立即入库并进入分析 → 需求审核，
+  // 而非落入待整理池（triage）需人工再整理。
+  const distillBubbleToIssue = async () => {
+    if (!bubbleMenu || !conv?.project_id) return;
+    const text = msgText(bubbleMenu.message).trim();
+    setBubbleMenu(null);
+    if (!text) { flashActivity('error', '这条消息没有可沉淀的文本'); return; }
+    try {
+      const first = text.split(/[\n。.!?！？]/)[0]?.trim() ?? text;
+      await submitIssue({
+        project_id: conv.project_id,
+        title: first.length > 30 ? first.slice(0, 30) : first,
+        description: text,
+        source_type: 'conversation',
+        mode: 'flow',
+      });
+      setLoadError('');
+      // 成功无任何提示会让用户以为「没反应」：沉淀走 flow 模式，需求立即开始分析，
+      // 不会在当前会议室出现，必须显式回馈一次，并指引去哪里看。
+      // 需求审核 / 全量需求总账都在「功能审计」页（Audit.tsx），不是「交付流水线」。
+      flashActivity('done', '已沉淀为需求，开始分析（功能审计 → 需求审核）');
+    } catch (e) { setLoadError(String(e)); }
+  };
+
   const toggleContextBubbleMessage = async () => {
     if (!bubbleMenu) return;
     const id = bubbleMenu.message.id;
@@ -1668,6 +2080,25 @@ export default function ConversationsPage() {
       setLoadError(String(e));
     }
   };
+
+  const openReader = () => {
+    if (!bubbleMenu) return;
+    setReader({ message: bubbleMenu.message, author: bubbleMenu.author });
+    setBubbleMenu(null);
+  };
+  const bumpReaderScale = (delta: number) => {
+    setReaderScale(s => {
+      const next = Math.min(2, Math.max(0.85, Math.round((s + delta) * 100) / 100));
+      localStorage.setItem('conv.readerScale', String(next));
+      return next;
+    });
+  };
+  useEffect(() => {
+    if (!reader) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setReader(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [reader]);
 
   const onSend = async (
     text: string,
@@ -1713,6 +2144,7 @@ export default function ConversationsPage() {
       if (blocks.length === 0) return false;
       const m = await sendMessage({ conversation_id: conv.id, content_json: JSON.stringify(blocks) });
       setMsgs(ms => [...ms, m]);
+      markSent(m.id);
       setQuoteDraft(null);
       loadConvs().catch(() => {});
       if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
@@ -1740,6 +2172,8 @@ export default function ConversationsPage() {
               return !!a && a.enabled;
             }).slice(0, 1)
           : [];
+        // 乐观置为「思考中」：让用户立刻知道 Agent 已收到并开始处理，无需等后端 running 事件。
+        flashActivity('running', 'Agent 正在思考…');
         await startConversationTask({
           conversation_id: conv.id,
           trigger_message_id: m.id,
@@ -1751,6 +2185,30 @@ export default function ConversationsPage() {
       return true;
     } catch (e) {
       setLoadError(String(e));
+      flashActivity('error', '发送失败');
+      return false;
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // 总结/结论快捷指令：调用后端在生成摘要的同时压缩上下文，随后重载消息（事件也会触发重载）。
+  // 返回是否成功，供 Composer 决定快捷 tag 显示「已完成」还是回退。
+  const onCompress = async (mode: 'summary' | 'conclusion'): Promise<boolean> => {
+    if (!conv || sending) return false;
+    setSending(true);
+    setLoadError('');
+    flashActivity('running', mode === 'conclusion' ? '正在收敛结论…' : '正在总结上下文…');
+    try {
+      await compressConversationContext({ conversation_id: conv.id, mode });
+      await loadMsgs(conv.id);
+      loadConvs().catch(() => {});
+      flashActivity('done', mode === 'conclusion' ? '结论已生成' : '上下文已压缩');
+      setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
+      return true;
+    } catch (e) {
+      setLoadError(String(e));
+      flashActivity('error', '处理失败');
       return false;
     } finally {
       setSending(false);
@@ -1843,12 +2301,17 @@ export default function ConversationsPage() {
 
   return (
     <>
-      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} />
+      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} collapsed={listCollapsed} onToggleCollapse={toggleList} />
 
       {conv ? (
         <div className="content">
           {/* ── Chat header ── */}
           <div className="chat-head">
+            {listCollapsed && (
+              <button className="icon-btn" title="展开对话列表" onClick={toggleList} style={{ marginRight: 2 }}>
+                <Icon name="columns" size={18} />
+              </button>
+            )}
             {conv.conv_type === 'group'
               ? <div className="av sq" style={{ width: 38, height: 38, background: conv.color, fontSize: 'var(--text-title)' }}>{conv.initial ?? conv.name?.[0] ?? '群'}</div>
               : (() => { const a = agentMap[conv.members[0]]; return a ? <Avatar agent={a} size={38} status={conv.unread > 0 ? 'online' : undefined} /> : null; })()}
@@ -1885,7 +2348,17 @@ export default function ConversationsPage() {
 
               {/* More-actions menu */}
               {showHeadMore && (
-                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 200 }}>
+                <div className="mention-pop" style={{ right: 0, left: 'auto', top: 38, bottom: 'auto', width: 220 }}>
+                  <div
+                    className="mention-row"
+                    onClick={async () => { await copyText(conv.id); setIdCopied(true); setTimeout(() => setIdCopied(false), 1400); }}
+                  >
+                    <Icon name={idCopied ? 'check' : 'copy'} size={15} style={{ color: idCopied ? 'var(--green)' : 'var(--text-3)' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div className="nm">{idCopied ? '已复制编号' : '复制会议室编号'}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{conv.id}</div>
+                    </div>
+                  </div>
                   {conv.conv_type === 'group' && (
                     <div className="mention-row" onClick={() => { setEditGroup(conv); setShowHeadMore(false); }}>
                       <Icon name="edit" size={15} style={{ color: 'var(--text-3)' }} />
@@ -2165,12 +2638,36 @@ export default function ConversationsPage() {
                 agents={agents}
                 isGroup={conv.conv_type === 'group'}
                 highlighted={activeSearchId === m.id}
+                searchTerm={showSearch ? searchQuery.trim() : ''}
                 rowRef={el => { messageRefs.current[m.id] = el; }}
                 onBubbleContextMenu={openBubbleMenu}
                 projectId={conv.project_id ?? undefined}
+                receipt={m.id === justSentId}
               />
             ))}
+            {activity?.phase === 'running' && (
+              <div className="msg rise">
+                <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Icon name="bot" size={20} />
+                </div>
+                <div className="msg-body">
+                  <div className="typing-cap">{activity.label}</div>
+                  <div className="bubble typing-bubble"><div className="typing"><i /><i /><i /></div></div>
+                </div>
+              </div>
+            )}
           </div>
+
+          {activity && (
+            <div className={'chat-activity ' + activity.phase}>
+              {activity.phase === 'running'
+                ? <span className="dot amber" />
+                : activity.phase === 'done'
+                  ? <Icon name="check" size={13} />
+                  : <Icon name="alert" size={13} />}
+              <span>{activity.label}</span>
+            </div>
+          )}
 
           {loadError && (
             <div className="chat-error-bar">
@@ -2188,6 +2685,7 @@ export default function ConversationsPage() {
             agents={agents}
             contextAttachments={contextAttachments}
             onSend={onSend}
+            onCompress={onCompress}
             onError={setLoadError}
             quote={quoteDraft}
             onClearQuote={() => setQuoteDraft(null)}
@@ -2196,6 +2694,13 @@ export default function ConversationsPage() {
         </div>
       ) : (
         <div className="content">
+          {listCollapsed && (
+            <div className="chat-head">
+              <button className="icon-btn" title="展开对话列表" onClick={toggleList}>
+                <Icon name="columns" size={18} />
+              </button>
+            </div>
+          )}
           <div className="empty"><Icon name="chat" /><div>选择一个会议室开始</div></div>
         </div>
       )}
@@ -2215,6 +2720,42 @@ export default function ConversationsPage() {
             <Icon name={bubbleMenu.message.excluded_from_context ? 'eye' : 'eye-off'} size={14} />
             {bubbleMenu.message.excluded_from_context ? '恢复' : '排除'}
           </button>
+          <button onClick={openReader}><Icon name="maximize" size={14} />阅读模式</button>
+          {conv?.project_id && (
+            <button onClick={distillBubbleToIssue}><Icon name="inbox" size={14} />沉淀为需求</button>
+          )}
+        </div>
+      )}
+      {reader && (
+        <div className="reader-overlay" onClick={e => { if (e.target === e.currentTarget) setReader(null); }}>
+          <div className="reader-bar" onDoubleClick={toggleMaximizeOnDoubleClick}>
+            <div className="reader-bar-info">
+              <Icon name="maximize" size={15} />
+              <span className="reader-bar-title">{reader.author}</span>
+              <span className="reader-bar-time">{fmtFull(reader.message.created_at)}</span>
+            </div>
+            <div className="reader-bar-tools">
+              <button className="icon-btn" title="缩小字号" onClick={() => bumpReaderScale(-0.1)} disabled={readerScale <= 0.85}>
+                <span style={{ fontSize: 'var(--text-label)', fontWeight: 700 }}>A−</span>
+              </button>
+              <span className="reader-scale-val">{Math.round(readerScale * 100)}%</span>
+              <button className="icon-btn" title="放大字号" onClick={() => bumpReaderScale(0.1)} disabled={readerScale >= 2}>
+                <span style={{ fontSize: 'var(--text-section)', fontWeight: 700 }}>A+</span>
+              </button>
+              <div className="chat-head-sep" />
+              <button className="icon-btn" title="退出阅读模式 (Esc)" onClick={() => setReader(null)}>
+                <Icon name="x" size={18} />
+              </button>
+            </div>
+          </div>
+          <div ref={readerScrollRef} className="reader-scroll scroll">
+            <div className="bubble doc reader-doc" style={{ ['--rs' as string]: String(readerScale) }}>
+              {visibleMessageBlocks(reader.message).map((b, i) => (
+                <Block key={i} b={b} projectId={conv?.project_id ?? undefined} messageId={reader.message.id} blockIndex={i} />
+              ))}
+            </div>
+            <ReaderToc scrollRef={readerScrollRef} watch={reader.message.id} />
+          </div>
         </div>
       )}
       {confirmDissolve && (

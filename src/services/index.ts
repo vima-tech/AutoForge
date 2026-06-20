@@ -8,15 +8,20 @@ import { invoke } from '@tauri-apps/api/core';
 // Tracks how many IPC calls are currently in-flight per command.
 const _inFlight: Record<string, number> = {};
 
+// 高频/流式命令：每帧音频都会触发，逐条打日志会刷爆控制台且 args 含大体积 base64。
+// 这类命令跳过 debug 日志（错误仍会上报）。
+const _quietCmds = new Set<string>(['asr_realtime_feed']);
+
 function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const t0 = performance.now();
   _inFlight[cmd] = (_inFlight[cmd] ?? 0) + 1;
-  console.debug(`[IPC] → ${cmd} (in-flight: ${_inFlight[cmd]})`, args ?? '');
+  const quiet = _quietCmds.has(cmd);
+  if (!quiet) console.debug(`[IPC] → ${cmd} (in-flight: ${_inFlight[cmd]})`, args ?? '');
   return invoke<T>(cmd, args)
     .then(result => {
       const ms = (performance.now() - t0).toFixed(1);
       _inFlight[cmd]--;
-      console.debug(`[IPC] ✓ ${cmd} ${ms}ms (in-flight: ${_inFlight[cmd]})`);
+      if (!quiet) console.debug(`[IPC] ✓ ${cmd} ${ms}ms (in-flight: ${_inFlight[cmd]})`);
       return result;
     })
     .catch(err => {
@@ -32,7 +37,8 @@ function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 export interface LlmConfig {
   id: string; name: string; model: string;
   endpoint: string; api_key: string; ctx_window: string;
-  temperature: number; enabled: boolean; api_spec: ApiSpec; created_at: string;
+  temperature: number; enabled: boolean; api_spec: ApiSpec;
+  supports_vision: boolean; created_at: string;
 }
 /** 接口规范（wire spec）：决定文本生成路由与工具调用格式。目前仅支持两种。 */
 export type ApiSpec = 'openai' | 'anthropic';
@@ -60,6 +66,9 @@ export interface Project {
   id: string; name: string; slug: string; description: string;
   repo_path: string; branch_dev: string; branch_main: string;
   status: string; config_yaml: string | null;
+  is_default: boolean;
+  archived_at?: string | null;
+  code_agent_id?: string | null;
   created_at: string; updated_at: string;
 }
 export interface Issue {
@@ -67,6 +76,10 @@ export interface Issue {
   title: string; description: string; category: string;
   severity: string; priority: number | null; status: string;
   fingerprint: string; created_at: string; updated_at: string;
+  source_ref?: string | null; raw_capture?: string | null;
+  repro_steps?: string | null; environment?: string | null;
+  expected?: string | null; actual?: string | null;
+  acceptance_json?: string | null;
 }
 export interface IssueAnalysis {
   id: string; issue_id: string; authenticity_score: number;
@@ -83,10 +96,13 @@ export interface IssueAnalysisSpec {
   triage: {
     authenticity_score: number; feasibility_score: number; priority_suggestion: number;
     category_suggestion: string; severity_suggestion: string; is_duplicate: boolean;
-    duplicate_of: string | null; duplicate_hint: string; analysis_summary: string; confidence: number;
+    duplicate_of: string | null; duplicate_hint: string;
+    /** 分析判定该需求是否真的需要改动代码；false 表示误报/已实现/纯提问，AutoForge 默认不建议执行。缺省视为 true。 */
+    needs_changes?: boolean; no_change_reason?: string;
+    analysis_summary: string; confidence: number;
   };
   understanding: {
-    problem_type: string; restated_requirement: string; user_story: string | null;
+    problem_type: string; restated_issue: string; restated_requirement?: string; user_story: string | null;
     current_behavior: string | null; expected_behavior: string | null;
     reproduction_steps: string[]; background: string | null;
   };
@@ -128,6 +144,7 @@ export interface ChangeRequest {
   id: string; project_id: string; issue_id: string; status: string;
   admin_id: string | null; approved_at: string | null;
   admin_suggestions_1: string | null; admin_suggestions_2: string | null;
+  merge_commit_message: string | null;
   target_branch: string; created_at: string; updated_at: string;
 }
 export interface WorktreeSession {
@@ -164,6 +181,7 @@ export interface ConversationAttachment {
   size_bytes: number; sha256: string; created_at: string;
 }
 export interface PipelineStats {
+  triage: number;
   pending_analysis: number; pending_review_1: number;
   executing: number; pending_review_2: number;
   merged: number; rejected: number; total_issues: number;
@@ -179,6 +197,7 @@ export interface PipelineStats {
   }>;
   project_pipelines: Array<{
     project_id: string; project_name: string; project_status: string;
+    triage: number;
     pending_analysis: number; pending_review_1: number;
     executing: number; pending_review_2: number;
     merged: number; rejected: number; total_issues: number;
@@ -221,6 +240,10 @@ export interface AdminDecision {
 
 export interface BadgeCounts { chat_unread: number; audit_pending: number; }
 
+export interface SystemResources {
+  cpu_pct: number; mem_pct: number; mem_used_mb: number; mem_total_mb: number;
+}
+
 export interface DevServerStatus {
   project_id: string;
   status: 'no_config' | 'idle' | 'starting' | 'running' | 'stopped';
@@ -229,6 +252,7 @@ export interface DevServerStatus {
 
 // ── System ───────────────────────────────────────────────────────────────────
 export const getSystemHealth = () => ipc<SystemHealth>('system_health');
+export const getSystemResources = () => ipc<SystemResources>('system_resources');
 export const checkClaudeAuth = () => ipc<boolean>('check_claude_auth');
 export const getPipelineStats = () => ipc<PipelineStats>('pipeline_stats');
 export const getBadgeCounts = () => ipc<BadgeCounts>('get_badge_counts');
@@ -246,6 +270,37 @@ export const listScanFindings = (testSessionId?: string) =>
   ipc<ScanFinding[]>('list_scan_findings', { testSessionId: testSessionId ?? null });
 export const listAdminDecisions = (projectId?: string) =>
   ipc<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
+
+// ── Code Agents（可插拔代码实现 agent：claude / codex / opencode） ──────────────
+export interface CodeAgent {
+  id: string; kind: string; label: string; program: string;
+  model: string | null; extra_args_json: string;
+  enabled: boolean; is_default: boolean; created_at: string;
+}
+export interface UpsertCodeAgentPayload {
+  id?: string | null; kind: string; label: string; program: string;
+  model?: string | null; extra_args?: string[]; enabled?: boolean;
+}
+export const listCodeAgents = () => ipc<CodeAgent[]>('list_code_agents');
+export const upsertCodeAgent = (payload: UpsertCodeAgentPayload) =>
+  ipc<CodeAgent>('upsert_code_agent', { payload });
+export const deleteCodeAgent = (id: string) => ipc<void>('delete_code_agent', { id });
+export const setDefaultCodeAgent = (id: string) => ipc<void>('set_default_code_agent', { id });
+export const setProjectCodeAgent = (projectId: string, codeAgentId: string | null) =>
+  ipc<void>('set_project_code_agent', { projectId, codeAgentId });
+export const checkCodeAgentAuth = (id: string) => ipc<boolean>('check_code_agent_auth', { id });
+
+// 错误历史：后端后台任务失败记录（runner 持久化的 last_error），供设置页排错。
+export interface JobFailure {
+  id: string;
+  job_type: string;
+  status: string;
+  attempt: number;
+  last_error?: string | null;
+  updated_at: string;
+}
+export const listJobFailures = (limit?: number) =>
+  ipc<JobFailure[]>('list_job_failures', { limit: limit ?? null });
 
 // ── Self-update (AutoForge managing its own running repo) ─────────────────────
 export interface SelfUpdateStatus {
@@ -297,7 +352,16 @@ export const updateProject = (id: string, payload: Partial<{
   name: string; description: string; repo_path: string;
   branch_dev: string; branch_main: string; status: string; config_yaml: string;
 }>) => ipc<Project>('update_project', { id, payload });
+/** 设为默认项目（全局唯一，其他页面置顶并优先选中）。传空串清除默认。 */
+export const setDefaultProject = (id: string) => ipc<void>('set_default_project', { id });
+/** 软删除：归档项目（保留 DB 数据，重新添加同仓库时按 .autoforge/project.json 身份锚挂回）。 */
 export const deleteProject = (id: string) => ipc<void>('delete_project', { id });
+/** 回收站：列出已归档项目。 */
+export const listArchivedProjects = () => ipc<Project[]>('list_archived_projects');
+/** 从回收站恢复一个已归档项目。 */
+export const restoreProject = (id: string) => ipc<Project>('restore_project', { id });
+/** 彻底删除（不可恢复）：级联清除该项目全部 DB 数据。 */
+export const purgeProject = (id: string) => ipc<void>('purge_project', { id });
 
 /** AI 推断的运行配置草稿（字段对齐 ProjectConfigForm，全部可选）。 */
 export interface RunConfigDraft {
@@ -323,31 +387,111 @@ export const aiGenerateRunConfig = (projectId: string) =>
 // ── Issues ───────────────────────────────────────────────────────────────────
 export const listIssues = (projectId?: string) =>
   ipc<Issue[]>('list_issues', { projectId: projectId ?? null });
+// 分页查询需求（总账滚动动态加载）：按状态/关键字过滤，updated_at 倒序，返回当前页 + 总数。
+export interface IssuePage { items: Issue[]; total: number }
+export const listIssuesPage = (
+  projectId: string | undefined,
+  status: string | undefined,
+  search: string | undefined,
+  limit: number,
+  offset: number,
+  excludeMerged?: boolean,   // 与功能审计页「显示已合并需求」开关共享：true 时隐藏已合并需求
+) => ipc<IssuePage>('list_issues_page', {
+  projectId: projectId || null,
+  status: status && status !== 'all' ? status : null,
+  search: search?.trim() || null,
+  excludeMerged: excludeMerged ?? false,
+  limit, offset,
+});
+// 某项目出现过的全部需求状态（去重），用于总账筛选 chip。
+export const listIssueStatuses = (projectId: string) =>
+  ipc<string[]>('list_issue_statuses', { projectId });
+// 按状态集合取需求（有界子集，如需求审核 队列），替代全量加载。
+export const listIssuesByStatuses = (projectId: string, statuses: string[]) =>
+  ipc<Issue[]>('list_issues_by_statuses', { projectId, statuses });
+// 批量取需求标题（轻量），用于变更请求列表解析标题。
+export const listIssueTitles = (ids: string[]) =>
+  ipc<{ id: string; title: string }[]>('list_issue_titles', { ids });
 export const getIssue = (id: string) => ipc<Issue>('get_issue', { id });
 export const getIssueAnalysis = (issueId: string) =>
   ipc<IssueAnalysis | null>('get_issue_analysis', { issueId });
 export const submitIssue = (payload: {
   project_id: string; title: string; description?: string;
   category?: string; severity?: string; source_type?: string;
+  mode?: 'flow' | 'triage';
+  repro_steps?: string; environment?: string; expected?: string; actual?: string;
 }) => ipc<Issue>('submit_issue', { payload });
+// 分析失败/卡住时重新触发需求分析（回到分析队列）。
+export const retryAnalysis = (issueId: string) =>
+  ipc<void>('retry_analysis', { issueId });
+
+// 需求审核 补充意见重评：带管理员补充意见重新分析当前需求，之后重回需求审核。
+export const reanalyzeWithFeedback = (issueId: string, feedback: string) =>
+  ipc<void>('reanalyze_with_feedback', { issueId, feedback });
+
+// 人审改 AI 生成的验收标准（acceptance_json，JSON 数组字符串）。
+export const updateIssueAcceptance = (issueId: string, acceptanceJson: string) =>
+  ipc<void>('update_issue_acceptance', { issueId, acceptanceJson });
+
+// CR 级测试遥测记录。
+export interface CrTestRun {
+  id: string; cr_id: string; result: string; summary: string; run_by: string; run_at: string;
+}
+export const listCrTestRuns = (crId: string) =>
+  ipc<CrTestRun[]>('list_cr_test_runs', { crId });
 
 // ── Change Requests ──────────────────────────────────────────────────────────
 export const listChangeRequests = (projectId?: string, status?: string) =>
   ipc<ChangeRequest[]>('list_change_requests', {
     projectId: projectId ?? null, status: status ?? null,
   });
+// 分页查询变更请求（功能审计代码闸滚动加载）：按状态过滤，created_at 倒序，返回当前页 + 总数。
+// 活动集（非合并）一次取够（大 limit）；已合并历史按页滚动加载，total 供「已合并」徽标计数。
+export interface ChangeRequestPage { items: ChangeRequest[]; total: number }
+export const listChangeRequestsPage = (
+  projectId: string | undefined,
+  status: string | undefined,
+  excludeMerged: boolean,
+  limit: number,
+  offset: number,
+) => ipc<ChangeRequestPage>('list_change_requests_page', {
+  projectId: projectId || null,
+  status: status && status !== 'all' ? status : null,
+  excludeMerged,
+  limit, offset,
+});
 export const getChangeRequest = (id: string) =>
   ipc<ChangeRequest>('get_change_request', { id });
+// 按需求 id 取其最新 CR：左栏分批加载后从总账下钻到未载入的 CR 时按需补拉单条。
+export const getChangeRequestByIssue = (issueId: string) =>
+  ipc<ChangeRequest | null>('get_change_request_by_issue', { issueId });
 export const getWorktreeSession = (crId: string) =>
   ipc<WorktreeSession | null>('get_worktree_session', { crId });
 export const getCodeDiff = (crId: string) =>
   ipc<string>('get_code_diff', { crId });
+export type MergeConflictView = { files: string[]; diff: string };
+export const getMergeConflict = (crId: string) =>
+  ipc<MergeConflictView>('get_merge_conflict', { crId });
+export const retryMerge = (crId: string) =>
+  ipc<void>('retry_merge', { crId });
+export const aiResolveMergeConflict = (crId: string) =>
+  ipc<void>('ai_resolve_merge_conflict', { crId });
 export const review1 = (issueId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
 }) => ipc<ChangeRequest>('review_1', { issueId, decision });
+// 批量需求审核：一次性通过多条待需求审核的需求，快速清空需求审核 队列。
+// 非 pending_issue_review 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
+export interface Review1BatchResult { approved: number; skipped: number; errors: number; }
+export const review1Batch = (issueIds: string[], suggestions?: string) =>
+  ipc<Review1BatchResult>('review_1_batch', { issueIds, suggestions: suggestions || undefined });
 export const review2 = (crId: string, decision: {
-  decision: string; suggestions?: string; admin_id?: string;
+  decision: string; suggestions?: string; admin_id?: string; commit_message?: string;
 }) => ipc<ChangeRequest>('review_2', { crId, decision });
+// 批量代码审核：一次性通过多条待代码审核 的变更请求，各自排队合并，快速清空代码审核 队列。
+// 非 pending_code_review 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
+export interface Review2BatchResult { approved: number; skipped: number; errors: number; }
+export const review2Batch = (crIds: string[], suggestions?: string) =>
+  ipc<Review2BatchResult>('review_2_batch', { crIds, suggestions: suggestions || undefined });
 export const retryChangeRequest = (crId: string) =>
   ipc<ChangeRequest>('retry_change_request', { crId });
 export const deleteChangeRequest = (crId: string) =>
@@ -428,6 +572,10 @@ export const startConversationTask = (payload: {
 }) => ipc<ConversationTask>('start_conversation_task', { payload });
 export const listConversationTasks = (conversationId: string) =>
   ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
+// 总结/结论 + 压缩上下文：生成摘要并把当前窗口内历史消息移出后续上下文。
+export const compressConversationContext = (payload: {
+  conversation_id: string; mode: 'summary' | 'conclusion';
+}) => ipc<void>('compress_conversation_context', { payload });
 
 // ── Innate 知识库（会议室命令 + 自成长配置） ─────────────────────────────────
 export const INNATE_SENDER = '__innate__';
@@ -477,24 +625,116 @@ export const writeWorkspaceFile = (projectId: string, relPath: string, content: 
 export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');
 export const createLlmConfig = (payload: {
   name: string; model: string;
-  endpoint: string; api_key: string; ctx_window?: string; temperature?: number;
+  endpoint: string; api_key: string; temperature?: number;
   api_spec?: ApiSpec;
 }) => ipc<LlmConfig>('create_llm_config', { payload });
 export const updateLlmConfig = (id: string, payload: Partial<{
   name: string; model: string; endpoint: string;
-  api_key: string; ctx_window: string; temperature: number; enabled: boolean;
+  api_key: string; temperature: number; enabled: boolean;
   api_spec: ApiSpec;
 }>) => ipc<LlmConfig>('update_llm_config', { id, payload });
 
 // ── Settings — Web 搜索工具 ───────────────────────────────────────────────────
 export interface WebSearchSettings {
-  provider: string; endpoint: string; max_results: number; api_key_set: boolean;
+  provider: string; endpoint: string; max_results: number; api_key_set: boolean; fetch_content: boolean;
 }
 export const getWebSearchSettings = () =>
   ipc<WebSearchSettings>('get_web_search_settings');
 export const setWebSearchSettings = (
-  provider: string, endpoint: string, max_results: number, api_key?: string,
-) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key });
+  provider: string, endpoint: string, max_results: number, api_key?: string, fetch_content = false,
+) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key, fetchContent: fetch_content });
+
+// ── 操作者身份卡（rail-me）────────────────────────────────────────────────────
+export interface OperatorProfile {
+  display_name: string; avatar: string; accent_color: string; role: string;
+}
+export const getOperatorProfile = () => ipc<OperatorProfile>('get_operator_profile');
+export const setOperatorProfile = (profile: OperatorProfile) =>
+  ipc<OperatorProfile>('set_operator_profile', { profile });
+
+// ── 活动通知收件箱 ────────────────────────────────────────────────────────────
+export type NotificationCategory = 'intervene' | 'progress' | 'result' | 'intake';
+export interface AppNotification {
+  id: string;
+  category: NotificationCategory;
+  kind: string;
+  title: string;
+  body: string;
+  link_page: string | null;
+  link_ref: string | null;
+  read: boolean;
+  created_at: string;
+}
+export interface NotificationInbox { items: AppNotification[]; unread: number; }
+export const listNotifications = (limit?: number) =>
+  ipc<NotificationInbox>('list_notifications', { limit });
+export const unreadNotificationCount = () => ipc<number>('unread_notification_count');
+export const markNotificationRead = (id: string) =>
+  ipc<void>('mark_notification_read', { id });
+export const markAllNotificationsRead = () => ipc<void>('mark_all_notifications_read');
+
+// ── Settings — 语音录入（ASR）────────────────────────────────────────────────
+export interface AsrSettings {
+  provider: string; endpoint: string; model: string; language: string; api_key_set: boolean;
+}
+export const getAsrSettings = () => ipc<AsrSettings>('get_asr_settings');
+export const setAsrSettings = (
+  provider: string, endpoint: string, model: string, language: string, api_key?: string,
+) => ipc<AsrSettings>('set_asr_settings', { provider, endpoint, model, language, apiKey: api_key });
+
+// 会议录音整段转写：一段 16kHz/单声道/16bit PCM(base64) 经阿里百炼 DashScope 实时 WS
+// 转写为完整文本（与实时麦克风同一条链路）。长录音由前端切段、逐段调用后拼接。
+export const transcribeRecordingSegment = (pcm_base64: string) =>
+  ipc<string>('transcribe_recording_segment', { pcmBase64: pcm_base64 });
+
+// 兜底：浏览器 WebView 解不出某格式时，把原始文件字节(base64)交后端 symphonia 解码
+// （mp3/m4a-aac/wav/flac/ogg-vorbis）→ 分段经 DashScope WS → 返回完整转写文本。
+export const transcribeRecordingFile = (file_base64: string, mime?: string) =>
+  ipc<string>('transcribe_recording_file', { fileBase64: file_base64, mime });
+
+// 实时语音识别（阿里 DashScope 流式）：start 返回 session_id，结果经 AutoForge://event 的
+// asr_result 事件推送；前端按 16kHz/单声道/16bit PCM 分帧 feed，结束调 stop。
+export const asrRealtimeStart = () => ipc<string>('asr_realtime_start');
+export const asrRealtimeFeed = (session_id: string, audio_base64: string) =>
+  ipc<void>('asr_realtime_feed', { sessionId: session_id, audioBase64: audio_base64 });
+export const asrRealtimeStop = (session_id: string) =>
+  ipc<void>('asr_realtime_stop', { sessionId: session_id });
+
+// ── 会议录音：转写文本 → AI 提炼纪要 + 拆解需求（先审后入）────────────────────
+export interface MeetingIssue {
+  title: string; category: string; severity: string; description: string;
+}
+export interface MeetingAnalysis {
+  summary_md: string; issues: MeetingIssue[];
+}
+// 分析会议转写：返回纪要 + 需求列表（不落盘、不入池）。
+export const analyzeMeeting = (transcript: string) =>
+  ipc<MeetingAnalysis>('analyze_meeting', { transcript });
+// 把会议纪要写入项目 .autoforge/docs/meetings/，返回相对路径。
+export const saveMeetingDoc = (
+  project_id: string, title: string, summary_md: string, transcript: string,
+) => ipc<string>('save_meeting_doc', { projectId: project_id, title, summaryMd: summary_md, transcript });
+
+// 凭据加密主密钥后端："keychain"（系统钥匙环）或 "file"（0600 文件兜底，安全性较弱）。
+export type SecretBackend = 'keychain' | 'file';
+export const getSecretBackendStatus = () =>
+  ipc<SecretBackend>('secret_backend_status');
+
+// ── Settings — 配置备份（口令加密导出 / 导入）────────────────────────────────
+export interface BackupSummary {
+  llm_configs: number; agents: number; mcp_servers: number;
+  notify_channels: number; app_settings: number;
+}
+export interface ExportResult { path: string; summary: BackupSummary; }
+/** 口令加密导出全部配置到备份目录，返回文件路径与计数。 */
+export const exportConfig = (passphrase: string) =>
+  ipc<ExportResult>('export_config', { passphrase });
+/** 用口令解密备份文件内容并恢复配置（按主键 upsert）。 */
+export const importConfig = (content: string, passphrase: string) =>
+  ipc<BackupSummary>('import_config', { content, passphrase });
+/** 在系统文件管理器中定位备份文件。 */
+export const revealBackup = (path: string) =>
+  ipc<void>('reveal_backup', { path });
 
 // ── Settings — MCP servers ────────────────────────────────────────────────────
 export type McpTransport = 'stdio' | 'http';
@@ -517,8 +757,10 @@ export const updateMcpServer = (id: string, payload: McpServerInput) =>
 export const deleteMcpServer = (id: string) => ipc<void>('delete_mcp_server', { id });
 export const testMcpConnection = (id: string) => ipc<string[]>('test_mcp_connection', { id });
 export const deleteLlmConfig = (id: string) => ipc<void>('delete_llm_config', { id });
+/** 测试连接结果：状态文案 + 顺带刷新（上下文窗口 / 多模态）后的配置。 */
+export interface TestLlmResult { message: string; config: LlmConfig; }
 export const testLlmConnection = (id: string, draft?: Partial<LlmConfig>) =>
-  ipc<string>('test_llm_connection', { id, draft: draft && Object.keys(draft).length ? draft : null });
+  ipc<TestLlmResult>('test_llm_connection', { id, draft: draft && Object.keys(draft).length ? draft : null });
 
 // ── Settings — Agents ────────────────────────────────────────────────────────
 export const listAgents = () => ipc<Agent[]>('list_agents');
@@ -548,7 +790,72 @@ export const setRoleSlot = (kind: string, payload: {
   llm_id?: string; prompt_mode?: 'builtin' | 'append' | 'custom';
   supplement?: string; enabled?: boolean;
   visible_in_chat?: boolean; mentionable?: boolean; memory_enabled?: boolean;
+  capabilities_json?: string;
 }) => ipc<RoleSlot[]>('set_role_slot', { kind, payload });
+
+// 内置工具目录：驱动 Agent 能力开关的动态渲染（新增后端工具自动出现，无需改前端）。
+export interface BuiltinToolInfo { name: string; label: string; needs_project: boolean; }
+export const listBuiltinTools = () => ipc<BuiltinToolInfo[]>('list_builtin_tools');
+
+// ── LLM Trace（调用链路追踪）────────────────────────────────────────────────
+export interface LlmTraceSummary {
+  trace_id: string;
+  agent_id: string | null; agent_role: string | null; agent_name: string | null;
+  project_id: string | null; issue_id: string | null; conversation_id: string | null; task_id: string | null;
+  status: string; error: string | null;
+  input: string | null; output: string | null;
+  total_tokens: number | null; latency_ms: number | null;
+  span_count: number; created_at: string;
+  innate_triggered: boolean; // root span 是否注入了 Innate 记忆召回（派生字段）
+}
+export interface LlmTrace {
+  id: string; trace_id: string; parent_id: string | null; seq: number;
+  kind: string; name: string | null;
+  agent_id: string | null; agent_role: string | null; agent_name: string | null;
+  project_id: string | null; issue_id: string | null; conversation_id: string | null; task_id: string | null;
+  provider: string | null; model: string | null; system_prompt: string | null;
+  status: string; error: string | null; input: string | null; output: string | null;
+  prompt_tokens: number | null; completion_tokens: number | null; total_tokens: number | null;
+  latency_ms: number | null; metadata_json: string | null;
+  started_at: string | null; ended_at: string | null; created_at: string;
+  innate_triggered: boolean; // 本 span 是否注入了 Innate 记忆召回（派生字段）
+}
+export interface TraceFilter {
+  issue_id?: string; conversation_id?: string; agent_name?: string; agent_role?: string;
+  agent_id?: string; project_id?: string; status?: string; kind?: string; limit?: number;
+}
+export const listLlmTraces = (filter: TraceFilter = {}) => ipc<LlmTraceSummary[]>('list_llm_traces', { filter });
+export const getLlmTrace = (traceId: string) => ipc<LlmTrace[]>('get_llm_trace', { traceId });
+export const listTraceAgentNames = () => ipc<string[]>('list_trace_agent_names');
+export const clearLlmTraces = (traceId?: string) => ipc<void>('clear_llm_traces', { traceId: traceId ?? null });
+
+// ── Agent Outputs（环节 Agent 结构化产出 / schema 驱动）─────────────────────────
+export interface AgentOutputSummary {
+  id: string; role: string; schema_version: string;
+  target_kind: string; target_id: string;
+  project_id: string | null; trace_id: string | null;
+  status: string; output_json: string | null; created_at: string;
+}
+export interface AgentOutput extends AgentOutputSummary {
+  raw: string | null;
+}
+export interface AgentOutputFilter {
+  role?: string; target_kind?: string; target_id?: string;
+  project_id?: string; status?: string; limit?: number;
+}
+export const listAgentOutputs = (filter: AgentOutputFilter = {}) => ipc<AgentOutputSummary[]>('list_agent_outputs', { filter });
+export const getAgentOutput = (id: string) => ipc<AgentOutput | null>('get_agent_output', { id });
+export const listAgentOutputRoles = () => ipc<string[]>('list_agent_output_roles');
+export const clearAgentOutputs = (id?: string) => ipc<void>('clear_agent_outputs', { id: id ?? null });
+
+export interface FieldStat { path: string; filled: number; total: number; fill_rate: number; }
+export interface FieldHealth {
+  role: string; schema_version: string | null; total: number;
+  status_ok: number; status_partial: number; status_error: number;
+  fields: FieldStat[];
+}
+export const agentOutputFieldHealth = (role: string, schemaVersion?: string, projectId?: string) =>
+  ipc<FieldHealth>('agent_output_field_health', { role, schemaVersion: schemaVersion ?? null, projectId: projectId ?? null });
 
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
 
@@ -633,14 +940,60 @@ export const updateIntakeConfig = (payload: Partial<{
 }>) => ipc<IntakeConfig>('update_intake_config', { payload });
 export const getWebhookStatus = () => ipc<WebhookStatus>('get_webhook_status');
 export const syncGithubIssues = () => ipc<SyncResult>('sync_github_issues');
-export const runCodeScan = (projectId: string, scanTypes?: string[]) =>
-  ipc<ScanResult>('run_code_scan', { projectId, scanTypes: scanTypes ?? [] });
 export const bulkImportIssues = (projectId: string, format: string, content: string) =>
   ipc<BulkResult>('bulk_import_issues', { projectId, format, content });
+// 文件批量导入（csv/xlsx/xls/ods）：文件内容以 base64 传入，后端按后缀解析。
+export const bulkImportFile = (projectId: string, fileName: string, dataBase64: string) =>
+  ipc<BulkResult>('bulk_import_file', { projectId, fileName, dataBase64 });
+// 导出批量导入模板（csv/xlsx）：写入系统下载目录并在文件管理器中定位，返回路径。
+export const exportBulkTemplate = (format: 'csv' | 'xlsx') =>
+  ipc<string>('export_bulk_template', { format });
 export const submitFromArtifact = (payload: {
   project_id: string; title: string; description?: string;
   category?: string; severity?: string; source_ref?: string;
 }) => ipc<Issue>('submit_from_artifact', { payload });
+
+// 在会议室对话 card 内直接确认/拒绝一条整理好的需求草稿。
+// confirm → 入流水线并返回创建的 Issue；reject → 返回 null。决策持久化到该消息。
+export const decideIssueDraft = (payload: {
+  message_id: string; decision: 'confirm' | 'reject'; block_index?: number;
+}) => ipc<Issue | null>('decide_issue_draft', { payload });
+
+// ── Triage（待整理池）─────────────────────────────────────────────────────────
+export interface RefineResult { refined: number; discarded: number; errors: number; }
+export const listTriageIssues = (projectId?: string) =>
+  ipc<Issue[]>('list_triage_issues', { projectId: projectId ?? null });
+export const refineTriage = (issueIds: string[]) =>
+  ipc<RefineResult>('refine_triage', { issueIds });
+export const discardTriage = (issueId: string) =>
+  ipc<void>('discard_triage', { issueId });
+export interface RejectResult { deleted: number; rejected: number; skipped: number; }
+export const rejectIssues = (issueIds: string[]) =>
+  ipc<RejectResult>('reject_issues', { issueIds });
+
+// ── 工厂自喂料（autosupply）────────────────────────────────────────────────────
+export interface AutosupplySettings {
+  enabled: boolean; interval_min: number; scan_enabled: boolean;
+  proposer_enabled: boolean; max_per_run: number;
+  analyze_enabled: boolean; triage_enabled: boolean;
+}
+export const getAutosupplySettings = () => ipc<AutosupplySettings>('get_autosupply_settings');
+export const setAutosupplySettings = (s: AutosupplySettings) =>
+  ipc<AutosupplySettings>('set_autosupply_settings', {
+    enabled: s.enabled, intervalMin: s.interval_min, scanEnabled: s.scan_enabled,
+    proposerEnabled: s.proposer_enabled, maxPerRun: s.max_per_run,
+    analyzeEnabled: s.analyze_enabled, triageEnabled: s.triage_enabled,
+  });
+export const runProposer = (projectId: string, max?: number) =>
+  ipc<ScanResult>('run_proposer', { projectId, max: max ?? null });
+export const runAutosupplyNow = () => ipc<ScanResult>('run_autosupply_now');
+// 当前是否正有一轮自喂料在跑（状态真源在后端，供切页重挂载后恢复回显）。
+export const autosupplyIsRunning = () => ipc<boolean>('autosupply_is_running');
+
+// 信任旋钮：strict / standard / loose。应用预设到自喂料，不触碰审核闸。
+export type AutonomyLevel = 'strict' | 'standard' | 'loose';
+export const getAutonomyLevel = () => ipc<AutonomyLevel>('get_autonomy_level');
+export const setAutonomyLevel = (level: AutonomyLevel) => ipc<AutonomyLevel>('set_autonomy_level', { level });
 
 // ── Dev Server ───────────────────────────────────────────────────────────────
 export const getDevServerStatus = (projectId: string) =>
@@ -663,6 +1016,8 @@ export interface CrPreviewStatus {
   frontend_only: boolean;
   /** kind 由项目文件自动识别（config_yaml 未显式声明 dev.kind） */
   auto_detected: boolean;
+  /** launch_cr_app 启动的桌面应用进程仍存活 —— UI 据此把「启动」切为「停止」 */
+  app_running: boolean;
 }
 export const getCrPreview = (crId: string) =>
   ipc<CrPreviewStatus>('get_cr_preview', { crId });
@@ -702,7 +1057,11 @@ export const getBranchPreviewLog = (projectId: string, branch: string) =>
 
 // ── Specs ─────────────────────────────────────────────────────────────────────
 
-export type SpecCategory = 'tech_stack' | 'architecture' | 'coding' | 'api' | 'testing';
+export type SpecCategory = 'tech_stack' | 'architecture' | 'coding' | 'api' | 'testing' | 'reference';
+/** 规格来源：'db'(内容内联) | 'file'(指向 .autoforge/specs 磁盘文件) */
+export type SpecSource = 'db' | 'file';
+/** 注入档位：always 全文常驻 / on_demand 工具按需读 / off 不暴露 */
+export type SpecInjection = 'always' | 'on_demand' | 'off';
 
 export interface ProjectSpec {
   id: string;
@@ -711,6 +1070,10 @@ export interface ProjectSpec {
   title: string;
   content: string;
   sort_order: number;
+  source: SpecSource;
+  rel_path: string;
+  description: string;
+  injection: SpecInjection;
   created_at: string;
   updated_at: string;
 }
@@ -719,11 +1082,21 @@ export const listProjectSpecs = (projectId: string) =>
   ipc<ProjectSpec[]>('list_project_specs', { projectId });
 export const upsertProjectSpec = (
   projectId: string, id: string | null, category: SpecCategory, title: string, content: string,
-) => ipc<ProjectSpec>('upsert_project_spec', { projectId, id, category, title, content });
+  description?: string, injection?: SpecInjection,
+) => ipc<ProjectSpec>('upsert_project_spec', { projectId, id, category, title, content, description, injection });
 export const deleteProjectSpec = (id: string) =>
   ipc<boolean>('delete_project_spec', { id });
 export const aiGenerateSpecs = (projectId: string) =>
   ipc<string>('ai_generate_specs', { projectId });
+/** 扫描 .autoforge/specs 目录，把自由 .md 文件对账登记为文件规格 */
+export const scanSpecFiles = (projectId: string) =>
+  ipc<string>('scan_spec_files', { projectId });
+/** 取规格全文（db 源内联 / file 源读盘） */
+export const getSpecContent = (id: string) =>
+  ipc<string>('get_spec_content', { id });
+/** 轻量切换注入档位 */
+export const setSpecInjection = (id: string, injection: SpecInjection) =>
+  ipc<boolean>('set_spec_injection', { id, injection });
 
 // ── Delivery pipeline: prototype (03) / security (07) / deploy (08) / scan (06) ──
 
@@ -788,6 +1161,14 @@ export const getAutoPassEnabled = () =>
   ipc<boolean>('get_auto_pass_enabled');
 export const setAutoPassEnabled = (enabled: boolean) =>
   ipc<void>('set_auto_pass_enabled', { enabled });
+export const getAutoConflictResolveEnabled = () =>
+  ipc<boolean>('get_auto_conflict_resolve_enabled');
+export const setAutoConflictResolveEnabled = (enabled: boolean) =>
+  ipc<void>('set_auto_conflict_resolve_enabled', { enabled });
+export const getCustomMergeMessageEnabled = () =>
+  ipc<boolean>('get_custom_merge_message_enabled');
+export const setCustomMergeMessageEnabled = (enabled: boolean) =>
+  ipc<void>('set_custom_merge_message_enabled', { enabled });
 
 // M5 — preview data masking + container preview
 export const maskPreviewData = (crId: string) =>
@@ -798,29 +1179,81 @@ export const provisionPreviewContainer = (crId: string) =>
 // M11 — notification hub
 export interface NotifyChannel {
   id: string; name: string; kind: string;
-  target: string; events: string; enabled: boolean; created_at: string;
+  target: string; events: string; enabled: boolean;
+  has_secret: boolean; created_at: string;
+}
+export interface NotifyChannelPayload {
+  name: string; kind: string; target: string;
+  events?: string; secret?: string; enabled?: boolean;
 }
 export const listNotifyChannels = () => ipc<NotifyChannel[]>('list_notify_channels');
-export const createNotifyChannel = (payload: {
-  name: string; kind: string; target: string; events?: string; enabled?: boolean;
-}) => ipc<NotifyChannel>('create_notify_channel', { payload });
-export const updateNotifyChannel = (id: string, payload: {
-  name: string; kind: string; target: string; events?: string; enabled?: boolean;
-}) => ipc<NotifyChannel>('update_notify_channel', { id, payload });
+export const createNotifyChannel = (payload: NotifyChannelPayload) =>
+  ipc<NotifyChannel>('create_notify_channel', { payload });
+export const updateNotifyChannel = (id: string, payload: NotifyChannelPayload) =>
+  ipc<NotifyChannel>('update_notify_channel', { id, payload });
 export const deleteNotifyChannel = (id: string) =>
   ipc<void>('delete_notify_channel', { id });
-export const testNotifyChannel = (kind: string, target: string) =>
-  ipc<void>('test_notify_channel', { kind, target });
+export const testNotifyChannel = (id: string) =>
+  ipc<void>('test_notify_channel', { id });
 
-// M10 — embeddable feedback widget
+// 微信 ClawBot 扫码绑定
+export interface ClawbotQrStart {
+  qrcode: string; qr_svg: string; qr_url: string; base_url: string;
+}
+export interface ClawbotQrPoll {
+  status: string; base_url: string;
+  bot_token: string | null; to_user_id: string | null;
+  bot_id: string | null; target: string | null;
+}
+export const clawbotStartLogin = () => ipc<ClawbotQrStart>('clawbot_start_login');
+export const clawbotPollLogin = (qrcode: string, baseUrl: string, verifyCode?: string) =>
+  ipc<ClawbotQrPoll>('clawbot_poll_login', { qrcode, baseUrl, verifyCode: verifyCode ?? null });
+
+// 项目级需求接入 token（统一承载 webhook 接入 flow / 反馈 widget triage 两类）
+export interface WidgetToken {
+  id: string;
+  project_id: string;
+  token: string;
+  label: string;
+  enabled: boolean;
+  mode: string; // 'flow' | 'triage'
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+}
 export const getWidgetSnippet = (projectId: string) =>
   ipc<string>('get_widget_snippet', { projectId });
+export const listWidgetTokens = (projectId: string) =>
+  ipc<WidgetToken[]>('list_widget_tokens', { projectId });
+export const createWidgetToken = (projectId: string, label?: string) =>
+  ipc<WidgetToken>('create_widget_token', { projectId, label: label ?? null });
+export const setWidgetTokenEnabled = (id: string, enabled: boolean) =>
+  ipc<void>('set_widget_token_enabled', { id, enabled });
+export const deleteWidgetToken = (id: string) =>
+  ipc<void>('delete_widget_token', { id });
+// 项目 webhook 接入 token（mode=flow）：需求入口展示/轮换
+export const getProjectWebhookToken = (projectId: string) =>
+  ipc<WidgetToken>('get_project_webhook_token', { projectId });
+export const regenerateProjectWebhookToken = (projectId: string) =>
+  ipc<WidgetToken>('regenerate_project_webhook_token', { projectId });
 
 // Node 03 — prototype prompt edit / delete
 export const deletePrototypePrompt = (id: string) =>
   ipc<void>('delete_prototype_prompt', { id });
 export const updatePrototypePrompt = (id: string, title: string, prompt: string) =>
   ipc<PrototypePrompt>('update_prototype_prompt', { id, title, prompt });
+
+// OpenDesign 本地服务：默认自动模式（检测/克隆 nexu-io/open-design → install → tools-dev 启动）；
+// 填写「启动命令」则切到自定义模式（执行该命令并打开 URL）。repo_path 可显式指定本地检出。
+export interface OpenDesignSettings { command: string; url: string; repo_path: string }
+export const getOpenDesignSettings = () =>
+  ipc<OpenDesignSettings>('get_opendesign_settings');
+export const setOpenDesignSettings = (command: string, url: string, repoPath: string) =>
+  ipc<OpenDesignSettings>('set_opendesign_settings', { command, url, repoPath });
+/** 拉起本地 OpenDesign 服务，返回就绪后应打开的 URL（浏览器打开走 openUrl）。 */
+export const launchOpenDesign = () => ipc<string>('launch_opendesign');
+/** 取自动启动日志末尾，用于排查启动失败原因。 */
+export const getOpenDesignLog = () => ipc<string>('get_opendesign_log');
 
 // Delivery node artifacts (persisted to .autoforge/deliverables/<node>/)
 export interface DeliveryArtifact {
@@ -835,6 +1268,8 @@ export const importDeliveryArtifact = (
 ) => ipc<DeliveryArtifact>('import_delivery_artifact', { projectId, node, fileName, mime, dataBase64 });
 export const updateDeliveryArtifactMeta = (id: string, description: string) =>
   ipc<DeliveryArtifact>('update_delivery_artifact_meta', { id, description });
+export const renameDeliveryArtifact = (id: string, name: string) =>
+  ipc<DeliveryArtifact>('rename_delivery_artifact', { id, name });
 export const deleteDeliveryArtifact = (id: string) =>
   ipc<void>('delete_delivery_artifact', { id });
 export const deliveryArtifactDataUrl = (id: string) =>

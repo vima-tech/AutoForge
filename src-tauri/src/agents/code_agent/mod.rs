@@ -1,9 +1,73 @@
 use anyhow::Result;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use async_trait::async_trait;
 
+pub mod cli;
+pub use cli::{CliCodeAgent, CliProfile};
+
+/// 可插拔代码实现 agent 的统一抽象。纯 Rust，零 Tauri 类型——业务层只依赖此 trait，
+/// 不感知底层是哪个 CLI（claude / codex / opencode），未来可换非 CLI 实现。
+#[async_trait]
+pub trait CodeAgent: Send + Sync {
+    /// 在 worktree 内执行实现任务，返回 (exit_code, stdout, stderr)。
+    async fn run(&self, worktree: &str, prompt: &str, timeout_secs: u64)
+        -> Result<(i32, String, String)>;
+    /// 该 agent 是否已安装并（在可探测时）登录。
+    async fn check_auth(&self) -> bool;
+    /// kind 标识（claude / codex / opencode）。
+    fn kind(&self) -> &str;
+}
+
+/// 按「项目覆盖 → 全局默认 → 硬兜底 claude」解析出本次该用的 code agent。
+/// 表不存在 / 查询失败 / 无启用项时一律安全回落到 claude，绝不让解析失败阻断流水线。
+pub async fn resolve(
+    db: &crate::db::Db,
+    project: &crate::models::project::Project,
+) -> Box<dyn CodeAgent> {
+    use crate::models::code_agent::CodeAgentRow;
+
+    // 1) 项目级覆盖（且该 agent 启用）。
+    let mut row: Option<CodeAgentRow> = if let Some(id) =
+        project.code_agent_id.as_deref().filter(|s| !s.is_empty())
+    {
+        sqlx::query_as::<_, CodeAgentRow>("SELECT * FROM code_agents WHERE id=? AND enabled=1")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    // 2) 全局默认（启用）。
+    if row.is_none() {
+        row = sqlx::query_as::<_, CodeAgentRow>(
+            "SELECT * FROM code_agents WHERE is_default=1 AND enabled=1 LIMIT 1",
+        )
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    }
+
+    match row {
+        Some(r) => Box::new(CliCodeAgent::new(CliProfile {
+            kind: r.kind,
+            program: r.program,
+            model: r.model,
+            extra_args: parse_extra_args(&r.extra_args_json),
+        })),
+        // 3) 硬兜底。
+        None => Box::new(CliCodeAgent::claude()),
+    }
+}
+
+/// `extra_args_json` 存的是 JSON 字符串数组；解析失败按空处理（不阻断）。
+pub fn parse_extra_args(json: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(json).unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn build_prompt(
     title: &str,
     desc: &str,
@@ -62,6 +126,7 @@ pub fn build_prompt(
     prompt.push_str(
         r#"
 ## 要求
+0. 全自主执行：本任务在无人值守的流水线中运行，无法向用户提问或等待确认。遇到方案取舍、技术选型、命名等不确定点，**直接采用你判断下的最佳/推荐方案并落地实现**，不要停下来征询意见、不要只给建议而不动手；把所选方案与理由记到下方「改动摘要」即可。
 1. 在当前 worktree 中实现上述需求
 2. 编写必要的测试
 3. 完成后输出实现报告，格式如下：
@@ -90,13 +155,13 @@ fn render_spec_brief(spec: &crate::agents::analysis::IssueAnalysisSpec) -> Strin
     let mut s = String::new();
 
     let u = &spec.understanding;
-    if !u.restated_requirement.is_empty() || !u.problem_type.is_empty() {
+    if !u.restated_issue.is_empty() || !u.problem_type.is_empty() {
         s.push_str("\n## 需求理解\n");
         if !u.problem_type.is_empty() {
             let _ = writeln!(s, "- 类型：{}", u.problem_type);
         }
-        if !u.restated_requirement.is_empty() {
-            let _ = writeln!(s, "- 重述：{}", u.restated_requirement);
+        if !u.restated_issue.is_empty() {
+            let _ = writeln!(s, "- 重述：{}", u.restated_issue);
         }
         if let Some(cur) = u.current_behavior.as_deref().filter(|v| !v.is_empty()) {
             let _ = writeln!(s, "- 当前行为：{}", cur);
@@ -269,56 +334,95 @@ fn read_project_file(repo_path: &str, name: &str) -> Option<String> {
     std::fs::read_to_string(std::path::Path::new(repo_path).join(name)).ok()
 }
 
-/// Run claude code agent in a worktree
-/// Returns (exit_code, stdout, stderr)
-pub async fn run(
-    worktree_path: &str,
-    prompt: &str,
-    timeout_secs: u64,
-) -> Result<(i32, String, String)> {
-    // The prompt is fed via stdin rather than as a positional argument: claude's
-    // `--disallowedTools` flag is variadic and would otherwise greedily consume
-    // the prompt as a list of tool names, leaving the run with no actual prompt
-    // ("Input must be provided ... when using --print").
-    let mut cmd = Command::new("claude");
-    cmd.arg("--print")
-        .arg("--permission-mode")
-        .arg("acceptEdits")
-        .arg("--disallowedTools")
-        .arg("Bash(git *)")
-        .current_dir(worktree_path)
-        // Defense-in-depth: `--disallowedTools "Bash(git *)"` only blocks the
-        // direct `git ` form; the agent could still shell out via `sh -c`,
-        // scripts, etc. Disabling all git transport protocols neutralizes any
-        // remote git operation (push/fetch/clone) no matter how it is invoked,
-        // while local commits/builds/tests in the worktree keep working.
-        .env("GIT_ALLOW_PROTOCOL", "")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes()).await?;
-        stdin.shutdown().await?; // close stdin so claude stops waiting for input
-    }
-
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("claude code agent timed out after {}s", timeout_secs))??;
-
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((code, stdout, stderr))
-}
-
 /// Extract the report section starting at "## 改动摘要"
 pub fn extract_report(output: &str) -> &str {
     if let Some(pos) = output.find("## 改动摘要") {
         &output[pos..]
     } else {
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proj(code_agent_id: Option<&str>) -> crate::models::project::Project {
+        crate::models::project::Project {
+            id: "p1".into(),
+            name: "P".into(),
+            slug: "p".into(),
+            description: String::new(),
+            repo_path: String::new(),
+            branch_dev: "dev".into(),
+            branch_main: "main".into(),
+            status: "active".into(),
+            config_yaml: None,
+            is_default: false,
+            archived_at: None,
+            code_agent_id: code_agent_id.map(|s| s.to_string()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    async fn mem_db() -> crate::db::Db {
+        // 单连接池跑迁移，规避 sqlx 在多连接 SQLite 上的迁移竞态（仅测试用）。
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = std::env::temp_dir().join(format!(
+            "af-codeagent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("t.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[test]
+    fn parse_extra_args_tolerates_garbage() {
+        assert!(parse_extra_args("[]").is_empty());
+        assert_eq!(parse_extra_args(r#"["-a","b c"]"#), vec!["-a".to_string(), "b c".to_string()]);
+        assert!(parse_extra_args("not json").is_empty());
+    }
+
+    #[test]
+    fn extract_report_falls_back_to_full_output() {
+        // marker 缺失（codex/opencode 可能不输出标题）→ 返回全文，不丢内容。
+        assert_eq!(extract_report("done, edited foo.rs"), "done, edited foo.rs");
+        assert_eq!(extract_report("noise\n## 改动摘要\nx"), "## 改动摘要\nx");
+    }
+
+    #[tokio::test]
+    async fn resolve_priority_project_then_default_then_fallback() {
+        let db = mem_db().await;
+        // 种子默认 = claude。
+        assert_eq!(resolve(&db, &proj(None)).await.kind(), "claude");
+        // 项目级覆盖生效。
+        assert_eq!(resolve(&db, &proj(Some("codex"))).await.kind(), "codex");
+        // 覆盖项被禁用 → 回落全局默认。
+        sqlx::query("UPDATE code_agents SET enabled=0 WHERE id='codex'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(resolve(&db, &proj(Some("codex"))).await.kind(), "claude");
+        // 未知 id → 回落默认。
+        assert_eq!(resolve(&db, &proj(Some("ghost"))).await.kind(), "claude");
+        // 换默认为 opencode 后，无覆盖的项目取 opencode。
+        sqlx::query("UPDATE code_agents SET is_default=0 WHERE is_default=1")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE code_agents SET is_default=1 WHERE id='opencode'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(resolve(&db, &proj(None)).await.kind(), "opencode");
     }
 }

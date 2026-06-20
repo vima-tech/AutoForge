@@ -2,6 +2,7 @@ use crate::models::issue::Issue;
 use crate::models::project::Project;
 use crate::models::prototype::PrototypePrompt;
 use crate::state::AppState;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
@@ -285,4 +286,417 @@ async fn llm_prompt(
     } else {
         Some(raw.trim().to_string())
     }
+}
+
+// ============================================================================
+// OpenDesign 本地服务：可配置「启动命令 + 访问 URL」（存 app_settings），
+// 一键拉起本地服务并由前端打开浏览器。命令/URL 来自用户设置，默认见下。
+// ============================================================================
+
+/// OpenDesign（nexu-io/open-design）是 pnpm 单仓 monorepo，**没有** `npx opendesign`
+/// 这种入口，也不跑在 5173；唯一生命周期入口是 `pnpm tools-dev`。因此默认走「自动模式」：
+/// 检测已有检出（无则浅克隆）→ corepack/pnpm install → `tools-dev start web` → 轮询就绪 URL。
+/// 仅当用户在设置里显式填了「启动命令」时，才回落到旧的「自定义命令 + URL」逃生通道。
+const OPENDESIGN_REPO_URL: &str = "https://github.com/nexu-io/open-design.git";
+/// 默认命令留空 = 自动模式；非空 = 自定义模式（逃生通道）。
+const OPENDESIGN_DEFAULT_COMMAND: &str = "";
+/// 默认 URL 留空：自动模式下 URL 由 `tools-dev status` 解析得到，无需预设端口。
+const OPENDESIGN_DEFAULT_URL: &str = "";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenDesignSettings {
+    /// 自定义启动命令（逃生通道）：非空则按旧行为执行该命令并打开 `url`；
+    /// 留空（默认）走自动模式（检测/克隆/安装/启动 nexu-io/open-design）。
+    pub command: String,
+    /// 服务就绪后要打开的浏览器地址。自动模式下会被实际解析到的 URL 覆盖。
+    pub url: String,
+    /// 可选：显式指定本地 open-design 检出路径。留空则自动探测常见位置，
+    /// 仍找不到时克隆到 AutoForge 自管目录。
+    pub repo_path: String,
+}
+
+async fn read_setting(state: &AppState, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key=?")
+        .bind(key)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn write_setting(state: &AppState, key: &str, value: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn load_opendesign_settings(state: &AppState) -> OpenDesignSettings {
+    let command = read_setting(state, "opendesign.command")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OPENDESIGN_DEFAULT_COMMAND.to_string());
+    let url = read_setting(state, "opendesign.url")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OPENDESIGN_DEFAULT_URL.to_string());
+    let repo_path = read_setting(state, "opendesign.repo_path")
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    OpenDesignSettings {
+        command,
+        url,
+        repo_path,
+    }
+}
+
+#[tauri::command]
+pub async fn get_opendesign_settings(
+    state: State<'_, AppState>,
+) -> Result<OpenDesignSettings, String> {
+    Ok(load_opendesign_settings(&state).await)
+}
+
+/// 保存 OpenDesign 启动配置。三者均可为空：命令空=自动模式，repo_path 空=自动探测/克隆，
+/// URL 空=自动模式下由 `tools-dev status` 解析。
+#[tauri::command]
+pub async fn set_opendesign_settings(
+    command: String,
+    url: String,
+    repo_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<OpenDesignSettings, String> {
+    write_setting(&state, "opendesign.command", command.trim()).await?;
+    write_setting(&state, "opendesign.url", url.trim()).await?;
+    write_setting(
+        &state,
+        "opendesign.repo_path",
+        repo_path.unwrap_or_default().trim(),
+    )
+    .await?;
+    Ok(load_opendesign_settings(&state).await)
+}
+
+/// 简单的 URL 可达性探测（与 dev_server 一致：2s 超时、容忍自签名证书）。
+async fn url_reachable(url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .danger_accept_invalid_certs(true)
+        .build()
+    else {
+        return false;
+    };
+    client.get(url).send().await.is_ok()
+}
+
+// ---- 日志：自动启动全过程写入临时日志文件，失败时把末尾内嵌进错误，便于排查 ----
+
+fn opendesign_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("autoforge-opendesign.log")
+}
+
+/// 截断到日志开头（每次自动启动重置），返回新句柄前先清空旧内容。
+fn reset_log() {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::File::create(opendesign_log_path()) {
+        let _ = writeln!(f, "# OpenDesign 自动启动日志");
+    }
+}
+
+fn log_line(s: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(opendesign_log_path())
+    {
+        let _ = writeln!(f, "{s}");
+    }
+}
+
+fn read_log() -> String {
+    std::fs::read_to_string(opendesign_log_path()).unwrap_or_default()
+}
+
+/// 按字节安全截取字符串末尾（对齐到 UTF-8 字符边界，避免切片 panic）。
+fn tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
+/// 在 `cwd` 执行 shell 命令，stdout+stderr 一并落日志并返回组合输出；超时/非零退出返回 Err。
+async fn run_capture(
+    label: &str,
+    script: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    log_line(&format!("\n$ [{label}] {script}\n# cwd: {}", cwd.display()));
+    let mut cmd = crate::core::platform::shell(script);
+    cmd.current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
+        {
+            Err(_) => {
+                let m = format!("命令超时（>{timeout_secs}s）：{label}");
+                log_line(&m);
+                return Err(m);
+            }
+            Ok(Err(e)) => {
+                let m = format!("命令无法启动：{label}：{e}");
+                log_line(&m);
+                return Err(m);
+            }
+            Ok(Ok(o)) => o,
+        };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    log_line(&combined);
+    if out.status.success() {
+        Ok(combined)
+    } else {
+        Err(format!(
+            "{label} 失败（退出码 {}）：\n{}",
+            out.status.code().unwrap_or(-1),
+            tail(&combined, 1500)
+        ))
+    }
+}
+
+/// 解析可用的 pnpm 调用前缀：优先直接 `pnpm`，否则借 Node 自带的 `corepack pnpm`
+/// （corepack 会按仓库 packageManager 字段自动选定锁定的 pnpm 版本）。
+fn resolve_pnpm() -> Result<String, String> {
+    if crate::core::platform::has_executable("pnpm") {
+        Ok("pnpm".to_string())
+    } else if crate::core::platform::has_executable("corepack") {
+        Ok("corepack pnpm".to_string())
+    } else {
+        Err("未找到 pnpm，也没有 corepack。请安装 Node 24（自带 corepack），或先运行 `corepack enable`。"
+            .to_string())
+    }
+}
+
+/// 目录是否为 open-design 检出：根 package.json 的 name == "open-design"。
+fn is_opendesign_checkout(dir: &std::path::Path) -> bool {
+    let Ok(txt) = std::fs::read_to_string(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return false;
+    };
+    v.get("name").and_then(|n| n.as_str()) == Some("open-design")
+}
+
+/// 常见的本地检出候选位置（复用，避免重复克隆大仓库）。
+fn candidate_checkouts() -> Vec<std::path::PathBuf> {
+    let mut out = vec![];
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+    {
+        let base = std::path::PathBuf::from(home);
+        for sub in ["projects", "code", "src", "dev", "workspace", "repos", "."] {
+            out.push(base.join(sub).join("open-design"));
+        }
+    }
+    out
+}
+
+/// 浅克隆 open-design 到目标目录。
+async fn clone_opendesign(dest: &std::path::Path) -> Result<(), String> {
+    if !crate::core::platform::has_executable("git") {
+        return Err("未找到 git，无法克隆 OpenDesign。请安装 git，或在「设置」里指定本地检出路径。"
+            .to_string());
+    }
+    let parent = dest.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+    // 已存在但非有效检出 → 先移除，避免 git clone 因目录非空失败。
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    let script = format!(
+        "git clone --depth 1 {} \"{}\"",
+        OPENDESIGN_REPO_URL,
+        dest.to_string_lossy()
+    );
+    run_capture("git clone", &script, parent, 600).await?;
+    Ok(())
+}
+
+/// 解析最终使用的检出路径：显式设置 > 探测已有 > 自管目录已克隆 > 克隆。
+async fn resolve_repo_path(cfg: &OpenDesignSettings) -> Result<std::path::PathBuf, String> {
+    let explicit = cfg.repo_path.trim();
+    if !explicit.is_empty() {
+        let p = std::path::PathBuf::from(explicit);
+        if is_opendesign_checkout(&p) {
+            return Ok(p);
+        }
+        return Err(format!(
+            "设置中的 OpenDesign 路径不是有效检出（缺 package.json 或 name≠open-design）：{}",
+            p.display()
+        ));
+    }
+    for cand in candidate_checkouts() {
+        if is_opendesign_checkout(&cand) {
+            log_line(&format!("复用已有检出：{}", cand.display()));
+            return Ok(cand);
+        }
+    }
+    let managed = std::path::PathBuf::from(crate::state::opendesign_base());
+    if is_opendesign_checkout(&managed) {
+        log_line(&format!("复用自管检出：{}", managed.display()));
+        return Ok(managed);
+    }
+    log_line(&format!("未找到本地检出 → 克隆到 {}", managed.display()));
+    clone_opendesign(&managed).await?;
+    Ok(managed)
+}
+
+/// 首次安装依赖（node_modules 不存在时）。
+async fn ensure_installed(repo: &std::path::Path, pnpm: &str) -> Result<(), String> {
+    if repo.join("node_modules").is_dir() {
+        return Ok(());
+    }
+    log_line("node_modules 不存在 → 执行 pnpm install（首次较慢）");
+    if crate::core::platform::has_executable("corepack") {
+        // best-effort：启用仓库锁定的 pnpm 版本，失败不阻断（pnpm 可能已全局可用）。
+        let _ = run_capture("corepack enable", "corepack enable", repo, 60).await;
+    }
+    run_capture("pnpm install", &format!("{pnpm} install"), repo, 900).await?;
+    Ok(())
+}
+
+/// 查询 `tools-dev status --json`，若 web 已在运行则返回其 URL。
+async fn web_url_if_running(repo: &std::path::Path, pnpm: &str) -> Option<String> {
+    let mut cmd = crate::core::platform::shell(&format!("{pnpm} tools-dev status --json"));
+    cmd.current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    let so = String::from_utf8_lossy(&out.stdout);
+    // 输出可能夹带 pnpm 脚本头，截取首个 '{' 到末个 '}' 之间的 JSON 对象。
+    let start = so.find('{')?;
+    let end = so.rfind('}')?;
+    let v: serde_json::Value = serde_json::from_str(&so[start..=end]).ok()?;
+    let url = v.get("apps")?.get("web")?.get("url")?.as_str()?.to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// 自动模式：检测/克隆 → 安装 → 启动 web → 轮询就绪 URL。
+async fn launch_opendesign_auto(state: &AppState, cfg: &OpenDesignSettings) -> Result<String, String> {
+    reset_log();
+    if !crate::core::platform::has_executable("node") {
+        return Err("未检测到 Node.js。OpenDesign 需要 Node 24 + pnpm 10.33（建议用 nvm/fnm：`nvm install 24 && nvm use 24`），随后重试。"
+            .to_string());
+    }
+    let pnpm = resolve_pnpm()?;
+    let repo = resolve_repo_path(cfg).await?;
+    log_line(&format!("OpenDesign 检出：{}", repo.display()));
+    ensure_installed(&repo, &pnpm).await?;
+
+    // 已在运行？直接复用其 URL（避免重复启动）。
+    if let Some(url) = web_url_if_running(&repo, &pnpm).await {
+        if url_reachable(&url).await {
+            log_line(&format!("web 已在运行：{url}"));
+            let _ = write_setting(state, "opendesign.url", &url).await;
+            return Ok(url);
+        }
+    }
+
+    // 后台启动 web（`start` 拉起常驻服务后即返回，不像 `run` 前台阻塞）。
+    run_capture(
+        "tools-dev start web",
+        &format!("{pnpm} tools-dev start web"),
+        &repo,
+        180,
+    )
+    .await?;
+
+    // 轮询直到 status 给出可达 URL（首次可能要编译，~180s）。
+    for _ in 0..90 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Some(url) = web_url_if_running(&repo, &pnpm).await {
+            if url_reachable(&url).await {
+                log_line(&format!("就绪：{url}"));
+                let _ = write_setting(state, "opendesign.url", &url).await;
+                return Ok(url);
+            }
+        }
+    }
+    Err(format!(
+        "OpenDesign 启动超时（web 未就绪）。日志末尾：\n{}",
+        tail(&read_log(), 1500)
+    ))
+}
+
+/// 自定义模式（逃生通道）：执行用户填写的命令并轮询其 URL，沿用旧行为。
+async fn launch_opendesign_custom(cfg: &OpenDesignSettings) -> Result<String, String> {
+    let url = cfg.url.trim().to_string();
+    if url.is_empty() {
+        return Err("自定义启动命令模式下必须填写「访问 URL」。".to_string());
+    }
+    if url_reachable(&url).await {
+        return Ok(url);
+    }
+    // detached：让本地服务独立于桌面壳进程组存活，退出 AutoForge 不连带杀掉它。
+    let mut cmd = crate::core::platform::shell(&cfg.command);
+    crate::core::platform::detach_process_group(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.spawn()
+        .map_err(|e| format!("启动 OpenDesign 失败：{e}（命令：{}）", cfg.command))?;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if url_reachable(&url).await {
+            return Ok(url);
+        }
+    }
+    Ok(url)
+}
+
+/// 拉起本地 OpenDesign 服务并返回要打开的 URL（浏览器打开交给前端 `open_url`）。
+///
+/// - 未配置自定义命令（默认）→ 自动模式：检测已有检出/克隆 → install → `tools-dev start web`。
+/// - 配置了自定义命令 → 自定义模式：执行该命令并轮询 `url`。
+#[tauri::command]
+pub async fn launch_opendesign(state: State<'_, AppState>) -> Result<String, String> {
+    let cfg = load_opendesign_settings(&state).await;
+    if cfg.command.trim().is_empty() {
+        launch_opendesign_auto(&state, &cfg).await
+    } else {
+        launch_opendesign_custom(&cfg).await
+    }
+}
+
+/// 返回自动启动日志末尾（前端用于排查「拉不起来」时展示原因）。
+#[tauri::command]
+pub async fn get_opendesign_log() -> Result<String, String> {
+    Ok(tail(&read_log(), 16000))
 }

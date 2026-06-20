@@ -20,4 +20,4 @@
 
 ## API Key 存储
 
-LLM API Key 当前存储在 SQLite llm_configs 表，后续迁移至 Tauri keychain plugin，禁止以明文写入前端代码或 tauri.conf.json。
+所有密钥（LLM api_key、MCP env/headers、web_search api_key）经 core/secrets.rs 信封加密落库：主密钥存系统钥匙环（keyring crate，无钥匙环时退化为 0600 本地文件），密钥本体以 AES-256-GCM 加密为 enc:v1: 密文存 SQLite。禁止以明文写入前端代码、tauri.conf.json 或直接落库（写入必经 secrets::encrypt_field，读取必经 secrets::decrypt）。

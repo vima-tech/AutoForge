@@ -41,22 +41,36 @@ pub async fn create_llm_config(
     state: State<'_, AppState>,
 ) -> Result<LlmConfig, String> {
     let id = Uuid::new_v4().to_string();
-    let ctx_window = payload.ctx_window.unwrap_or_else(|| "200K".to_string());
     let temperature = payload.temperature.unwrap_or(0.3);
     let api_spec = normalize_api_spec(payload.api_spec.as_deref());
+    // 上下文窗口不再手填：后端按模型查表 + 接口探测自动推断（见 core::ctx_window）。
+    // 此处用明文 key 直接探测；拿不到回退「未知」，后续可在设置页点「重新检测」。
+    let ctx_window = crate::core::ctx_window::infer_window(
+        &payload.endpoint,
+        api_spec,
+        &payload.model,
+        &payload.api_key,
+    )
+    .await;
+    // 密钥静态加密落库（见 core::secrets）。
+    let api_key = crate::core::secrets::encrypt_field(&payload.api_key)?;
+
+    // 多模态能力不再手动开关：后端按模型名自动推断（见 core::vision）。
+    let supports_vision = crate::core::vision::supports_vision(&payload.model);
 
     sqlx::query(
-        "INSERT INTO llm_configs (id, name, model, endpoint, api_key, ctx_window, temperature, api_spec)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO llm_configs (id, name, model, endpoint, api_key, ctx_window, temperature, api_spec, supports_vision)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(&payload.name)
     .bind(&payload.model)
     .bind(&payload.endpoint)
-    .bind(&payload.api_key)
+    .bind(&api_key)
     .bind(&ctx_window)
     .bind(temperature)
     .bind(api_spec)
+    .bind(supports_vision)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -92,11 +106,7 @@ pub async fn update_llm_config(
     }
     if let Some(ref v) = payload.api_key {
         sets.push("api_key=?");
-        values.push(v.clone());
-    }
-    if let Some(ref v) = payload.ctx_window {
-        sets.push("ctx_window=?");
-        values.push(v.clone());
+        values.push(crate::core::secrets::encrypt_field(v)?);
     }
     if let Some(v) = payload.temperature {
         sets.push("temperature=?");
@@ -109,6 +119,22 @@ pub async fn update_llm_config(
     if let Some(ref v) = payload.api_spec {
         sets.push("api_spec=?");
         values.push(normalize_api_spec(Some(v)).to_string());
+    }
+
+    // model 变了 → 多模态能力随之改变，按模型名自动重新推断并落库（用户不再手动开关）。
+    if let Some(ref model) = payload.model {
+        let vision = crate::core::vision::supports_vision(model);
+        sets.push("supports_vision=?");
+        values.push(if vision { "1" } else { "0" }.to_string());
+    }
+
+    // model / endpoint / api_spec 变了，窗口随之改变 → 自动重新推断并落库
+    // （用户不再手填）。基于「草稿覆盖落库值」的有效配置探测。
+    if payload.model.is_some() || payload.endpoint.is_some() || payload.api_spec.is_some() {
+        if let Ok(window) = recompute_ctx_window(&state, &id, &payload).await {
+            sets.push("ctx_window=?");
+            values.push(window);
+        }
     }
 
     if sets.is_empty() {
@@ -138,6 +164,36 @@ pub async fn update_llm_config(
         .map_err(|e| e.to_string())
 }
 
+/// 以「落库值 + 草稿覆盖」为有效配置，自动推断上下文窗口展示串。
+/// 草稿（前台未保存输入）优先，未提供的字段回退落库值；密钥落库为密文需解密。
+async fn recompute_ctx_window(
+    state: &AppState,
+    id: &str,
+    draft: &UpdateLlmConfig,
+) -> Result<String, String> {
+    let cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("LLM 配置不存在: {}", id))?;
+
+    let model = draft.model.clone().unwrap_or(cfg.model);
+    let endpoint = draft.endpoint.clone().unwrap_or(cfg.endpoint);
+    let api_spec = normalize_api_spec(
+        draft
+            .api_spec
+            .as_deref()
+            .or(Some(cfg.api_spec.as_str())),
+    );
+    // 草稿密钥是明文；落库密钥需解密。缺 key 也照常探测（部分本地部署免鉴权）。
+    let api_key = match &draft.api_key {
+        Some(k) => k.clone(),
+        None => crate::core::secrets::decrypt(&cfg.api_key).unwrap_or_default(),
+    };
+    Ok(crate::core::ctx_window::infer_window(&endpoint, api_spec, &model, &api_key).await)
+}
+
 #[tauri::command]
 pub async fn delete_llm_config(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
@@ -155,18 +211,30 @@ pub async fn delete_llm_config(id: String, state: State<'_, AppState>) -> Result
     Ok(())
 }
 
+/// 测试连接结果：连接状态文案 + 顺带刷新的（脱敏）配置。
+/// 测试连接时会按当前（含草稿）配置重新推断上下文窗口与多模态能力并落库，
+/// 前端据 `config` 即时刷新展示。
+#[derive(Debug, Clone, Serialize)]
+pub struct TestLlmResult {
+    pub message: String,
+    pub config: LlmConfig,
+}
+
 #[tauri::command]
 pub async fn test_llm_connection(
     id: String,
     draft: Option<UpdateLlmConfig>,
     state: State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<TestLlmResult, String> {
     let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("LLM 配置不存在: {}", id))?;
+
+    // 落库值为密文，解密后再用；草稿值是前台明文，会在下方覆盖。
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key)?;
 
     // 用前台尚未保存的草稿覆盖落库值，使「填写后立即测试」反映最新输入，
     // 而非已保存的旧数据。
@@ -182,9 +250,6 @@ pub async fn test_llm_connection(
         }
         if let Some(v) = d.api_key {
             cfg.api_key = v;
-        }
-        if let Some(v) = d.ctx_window {
-            cfg.ctx_window = v;
         }
         if let Some(v) = d.temperature {
             cfg.temperature = v;
@@ -202,49 +267,209 @@ pub async fn test_llm_connection(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let started = Instant::now();
-    let api_spec = cfg.api_spec.to_ascii_lowercase();
+    let api_spec_lc = cfg.api_spec.to_ascii_lowercase();
     let endpoint = cfg.endpoint.trim_end_matches('/');
+    let api_spec = normalize_api_spec(Some(&cfg.api_spec));
 
-    let response = if api_spec == "anthropic" {
-        // Anthropic native API — distinct /v1/messages format
-        client
-            .post(join_endpoint(endpoint, "/v1/messages"))
-            .header("x-api-key", &cfg.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&serde_json::json!({
-                "model": cfg.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "temperature": cfg.temperature
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("连接失败: {}", e))?
-    } else {
-        // OpenAI-compatible: covers OpenAI, Azure, 自定义, and any other provider
-        client
-            .post(join_endpoint(endpoint, "/v1/chat/completions"))
-            .bearer_auth(&cfg.api_key)
-            .json(&serde_json::json!({
-                "model": cfg.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "temperature": 0
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("连接失败: {}", e))?
+    // 文本 ping（连通性）。自带计时，使 message 报告真实 ping 延迟而非总耗时。
+    let ping_fut = async {
+        let started = Instant::now();
+        let r = if api_spec_lc == "anthropic" {
+            // Anthropic native API — distinct /v1/messages format
+            client
+                .post(join_endpoint(endpoint, "/v1/messages"))
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&serde_json::json!({
+                    "model": cfg.model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": cfg.temperature
+                }))
+                .send()
+                .await
+        } else {
+            // OpenAI-compatible: covers OpenAI, Azure, 自定义, and any other provider
+            client
+                .post(join_endpoint(endpoint, "/v1/chat/completions"))
+                .bearer_auth(&cfg.api_key)
+                .json(&serde_json::json!({
+                    "model": cfg.model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": 0
+                }))
+                .send()
+                .await
+        };
+        (r, started.elapsed().as_millis())
     };
 
-    let latency_ms = started.elapsed().as_millis();
-    let status = response.status();
-    if status.is_success() {
-        Ok(format!("连接成功 · {}ms", latency_ms))
+    // 三个独立网络请求并发执行（原本串行，总耗时是三者之和）：
+    //   ① 文本 ping（连通性）  ② 上下文窗口探测（/v1/models）  ③ 多模态发图探测
+    // 总耗时收敛为三者中的最大值。多模态探测无条件并发，但其结果仅在文本连通时采信
+    // （见下），以便把「图片被拒」与鉴权/网络问题区分开；连不通时这次探测被丢弃。
+    let (
+        (send_result, latency_ms),
+        ctx_window,
+        vision_probe,
+    ) = tokio::join!(
+        ping_fut,
+        crate::core::ctx_window::infer_window(&cfg.endpoint, api_spec, &cfg.model, &cfg.api_key),
+        probe_vision(&client, &api_spec_lc, endpoint, &cfg.model, &cfg.api_key, cfg.temperature),
+    );
+
+    // 连接状态文案：成功/HTTP 错误/网络错误都转成 message，不提前返回。
+    // ping_ok 记录文本连通性，用于决定是否采信多模态探测结果。
+    let (message, ping_ok) = match send_result {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                (format!("连接成功 · {}ms", latency_ms), true)
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                let detail = body.chars().take(300).collect::<String>();
+                (format!("连接失败 · HTTP {} · {}", status, detail), false)
+            }
+        }
+        Err(e) => (format!("连接失败: {}", e), false),
+    };
+
+    // 多模态：仅在文本已连通时采信发图探测结果（这是识别 mimo 这类「名字看不出」
+    // 模型的唯一可靠途径）。结果不确定（鉴权/网络/服务端错误）或文本不通时维持原值。
+    let supports_vision = if ping_ok {
+        vision_probe.unwrap_or(cfg.supports_vision)
     } else {
-        let body = response.text().await.unwrap_or_default();
-        let detail = body.chars().take(300).collect::<String>();
-        Err(format!("连接失败 · HTTP {} · {}", status, detail))
+        cfg.supports_vision
+    };
+
+    // 仅当行内 model 仍是本次测试所用模型时才落库——避免测试期间用户并发保存/
+    // 切换模型，导致这条用旧模型推断出的窗口/多模态结果覆盖最新数据。
+    // （切页不影响准确性：DB 为真源，返回 Settings 页会 listLlmConfigs 重新拉取。）
+    let tested_model = cfg.model.clone();
+    sqlx::query("UPDATE llm_configs SET ctx_window=?, supports_vision=? WHERE id=? AND model=?")
+        .bind(&ctx_window)
+        .bind(supports_vision)
+        .bind(&id)
+        .bind(&tested_model)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 返回本次实测计算值（即便因并发/草稿未落库，也能让 UI 即时回显所测结果）；
+    // 其余字段取脱敏后的当前行。
+    let mut config = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map(mask_key)
+        .map_err(|e| e.to_string())?;
+    config.ctx_window = ctx_window;
+    config.supports_vision = supports_vision;
+
+    Ok(TestLlmResult { message, config })
+}
+
+/// 测试连接时的多模态「读回式」探测：发一张含**随机 4 位数字**的图片，要求模型只回数字，
+/// 再校验回复是否含该数字。仅在文本 ping 已连通时调用。
+///
+/// 为何不能只看 HTTP 200：很多 OpenAI 兼容网关（如 mimo）对带 `image_url` 的请求照常返回
+/// 200，却把图片 part 静默丢弃，纯文本模型也会"答得很顺"——只看状态码会把它误判为支持多模态，
+/// 实战发图时图被丢、模型答"看不到"。读回式校验把"端点接受图像字段"与"模型真的看见了"区分开。
+///
+/// 返回 Some(true)=确实读出了数字（支持）/ Some(false)=连通但读不出（不支持或端点丢图）/
+/// None=结果不确定（鉴权/限流/服务端/网络错误，调用方保持原值）。
+async fn probe_vision(
+    client: &reqwest::Client,
+    api_spec_lc: &str,
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    temperature: f64,
+) -> Option<bool> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    // 随机 4 位数字（首位非 0，避免模型省略前导零）；蒙对概率约 1/9000，足够低。
+    let code = {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        format!("{}{:03}", rng.gen_range(1..=9), rng.gen_range(0..1000))
+    };
+    let img_b64 = general_purpose::STANDARD.encode(crate::core::vision::render_code_png(&code));
+    let instruction =
+        "图片里有一个数字，请只输出这个数字本身，不要包含任何其他文字、空格或标点。";
+
+    let send = if api_spec_lc == "anthropic" {
+        client
+            .post(join_endpoint(endpoint, "/v1/messages"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": 16,
+                "temperature": temperature,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": instruction},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}}
+                ]}]
+            }))
+            .send()
+            .await
+    } else {
+        client
+            .post(join_endpoint(endpoint, "/v1/chat/completions"))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": 16,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": instruction},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", img_b64)}}
+                ]}]
+            }))
+            .send()
+            .await
+    };
+
+    match send {
+        Ok(resp) => {
+            let s = resp.status();
+            if s.as_u16() == 401 || s.as_u16() == 403 || s.as_u16() == 429 || s.is_server_error() {
+                return None; // 鉴权/限流/服务端错误：与图像能力无关，结果不确定
+            }
+            if !s.is_success() {
+                // 含图请求 4xx（多为 400/415/422）→ 端点直接拒收图像 → 不支持。
+                return Some(false);
+            }
+            let body = resp.json::<serde_json::Value>().await.ok()?;
+            let reply = extract_reply_text(api_spec_lc, &body);
+            // 只保留数字后判断是否读回了目标 code（substring 容忍模型加前后缀）。
+            let digits: String = reply.chars().filter(|c| c.is_ascii_digit()).collect();
+            Some(digits.contains(&code))
+        }
+        Err(_) => None, // 网络层错误：不确定
+    }
+}
+
+/// 从 LLM 响应体抽取纯文本回复（openai: choices[0].message.content；anthropic: content[].text）。
+fn extract_reply_text(api_spec_lc: &str, body: &serde_json::Value) -> String {
+    if api_spec_lc == "anthropic" {
+        body.get("content")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|it| it.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    } else {
+        body.pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
     }
 }
 
@@ -569,6 +794,8 @@ pub struct SetRoleSlotPayload {
     pub visible_in_chat: Option<bool>,
     pub mentionable: Option<bool>,
     pub memory_enabled: Option<bool>,
+    /// 工具白名单 JSON（约定 `{"tools":[...]}`）；None=不改。
+    pub capabilities_json: Option<String>,
 }
 
 /// 配置某个内置角色：自动确保单一持有 Agent（无则按注册表默认创建），并应用配置。
@@ -687,6 +914,10 @@ pub async fn set_role_slot(
         sets.push("memory_enabled=?".to_string());
         vals.push(AgentUpdateValue::Bool(v));
     }
+    if let Some(ref c) = payload.capabilities_json {
+        sets.push("capabilities_json=?".to_string());
+        vals.push(AgentUpdateValue::Text(c.clone()));
+    }
     if !sets.is_empty() {
         let sql = format!("UPDATE agents SET {} WHERE id=?", sets.join(", "));
         let mut q = sqlx::query(&sql);
@@ -797,6 +1028,27 @@ pub async fn set_agent_forge_role(
         .map_err(|e| e.to_string())
 }
 
+// ---- 凭据加密后端状态 ----
+
+/// 当前密钥主密钥所在后端："keychain"（系统钥匙环）或 "file"（0600 文件兜底）。
+/// 供设置页提示用户兜底场景下安全性较弱。
+#[tauri::command]
+pub fn secret_backend_status() -> String {
+    match crate::core::secrets::backend() {
+        crate::core::secrets::SecretBackend::Keychain => "keychain".to_string(),
+        crate::core::secrets::SecretBackend::File => "file".to_string(),
+    }
+}
+
+// ---- 工具：内置工具目录（供前端动态渲染 Agent 能力开关，新增工具自动出现）----
+
+/// 返回内置工具目录的元信息（name/label/needs_project）。前端据此渲染能力开关，
+/// 不必硬编码工具清单——在 `agents::tools::builtin_catalog` 加一个工具即自动出现在 UI。
+#[tauri::command]
+pub fn list_builtin_tools() -> Vec<crate::agents::tools::ToolInfo> {
+    crate::agents::tools::builtin_catalog_meta()
+}
+
 // ---- 工具：Web 搜索配置（存 app_settings，供 agents/tools/web_search 读取）----
 
 /// 回传给前端的 Web 搜索配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
@@ -806,6 +1058,8 @@ pub struct WebSearchSettings {
     pub endpoint: String,
     pub max_results: u32,
     pub api_key_set: bool,
+    /// 是否默认在搜索后自动抓取前几条结果的正文摘录。
+    pub fetch_content: bool,
 }
 
 async fn read_setting(state: &AppState, key: &str) -> Option<String> {
@@ -831,6 +1085,67 @@ async fn write_setting(state: &AppState, key: &str, value: &str) -> Result<(), S
     Ok(())
 }
 
+// ---- 操作者身份卡（rail-me）：单操作者桌面端，存 app_settings 的 operator_profile KV ----
+
+/// 操作者（Human-Lite-in-the-Loop 的「人」）身份。无登录/多用户概念。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorProfile {
+    /// 显示名（群聊/直聊里人类发言的作者名）。
+    pub display_name: String,
+    /// 头像内容：emoji 或 1–2 个字符的首字母缩写。
+    pub avatar: String,
+    /// 强调色（CSS 颜色串）；空串表示沿用主题默认 `--me-avatar-bg`。
+    pub accent_color: String,
+    /// 角色/头衔（可选，注入编排上下文供 Agent 称呼）。
+    pub role: String,
+}
+
+impl Default for OperatorProfile {
+    fn default() -> Self {
+        OperatorProfile {
+            display_name: "我".into(),
+            avatar: "管".into(),
+            accent_color: String::new(),
+            role: "操作者".into(),
+        }
+    }
+}
+
+async fn load_operator_profile(state: &AppState) -> OperatorProfile {
+    match read_setting(state, "operator_profile").await {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        None => OperatorProfile::default(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_operator_profile(state: State<'_, AppState>) -> Result<OperatorProfile, String> {
+    Ok(load_operator_profile(&state).await)
+}
+
+#[tauri::command]
+pub async fn set_operator_profile(
+    state: State<'_, AppState>,
+    profile: OperatorProfile,
+) -> Result<OperatorProfile, String> {
+    // 归一：去空白；显示名/头像兜底，避免渲染出空头像或空作者名。
+    let mut p = profile;
+    p.display_name = p.display_name.trim().to_string();
+    if p.display_name.is_empty() {
+        p.display_name = OperatorProfile::default().display_name;
+    }
+    p.avatar = p.avatar.trim().chars().take(2).collect();
+    if p.avatar.is_empty() {
+        p.avatar = p.display_name.chars().next().map(|c| c.to_string()).unwrap_or_default();
+    }
+    p.accent_color = p.accent_color.trim().to_string();
+    p.role = p.role.trim().to_string();
+
+    let json = serde_json::to_string(&p).map_err(|e| e.to_string())?;
+    write_setting(&state, "operator_profile", &json).await?;
+    Ok(p)
+}
+
 #[tauri::command]
 pub async fn get_web_search_settings(
     state: State<'_, AppState>,
@@ -849,11 +1164,16 @@ pub async fn get_web_search_settings(
         .await
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    let fetch_content = read_setting(&state, "web_search.fetch_content")
+        .await
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
     Ok(WebSearchSettings {
         provider,
         endpoint,
         max_results,
         api_key_set,
+        fetch_content,
     })
 }
 
@@ -864,6 +1184,7 @@ pub async fn set_web_search_settings(
     endpoint: String,
     max_results: u32,
     api_key: Option<String>,
+    fetch_content: bool,
     state: State<'_, AppState>,
 ) -> Result<WebSearchSettings, String> {
     write_setting(&state, "web_search.provider", provider.trim()).await?;
@@ -874,8 +1195,151 @@ pub async fn set_web_search_settings(
         &max_results.clamp(1, 10).to_string(),
     )
     .await?;
+    write_setting(
+        &state,
+        "web_search.fetch_content",
+        if fetch_content { "1" } else { "0" },
+    )
+    .await?;
     if let Some(key) = api_key {
-        write_setting(&state, "web_search.api_key", key.trim()).await?;
+        let enc = crate::core::secrets::encrypt_field(key.trim())?;
+        write_setting(&state, "web_search.api_key", &enc).await?;
     }
     get_web_search_settings(state).await
+}
+
+// ---- 语音录入（ASR）配置（存 app_settings，供 agents/asr 读取）----
+
+/// 回传给前端的 ASR 配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsrSettings {
+    pub provider: String,
+    pub endpoint: String,
+    pub model: String,
+    pub language: String,
+    pub api_key_set: bool,
+}
+
+#[tauri::command]
+pub async fn get_asr_settings(state: State<'_, AppState>) -> Result<AsrSettings, String> {
+    let provider = read_setting(&state, "asr.provider").await.unwrap_or_default();
+    let endpoint = read_setting(&state, "asr.endpoint").await.unwrap_or_default();
+    let model = read_setting(&state, "asr.model").await.unwrap_or_default();
+    let language = read_setting(&state, "asr.language").await.unwrap_or_default();
+    let api_key_set = read_setting(&state, "asr.api_key")
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    Ok(AsrSettings {
+        provider,
+        endpoint,
+        model,
+        language,
+        api_key_set,
+    })
+}
+
+/// 保存 ASR 配置。`api_key` 为 None 时不改动已存的 key（与 LLM/web_search 一致）。
+#[tauri::command]
+pub async fn set_asr_settings(
+    provider: String,
+    endpoint: String,
+    model: String,
+    language: String,
+    api_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AsrSettings, String> {
+    write_setting(&state, "asr.provider", provider.trim()).await?;
+    write_setting(&state, "asr.endpoint", endpoint.trim()).await?;
+    write_setting(&state, "asr.model", model.trim()).await?;
+    write_setting(&state, "asr.language", language.trim()).await?;
+    if let Some(key) = api_key {
+        let enc = crate::core::secrets::encrypt_field(key.trim())?;
+        write_setting(&state, "asr.api_key", &enc).await?;
+    }
+    get_asr_settings(state).await
+}
+
+// ---- 工厂自喂料（autosupply）配置（存 app_settings，供调度器读取）----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutosupplySettings {
+    pub enabled: bool,
+    pub interval_min: i64,
+    pub scan_enabled: bool,
+    pub proposer_enabled: bool,
+    pub max_per_run: i64,
+    pub analyze_enabled: bool,
+    pub triage_enabled: bool,
+}
+
+#[tauri::command]
+pub async fn get_autosupply_settings(
+    state: State<'_, AppState>,
+) -> Result<AutosupplySettings, String> {
+    let cfg = crate::tasks::autosupply::AutosupplyConfig::load(&state.db).await;
+    Ok(AutosupplySettings {
+        enabled: cfg.enabled,
+        interval_min: cfg.interval_min,
+        scan_enabled: cfg.scan_enabled,
+        proposer_enabled: cfg.proposer_enabled,
+        max_per_run: cfg.max_per_run as i64,
+        analyze_enabled: cfg.analyze_enabled,
+        triage_enabled: cfg.triage_enabled,
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn set_autosupply_settings(
+    enabled: bool,
+    interval_min: i64,
+    scan_enabled: bool,
+    proposer_enabled: bool,
+    max_per_run: i64,
+    analyze_enabled: bool,
+    triage_enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<AutosupplySettings, String> {
+    write_setting(&state, "autosupply.enabled", if enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.interval_min", &interval_min.max(5).to_string()).await?;
+    write_setting(&state, "autosupply.scan_enabled", if scan_enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.proposer_enabled", if proposer_enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.max_per_run", &max_per_run.clamp(1, 200).to_string()).await?;
+    write_setting(&state, "autosupply.analyze_enabled", if analyze_enabled { "1" } else { "0" }).await?;
+    write_setting(&state, "autosupply.triage_enabled", if triage_enabled { "1" } else { "0" }).await?;
+    get_autosupply_settings(state).await
+}
+
+// ---- 信任旋钮（autonomy level）：strict / standard / loose ----
+// 现阶段对 AI 未完全放心 → 默认 strict。档位应用预设到 autosupply（已被 triage 池闸门兜底），
+// **不触碰**审核闸/并发/合并——两道人工审核闸在任何档位都保留（裁决权不下放）。
+
+#[tauri::command]
+pub async fn get_autonomy_level(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(read_setting(&state, "autonomy.level")
+        .await
+        .filter(|s| matches!(s.as_str(), "strict" | "standard" | "loose"))
+        .unwrap_or_else(|| "strict".to_string()))
+}
+
+#[tauri::command]
+pub async fn set_autonomy_level(
+    level: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let level = match level.as_str() {
+        "standard" | "loose" => level,
+        _ => "strict".to_string(),
+    };
+    write_setting(&state, "autonomy.level", &level).await?;
+    // 应用预设到自喂料（信任越高，放得越开）。proposer 仅 loose 档自动开。
+    let (proposer, max) = match level.as_str() {
+        "loose" => ("1", "40"),
+        "standard" => ("0", "20"),
+        _ => ("0", "10"),
+    };
+    write_setting(&state, "autosupply.proposer_enabled", proposer).await?;
+    write_setting(&state, "autosupply.max_per_run", max).await?;
+    Ok(level)
 }

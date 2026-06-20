@@ -39,3 +39,35 @@ pub async fn set_auto_pass_enabled(
         .await
         .map_err(|e| e.to_string())
 }
+
+/// 自动 AI 解冲突开关（与门控降级并排放在 Settings 门控降级面板）。OFF by default.
+#[tauri::command]
+pub async fn get_auto_conflict_resolve_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(crate::core::gate::auto_conflict_resolve_enabled(&state.db).await)
+}
+
+#[tauri::command]
+pub async fn set_auto_conflict_resolve_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::core::gate::set_auto_conflict_resolve_enabled(&state.db, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 合并提交信息自定义开关（默认关）。开启后代码审核页出现提交信息输入框。
+#[tauri::command]
+pub async fn get_custom_merge_message_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(crate::core::gate::custom_merge_message_enabled(&state.db).await)
+}
+
+#[tauri::command]
+pub async fn set_custom_merge_message_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::core::gate::set_custom_merge_message_enabled(&state.db, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}

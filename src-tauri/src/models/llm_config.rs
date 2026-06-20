@@ -7,11 +7,16 @@ pub struct LlmConfig {
     pub model: String,
     pub endpoint: String,
     pub api_key: String,
+    /// 上下文窗口（展示用参考值，如 "200K"）。**后端自动推断**（查表 + 接口探测），
+    /// 不再由用户手填；拿不到时为「未知」。见 `core::ctx_window`。
     pub ctx_window: String,
     pub temperature: f64,
     pub enabled: bool,
     /// 接口规范：openai | anthropic。决定文本生成路由与工具调用 wire 格式。
     pub api_spec: String,
+    /// 是否支持多模态（图片识别）。**后端按模型名自动推断**（见 `core::vision`），
+    /// 不再由用户手动开关；true 时绑定该 LLM 的角色 Agent 可在会议室识别图片附件。
+    pub supports_vision: bool,
     pub created_at: String,
 }
 
@@ -21,7 +26,6 @@ pub struct CreateLlmConfig {
     pub model: String,
     pub endpoint: String,
     pub api_key: String,
-    pub ctx_window: Option<String>,
     pub temperature: Option<f64>,
     pub api_spec: Option<String>,
 }
@@ -32,7 +36,6 @@ pub struct UpdateLlmConfig {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub api_key: Option<String>,
-    pub ctx_window: Option<String>,
     pub temperature: Option<f64>,
     pub enabled: Option<bool>,
     pub api_spec: Option<String>,

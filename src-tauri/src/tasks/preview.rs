@@ -91,20 +91,12 @@ struct StartSpec {
 /// Detect an available container runtime (podman preferred, then docker).
 pub fn container_runtime() -> Option<&'static str> {
     for rt in ["podman", "docker"] {
-        if which(rt) {
+        // Cross-platform PATH lookup (handles `;` separator + `.exe` on Windows).
+        if crate::core::platform::has_executable(rt) {
             return Some(rt);
         }
     }
     None
-}
-
-fn which(bin: &str) -> bool {
-    std::env::var("PATH")
-        .map(|p| {
-            p.split(':')
-                .any(|d| std::path::Path::new(d).join(bin).exists())
-        })
-        .unwrap_or(false)
 }
 
 /// Deterministic host-port assignment (FNV-1a) in [19000, 23000).

@@ -11,6 +11,14 @@ pub struct Project {
     pub branch_main: String,
     pub status: String,
     pub config_yaml: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    /// 软删除时间戳；NULL = 在用，非空 = 已归档（回收站）。
+    #[serde(default)]
+    pub archived_at: Option<String>,
+    /// 项目级 code agent 覆盖；NULL = 跟随全局默认（见 agents/code_agent::resolve）。
+    #[serde(default)]
+    pub code_agent_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

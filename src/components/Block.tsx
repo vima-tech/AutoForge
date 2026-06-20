@@ -1,14 +1,15 @@
 import React, { useState } from 'react';
 import Icon from './Icon';
 import Markdown from './Markdown';
+import { highlightText } from './highlight';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, openAttachment, submitFromArtifact, writeWorkspaceFile } from '../services';
+import { attachmentDataUrl, decideIssueDraft, openAttachment, writeWorkspaceFile } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
 interface Token { c: string | null; t: string }
 
-function tokenize(code: string): Token[] {
+export function tokenize(code: string): Token[] {
   const tokens: Token[] = [];
   const re = /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d+\.?\d*\b)|([A-Za-z_$][\w$]*)|(\s+)|([^\sA-Za-z0-9_$"'\/]+|\/)/g;
   let m: RegExpExecArray | null;
@@ -26,7 +27,7 @@ function tokenize(code: string): Token[] {
   return tokens;
 }
 
-function CodeBlock({ lang, code, projectId }: { lang: string; code: string; projectId?: string }) {
+function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: string; projectId?: string; highlight?: string }) {
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
@@ -70,42 +71,40 @@ function CodeBlock({ lang, code, projectId }: { lang: string; code: string; proj
           </button>
         </div>
       </div>
-      <pre><code>{tokens.map((tk, i) => tk.c ? <span key={i} className={tk.c}>{tk.t}</span> : tk.t)}</code></pre>
+      <pre><code>{tokens.map((tk, i) => tk.c ? <span key={i} className={tk.c}>{highlightText(tk.t, highlight)}</span> : <React.Fragment key={i}>{highlightText(tk.t, highlight)}</React.Fragment>)}</code></pre>
     </div>
   );
 }
 
 // ── ArtifactBlock ─────────────────────────────────────────────────────────────
 
-function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string }) {
-  const [submitted, setSubmitted] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: Extract<BlockType, { t: 'artifact' }>; projectId?: string; highlight?: string; messageId?: string; blockIndex?: number }) {
+  // 需求草稿的决策：优先用持久化在块上的 decided，其次本地乐观状态。
+  const [decision, setDecision] = useState<'confirmed' | 'rejected' | ''>(b.decided ?? '');
+  const [deciding, setDeciding] = useState<'confirm' | 'reject' | ''>('');
   const [submitErr, setSubmitErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
   const [saveErr, setSaveErr] = useState('');
 
-  const meta = (b as any)._meta as {
-    project_id?: string; title?: string; description?: string;
-    category?: string; severity?: string;
-  } | undefined;
-  const isDraft = b.kind === 'requirement_draft';
+  const meta = b._meta;
+  const isDraft = b.kind === 'issue_draft' || b.kind === 'requirement_draft';
   const effectiveProjectId = projectId || meta?.project_id;
 
-  const handleSubmitDraft = async () => {
-    if (!meta?.title || submitting) return;
-    setSubmitting(true); setSubmitErr('');
+  // 在对话 card 内直接确认/拒绝整理好的需求，让整理环节就地闭环。
+  const handleDecide = async (decideAs: 'confirm' | 'reject') => {
+    if (deciding || decision) return;
+    if (!messageId) { setSubmitErr('无法定位消息，请刷新后重试'); return; }
+    if (decideAs === 'confirm' && !effectiveProjectId) {
+      setSubmitErr('该群聊未绑定项目，无法确认入库');
+      return;
+    }
+    setDeciding(decideAs); setSubmitErr('');
     try {
-      await submitFromArtifact({
-        project_id: meta.project_id || '',
-        title: meta.title || b.title,
-        description: meta.description || b.body,
-        category: meta.category,
-        severity: meta.severity,
-      });
-      setSubmitted(true);
+      await decideIssueDraft({ message_id: messageId, decision: decideAs, block_index: blockIndex });
+      setDecision(decideAs === 'confirm' ? 'confirmed' : 'rejected');
     } catch (e) { setSubmitErr(String(e)); }
-    finally { setSubmitting(false); }
+    finally { setDeciding(''); }
   };
 
   const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs') => {
@@ -129,12 +128,12 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
   };
 
   return (
-    <div className="artifact">
+    <div className={'artifact' + (isDraft ? ' artifact-draft' : '')}>
       <div className="artifact-head">
         <div className="artifact-ic"><Icon name={isDraft ? 'inbox' : 'zap'} size={17} /></div>
         <div style={{ minWidth: 0 }}>
           <div className="artifact-kind">{isDraft ? '需求草稿' : b.kind}</div>
-          <div className="artifact-title">{b.title}</div>
+          <div className="artifact-title">{highlightText(b.title, highlight)}</div>
         </div>
       </div>
       <div style={{ padding: '4px 14px' }}>
@@ -145,17 +144,24 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
           </div>
         ))}
       </div>
-      <div className="artifact-body">{b.body}</div>
+      <div className="artifact-body"><Markdown md={b.body} highlight={highlight} /></div>
       <div className="artifact-foot">
         {isDraft ? (
-          submitted ? (
+          decision === 'confirmed' ? (
             <span className="chip green" style={{ padding: '3px 10px' }}>
-              <Icon name="check" size={12} style={{ marginRight: 4 }} />已提交入队
+              <Icon name="check" size={12} style={{ marginRight: 4 }} />已确认 · 进入流水线
+            </span>
+          ) : decision === 'rejected' ? (
+            <span className="chip" style={{ padding: '3px 10px', color: 'var(--text-3)' }}>
+              <Icon name="x" size={12} style={{ marginRight: 4 }} />已拒绝
             </span>
           ) : (
             <>
-              <button className="btn btn-sm btn-primary" disabled={submitting} onClick={handleSubmitDraft}>
-                <Icon name="arrowUp" size={13} />{submitting ? '提交中…' : '提交到流水线'}
+              <button className="btn btn-sm btn-primary" disabled={!!deciding} onClick={() => handleDecide('confirm')}>
+                <Icon name="check" size={13} />{deciding === 'confirm' ? '确认中…' : '确认需求'}
+              </button>
+              <button className="btn btn-sm btn-danger" disabled={!!deciding} onClick={() => handleDecide('reject')}>
+                <Icon name="x" size={13} />{deciding === 'reject' ? '拒绝中…' : '拒绝需求'}
               </button>
               {submitErr && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--red)' }}>{submitErr}</span>}
             </>
@@ -180,10 +186,17 @@ function ArtifactBlock({ b, projectId }: { b: Extract<BlockType, { t: 'artifact'
 
 // ── FileWrittenBlock ──────────────────────────────────────────────────────────
 
-function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> }) {
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function FileWrittenBlock({ b, highlight }: { b: Extract<BlockType, { t: 'file_written' }>; highlight?: string }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div style={{
+    <div className="file-written" style={{
       border: `1px solid ${b.error ? 'var(--red)' : 'var(--ember)'}`,
       borderRadius: 10, overflow: 'hidden',
       background: b.error ? 'color-mix(in srgb, var(--red) 8%, transparent)' : 'var(--ember-tint)',
@@ -196,13 +209,13 @@ function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> 
           .autoforge/{b.path}
         </span>
         <span style={{ fontSize: 'var(--text-caption)', color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }}>
-          {b.error ? '写入失败' : `${(b.size_bytes / 1024).toFixed(1)} KB 已写入`}
+          {b.error ? '写入失败' : `${formatBytes(b.size_bytes)} 已写入`}
         </span>
         <Icon name={expanded ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
       {expanded && b.preview && (
         <pre style={{ margin: 0, padding: '0 12px 10px', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: '1px solid var(--border)' }}>
-          {b.preview}{b.size_bytes > 200 ? ' …' : ''}
+          {highlightText(b.preview, highlight)}{b.size_bytes > 200 ? ' …' : ''}
         </pre>
       )}
     </div>
@@ -211,7 +224,7 @@ function FileWrittenBlock({ b }: { b: Extract<BlockType, { t: 'file_written' }> 
 
 // ── Main Block ────────────────────────────────────────────────────────────────
 
-export default function Block({ b, projectId }: { b: BlockType; projectId?: string }) {
+export default function Block({ b, projectId, highlight, messageId, blockIndex }: { b: BlockType; projectId?: string; highlight?: string; messageId?: string; blockIndex?: number }) {
   const [previewUrl, setPreviewUrl] = useState('');
   const [attachmentError, setAttachmentError] = useState('');
 
@@ -233,15 +246,15 @@ export default function Block({ b, projectId }: { b: BlockType; projectId?: stri
     openAttachment(id).catch(e => setAttachmentError(String(e)));
   };
 
-  if (b.t === 'md') return <Markdown md={b.md} />;
-  if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} projectId={projectId} />;
+  if (b.t === 'md') return <Markdown md={b.md} highlight={highlight} />;
+  if (b.t === 'code') return <CodeBlock lang={b.lang} code={b.code} projectId={projectId} highlight={highlight} />;
   if (b.t === 'typing') return <div className="typing"><i /><i /><i /></div>;
   if (b.t === 'file') return (
     <div className="att">
       <div className="att-ic" style={{ background: b.color }}><Icon name="file" size={19} /></div>
       <div style={{ minWidth: 0 }}>
-        <div className="att-name">{b.name}</div>
-        <div className="att-meta">{b.meta}</div>
+        <div className="att-name">{highlightText(b.name, highlight)}</div>
+        <div className="att-meta">{highlightText(b.meta, highlight)}</div>
         {attachmentError && <div className="att-error">{attachmentError}</div>}
       </div>
       <button className="icon-btn" style={{ marginLeft: 'auto' }} disabled={!b.id} title="打开附件" onClick={() => openStoredAttachment(b.id)}>
@@ -254,7 +267,7 @@ export default function Block({ b, projectId }: { b: BlockType; projectId?: stri
       {previewUrl
         ? <img src={previewUrl} alt={b.label} />
         : <div className="ph" style={{ background: `linear-gradient(135deg, ${b.color}, ${b.color}99)` }}><Icon name="image" size={30} /></div>}
-      <div className="cap">{b.label}　{b.meta}</div>
+      <div className="cap">{highlightText(b.label, highlight)}　{highlightText(b.meta, highlight)}</div>
       {attachmentError && <button className="att-img-error" title={attachmentError}><Icon name="alert" size={14} /></button>}
       {b.id && (
         <button className="att-img-open icon-btn" title="打开附件" onClick={() => openStoredAttachment(b.id)}>
@@ -263,7 +276,7 @@ export default function Block({ b, projectId }: { b: BlockType; projectId?: stri
       )}
     </div>
   );
-  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} />;
-  if (b.t === 'file_written') return <FileWrittenBlock b={b} />;
+  if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} highlight={highlight} messageId={messageId} blockIndex={blockIndex} />;
+  if (b.t === 'file_written') return <FileWrittenBlock b={b} highlight={highlight} />;
   return null;
 }

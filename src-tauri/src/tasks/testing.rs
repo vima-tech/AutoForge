@@ -5,7 +5,6 @@ use crate::tasks::runner::{enqueue, JobSender};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::time::Duration;
-use tokio::process::Command;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +223,42 @@ pub async fn run_and_gate(
         },
     );
 
+    // schema 驱动测试 agent：把本次测试结果（失败时附 LLM 结构化诊断）落到统一产出表
+    // agent_outputs（role=test），与需求分析产出同存可串成流水线。best-effort，绝不影响闸口结果。
+    {
+        let (cr_title, acceptance) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT title, acceptance_json FROM issues WHERE id=?",
+        )
+        .bind(&cr.issue_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| (cr_id.to_string(), None));
+
+        let check_inputs: Vec<crate::agents::test_agent::CheckInput> = results
+            .iter()
+            .map(|r| crate::agents::test_agent::CheckInput {
+                name: r.name.clone(),
+                command: r.command.clone(),
+                ok: r.ok,
+                code: r.code,
+                stdout: r.stdout.clone(),
+                stderr: r.stderr.clone(),
+            })
+            .collect();
+
+        crate::agents::test_agent::report(
+            db,
+            cr_id,
+            &cr_title,
+            &project.id,
+            &check_inputs,
+            acceptance.as_deref(),
+        )
+        .await;
+    }
+
     Ok(failed.is_empty())
 }
 
@@ -272,14 +307,12 @@ pub(crate) async fn run_check(
     command: String,
     timeout_secs: u64,
 ) -> CheckResult {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-lc")
-        .arg(&command)
-        .current_dir(repo_path)
-        // Own process group so a timeout can be reaped, and ensure the child is
-        // killed if this future is dropped (e.g. on timeout) instead of leaking.
-        .process_group(0)
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(repo_path)
+        // Killed if this future is dropped (e.g. on timeout) instead of leaking.
         .kill_on_drop(true);
+    // Own process group so a timeout can be reaped (cross-platform helper).
+    crate::core::platform::detach_process_group(&mut cmd);
     let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
     match output {

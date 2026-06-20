@@ -1,40 +1,93 @@
 use super::IntakePayload;
 use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::warn;
 
+/// 递归扫描源码文件，命中 TODO/FIXME/HACK/XXX 行。纯 Rust 实现，跨平台一致
+/// （不再 shell-out `grep`——Windows 无 grep）。返回 `path:line:内容` 形式的行。
+fn grep_todos(repo_path: &str) -> Vec<String> {
+    const EXTS: &[&str] = &["rs", "ts", "tsx", "js", "py", "go"];
+    const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__", "dist", "build"];
+    const TAGS: &[&str] = &["TODO", "FIXME", "HACK", "XXX"];
+
+    fn looks_like_tag(line: &str) -> bool {
+        TAGS.iter().any(|tag| {
+            if let Some(idx) = line.find(tag) {
+                // 紧跟 `:` 或 `(...):`，且其后有非空内容，近似原正则。
+                let rest = line[idx + tag.len()..].trim_start();
+                let rest = rest.strip_prefix('(').map_or(rest, |r| {
+                    r.split_once(')').map_or(rest, |(_, after)| after)
+                });
+                rest.strip_prefix(':')
+                    .map(|after| !after.trim().is_empty())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    }
+
+    let mut hits: Vec<String> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![Path::new(repo_path).to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if hits.len() >= 100 {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                stack.push(path);
+            } else {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !EXTS.contains(&ext) {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue, // 二进制/非 UTF-8 跳过
+                };
+                let rel = path.to_string_lossy();
+                for (i, line) in content.lines().enumerate() {
+                    if hits.len() >= 100 {
+                        break;
+                    }
+                    if looks_like_tag(line) {
+                        hits.push(format!("{}:{}:{}", rel, i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    hits
+}
+
 /// 扫描代码库中的 TODO/FIXME/HACK/XXX 注释
 pub async fn scan_todos(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
-    let output = Command::new("grep")
-        .args([
-            "-rn",
-            "--include=*.rs",
-            "--include=*.ts",
-            "--include=*.tsx",
-            "--include=*.js",
-            "--include=*.py",
-            "--include=*.go",
-            "-E",
-            r"(TODO|FIXME|HACK|XXX)(\([^)]*\))?:\s*.+",
-            repo_path,
-        ])
-        .output()
-        .await;
-
-    let output = match output {
-        Ok(o) => o,
+    let repo_path_owned = repo_path.to_string();
+    // 阻塞文件遍历放到 blocking 线程池，避免卡住 tokio 工作线程。
+    let lines = match tokio::task::spawn_blocking(move || grep_todos(&repo_path_owned)).await {
+        Ok(v) => v,
         Err(e) => {
-            warn!("[scanner] grep failed: {}", e);
+            warn!("[scanner] todo scan failed: {}", e);
             return vec![];
         }
     };
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
+    lines
+        .iter()
         .filter(|l| !l.is_empty())
         .take(100)
         .filter_map(|line| {
-            // 格式：path/to/file.rs:123:// TODO: fix this
+            // 格式：file_path:line:comment，例如 src/x.rs:123 处的一条标记注释
             let mut parts = line.splitn(3, ':');
             let file_path = parts.next()?;
             let line_num = parts.next()?;
@@ -156,8 +209,10 @@ pub async fn scan_npm_audit(project_id: &str, repo_path: &str) -> Vec<IntakePayl
         return vec![];
     }
 
-    let output = Command::new("npm")
-        .args(["audit", "--json"])
+    // Route through the platform shell: on Windows `npm` is `npm.cmd`, which
+    // `Command::new("npm")` cannot resolve directly (CreateProcess only appends
+    // `.exe`). `cmd /C` / `sh -lc` resolve the shim correctly.
+    let output = crate::core::platform::shell("npm audit --json")
         .current_dir(repo_path)
         .output()
         .await;
@@ -219,4 +274,523 @@ pub async fn scan_npm_audit(project_id: &str, repo_path: &str) -> Vec<IntakePayl
             })
         })
         .collect()
+}
+
+/// 运行 pip-audit（Python 依赖漏洞）。需仓库含 requirements.txt 或 pyproject.toml。
+pub async fn scan_pip_audit(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    if !Path::new(repo_path).join("requirements.txt").exists()
+        && !Path::new(repo_path).join("pyproject.toml").exists()
+    {
+        return vec![];
+    }
+
+    // pip-audit 输出 JSON：{"dependencies":[{"name","version","vulns":[{"id","description","fix_versions"}]}]}
+    let output = crate::core::platform::shell("pip-audit -f json")
+        .current_dir(repo_path)
+        .output()
+        .await;
+    let stdout = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(e) => {
+            warn!("[scanner] pip-audit failed: {}", e);
+            return vec![];
+        }
+    };
+    let val: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    // 兼容两种顶层形态：{"dependencies":[...]} 或直接数组。
+    let deps = val
+        .get("dependencies")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .or_else(|| val.as_array().cloned())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for dep in deps {
+        let pkg = dep.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let version = dep.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        let vulns = match dep.get("vulns").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for vuln in vulns {
+            if out.len() >= 50 {
+                return out;
+            }
+            let id = vuln.get("id").and_then(|i| i.as_str()).unwrap_or("UNKNOWN");
+            let desc = vuln
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let fix = vuln
+                .get("fix_versions")
+                .and_then(|f| f.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            out.push(IntakePayload {
+                project_id: project_id.to_string(),
+                title: format!("[安全] pip {}: {}", pkg, id),
+                description: Some(format!(
+                    "Advisory: {}\nPackage: {} {}\nFix: {}\n\n{}",
+                    id, pkg, version, fix, desc
+                )),
+                category: Some("Debt".to_string()),
+                // pip-audit 默认不给 CVSS 评级，统一标 medium，交由分析阶段定级。
+                severity: Some("medium".to_string()),
+                source_type: "security_audit".to_string(),
+                source_ref: Some(format!("pip:{}", id)),
+            });
+        }
+    }
+    out
+}
+
+/// 运行 govulncheck（Go 依赖/调用链漏洞）。需仓库含 go.mod。
+pub async fn scan_govulncheck(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    if !Path::new(repo_path).join("go.mod").exists() {
+        return vec![];
+    }
+
+    // govulncheck -json 输出**串联的 JSON 对象流**（非单一数组），用流式反序列化逐个读，
+    // 收集含 "osv" 字段的漏洞条目。
+    let output = crate::core::platform::shell("govulncheck -json ./...")
+        .current_dir(repo_path)
+        .output()
+        .await;
+    let stdout = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(e) => {
+            warn!("[scanner] govulncheck failed: {}", e);
+            return vec![];
+        }
+    };
+
+    let mut out = Vec::new();
+    let stream = serde_json::Deserializer::from_str(&stdout).into_iter::<serde_json::Value>();
+    for item in stream.flatten() {
+        let Some(osv) = item.get("osv") else { continue };
+        if out.len() >= 50 {
+            break;
+        }
+        let id = osv.get("id").and_then(|i| i.as_str()).unwrap_or("UNKNOWN");
+        let summary = osv
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .or_else(|| osv.get("details").and_then(|d| d.as_str()))
+            .unwrap_or("");
+        out.push(IntakePayload {
+            project_id: project_id.to_string(),
+            title: format!(
+                "[安全] go {}: {}",
+                id,
+                summary.chars().take(80).collect::<String>()
+            ),
+            description: Some(format!("Advisory: {}\n\n{}", id, summary)),
+            category: Some("Debt".to_string()),
+            severity: Some("high".to_string()),
+            source_type: "security_audit".to_string(),
+            source_ref: Some(format!("go:{}", id)),
+        });
+    }
+    out
+}
+
+// ── 静态代码分析（发现真实代码问题，区别于只查依赖漏洞的 *_audit）────────────────
+//
+// TODO/FIXME 扫描只能发现「人主动标注」的待办；依赖审计只查第三方漏洞。
+// 真正的代码缺陷（未使用变量、可疑写法、类型错误、可疑比较……）要靠各语言的
+// 静态分析器。这里按 `core::stack` 检测到的栈，调度对应分析器，把告警转成 intake。
+//
+// 设计：best-effort——分析器未安装/超时/无配置一律静默返回空，绝不阻塞自喂料；
+// 解析逻辑抽成纯函数（带单测），异步壳只负责跑命令 + 计时保护。
+
+/// 单个分析器最长运行时间（编译型如 clippy 可能较久）。
+const ANALYZER_TIMEOUT_SECS: u64 = 300;
+/// 单个分析器最多产出的告警条数（防一次性淹没）。
+const ANALYZER_MAX_FINDINGS: usize = 50;
+
+/// 跑一条命令并加超时保护；超时/启动失败返回 None。`kill_on_drop` 保证超时后进程被回收。
+async fn run_capped(mut cmd: Command, secs: u64) -> Option<std::process::Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(secs), cmd.output()).await {
+        Ok(Ok(o)) => Some(o),
+        Ok(Err(e)) => {
+            warn!("[analyzer] command failed: {}", e);
+            None
+        }
+        Err(_) => {
+            warn!("[analyzer] command timed out after {}s", secs);
+            None
+        }
+    }
+}
+
+/// 按栈画像调度静态分析器，汇总所有告警为 intake 载荷。
+pub async fn scan_static_analysis(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    let analyzers = crate::core::stack::code_analyzers(Path::new(repo_path));
+    let mut out = Vec::new();
+    for a in analyzers {
+        let mut found = match a {
+            "clippy" => scan_clippy(project_id, repo_path).await,
+            "ruff" => scan_ruff(project_id, repo_path).await,
+            "go_vet" => scan_go_vet(project_id, repo_path).await,
+            "eslint" => scan_eslint(project_id, repo_path).await,
+            _ => vec![],
+        };
+        out.append(&mut found);
+    }
+    out
+}
+
+/// clippy（Rust）：`cargo clippy --message-format=json`。Tauri 仓库自动定位 src-tauri 清单。
+pub async fn scan_clippy(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    let root = Path::new(repo_path);
+    let manifest = if root.join("src-tauri/Cargo.toml").exists() {
+        Some("src-tauri/Cargo.toml")
+    } else if root.join("Cargo.toml").exists() {
+        Some("Cargo.toml")
+    } else {
+        return vec![];
+    };
+    let mut cmd = Command::new("cargo");
+    cmd.args(["clippy", "--message-format=json", "--quiet"]);
+    if let Some(m) = manifest {
+        cmd.args(["--manifest-path", m]);
+    }
+    cmd.current_dir(repo_path);
+    let Some(output) = run_capped(cmd, ANALYZER_TIMEOUT_SECS).await else {
+        return vec![];
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_clippy_json(project_id, &stdout)
+}
+
+/// 解析 clippy `--message-format=json` 的串联 JSON 行流（每行一个对象）。
+fn parse_clippy_json(project_id: &str, stdout: &str) -> Vec<IntakePayload> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if out.len() >= ANALYZER_MAX_FINDINGS {
+            break;
+        }
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let msg = match v.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+        let level = msg.get("level").and_then(|l| l.as_str()).unwrap_or("");
+        if level != "warning" && level != "error" {
+            continue;
+        }
+        // 取主 span 的 file:line；无 span（汇总行如「aborting due to…」）跳过。
+        let span = msg
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .and_then(|arr| arr.iter().find(|s| s.get("is_primary").and_then(|p| p.as_bool()).unwrap_or(false)).or_else(|| arr.first()));
+        let Some(span) = span else { continue };
+        let file = span.get("file_name").and_then(|f| f.as_str()).unwrap_or("");
+        let line_no = span.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0);
+        if file.is_empty() {
+            continue;
+        }
+        let code = msg
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("clippy");
+        let text = msg.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let short: String = text.chars().take(80).collect();
+        out.push(IntakePayload {
+            project_id: project_id.to_string(),
+            title: format!("[分析] clippy {}: {}", code, short),
+            description: Some(format!(
+                "规则：{}\n位置：{}:{}\n级别：{}\n\n{}",
+                code, file, line_no, level, text
+            )),
+            category: Some(if level == "error" { "Bug" } else { "Debt" }.to_string()),
+            severity: Some(if level == "error" { "high" } else { "low" }.to_string()),
+            source_type: "code_analysis".to_string(),
+            source_ref: Some(format!("clippy:{}:{}", file, line_no)),
+        });
+    }
+    out
+}
+
+/// ruff（Python）：`ruff check --output-format json .`。
+pub async fn scan_ruff(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    let mut cmd = Command::new("ruff");
+    cmd.args(["check", "--output-format", "json", "."]);
+    cmd.current_dir(repo_path);
+    let Some(output) = run_capped(cmd, ANALYZER_TIMEOUT_SECS).await else {
+        return vec![];
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_ruff_json(project_id, &stdout)
+}
+
+/// 解析 ruff JSON 数组：`[{filename, location:{row}, code, message}]`。
+fn parse_ruff_json(project_id: &str, stdout: &str) -> Vec<IntakePayload> {
+    let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(stdout.trim())
+    else {
+        return vec![];
+    };
+    arr.iter()
+        .take(ANALYZER_MAX_FINDINGS)
+        .filter_map(|v| {
+            let file = v.get("filename").and_then(|f| f.as_str()).unwrap_or("");
+            if file.is_empty() {
+                return None;
+            }
+            let line_no = v
+                .get("location")
+                .and_then(|l| l.get("row"))
+                .and_then(|r| r.as_u64())
+                .unwrap_or(0);
+            let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("ruff");
+            let text = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            let short: String = text.chars().take(80).collect();
+            Some(IntakePayload {
+                project_id: project_id.to_string(),
+                title: format!("[分析] ruff {}: {}", code, short),
+                description: Some(format!("规则：{}\n位置：{}:{}\n\n{}", code, file, line_no, text)),
+                category: Some("Debt".to_string()),
+                severity: Some("low".to_string()),
+                source_type: "code_analysis".to_string(),
+                source_ref: Some(format!("ruff:{}:{}", file, line_no)),
+            })
+        })
+        .collect()
+}
+
+/// go vet（Go）：诊断写在 stderr，形如 `path:line:col: message`。
+pub async fn scan_go_vet(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    let mut cmd = Command::new("go");
+    cmd.args(["vet", "./..."]);
+    cmd.current_dir(repo_path);
+    let Some(output) = run_capped(cmd, ANALYZER_TIMEOUT_SECS).await else {
+        return vec![];
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_go_vet(project_id, &stderr)
+}
+
+/// 解析 go vet stderr：取形如 `file:line:col: msg` 或 `file:line: msg` 的诊断行。
+fn parse_go_vet(project_id: &str, stderr: &str) -> Vec<IntakePayload> {
+    let mut out = Vec::new();
+    for line in stderr.lines() {
+        if out.len() >= ANALYZER_MAX_FINDINGS {
+            break;
+        }
+        let line = line.trim();
+        // 跳过非诊断行（如 "# package/path" 标题、go 工具进度）。
+        if line.is_empty() || line.starts_with('#') || line.starts_with("go:") {
+            continue;
+        }
+        // 形如 file:line[:col]: message —— 至少含 "file:line: "。
+        let mut parts = line.splitn(4, ':');
+        let (Some(file), Some(line_no)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if file.is_empty() || line_no.parse::<u32>().is_err() {
+            continue;
+        }
+        // 第三段可能是 col 或直接是消息；拼回剩余作为消息。
+        let rest: Vec<&str> = [parts.next(), parts.next()].into_iter().flatten().collect();
+        let text = rest.join(":");
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let short: String = text.chars().take(80).collect();
+        out.push(IntakePayload {
+            project_id: project_id.to_string(),
+            title: format!("[分析] go vet: {}", short),
+            description: Some(format!("位置：{}:{}\n\n{}", file, line_no, text)),
+            category: Some("Bug".to_string()),
+            severity: Some("medium".to_string()),
+            source_type: "code_analysis".to_string(),
+            source_ref: Some(format!("go_vet:{}:{}", file, line_no)),
+        });
+    }
+    out
+}
+
+/// eslint（JS/TS）：仅当仓库本地装了 eslint（`node_modules/.bin/eslint`）且有配置时运行，
+/// 避免 `npx` 触发联网安装。通过平台 shell 跑本地 bin，输出 JSON。
+pub async fn scan_eslint(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    let root = Path::new(repo_path);
+    if !root.join("node_modules/.bin/eslint").exists() {
+        return vec![];
+    }
+    // 至少存在一种 eslint 配置（flat 或传统），否则跳过。
+    let has_config = ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", ".eslintrc",
+        ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.json", ".eslintrc.yml", ".eslintrc.yaml"]
+        .iter()
+        .any(|c| root.join(c).exists())
+        || std::fs::read_to_string(root.join("package.json"))
+            .map(|s| s.contains("\"eslintConfig\""))
+            .unwrap_or(false);
+    if !has_config {
+        return vec![];
+    }
+    let mut cmd = crate::core::platform::shell("node_modules/.bin/eslint -f json .");
+    cmd.current_dir(repo_path);
+    let Some(output) = run_capped(cmd, ANALYZER_TIMEOUT_SECS).await else {
+        return vec![];
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_eslint_json(project_id, &stdout)
+}
+
+/// 解析 eslint `-f json` 输出：`[{filePath, messages:[{line, ruleId, message, severity}]}]`。
+/// severity 2=error→Bug/medium，1=warning→Debt/low，0(off) 跳过。
+fn parse_eslint_json(project_id: &str, stdout: &str) -> Vec<IntakePayload> {
+    let start = match stdout.find('[') {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let end = match stdout.rfind(']') {
+        Some(e) => e,
+        None => return vec![],
+    };
+    if end <= start {
+        return vec![];
+    }
+    let Ok(serde_json::Value::Array(files)) =
+        serde_json::from_str::<serde_json::Value>(&stdout[start..=end])
+    else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for file_entry in &files {
+        let file = file_entry.get("filePath").and_then(|f| f.as_str()).unwrap_or("");
+        let Some(messages) = file_entry.get("messages").and_then(|m| m.as_array()) else {
+            continue;
+        };
+        for m in messages {
+            if out.len() >= ANALYZER_MAX_FINDINGS {
+                return out;
+            }
+            let sev = m.get("severity").and_then(|s| s.as_u64()).unwrap_or(0);
+            if sev == 0 {
+                continue;
+            }
+            let line_no = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
+            let rule = m.get("ruleId").and_then(|r| r.as_str()).unwrap_or("eslint");
+            let text = m.get("message").and_then(|t| t.as_str()).unwrap_or("");
+            let short: String = text.chars().take(80).collect();
+            out.push(IntakePayload {
+                project_id: project_id.to_string(),
+                title: format!("[分析] eslint {}: {}", rule, short),
+                description: Some(format!("规则：{}\n位置：{}:{}\n\n{}", rule, file, line_no, text)),
+                category: Some(if sev >= 2 { "Bug" } else { "Debt" }.to_string()),
+                severity: Some(if sev >= 2 { "medium" } else { "low" }.to_string()),
+                source_type: "code_analysis".to_string(),
+                source_ref: Some(format!("eslint:{}:{}", file, line_no)),
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_todo_tags_recursively_cross_platform() {
+        // 标签字面量用 concat! 在编译期拼出，避免本测试源码自身被 TODO 扫描器
+        // （grep_todos）误当成待办命中、反复供料成需求。
+        let todo = concat!("TO", "DO");
+        let fixme = concat!("FIX", "ME");
+
+        let dir = std::env::temp_dir().join(format!("af-scan-{}", std::process::id()));
+        let sub = dir.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(sub.join("a.rs"), format!("// {todo}: fix me\nlet x = 1;\n")).unwrap();
+        std::fs::write(sub.join("b.ts"), format!("// {fixme}(bob): broken\n// note: plain\n"))
+            .unwrap();
+        std::fs::write(dir.join("node_modules").join("c.js"), format!("// {todo}: ignored\n"))
+            .unwrap();
+        std::fs::write(sub.join("d.png"), format!("{todo}: not source\n")).unwrap();
+
+        let hits = grep_todos(dir.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(hits.iter().any(|h| h.contains(&format!("{todo}: fix me"))));
+        assert!(hits.iter().any(|h| h.contains(&format!("{fixme}(bob): broken"))));
+        // skipped: node_modules, non-source ext, and "note:" (not a tag)
+        assert!(!hits.iter().any(|h| h.contains("ignored")));
+        assert!(!hits.iter().any(|h| h.contains("not source")));
+        assert!(!hits.iter().any(|h| h.contains("plain")));
+    }
+
+    #[test]
+    fn parses_clippy_findings_and_skips_summary() {
+        let stdout = r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused variable: `x`","code":{"code":"unused_variables"},"spans":[{"file_name":"src/a.rs","line_start":12,"is_primary":true}]}}
+{"reason":"compiler-artifact","package_id":"foo"}
+{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","code":null,"spans":[{"file_name":"src/b.rs","line_start":3,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"level":"error","message":"aborting due to previous error","spans":[]}}"#;
+        let out = parse_clippy_json("p1", stdout);
+        assert_eq!(out.len(), 2, "artifact + summary(no span) skipped");
+        assert!(out[0].title.contains("clippy unused_variables"));
+        assert_eq!(out[0].severity.as_deref(), Some("low"));
+        assert_eq!(out[0].category.as_deref(), Some("Debt"));
+        // 无 code 时回退到 "clippy"；error → Bug/high。
+        assert!(out[1].title.contains("clippy clippy"));
+        assert_eq!(out[1].severity.as_deref(), Some("high"));
+        assert_eq!(out[1].category.as_deref(), Some("Bug"));
+        assert_eq!(out[1].source_ref.as_deref(), Some("clippy:src/b.rs:3"));
+    }
+
+    #[test]
+    fn parses_ruff_json() {
+        let stdout = r#"[{"filename":"app/main.py","location":{"row":7,"column":1},"code":"F401","message":"`os` imported but unused"}]"#;
+        let out = parse_ruff_json("p1", stdout);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].title.contains("ruff F401"));
+        assert_eq!(out[0].source_ref.as_deref(), Some("ruff:app/main.py:7"));
+        // 空/非数组输出安全返回空。
+        assert!(parse_ruff_json("p1", "").is_empty());
+        assert!(parse_ruff_json("p1", "not json").is_empty());
+    }
+
+    #[test]
+    fn parses_go_vet_stderr() {
+        let stderr = "# example.com/m\nmain.go:10:2: result of fmt.Sprintf call not used\nok\ngo: downloading x";
+        let out = parse_go_vet("p1", stderr);
+        assert_eq!(out.len(), 1, "only the file:line:col diagnostic counts");
+        assert!(out[0].title.contains("go vet"));
+        assert!(out[0].description.as_ref().unwrap().contains("fmt.Sprintf"));
+        assert_eq!(out[0].source_ref.as_deref(), Some("go_vet:main.go:10"));
+    }
+
+    #[test]
+    fn parses_eslint_json_skips_off() {
+        let stdout = r#"[{"filePath":"/r/src/a.ts","messages":[{"line":4,"ruleId":"no-unused-vars","message":"'y' is defined but never used.","severity":1},{"line":9,"ruleId":"eqeqeq","message":"Expected '===' and instead saw '=='.","severity":2},{"line":1,"ruleId":null,"message":"off","severity":0}]}]"#;
+        let out = parse_eslint_json("p1", stdout);
+        assert_eq!(out.len(), 2, "severity 0 skipped");
+        assert_eq!(out[0].severity.as_deref(), Some("low"));
+        assert_eq!(out[0].category.as_deref(), Some("Debt"));
+        assert_eq!(out[1].severity.as_deref(), Some("medium"));
+        assert_eq!(out[1].category.as_deref(), Some("Bug"));
+        assert!(out[1].title.contains("eslint eqeqeq"));
+    }
 }

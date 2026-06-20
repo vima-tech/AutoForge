@@ -87,7 +87,15 @@ pub async fn start_conversation_task(
 
     let db = state.db.clone();
     let app_for_task = app.clone();
-    tauri::async_runtime::spawn(async move {
+    // trace 关联标签：本次任务的所有 LLM/工具 span 都带上会议室/任务/项目，便于按条件筛选。
+    // task_local 不跨 spawn，故在 spawn 的任务体外层包一层 with_tags。
+    let trace_tags = crate::core::trace::TraceTags {
+        conversation_id: Some(payload.conversation_id.clone()),
+        task_id: Some(task_id.clone()),
+        project_id: conversation.project_id.clone(),
+        ..Default::default()
+    };
+    tauri::async_runtime::spawn(crate::core::trace::with_tags(trace_tags, async move {
         if let Err(e) = execute_conversation_task(
             db.clone(),
             app_for_task.clone(),
@@ -109,7 +117,7 @@ pub async fn start_conversation_task(
             .await;
             emit_task_update(&app_for_task, &payload.conversation_id, &task_id, "failed");
         }
-    });
+    }));
 
     Ok(task)
 }
@@ -126,6 +134,136 @@ pub async fn list_conversation_tasks(
     .fetch_all(&state.db)
     .await
     .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompressContextPayload {
+    pub conversation_id: String,
+    /// "summary"（默认）= 纯压缩摘要；"conclusion" = 收敛结论。
+    #[serde(default)]
+    pub mode: String,
+}
+
+/// 手动触发的「总结内容 / 形成结论」快捷指令：在生成摘要/结论的同时，把当前窗口内的
+/// 历史消息全部移出后续上下文（excluded_from_context=1），让摘要本身成为新的上下文基线，
+/// 起到压缩上下文的作用。命令体保持薄包装，逻辑下沉到 `compress_context_now`。
+#[tauri::command]
+pub async fn compress_conversation_context(
+    payload: CompressContextPayload,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trace_tags = crate::core::trace::TraceTags {
+        conversation_id: Some(payload.conversation_id.clone()),
+        ..Default::default()
+    };
+    crate::core::trace::with_tags(
+        trace_tags,
+        compress_context_now(&state.db, &app, &payload.conversation_id, &payload.mode),
+    )
+    .await
+}
+
+async fn compress_context_now(
+    db: &crate::db::Db,
+    app: &AppHandle,
+    conversation_id: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(conversation_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    let project_id = conversation.project_id.as_deref();
+
+    let is_conclusion = mode == "conclusion";
+    // 结论用 summarizer 角色，纯压缩用 context_compressor；任一缺失则互相回退。
+    let primary_kind = if is_conclusion { "summarizer" } else { "context_compressor" };
+    let fallback_kind = if is_conclusion { "context_compressor" } else { "summarizer" };
+    let (agent, used_kind) = match load_system_role_agent(db, primary_kind).await? {
+        Some(a) => (a, primary_kind),
+        None => (
+            load_system_role_agent(db, fallback_kind)
+                .await?
+                .ok_or_else(|| "未配置总结/压缩系统角色".to_string())?,
+            fallback_kind,
+        ),
+    };
+
+    let messages = sqlx::query_as::<_, Message>(
+        "SELECT *
+         FROM messages
+         WHERE conversation_id=? AND excluded_from_context=0
+         ORDER BY created_at ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if messages.len() < 2 {
+        return Err("当前窗口内的消息太少，无需总结压缩".to_string());
+    }
+    let source = messages_to_context_text(db, &messages).await?;
+    if source.trim().is_empty() {
+        return Err("没有可用于总结的消息内容".to_string());
+    }
+
+    let prompt = if is_conclusion {
+        format!(
+            "以下是群聊到目前为止的完整讨论：\n\n{}\n\n请综合各方观点，收敛出明确结论与下一步行动方案。要求：\n- 明确给出结论/裁决及理由。\n- 列出后续行动项（含负责人，如有）。\n- 保留关键约束、分歧与重要事实。\n- 用结构化 Markdown 输出，不要复述完整原文，不要编造未出现的信息。",
+            source
+        )
+    } else {
+        format!(
+            "以下是群聊到目前为止的完整讨论，请压缩成一份可长期引用的上下文摘要：\n\n{}\n\n要求：\n- 保留需求、决策、约束、待办、分歧和重要事实。\n- 删除寒暄和重复表达。\n- 用结构化 Markdown 输出。\n- 不要编造未出现的信息。",
+            source
+        )
+    };
+    let fallback_system = if is_conclusion {
+        "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。"
+    } else {
+        "你是 AutoForge 的上下文压缩器，负责把长对话压缩成可靠摘要，降低后续 Agent 的上下文负担。"
+    };
+
+    let (ok, summary) = run_system_agent_text(
+        db, &agent, used_kind, &prompt, fallback_system, project_id, Some(&source),
+    )
+    .await;
+    if !ok {
+        return Err(summary);
+    }
+
+    let heading = if is_conclusion {
+        "讨论结论"
+    } else {
+        "上下文压缩摘要"
+    };
+    let markdown = format!(
+        "## {}\n\n{}\n\n> 已压缩 {} 条历史消息；原消息仍保留在对话中，但不再进入后续 Agent 上下文。",
+        heading,
+        summary.trim(),
+        messages.len()
+    );
+    let message_id =
+        insert_agent_markdown_message(db, conversation_id, &agent.id, &markdown).await?;
+    for msg in &messages {
+        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
+            .bind(&msg.id)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    event::emit(
+        app,
+        event::AppEvent::MessageReceived {
+            conversation_id: conversation_id.to_string(),
+            message_id,
+        },
+    );
+    Ok(())
 }
 
 async fn execute_conversation_task(
@@ -206,6 +344,7 @@ async fn execute_conversation_task(
             &snapshot,
             &accumulated,
             &roster,
+            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -255,6 +394,7 @@ async fn execute_conversation_task(
             &snapshot,
             &accumulated,
             &roster,
+            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -366,6 +506,24 @@ async fn build_plan(
         }
     }
 
+    // 需求录入意图：用户想把内容「加进系统 / 沉淀为需求」，而不是展开讨论。
+    // 走专门的需求捕获路径——只派一个 Agent 产出 requirement_draft 草稿块（前端可一键
+    // 「提交到流水线」），激活原本休眠的 requirement_draft 链路；单 Agent 也避免并行
+    // 多 Agent 各说各话、结论不一致。仅当群聊已绑定项目（草稿才能提交）时启用。
+    if conversation.project_id.is_some() && asks_to_capture_issue(instruction) {
+        let target = route_by_relevance(instruction, members)
+            .or_else(|| members.first().map(|a| a.id.clone()));
+        if let Some(agent_id) = target {
+            return Ok(ConversationPlan {
+                steps: vec![ConversationPlanStep {
+                    step_type: "single".to_string(),
+                    agents: vec![agent_id],
+                    instruction: capture_issue_instruction(instruction),
+                }],
+            });
+        }
+    }
+
     let mentioned: Vec<String> = mentioned_agent_ids
         .iter()
         .filter(|id| members.iter().any(|a| &a.id == *id))
@@ -375,8 +533,40 @@ async fn build_plan(
     // Pure synthesis request with no @mentions: skip Planner and all business-agent steps.
     // Returning an empty plan makes plan_has_final_single=false, so the post-plan
     // summarizer hook fires directly with the conversation snapshot as context.
-    if mentioned.is_empty() && asks_for_synthesis(instruction) && !asks_for_artifact(instruction) {
+    //
+    // 方向三：收窄触发面。原先只要消息"含"总结/建议/最后等任一词就走纯 summarizer 空计划，
+    // 导致"再优化一下并给点建议""那最后这块怎么改"这类日常对话被误判为只综合不回应（伪沉默）。
+    // 现要求这是一条很短的、主旨即收口的请求（is_pure_synthesis_request），且确有前一轮 Agent
+    // 发言可供综合（last_speaking_member 命中）时才走空计划，否则按普通对话正常选人接话。
+    if mentioned.is_empty()
+        && is_pure_synthesis_request(instruction)
+        && !asks_for_artifact(instruction)
+        && last_speaking_member(db, &conversation.id, members)
+            .await
+            .is_some()
+    {
         return Ok(ConversationPlan { steps: vec![] });
+    }
+
+    // 方向一 + 方向二：无 @ 且非显式"序列/产物"请求时，用零成本"分诊 + 连续性"直接选出接话人，
+    // 跳过 planner 这一跳 LLM——更快、更省，也让每句话都有相关 Agent 接话（无需每次 @）。
+    //   1) 相关性分诊：消息字面命中某成员的名字/英文名/角色/专长 → 由该成员接话（等价于"软 @"）。
+    //   2) 对话连续性：否则默认由上一轮发言的成员接话，自然承接追问（"再细化一下""那这样呢"）。
+    // 两者都没命中（如全新群聊的首条、无关键词消息）才落到 planner / fallback 既有兜底，不放大并发。
+    if mentioned.is_empty() && !asks_for_sequence(instruction) && !asks_for_artifact(instruction) {
+        let mut target = route_by_relevance(instruction, members);
+        if target.is_none() {
+            target = last_speaking_member(db, &conversation.id, members).await;
+        }
+        if let Some(agent_id) = target {
+            return Ok(ConversationPlan {
+                steps: vec![ConversationPlanStep {
+                    step_type: "single".to_string(),
+                    agents: vec![agent_id],
+                    instruction: instruction.to_string(),
+                }],
+            });
+        }
     }
 
     let needs_planner = mentioned.is_empty() || asks_for_sequence(instruction);
@@ -474,9 +664,14 @@ async fn ask_planner(
         Some(instruction),
     )
     .await;
-    let raw = crate::agents::llm::run_agent_text(db, planner, &prompt, system_prompt.as_deref(), &[])
-        .await
-        .map_err(|e| e.to_string())?;
+    // planner 也可按需用工具（如先读真实代码再排计划）；未开启工具时自动回退无工具单轮。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
+    let registry = crate::agents::tools::build_registry_for_agent(db, planner, &tool_ctx).await;
+    let raw = crate::agents::llm::run_agent_text_with_tools(
+        db, planner, &prompt, system_prompt.as_deref(), &[], &registry,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     parse_plan_json(&raw)
 }
 
@@ -525,10 +720,11 @@ fn fallback_plan(
     members: &[Agent],
 ) -> Result<ConversationPlan, String> {
     let agents = if mentioned_agent_ids.is_empty() {
-        members
-            .iter()
-            .take(1)
-            .map(|a| a.id.clone())
+        // 方向一（兜底）：planner 缺失/失败且无 @ 时，优先选与消息最相关的成员，
+        // 而非机械地取成员顺序里的第一个；都不相关才退回第一个成员。
+        route_by_relevance(instruction, members)
+            .or_else(|| members.first().map(|a| a.id.clone()))
+            .into_iter()
             .collect::<Vec<_>>()
     } else {
         mentioned_agent_ids
@@ -595,6 +791,7 @@ async fn run_plan_step(
     snapshot: &str,
     accumulated: &str,
     roster: &str,
+    project_id: Option<&str>,
 ) -> Result<(Vec<AgentOutcome>, bool), String> {
     let step_id = Uuid::new_v4().to_string();
     let agent_ids_json = serde_json::to_string(agents).map_err(|e| e.to_string())?;
@@ -626,6 +823,7 @@ async fn run_plan_step(
             snapshot.to_string(),
             accumulated.to_string(),
             roster.to_string(),
+            project_id.map(str::to_string),
         ));
     }
 
@@ -756,6 +954,7 @@ async fn run_agent_for_step(
     snapshot: String,
     accumulated: String,
     roster: String,
+    project_id: Option<String>,
 ) -> Result<AgentOutcome, String> {
     let run_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -776,47 +975,81 @@ async fn run_agent_for_step(
         String::new()
     } else {
         format!(
-            "群聊成员名单（可用 @名字 点名协作，发挥各自专长）：\n{}\n\n",
+            "群聊成员名单（了解在场成员；话题相关时可 @名字 点名协作）：\n{}\n\n",
             roster
         )
     };
     let prompt = format!(
-        "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n如果某个问题更适合其他成员的专长，用 @对方名字 点名邀请其参与（仅 @ 名单中的成员）。",
+        "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n优先自己把问题答完，不必为了协作而刻意 @ 别人；但当某部分确实更适合其他成员的专长、或你想就分歧点邀请其表态时，可以自然地用 @对方名字 点名（仅 @ 名单中的成员，且只 @ 与当前话题真正相关的成员）。不要为了凑发言或客套而 @ 无关成员。",
         roster_section,
         snapshot,
         if accumulated.trim().is_empty() { "无" } else { &accumulated },
         instruction,
         agent.name
     );
-    let system_prompt = if agent.system_prompt.trim().is_empty() {
-        None
+    // 统一输出规范：自由对话 Agent 的发言需条理清晰、简洁准确。把规范追加到 Agent
+    // 自身系统提示词之后（无自定义提示词时单独使用），不影响有严格输出契约的系统角色。
+    let base_prompt = agent.system_prompt.trim();
+    let system_prompt = if base_prompt.is_empty() {
+        crate::agents::roles::OUTPUT_FORMAT_GUIDE.to_string()
     } else {
-        Some(agent.system_prompt.as_str())
+        format!(
+            "{}\n\n{}",
+            base_prompt,
+            crate::agents::roles::OUTPUT_FORMAT_GUIDE
+        )
     };
-    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 勾选了它的 MCP server 工具。
-    let registry = crate::agents::tools::build_registry_for_agent(&db, &agent).await;
-    let result =
-        crate::agents::llm::run_agent_text_with_tools(&db, &agent, &prompt, system_prompt, &[], &registry)
+    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 代码扫描(项目仓库) + 勾选的 MCP server 工具。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
+    let registry =
+        crate::agents::tools::build_registry_for_agent(&db, &agent, &tool_ctx).await;
+    // 多模态：收集最近上下文窗口内的图片附件，交给绑定多模态 LLM 的 Agent 识别。
+    // 非多模态 LLM 会在 llm 层静默忽略这些图片（快照里仍保留「[图片: …]」文字描述）。
+    let images = collect_context_images(&db, &conversation_id, 40, 6).await;
+    // 把「LLM 调用 + 解析 <write-file> + 落盘」包进同一个 trace run：写文件以 tool span
+    // 挂在与本次 Agent 调用相同的 trace 下，链路追踪里即可审计 Agent 写了哪些工作区文件。
+    let (ok, text, text_after_writes, error, write_blocks) =
+        crate::core::trace::scope_run(&db, &agent, async {
+            let result = crate::agents::llm::run_agent_text_with_tools(
+                &db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
+            )
             .await;
-
-    let (ok, text, error) = match result {
-        Ok(text) => (true, text, None),
-        Err(e) => {
-            let msg = format!("[系统错误: {}]", e);
-            (false, msg.clone(), Some(e.to_string()))
-        }
-    };
-
-    // Parse file writes first (before requirement draft extraction)
-    let (text_after_writes, file_writes) =
-        crate::commands::workspace::parse_agent_file_writes(&text);
-    let write_blocks =
-        crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes).await;
+            let (ok, text, error) = match result {
+                Ok(text) => (true, text, None),
+                Err(e) => {
+                    let msg = format!("[系统错误: {}]", e);
+                    (false, msg, Some(e.to_string()))
+                }
+            };
+            // Parse file writes first (before requirement draft extraction)
+            let (text_after_writes, file_writes) =
+                crate::commands::workspace::parse_agent_file_writes(&text);
+            let write_blocks =
+                crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes)
+                    .await;
+            (ok, text, text_after_writes, error, write_blocks)
+        })
+        .await;
 
     // 检测 LLM 输出中是否嵌入了 requirement_draft artifact JSON
-    let (clean_text, draft_artifact) = extract_requirement_draft_artifact(&text_after_writes);
+    let (clean_text, draft_artifact) = extract_issue_draft_artifact(&text_after_writes);
     let mut blocks = vec![serde_json::json!({ "t": "md", "md": clean_text })];
-    if let Some(artifact) = draft_artifact {
+    if let Some(mut artifact) = draft_artifact {
+        // LLM 只产出 requirement_draft 的业务字段，这里补齐前端渲染/提交所需：
+        // 1) 打上 block 类型 t=artifact，否则 Block.tsx 不会渲染成 artifact 块；
+        // 2) 用已知会话项目 id 覆盖 _meta.project_id（不信任 LLM 自填），
+        //    使「提交到流水线」按钮真正可用。
+        if let Some(obj) = artifact.as_object_mut() {
+            obj.insert("t".to_string(), serde_json::json!("artifact"));
+            if let Some(pid) = project_id.as_deref() {
+                let meta = obj
+                    .entry("_meta")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(meta_obj) = meta.as_object_mut() {
+                    meta_obj.insert("project_id".to_string(), serde_json::json!(pid));
+                }
+            }
+        }
         blocks.push(artifact);
     }
     for wb in write_blocks {
@@ -1021,7 +1254,15 @@ async fn run_system_agent_text(
         recall_key,
     )
     .await;
-    match crate::agents::llm::run_agent_text(db, agent, prompt, system_prompt.as_deref(), &[]).await {
+    // 系统角色也可按需用工具（代码扫描/web_search）：注册表按 capabilities 白名单 + 项目绑定装配；
+    // 为空（未开启工具/无项目）时 run_agent_text_with_tools 自动回退到无工具单轮，行为不变。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
+    let registry = crate::agents::tools::build_registry_for_agent(db, agent, &tool_ctx).await;
+    match crate::agents::llm::run_agent_text_with_tools(
+        db, agent, prompt, system_prompt.as_deref(), &[], &registry,
+    )
+    .await
+    {
         Ok(text) => (true, text),
         Err(e) => (false, format!("[系统错误: {}]", e)),
     }
@@ -1332,6 +1573,69 @@ fn attachment_path(attachment: &ConversationAttachment) -> Result<PathBuf, Strin
     Ok(PathBuf::from(crate::state::attachments_base()).join(rel))
 }
 
+/// 收集会议室最近上下文窗口内的图片附件路径（按时间顺序，最多 `max_images` 张），
+/// 供多模态 Agent 识别。扫描最近 `limit` 条未移出上下文的消息中的 `image` 块，解析其
+/// 附件 id 为磁盘路径；非图片 / 路径非法的项忽略。best-effort，任何查询失败返回空。
+async fn collect_context_images(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    limit: i64,
+    max_images: usize,
+) -> Vec<PathBuf> {
+    let messages = match sqlx::query_as::<_, Message>(
+        "SELECT * FROM messages
+         WHERE conversation_id=? AND excluded_from_context=0
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind(conversation_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    // messages 为时间倒序（最新在前）；从最新往回收集图片附件 id，凑满上限即停。
+    let mut ids: Vec<String> = Vec::new();
+    for msg in &messages {
+        let blocks: Vec<serde_json::Value> =
+            serde_json::from_str(&msg.content_json).unwrap_or_default();
+        for block in &blocks {
+            if block.get("t").and_then(|v| v.as_str()) == Some("image") {
+                if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        if ids.len() >= max_images {
+            break;
+        }
+    }
+    ids.truncate(max_images);
+    // 还原为时间正序（最旧在前），让多模态请求里的图片顺序贴近对话阅读顺序。
+    ids.reverse();
+
+    let mut paths = Vec::new();
+    for id in ids {
+        if let Ok(Some(att)) = sqlx::query_as::<_, ConversationAttachment>(
+            "SELECT * FROM conversation_attachments WHERE id=?",
+        )
+        .bind(&id)
+        .fetch_optional(db)
+        .await
+        {
+            if att.kind == "image" {
+                if let Ok(path) = attachment_path(&att) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
 async fn load_schedulable_members(
     db: &crate::db::Db,
     conversation_id: &str,
@@ -1401,6 +1705,73 @@ fn asks_for_sequence(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// 用户意图：把当前内容「录入系统 / 沉淀为正式需求」，而非聊一聊。命中后走需求
+/// 捕获路径，让 Agent 产出可一键入流水线的 requirement_draft 草稿，而不是讨论。
+fn asks_to_capture_issue(text: &str) -> bool {
+    [
+        "加到系统",
+        "增加到系统",
+        "加入系统",
+        "录入系统",
+        "录入需求",
+        "提交需求",
+        "沉淀为需求",
+        "沉淀成需求",
+        "提交到流水线",
+        "加入流水线",
+        "加到流水线",
+        "登记需求",
+        "记录这个需求",
+        "建一个需求",
+        "新建需求",
+        "创建需求",
+        "立项",
+        // 「重提 / 重新发起」：之前草稿被拒或丢失后想重新生成一张可入流水线的草稿卡。
+        // 不补这些，重提消息会落到普通对话路径，Agent 只会输出纯文本草稿、无法一键提交。
+        "重新提",
+        "重新发起",
+        "重新录入",
+        "重新登记",
+        "重新生成需求",
+        "再提一",
+        "再次提交",
+        "重提",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// 需求捕获指令：要求 Agent 先核实现状（避免重复造轮子），再以固定 JSON 结构产出
+/// requirement_draft 产物。`extract_issue_draft_artifact` 会解析该 JSON，
+/// `run_agent_for_step` 再补上 `t:"artifact"` 与真实 `project_id`，前端即可一键提交。
+fn capture_issue_instruction(user_text: &str) -> String {
+    format!(
+        "用户希望把下面这条内容**录入系统、沉淀为一条正式需求**，而不是展开讨论：\n\n{}\n\n\
+请按以下步骤处理：\n\
+1. 若你有代码检索工具（list_files / search_code / read_file），**先检索当前项目仓库**，\
+确认该需求与既有功能是否重叠，判断现状（已实现 / 部分实现 / 全新），避免提出重复造轮子的需求；\
+**没有检索工具或无法核实时，必须如实说明「现状未经核实」，不得凭空臆断。**\n\
+2. 用一句话给出清晰的需求标题；\n\
+3. 正文写明：背景与现状、目标、范围（做 / 不做）、关键约束、验收要点；\n\
+4. **最后必须输出一个 requirement_draft 产物 JSON**（用 ```json 代码块包裹），结构如下，供用户一键提交到流水线：\n\
+```json\n\
+{{\n\
+  \"kind\": \"issue_draft\",\n\
+  \"title\": \"需求标题\",\n\
+  \"rows\": [[\"状态\", \"草案\"], [\"现状\", \"已实现/部分实现/全新/未核实\"], [\"类别\", \"feature\"]],\n\
+  \"body\": \"需求正文（Markdown）\",\n\
+  \"_meta\": {{\n\
+    \"title\": \"需求标题\",\n\
+    \"description\": \"完整需求描述（含现状结论）\",\n\
+    \"category\": \"feature\",\n\
+    \"severity\": \"medium\"\n\
+  }}\n\
+}}\n\
+```",
+        user_text.trim()
+    )
+}
+
 fn asks_for_synthesis(text: &str) -> bool {
     [
         "总结", "裁决", "汇总", "综合", "结论", "建议", "最后", "评审",
@@ -1426,6 +1797,64 @@ fn asks_for_artifact(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+/// 收窄版"纯综合/收尾请求"判定：消息很短且主旨就是收口（总结/裁决/综合/结论…），
+/// 而非在正常对话里顺带提到这些词。配合 last_speaking_member 一起，决定是否走
+/// "只综合前文、不安排业务 Agent 新答"的空计划路径，避免日常对话被误判为伪沉默。
+fn is_pure_synthesis_request(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().count() <= 24 && asks_for_synthesis(t)
+}
+
+/// 无 @ 时的零成本相关性分诊（方向一）：按成员的 name / name_en / role / role_type
+/// 与消息做大小写无关的字面匹配打分，返回得分最高的成员 id（得分>0）；平局取成员
+/// 顺序靠前者。任何成员都没命中则返回 None，交由连续性 / planner / fallback 处理。
+/// 纯函数、不触 LLM，等价于用户"打了角色名但忘了加 @"的软提及。
+fn route_by_relevance(instruction: &str, members: &[Agent]) -> Option<String> {
+    let hay = instruction.to_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for m in members {
+        let mut score = 0usize;
+        for kw in [
+            m.name.as_str(),
+            m.name_en.as_str(),
+            m.role.as_str(),
+            m.role_type.as_str(),
+        ] {
+            let kw = kw.trim();
+            // 至少 2 个字符才算关键词，避免单字/空串造成的噪声误命中。
+            if kw.chars().count() >= 2 && hay.contains(&kw.to_lowercase()) {
+                score += 1;
+            }
+        }
+        if score > 0 && best.map_or(true, |(b, _)| score > b) {
+            best = Some((score, m.id.as_str()));
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
+/// 找出会议室中最近一次"由某 Agent 发出"的消息作者，即上一轮发言人（方向二）。
+/// 触发任务的用户消息 from_agent 为 NULL，故这里取到的是真正的上一轮 Agent。
+/// 仅当该作者仍是当前可调度成员时返回，用于无 @ 追问时的对话连续性默认接话。
+async fn last_speaking_member(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    members: &[Agent],
+) -> Option<String> {
+    let last: Option<(String,)> = sqlx::query_as(
+        "SELECT from_agent FROM messages
+         WHERE conversation_id=? AND from_agent IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let last = last.map(|(a,)| a)?;
+    members.iter().find(|m| m.id == last).map(|m| m.id.clone())
 }
 
 fn infer_artifact_kind(text: &str) -> &'static str {
@@ -1509,8 +1938,8 @@ fn parse_plan_json(raw: &str) -> Result<ConversationPlan, String> {
 
 /// 从 LLM 输出中提取 requirement_draft artifact JSON block。
 /// 若找到，返回 (清理后的文本, Some(artifact值))，否则返回 (原文本, None)。
-fn extract_requirement_draft_artifact(text: &str) -> (String, Option<serde_json::Value>) {
-    if !text.contains("requirement_draft") {
+fn extract_issue_draft_artifact(text: &str) -> (String, Option<serde_json::Value>) {
+    if !text.contains("issue_draft") && !text.contains("requirement_draft") {
         return (text.to_string(), None);
     }
 
@@ -1540,9 +1969,9 @@ fn extract_requirement_draft_artifact(text: &str) -> (String, Option<serde_json:
         }
         if let Some(end_pos) = end {
             let candidate = &text[pos..end_pos];
-            if candidate.contains("requirement_draft") {
+            if candidate.contains("issue_draft") || candidate.contains("requirement_draft") {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
-                    if val.get("kind").and_then(|k| k.as_str()) == Some("requirement_draft") {
+                    if matches!(val.get("kind").and_then(|k| k.as_str()), Some("issue_draft") | Some("requirement_draft")) {
                         // 移除 JSON 及周围的 markdown 代码围栏
                         let before = text[..pos]
                             .trim_end()

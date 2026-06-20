@@ -4,7 +4,6 @@ use crate::state::AppState;
 use serde::Deserialize;
 use std::time::Duration;
 use tauri::State;
-use tokio::process::Command;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize, Default)]
@@ -191,15 +190,14 @@ pub async fn confirm_deploy(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut deploy_cmd = Command::new("sh");
+    let mut deploy_cmd = crate::core::platform::shell(&dep.script);
     deploy_cmd
-        .arg("-lc")
-        .arg(&dep.script)
         .current_dir(&project.repo_path)
-        // Own process group + kill-on-drop so a timed-out deploy script (and its
-        // children) is reaped instead of leaking after the 600s deadline.
-        .process_group(0)
+        // kill-on-drop so a timed-out deploy script (and its children) is reaped
+        // instead of leaking after the 600s deadline.
         .kill_on_drop(true);
+    // Own process group for whole-tree teardown (cross-platform helper).
+    crate::core::platform::detach_process_group(&mut deploy_cmd);
     let output = tokio::time::timeout(Duration::from_secs(600), deploy_cmd.output()).await;
 
     let (status, log) = match output {
@@ -330,7 +328,7 @@ fn strip_code_fence(text: &str) -> String {
     let t = text.trim();
     if let Some(rest) = t.strip_prefix("```") {
         // drop optional language tag on the first line
-        let body = rest.splitn(2, '\n').nth(1).unwrap_or("");
+        let body = rest.split_once('\n').map(|(_, after)| after).unwrap_or("");
         return body.trim_end_matches("```").trim().to_string();
     }
     t.to_string()

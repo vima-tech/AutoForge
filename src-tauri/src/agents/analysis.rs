@@ -18,12 +18,14 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
     "is_duplicate": <true|false>,
     "duplicate_of": <疑似重复的需求标识，未知则 null>,
     "duplicate_hint": "<疑似重复的简述，否则空字符串>",
+    "needs_changes": <true|false 该需求是否真的需要改动代码>,
+    "no_change_reason": "<needs_changes 为 false 时，一句话说明为何无需改动；否则空字符串>",
     "analysis_summary": "<120字以内摘要>",
     "confidence": <0.0-1.0 本次分析整体置信度>
   },
   "understanding": {
     "problem_type": "<bug|feature|enhancement|refactor|tech_debt|question>",
-    "restated_requirement": "<用实现视角重述需求，消除歧义>",
+    "restated_issue": "<用实现视角重述需求，消除歧义>",
     "user_story": <字符串或 null>,
     "current_behavior": <bug 的当前错误行为，非 bug 为 null>,
     "expected_behavior": <期望行为，可 null>,
@@ -56,7 +58,7 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
   "risks": [{"description": "<风险>", "severity": "<low|medium|high>", "mitigation": <缓解或 null>}],
   "constraints": {"must": ["<必须遵守，来自项目规范>"], "must_not": ["<禁止事项>"]},
   "assumptions": ["<分析所做假设>"],
-  "open_questions": ["<需人工在审核1澄清的问题>"],
+  "open_questions": ["<需人工在需求审核澄清的问题>"],
   "estimate": {"complexity": "<xs|s|m|l|xl>", "confidence": <0.0-1.0>, "rationale": <理由或 null>},
   "claude_code_brief": {
     "objective": "<一句话目标>",
@@ -74,6 +76,7 @@ pub const SYSTEM_PROMPT: &str = r#"你是 AutoForge 的需求分析 Agent。你�
 - claude_code_brief 是 scope + implementation_plan 的蒸馏，必须自洽、可直接执行。
 - 信息不足时，在 open_questions / assumptions 中说明，并相应降低 confidence，不要臆造。
 - bug 类必须给出 root_cause 与 reproduction_steps；非 bug 类 root_cause 用 null。
+- needs_changes：当需求确实需要改动代码时为 true。若判定为「误报/无需改动」——例如所指为测试夹具或示例数据、功能已实现、纯属提问或咨询、描述的问题在当前代码中不存在——则置 false，并在 no_change_reason 用一句话说明，同时 scope.affected_files 应为空。此时 AutoForge 将默认不建议进入编码执行。
 "#;
 
 // ── 完整结构化分析规格（对齐 schemas/issue_analysis.schema.json v1.0）──────────────
@@ -96,12 +99,17 @@ pub struct Triage {
     pub duplicate_of: Option<String>,
     #[serde(default)]
     pub duplicate_hint: String,
+    #[serde(default = "yes")]
+    pub needs_changes: bool,
+    #[serde(default)]
+    pub no_change_reason: String,
     #[serde(default)]
     pub analysis_summary: String,
     #[serde(default = "half")]
     pub confidence: f64,
 }
 fn half() -> f64 { 0.5 }
+fn yes() -> bool { true }
 fn five() -> i64 { 5 }
 fn cat_default() -> String { "Feature".to_string() }
 fn sev_default() -> String { "medium".to_string() }
@@ -116,6 +124,8 @@ impl Default for Triage {
             is_duplicate: false,
             duplicate_of: None,
             duplicate_hint: String::new(),
+            needs_changes: true,
+            no_change_reason: String::new(),
             analysis_summary: String::new(),
             confidence: 0.5,
         }
@@ -126,8 +136,8 @@ impl Default for Triage {
 pub struct Understanding {
     #[serde(default)]
     pub problem_type: String,
-    #[serde(default)]
-    pub restated_requirement: String,
+    #[serde(default, alias = "restated_requirement")]
+    pub restated_issue: String,
     #[serde(default)]
     pub user_story: Option<String>,
     #[serde(default)]
@@ -369,6 +379,9 @@ pub struct AnalysisResult {
     pub raw_output: String,
     pub analysis_json: String,
     pub spec: IssueAnalysisSpec,
+    /// 本次分析的 trace_id（若走自定义 LLM agent），供 dual-write 到 agent_outputs 链回下钻。
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 impl Default for AnalysisResult {
@@ -387,6 +400,7 @@ impl Default for AnalysisResult {
             raw_output: String::new(),
             analysis_json: serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
             spec,
+            trace_id: None,
         }
     }
 }
@@ -412,6 +426,7 @@ impl AnalysisResult {
             raw_output: String::new(),
             analysis_json,
             spec,
+            trace_id: None,
         }
     }
 }
@@ -500,19 +515,11 @@ pub async fn build_project_context(repo_path: &str) -> String {
         }
     }
 
-    // Directory tree (depth 2, skip hidden / build dirs)
-    if let Ok(out) = Command::new("find")
-        .arg(repo_path)
-        .arg("-maxdepth").arg("2")
-        .arg("-type").arg("d")
-        .arg("!").arg("-path").arg("*/.*")
-        .arg("!").arg("-path").arg("*/node_modules/*")
-        .arg("!").arg("-path").arg("*/target/*")
-        .arg("!").arg("-path").arg("*/__pycache__/*")
-        .output()
-        .await
+    // Directory tree (depth 2, skip hidden / build dirs). Pure-Rust walk so it
+    // works identically on Linux/macOS/Windows (no `find` shell-out — Windows'
+    // `find.exe` is an unrelated text-search tool).
     {
-        let tree = String::from_utf8_lossy(&out.stdout);
+        let tree = list_dirs_depth2(repo_path);
         let limited: String = tree.chars().take(1500).collect();
         if !limited.trim().is_empty() {
             parts.push(format!("## 目录结构\n{}", limited));
@@ -537,6 +544,41 @@ pub async fn build_project_context(repo_path: &str) -> String {
     parts.join("\n\n")
 }
 
+/// List directories up to depth 2 under `root`, skipping hidden and common build
+/// dirs. Replaces a `find` shell-out for cross-platform parity. Output mirrors
+/// `find`'s newline-separated paths, sorted for determinism.
+fn list_dirs_depth2(root: &str) -> String {
+    fn skip(name: &str) -> bool {
+        name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__")
+    }
+    let mut dirs: Vec<String> = Vec::new();
+    let root_path = std::path::Path::new(root);
+    let read = |p: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| !skip(n))
+                    .unwrap_or(false)
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    for d1 in read(root_path) {
+        dirs.push(d1.to_string_lossy().to_string());
+        for d2 in read(&d1) {
+            dirs.push(d2.to_string_lossy().to_string());
+        }
+    }
+    dirs.join("\n")
+}
+
 /// Resolve the agent holding the `analysis` forge role (comma-separated field).
 /// Returns the first enabled match by creation order, or None if unassigned.
 async fn resolve_analysis_agent(db: &crate::db::Db) -> Option<crate::models::agent::Agent> {
@@ -558,6 +600,8 @@ pub async fn analyze(
     title: &str,
     description: &str,
     project_context: Option<&str>,
+    project_id: Option<&str>,
+    recalled: Option<&str>,
 ) -> Result<AnalysisResult> {
     let prompt = match project_context.filter(|c| !c.trim().is_empty()) {
         Some(ctx) => format!(
@@ -573,21 +617,57 @@ pub async fn analyze(
     // Run via the analysis Agent's bound LLM (custom/低成本 model) so only Claude Code
     // hits the Claude CLI. Fall back to the local Claude CLI only when no analysis Agent
     // is assigned, so a fresh install still works.
-    let raw = match resolve_analysis_agent(db).await {
+    let (raw, trace_id) = match resolve_analysis_agent(db).await {
         Some(agent) => {
-            let sys = crate::agents::roles::compose_system_prompt(
+            let mut sys = crate::agents::roles::compose_system_prompt(
                 Some("analysis"),
                 &agent.prompt_mode,
                 &agent.system_prompt,
             );
-            crate::agents::llm::run_agent_text(db, &agent, &prompt, Some(&sys), &[]).await?
+            // Inject the traced Innate recall under the shared heading so the
+            // analysis Agent reasons with past experience — and the Trace page's
+            // INNATE flag lights up for analysis too (same marker as run_system_role_text).
+            if let Some(r) = recalled.map(str::trim).filter(|s| !s.is_empty()) {
+                sys = format!(
+                    "{}\n\n## {}\n{}",
+                    sys,
+                    crate::agents::llm::INNATE_RECALL_HEADING,
+                    r
+                );
+            }
+            // 走工具循环：分析 Agent 可按需读取/检索项目真实源码（绑定项目时），
+            // 让评估基于实际代码而非仅需求文本。未开启工具/无项目时自动回退单轮。
+            let ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
+            let registry = crate::agents::tools::build_registry_for_agent(db, &agent, &ctx).await;
+            // 包一层 scope_run（内部 LLM 调用复用同一 trace），以便取到 trace_id 链回下钻。
+            crate::core::trace::scope_run(db, &agent, async {
+                let raw = crate::agents::llm::run_agent_text_with_tools(
+                    db, &agent, &prompt, Some(&sys), &[], &registry,
+                )
+                .await?;
+                let tid = crate::core::trace::current_trace_id();
+                Ok::<_, anyhow::Error>((raw, tid))
+            })
+            .await?
         }
-        None => local_claude::run_text(&prompt, Some(SYSTEM_PROMPT)).await?,
+        None => {
+            let sys = match recalled.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(r) => format!(
+                    "{}\n\n## {}\n{}",
+                    SYSTEM_PROMPT,
+                    crate::agents::llm::INNATE_RECALL_HEADING,
+                    r
+                ),
+                None => SYSTEM_PROMPT.to_string(),
+            };
+            (local_claude::run_text(&prompt, Some(&sys)).await?, None)
+        }
     };
 
     // Parse into the full structured spec (with legacy fallback); keep raw for audit.
     let mut result = parse_analysis(&raw).unwrap_or_default();
     result.raw_output = raw;
+    result.trace_id = trace_id;
     Ok(result)
 }
 
@@ -639,6 +719,8 @@ pub fn parse_spec(text: &str) -> Option<IssueAnalysisSpec> {
         is_duplicate: l.is_duplicate.unwrap_or(false),
         duplicate_of: None,
         duplicate_hint: l.duplicate_hint.unwrap_or_default(),
+        needs_changes: true,
+        no_change_reason: String::new(),
         analysis_summary: l.analysis_summary.unwrap_or_default(),
         confidence: 0.5,
     };

@@ -37,11 +37,16 @@ impl McpConnection {
                 if server.command.trim().is_empty() {
                     return Err(anyhow!("stdio MCP server 未配置 command"));
                 }
-                let mut cmd = tokio::process::Command::new(server.command.trim());
+                // Resolve via PATH so Windows can launch `.cmd`/`.bat` shims
+                // (e.g. `npx`, `npm`)—`Command::new` only auto-appends `.exe`.
+                let mut cmd = tokio::process::Command::new(crate::core::platform::program(
+                    server.command.trim(),
+                ));
                 let args: Vec<String> = serde_json::from_str(&server.args_json).unwrap_or_default();
                 cmd.args(&args);
+                let env_json = crate::core::secrets::decrypt(&server.env_json).unwrap_or_default();
                 let env: std::collections::BTreeMap<String, String> =
-                    serde_json::from_str(&server.env_json).unwrap_or_default();
+                    serde_json::from_str(&env_json).unwrap_or_default();
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
@@ -56,8 +61,10 @@ impl McpConnection {
                     return Err(anyhow!("http MCP server 未配置 url"));
                 }
                 let mut config = StreamableHttpClientTransportConfig::with_uri(server.url.trim());
+                let headers_json =
+                    crate::core::secrets::decrypt(&server.headers_json).unwrap_or_default();
                 let headers: std::collections::BTreeMap<String, String> =
-                    serde_json::from_str(&server.headers_json).unwrap_or_default();
+                    serde_json::from_str(&headers_json).unwrap_or_default();
                 for (k, v) in headers {
                     if let (Ok(name), Ok(val)) = (
                         reqwest::header::HeaderName::from_bytes(k.as_bytes()),

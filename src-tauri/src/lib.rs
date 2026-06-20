@@ -33,14 +33,39 @@ pub fn run() {
             let attachments = data_dir.join("attachments").to_string_lossy().to_string();
             let materials = data_dir.join("materials").to_string_lossy().to_string();
             let kb = data_dir.join("kb").to_string_lossy().to_string();
+            let backups = data_dir.join("backups").to_string_lossy().to_string();
+            let opendesign = data_dir.join("opendesign").to_string_lossy().to_string();
             state::init_worktrees_base(worktrees);
             state::init_attachments_base(attachments);
             state::init_materials_base(materials);
             state::init_kb_base(kb);
+            state::init_backups_base(backups);
+            state::init_opendesign_base(opendesign);
+
+            // 凭据加密：注入主密钥兜底文件路径并预热（确定 keychain/file 后端），
+            // 必须在任何加解密与迁移之前。
+            let master_key_file = data_dir.join("master.key").to_string_lossy().to_string();
+            core::secrets::init_secrets(master_key_file);
+            core::secrets::warm_up();
 
             let db = tauri::async_runtime::block_on(async {
                 db::init(&db_path).await.expect("db init failed")
             });
+
+            // 一次性把库内残留明文密钥就地加密（幂等，失败不阻断启动）。
+            tauri::async_runtime::block_on(async {
+                match core::secrets::migrate_plaintext_secrets(&db).await {
+                    Ok(n) if n > 0 => println!("[secrets] 已加密迁移 {} 个明文密钥字段", n),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[secrets] 明文密钥迁移失败: {}", e),
+                }
+            });
+            // 一次性为已有项目补全仓库内身份锚 .autoforge/project.json（幂等、非破坏，
+            // 不动 DB；使旧项目也能在「删除后重新添加同一仓库」时挂回历史数据）。
+            tauri::async_runtime::block_on(async {
+                commands::projects::backfill_project_identities(&db).await;
+            });
+
             let (max_slots, pause_threshold, queue_strategy) =
                 tauri::async_runtime::block_on(commands::system::load_concurrency_settings(&db))
                     .expect("load concurrency settings failed");
@@ -51,6 +76,8 @@ pub fn run() {
             let job_tx = tasks::runner::start(db.clone(), app_handle.clone(), concurrency.clone());
 
             let webhook_handle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+            let autosupply_running =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             app.manage(AppState {
                 db: db.clone(),
@@ -60,6 +87,10 @@ pub fn run() {
                     std::collections::HashMap::new(),
                 )),
                 webhook_handle: webhook_handle.clone(),
+                asr_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                autosupply_running: autosupply_running.clone(),
             });
 
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
@@ -85,6 +116,31 @@ pub fn run() {
                             )
                             .await;
                         }
+                    }
+                }
+            });
+
+            // 工厂自喂料调度（design 阶段 C）：按 autosupply.interval_min 对活跃项目跑
+            // 扫描 + proposer，产物全部进 triage 池（永不自动进流水线）。默认关闭。
+            let db_for_supply = db.clone();
+            let tx_for_supply = job_tx.clone();
+            let app_for_supply = app_handle.clone();
+            let running_for_supply = autosupply_running.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    let sleep_min = cfg.interval_min.max(5) as u64;
+                    tokio::time::sleep(std::time::Duration::from_secs(sleep_min * 60)).await;
+                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    if cfg.enabled {
+                        let _ = tasks::autosupply::run_cycle(
+                            &db_for_supply,
+                            &tx_for_supply,
+                            &app_for_supply,
+                            &cfg,
+                            &running_for_supply,
+                        )
+                        .await;
                     }
                 }
             });
@@ -132,20 +188,14 @@ pub fn run() {
                 .fetch_one(&db_for_wh)
                 .await
                 {
-                    if cfg.webhook_enabled && !cfg.webhook_token.is_empty() {
+                    if cfg.webhook_enabled {
                         let port = cfg.webhook_port as u16;
-                        let token = cfg.webhook_token.clone();
                         let db_clone = db_for_wh.clone();
                         let app_clone = app_for_wh.clone();
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = intake::webhook::start(
-                                port,
-                                token,
-                                db_clone,
-                                job_tx.clone(),
-                                app_clone,
-                            )
-                            .await
+                            if let Err(e) =
+                                intake::webhook::start(port, db_clone, job_tx.clone(), app_clone)
+                                    .await
                             {
                                 tracing::error!("[webhook] server error: {}", e);
                             }
@@ -161,6 +211,32 @@ pub fn run() {
                 if let Ok(icon) = tauri::image::Image::from_bytes(icon_bytes) {
                     let _ = win.set_icon(icon);
                 }
+
+                // Linux/WebKitGTK 默认拒绝 getUserMedia，导致语音录入报 NotAllowedError。
+                // 开启 media-stream 并自动放行麦克风/摄像头权限请求（本地桌面应用，可信）。
+                // macOS/Windows 的 webview 默认即放行，无需处理。
+                #[cfg(target_os = "linux")]
+                {
+                    use webkit2gtk::glib::object::ObjectExt;
+                    use webkit2gtk::{
+                        PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt,
+                    };
+                    let _ = win.with_webview(|webview| {
+                        let wv = webview.inner();
+                        if let Some(settings) = WebViewExt::settings(&wv) {
+                            settings.set_enable_media_stream(true);
+                        }
+                        // 仅放行麦克风/摄像头（UserMedia）请求，其余权限交回默认处理。
+                        wv.connect_permission_request(|_, req| {
+                            if req.is::<UserMediaPermissionRequest>() {
+                                req.allow();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    });
+                }
             }
 
             Ok(())
@@ -173,24 +249,56 @@ pub fn run() {
             commands::projects::create_local_project,
             commands::projects::clone_project_from_git,
             commands::projects::update_project,
+            commands::projects::set_default_project,
             commands::projects::delete_project,
+            commands::projects::restore_project,
+            commands::projects::purge_project,
+            commands::projects::list_archived_projects,
             commands::issues::list_issues,
+            commands::issues::list_issues_page,
+            commands::issues::list_issue_statuses,
+            commands::issues::list_issues_by_statuses,
+            commands::issues::list_issue_titles,
             commands::issues::get_issue,
             commands::issues::get_issue_analysis,
             commands::issues::submit_issue,
+            commands::issues::retry_analysis,
+            commands::issues::reanalyze_with_feedback,
+            commands::issues::update_issue_acceptance,
+            commands::issues::list_cr_test_runs,
             commands::intake::get_intake_config,
             commands::intake::update_intake_config,
             commands::intake::get_webhook_status,
             commands::intake::sync_github_issues,
-            commands::intake::run_code_scan,
             commands::intake::bulk_import_issues,
+            commands::intake::bulk_import_file,
+            commands::intake::export_bulk_template,
             commands::intake::submit_from_artifact,
+            commands::intake::decide_issue_draft,
+            commands::intake::list_triage_issues,
+            commands::intake::refine_triage,
+            commands::intake::discard_triage,
+            commands::intake::reject_issues,
+            commands::intake::run_proposer,
+            commands::intake::run_autosupply_now,
+            commands::intake::autosupply_is_running,
+            commands::settings::get_autosupply_settings,
+            commands::settings::set_autosupply_settings,
+            commands::settings::get_autonomy_level,
+            commands::settings::set_autonomy_level,
             commands::change_requests::list_change_requests,
+            commands::change_requests::list_change_requests_page,
+            commands::change_requests::get_change_request_by_issue,
             commands::change_requests::get_change_request,
             commands::change_requests::get_worktree_session,
             commands::change_requests::get_code_diff,
+            commands::change_requests::get_merge_conflict,
+            commands::change_requests::retry_merge,
+            commands::change_requests::ai_resolve_merge_conflict,
             commands::change_requests::review_1,
+            commands::change_requests::review_1_batch,
             commands::change_requests::review_2,
+            commands::change_requests::review_2_batch,
             commands::change_requests::retry_change_request,
             commands::change_requests::delete_change_request,
             commands::conversations::list_conversations,
@@ -225,6 +333,7 @@ pub fn run() {
             commands::workspace::write_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::list_conversation_tasks,
+            commands::orchestration::compress_conversation_context,
             commands::knowledge::run_conversation_command,
             commands::knowledge::get_knowledge_settings,
             commands::knowledge::set_knowledge_settings,
@@ -237,6 +346,35 @@ pub fn run() {
             commands::settings::test_llm_connection,
             commands::settings::get_web_search_settings,
             commands::settings::set_web_search_settings,
+            commands::settings::get_operator_profile,
+            commands::settings::set_operator_profile,
+            commands::notifications::list_notifications,
+            commands::notifications::unread_notification_count,
+            commands::notifications::mark_notification_read,
+            commands::notifications::mark_all_notifications_read,
+            commands::settings::get_asr_settings,
+            commands::settings::set_asr_settings,
+            commands::asr::transcribe_recording_segment,
+            commands::asr::transcribe_recording_file,
+            commands::asr::asr_realtime_start,
+            commands::asr::asr_realtime_feed,
+            commands::asr::asr_realtime_stop,
+            commands::meetings::analyze_meeting,
+            commands::meetings::save_meeting_doc,
+            commands::settings::list_builtin_tools,
+            commands::trace::list_llm_traces,
+            commands::trace::get_llm_trace,
+            commands::trace::list_trace_agent_names,
+            commands::trace::clear_llm_traces,
+            commands::agent_outputs::list_agent_outputs,
+            commands::agent_outputs::get_agent_output,
+            commands::agent_outputs::list_agent_output_roles,
+            commands::agent_outputs::agent_output_field_health,
+            commands::agent_outputs::clear_agent_outputs,
+            commands::settings::secret_backend_status,
+            commands::backup::export_config,
+            commands::backup::import_config,
+            commands::backup::reveal_backup,
             commands::mcp::list_mcp_servers,
             commands::mcp::create_mcp_server,
             commands::mcp::update_mcp_server,
@@ -250,7 +388,14 @@ pub fn run() {
             commands::settings::list_role_catalog,
             commands::settings::set_role_slot,
             commands::system::system_health,
+            commands::system::system_resources,
             commands::system::check_claude_auth,
+            commands::code_agents::list_code_agents,
+            commands::code_agents::upsert_code_agent,
+            commands::code_agents::delete_code_agent,
+            commands::code_agents::set_default_code_agent,
+            commands::code_agents::set_project_code_agent,
+            commands::code_agents::check_code_agent_auth,
             commands::system::pipeline_stats,
             commands::system::get_badge_counts,
             commands::system::update_concurrency_config,
@@ -259,6 +404,7 @@ pub fn run() {
             commands::system::list_test_sessions,
             commands::system::list_scan_findings,
             commands::system::list_admin_decisions,
+            commands::system::list_job_failures,
             commands::self_update::self_update_status,
             commands::self_update::self_update_pull,
             commands::self_update::self_update_pending,
@@ -297,6 +443,9 @@ pub fn run() {
             commands::specs::upsert_project_spec,
             commands::specs::delete_project_spec,
             commands::specs::ai_generate_specs,
+            commands::specs::scan_spec_files,
+            commands::specs::get_spec_content,
+            commands::specs::set_spec_injection,
             commands::security::list_security_audits,
             commands::deploy::list_deployments,
             commands::deploy::generate_deploy_script,
@@ -307,9 +456,14 @@ pub fn run() {
             commands::prototype::generate_prototype_prompt,
             commands::prototype::delete_prototype_prompt,
             commands::prototype::update_prototype_prompt,
+            commands::prototype::get_opendesign_settings,
+            commands::prototype::set_opendesign_settings,
+            commands::prototype::launch_opendesign,
+            commands::prototype::get_opendesign_log,
             commands::artifacts::list_delivery_artifacts,
             commands::artifacts::import_delivery_artifact,
             commands::artifacts::update_delivery_artifact_meta,
+            commands::artifacts::rename_delivery_artifact,
             commands::artifacts::delete_delivery_artifact,
             commands::artifacts::delivery_artifact_data_url,
             commands::artifacts::reveal_delivery_artifact,
@@ -319,12 +473,24 @@ pub fn run() {
             commands::grading::list_auto_pass_policy,
             commands::grading::get_auto_pass_enabled,
             commands::grading::set_auto_pass_enabled,
+            commands::grading::get_auto_conflict_resolve_enabled,
+            commands::grading::set_auto_conflict_resolve_enabled,
+            commands::grading::get_custom_merge_message_enabled,
+            commands::grading::set_custom_merge_message_enabled,
             commands::notify::list_notify_channels,
             commands::notify::create_notify_channel,
             commands::notify::update_notify_channel,
             commands::notify::delete_notify_channel,
             commands::notify::test_notify_channel,
+            commands::notify::clawbot_start_login,
+            commands::notify::clawbot_poll_login,
             commands::widget::get_widget_snippet,
+            commands::widget::list_widget_tokens,
+            commands::widget::create_widget_token,
+            commands::widget::get_project_webhook_token,
+            commands::widget::regenerate_project_webhook_token,
+            commands::widget::set_widget_token_enabled,
+            commands::widget::delete_widget_token,
             commands::preview::mask_preview_data,
             commands::preview::provision_preview_container,
         ])

@@ -198,6 +198,15 @@ pub async fn run(
         return Err(anyhow!("worktree add failed for {}: {}", cr_id, wt_err));
     }
 
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "worktree_ready".to_string(),
+            note: Some(format!("已创建工作区分支 {}（第 {} 轮）", branch_name, iteration)),
+        },
+    );
+
     // Innate: recall procedural knowledge (project ⊕ shared) into the coding prompt.
     // Traced recall captures the project-db trace id + chunk ids so the eventual
     // outcome (merge = success / review_2 reject = failure) closes the loop.
@@ -206,21 +215,7 @@ pub async fn run(
         &format!("{} {}", issue.title, issue.description),
     )
     .await;
-    if let Some(trace_id) = recall.trace_id.as_deref() {
-        let _ = sqlx::query(
-            "INSERT INTO kb_traces (change_request_id, project_id, trace_id, used_ids, created_at)
-             VALUES (?, ?, ?, ?, datetime('now'))
-             ON CONFLICT(change_request_id) DO UPDATE SET
-                 project_id=excluded.project_id, trace_id=excluded.trace_id,
-                 used_ids=excluded.used_ids, created_at=excluded.created_at",
-        )
-        .bind(cr_id)
-        .bind(&cr.project_id)
-        .bind(trace_id)
-        .bind(recall.used_ids.join(","))
-        .execute(db)
-        .await;
-    }
+    crate::knowledge::store_recall_trace(db, "change_request", cr_id, &cr.project_id, &recall).await;
     let analysis_summary = if recall.text.trim().is_empty() {
         analysis_summary
     } else {
@@ -229,6 +224,17 @@ pub async fn run(
             analysis_summary, recall.text
         )
     };
+
+    // Record the fork point: the worktree's HEAD right after creation == dev's tip
+    // before the agent commits anything. This is the immutable base the CR diff is
+    // scoped against, so a later independent advance of dev can't pollute the diff.
+    let base_commit = GitProxy::new(&worktree_path)
+        .run(&["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|(code, _, _)| *code == 0)
+        .map(|(_, out, _)| out.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // Create WorktreeSession record
     let session_id = Uuid::new_v4().to_string();
@@ -247,8 +253,8 @@ pub async fn run(
 
     sqlx::query(
         "INSERT INTO worktree_sessions
-         (id, change_request_id, worktree_path, branch_name, status, prompt_snapshot, iteration_count, started_at)
-         VALUES (?, ?, ?, ?, 'running', ?, ?, datetime('now'))"
+         (id, change_request_id, worktree_path, branch_name, status, prompt_snapshot, iteration_count, base_commit, started_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, ?, datetime('now'))"
     )
     .bind(&session_id)
     .bind(cr_id)
@@ -256,6 +262,7 @@ pub async fn run(
     .bind(&branch_name)
     .bind(&prompt)
     .bind(iteration)
+    .bind(&base_commit)
     .execute(db)
     .await?;
 
@@ -319,12 +326,24 @@ pub async fn run(
         },
     );
 
-    // Run claude code agent
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "coding".to_string(),
+            note: Some("调用 Claude Code 实现中（最长 30 分钟）…".to_string()),
+        },
+    );
+
+    // Run the configured code agent (claude / codex / opencode), resolved per
+    // project → global default → claude fallback.
     let timeout_secs = 1800; // 30 minutes
-    let (exit_code, stdout, stderr) =
-        crate::agents::code_agent::run(&worktree_path, &prompt, timeout_secs)
-            .await
-            .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
+    let code_agent = crate::agents::code_agent::resolve(db, &project).await;
+    info!("cr {} 使用代码 Agent: {}", cr_id, code_agent.kind());
+    let (exit_code, stdout, stderr) = code_agent
+        .run(&worktree_path, &prompt, timeout_secs)
+        .await
+        .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
 
     let report = crate::agents::code_agent::extract_report(&stdout).to_string();
 
@@ -386,26 +405,34 @@ pub async fn run(
         .map(|(_, out, _)| !out.trim().is_empty())
         .unwrap_or(false);
     if !has_changes {
-        let reason = build_failure_reason(
-            exit_code,
-            &stdout,
-            "Agent 执行完成但未对 worktree 产生任何文件改动，无法生成可审核的 diff。",
-        );
+        // The agent ran cleanly (exit 0) but produced no diff. This is a
+        // legitimate terminal outcome — typically the agent concluded the
+        // requirement was a misjudgment / already satisfied / a no-op — not a
+        // failure. Surface it as `no_change_needed` so it doesn't masquerade as
+        // a red error, and preserve the agent's own explanation (its report)
+        // verbatim so the operator can see *why* nothing changed.
+        let note = "ℹ️ Agent 执行完成，但分析后认为无需改动代码（未产生 diff）。以下为 Agent 的说明：";
+        let report_body = if report.trim().is_empty() {
+            "（Agent 未给出说明）".to_string()
+        } else {
+            report.clone()
+        };
+        let no_change_report = format!("{}\n\n{}", note, report_body);
         sqlx::query(
-            "UPDATE worktree_sessions SET status='failed', report_content=?, completed_at=datetime('now') WHERE id=?",
+            "UPDATE worktree_sessions SET status='no_change', report_content=?, completed_at=datetime('now') WHERE id=?",
         )
-        .bind(&reason)
+        .bind(&no_change_report)
         .bind(&session_id)
         .execute(db)
         .await?;
         sqlx::query(
-            "UPDATE change_requests SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
+            "UPDATE change_requests SET status='no_change_needed', updated_at=datetime('now') WHERE id=?",
         )
         .bind(cr_id)
         .execute(db)
         .await?;
         sqlx::query(
-            "UPDATE issues SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
+            "UPDATE issues SET status='no_change_needed', updated_at=datetime('now') WHERE id=?",
         )
         .bind(&issue.id)
         .execute(db)
@@ -414,11 +441,11 @@ pub async fn run(
             app,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
-                status: "execution_failed".to_string(),
-                message: Some("Agent 未产生任何文件改动".to_string()),
+                status: "no_change_needed".to_string(),
+                message: Some("Agent 分析后认为无需改动代码".to_string()),
             },
         );
-        return Err(anyhow!("no changes produced by agent for {}", cr_id));
+        return Ok(());
     }
     let _ = wt_git.run(&["add", "-A"]).await;
     let commit_msg = format!("AutoForge: {} (i{})", issue.title, iteration);
@@ -467,8 +494,22 @@ pub async fn run(
                 message: Some(reason.chars().take(200).collect()),
             },
         );
+        // Innate: close the code recall trace on terminal failure so it doesn't
+        // leak. Outcome is "fail" but feedback is None — a commit failure (often
+        // "no changes produced") is too ambiguous to demote the recalled chunks;
+        // we record the negative outcome for evolution without yanking confidence.
+        crate::knowledge::consume_recall_trace(db, "change_request", cr_id, "fail", None).await;
         return Err(anyhow!("commit failed for {}: {}", cr_id, commit_err));
     }
+
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "grading".to_string(),
+            note: Some("已提交改动，正在进行风险评级与安全预检…".to_string()),
+        },
+    );
 
     // §7: grade the diff for risk tier.
     let grade =
@@ -544,19 +585,19 @@ pub async fn run(
 
     // Standard path: stop for human review 2.
     sqlx::query(
-        "UPDATE change_requests SET status='pending_review_2', updated_at=datetime('now') WHERE id=?",
+        "UPDATE change_requests SET status='pending_code_review', updated_at=datetime('now') WHERE id=?",
     )
     .bind(cr_id)
     .execute(db)
     .await?;
     sqlx::query(
-        "UPDATE issues SET status='pending_review_2', updated_at=datetime('now') WHERE id=?",
+        "UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?",
     )
     .bind(&issue.id)
     .execute(db)
     .await?;
 
-    crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待审核 2").await;
+    crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待代码审核").await;
 
     event::emit(
         app,

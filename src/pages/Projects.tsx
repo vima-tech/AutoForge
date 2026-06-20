@@ -4,17 +4,21 @@ import Icon from '../components/Icon';
 import Select from '../components/Select';
 import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, ConfirmModal } from '../components/ProjectDialogs';
 import IntakePanel from '../components/IntakePanel';
+import { parseTs, fmtFull } from '../utils/datetime';
 import {
-  listProjects, updateProject, deleteProject, type Project,
+  listProjects, updateProject, deleteProject, setDefaultProject, type Project,
+  listArchivedProjects, restoreProject, purgeProject,
+  listCodeAgents, setProjectCodeAgent, type CodeAgent as CodeAgentT,
   listMaterialFolders, createMaterialFolder, renameMaterialFolder, deleteMaterialFolder,
   listMaterialFiles, searchMaterialFiles, importMaterialFile, moveMaterialFile, deleteMaterialFile,
   openMaterialFile, aiOrganizeMaterials, backupMaterialFiles,
   getMaterialBackupConfig, updateMaterialBackupConfig,
   listProjectSpecs, upsertProjectSpec, deleteProjectSpec, aiGenerateSpecs,
+  scanSpecFiles, getSpecContent, setSpecInjection,
   aiGenerateRunConfig,
   type MaterialFolder, type MaterialFile, type MaterialBackupConfig,
   type MaterialSearchResult,
-  type ProjectSpec, type SpecCategory, type RunConfigDraft,
+  type ProjectSpec, type SpecCategory, type SpecInjection, type RunConfigDraft,
 } from '../services';
 import {
   parseProjectConfigForm, buildProjectConfig,
@@ -30,8 +34,8 @@ function formatSize(bytes: number): string {
 }
 
 function formatMaterialTime(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return '—';
+  const d = parseTs(value);
+  if (!d) return '—';
   return d.toLocaleString('zh-CN', {
     month: '2-digit',
     day: '2-digit',
@@ -242,7 +246,7 @@ function FileCard({ file, searchMeta, onOpen, onDelete, onMove }: {
   onOpen: () => void; onDelete: () => void; onMove: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const updatedTitle = new Date(file.updated_at).toLocaleString('zh-CN');
+  const updatedTitle = fmtFull(file.updated_at);
   const backupChip = file.backup_status === 'synced'
     ? <span className="chip green" style={{ fontSize: 'var(--text-micro)', padding: '1px 5px' }}>已备份</span>
     : file.backup_status === 'error'
@@ -826,8 +830,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
       {confirmDelFolder && (
         <ConfirmModal
           msg={`确认删除文件夹「${confirmDelFolder.name}」？`}
-          sub="文件夹内的文件将移至根目录。"
-          okLabel="删除"
+          sub="文件夹及其中所有文件将移入系统回收站，可从回收站恢复。"
+          okLabel="移入回收站"
           onOk={() => execDeleteFolder(confirmDelFolder)}
           onCancel={() => setConfirmDelFolder(null)}
         />
@@ -836,8 +840,8 @@ function MaterialsPanel({ projectId }: { projectId: string }) {
       {confirmDelFile && (
         <ConfirmModal
           msg={`确认删除「${confirmDelFile.original_name}」？`}
-          sub="此操作不可撤销。"
-          okLabel="删除"
+          sub="文件将移入系统回收站，可从回收站恢复。"
+          okLabel="移入回收站"
           onOk={() => execDeleteFile(confirmDelFile)}
           onCancel={() => setConfirmDelFile(null)}
         />
@@ -854,14 +858,26 @@ const SPEC_CATEGORIES: { id: SpecCategory; label: string; icon: string; hint: st
   { id: 'coding',       label: '编码规范', icon: 'code',    hint: '错误处理、日志格式、注释语言' },
   { id: 'api',          label: 'API 契约', icon: 'zap',     hint: '接口风格、鉴权方式、版本策略' },
   { id: 'testing',      label: '测试要求', icon: 'check',   hint: '覆盖率门槛、必测模块' },
+  { id: 'reference',    label: '参考',     icon: 'file',    hint: 'Agent 写入的技术方案、设计文档等自由参考资料' },
 ];
 
-function SpecCard({ spec, onEdit, onDelete }: {
+// 注入档位元信息：标签 + chip 语义色（绿=常驻/蓝=按需/灰=关闭）。
+const INJECTION_META: { id: SpecInjection; label: string; chip: string; hint: string }[] = [
+  { id: 'always',    label: '常驻', chip: 'green', hint: '全文随每次任务注入上下文' },
+  { id: 'on_demand', label: '按需', chip: 'blue',  hint: '仅列入清单，Agent 用 read_spec 工具按需读取' },
+  { id: 'off',       label: '关闭', chip: '',      hint: '不向 Agent 暴露' },
+];
+
+function SpecCard({ spec, onEdit, onDelete, onInjection }: {
   spec: ProjectSpec;
   onEdit: (s: ProjectSpec) => void;
   onDelete: (s: ProjectSpec) => void;
+  onInjection: (s: ProjectSpec, mode: SpecInjection) => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const isFile = spec.source === 'file';
+  // file 源的正文不在 list 里（仅描述）；db 源直接展示 content。
+  const preview = isFile ? spec.description : (spec.content || spec.description);
   return (
     <div
       onMouseEnter={() => setHovered(true)}
@@ -870,21 +886,42 @@ function SpecCard({ spec, onEdit, onDelete }: {
     >
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 'var(--text-control)', fontWeight: 600, color: 'var(--text-1)', marginBottom: 4 }}>{spec.title}</div>
-          {spec.content && (
-            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{spec.content}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 'var(--text-control)', fontWeight: 600, color: 'var(--text-1)' }}>{spec.title}</span>
+            <span className={`chip ${isFile ? 'amber' : ''}`} style={{ fontSize: 'var(--text-micro)' }}>
+              <Icon name={isFile ? 'file' : 'box'} size={9} />{isFile ? '文件' : 'DB'}
+            </span>
+          </div>
+          {preview && (
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{preview}</div>
+          )}
+          {isFile && (
+            <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginTop: 4 }}>.autoforge/{spec.rel_path}</div>
           )}
         </div>
         {hovered && (
           <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
-            <button className="btn btn-sm" style={{ padding: '2px 6px' }} onClick={() => onEdit(spec)} title="编辑">
+            <button className="btn btn-sm" style={{ padding: '2px 6px' }} onClick={() => onEdit(spec)} title={isFile ? '查看 / 编辑文件内容' : '编辑'}>
               <Icon name="edit" size={11} />
             </button>
-            <button className="btn btn-sm" style={{ padding: '2px 6px', color: 'var(--red)' }} onClick={() => onDelete(spec)} title="删除">
+            <button className="btn btn-sm" style={{ padding: '2px 6px', color: 'var(--red)' }} onClick={() => onDelete(spec)} title={isFile ? '删除（连带磁盘文件）' : '删除'}>
               <Icon name="trash" size={11} />
             </button>
           </div>
         )}
+      </div>
+      {/* 注入档位：行内即时切换（DESIGN seg 段控，替代下拉） */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 9 }}>
+        <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', letterSpacing: '.08em', textTransform: 'uppercase' }}>注入</span>
+        <div className="seg" style={{ alignSelf: 'flex-start' }}>
+          {INJECTION_META.map(m => (
+            <button key={m.id} type="button" className={spec.injection === m.id ? 'on' : ''}
+              title={m.hint} onClick={() => { if (spec.injection !== m.id) onInjection(spec, m.id); }}
+              style={{ fontSize: 'var(--text-micro)', padding: '2px 9px' }}>
+              {m.label}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -897,46 +934,91 @@ function SpecEditModal({ spec, category, projectId, onSave, onClose }: {
   onSave: (s: ProjectSpec) => void;
   onClose: () => void;
 }) {
-  const [title, setTitle]     = useState(spec?.title ?? '');
-  const [content, setContent] = useState(spec?.content ?? '');
-  const [saving, setSaving]   = useState(false);
-  const [err, setErr]         = useState('');
+  const isFile = spec?.source === 'file';
+  const [title, setTitle]       = useState(spec?.title ?? '');
+  const [content, setContent]   = useState(spec?.content ?? '');
+  const [description, setDesc]  = useState(spec?.description ?? '');
+  const [cat, setCat]           = useState<SpecCategory>(spec?.category ?? category);
+  const [injection, setInj]     = useState<SpecInjection>(spec?.injection ?? 'always');
+  const [saving, setSaving]     = useState(false);
+  const [loading, setLoading]   = useState(isFile);
+  const [err, setErr]           = useState('');
+
+  // file 源正文不在 list 里，进入时按需拉全文。
+  useEffect(() => {
+    if (!isFile || !spec) return;
+    let alive = true;
+    setLoading(true);
+    getSpecContent(spec.id)
+      .then(c => { if (alive) setContent(c); })
+      .catch(e => { if (alive) setErr(String(e)); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [isFile, spec]);
 
   const save = async () => {
     setSaving(true); setErr('');
     try {
-      const result = await upsertProjectSpec(projectId, spec?.id ?? null, category, title, content);
+      const result = await upsertProjectSpec(projectId, spec?.id ?? null, cat, title, content, description, injection);
       onSave(result);
     } catch (e) { setErr(String(e)); }
     finally { setSaving(false); }
   };
 
-  const catMeta = SPEC_CATEGORIES.find(c => c.id === category)!;
+  const catMeta = SPEC_CATEGORIES.find(c => c.id === cat)!;
 
   return (
     <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
-      <div style={{ width: 520, background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '22px 24px' }} onClick={e => e.stopPropagation()}>
+      <div style={{ width: 560, maxHeight: '86vh', overflowY: 'auto', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', padding: '22px 24px' }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
           <div className="eyebrow" style={{ fontSize: 'var(--text-control)' }}>
             <span className="en">{catMeta.label.toUpperCase()}</span>
-            <span className="cn"> · {spec ? '编辑规格' : '新增规格'}</span>
+            <span className="cn"> · {spec ? (isFile ? '编辑文件规格' : '编辑规格') : '新增规格'}</span>
           </div>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={16} /></button>
         </div>
         {err && <div style={{ color: 'var(--red)', fontSize: 'var(--text-label)', marginBottom: 12, padding: '6px 10px', background: 'rgba(219,90,64,.08)', borderRadius: 6 }}>{err}</div>}
+        {isFile && (
+          <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginBottom: 12 }}>
+            <Icon name="file" size={10} /> .autoforge/{spec?.rel_path} · 保存将写回此文件
+          </div>
+        )}
         <div className="field" style={{ marginBottom: 14 }}>
           <label>标题</label>
-          <input autoFocus placeholder="简短的规格名称" value={title} onChange={e => setTitle(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && e.ctrlKey) save(); if (e.key === 'Escape') onClose(); }} />
+          <input autoFocus={!isFile} placeholder="简短的规格名称" value={title} onChange={e => setTitle(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) save(); if (e.key === 'Escape') onClose(); }} />
+        </div>
+        <div className="field" style={{ marginBottom: 14 }}>
+          <label>描述 <span style={{ fontWeight: 400, color: 'var(--text-faint)', fontSize: 'var(--text-caption)' }}>（清单/工具里展示的一句话摘要）</span></label>
+          <input placeholder="一句话说明这条规格是关于什么的" value={description} onChange={e => setDesc(e.target.value)} />
+        </div>
+        <div className="field" style={{ marginBottom: 14 }}>
+          <label>分类</label>
+          <div className="seg" style={{ alignSelf: 'flex-start', flexWrap: 'wrap' }}>
+            {SPEC_CATEGORIES.map(c => (
+              <button key={c.id} type="button" className={cat === c.id ? 'on' : ''} onClick={() => setCat(c.id)}
+                style={{ fontSize: 'var(--text-micro)', padding: '3px 10px' }}>{c.label}</button>
+            ))}
+          </div>
+        </div>
+        <div className="field" style={{ marginBottom: 14 }}>
+          <label>注入档位</label>
+          <div className="seg" style={{ alignSelf: 'flex-start' }}>
+            {INJECTION_META.map(m => (
+              <button key={m.id} type="button" className={injection === m.id ? 'on' : ''} title={m.hint} onClick={() => setInj(m.id)}
+                style={{ fontSize: 'var(--text-micro)', padding: '3px 12px' }}>{m.label}</button>
+            ))}
+          </div>
+          <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 5 }}>{INJECTION_META.find(m => m.id === injection)?.hint}</span>
         </div>
         <div className="field" style={{ marginBottom: 20 }}>
           <label>内容 <span style={{ fontWeight: 400, color: 'var(--text-faint)', fontSize: 'var(--text-caption)' }}>（{catMeta.hint}）</span></label>
-          <textarea rows={5} placeholder="具体约束说明…" value={content} onChange={e => setContent(e.target.value)}
+          <textarea rows={isFile ? 12 : 5} placeholder={loading ? '读取文件中…' : '具体约束说明…'} value={content} onChange={e => setContent(e.target.value)} disabled={loading}
             style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }} />
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
           <button className="btn btn-sm" onClick={onClose}>取消</button>
-          <button className="btn btn-sm btn-primary" onClick={save} disabled={saving || !title.trim()}>
+          <button className="btn btn-sm btn-primary" onClick={save} disabled={saving || loading || !title.trim()}>
             {saving ? '保存中…' : '保存'}
           </button>
         </div>
@@ -956,6 +1038,7 @@ function SpecPanel({ projectId }: { projectId: string }) {
   // undefined = modal closed, null = new item, ProjectSpec = editing existing
   const [confirmAiGen,  setConfirmAiGen]  = useState(false);
   const [confirmDelSpec, setConfirmDelSpec] = useState<ProjectSpec | null>(null);
+  const [scanning, setScanning]   = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -964,9 +1047,32 @@ function SpecPanel({ projectId }: { projectId: string }) {
     finally { setLoading(false); }
   }, [projectId]);
 
-  useEffect(() => { setLoading(true); load(); }, [load]);
-
   const flash = (msg: string) => { setMessage(msg); setTimeout(() => setMessage(''), 4000); };
+
+  // 进入面板时先对账 .autoforge/specs 目录（把 agent 写的自由文件登记为文件规格），再加载。
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    (async () => {
+      try { await scanSpecFiles(projectId); } catch { /* 对账失败不阻断展示 */ }
+      if (alive) await load();
+    })();
+    return () => { alive = false; };
+  }, [projectId, load]);
+
+  const doScan = async () => {
+    setScanning(true); setError('');
+    try { flash(await scanSpecFiles(projectId)); await load(); }
+    catch (e) { setError(String(e)); }
+    finally { setScanning(false); }
+  };
+
+  const onInjection = async (s: ProjectSpec, mode: SpecInjection) => {
+    // 乐观更新，再落库。
+    setSpecs(prev => prev.map(x => x.id === s.id ? { ...x, injection: mode } : x));
+    try { await setSpecInjection(s.id, mode); }
+    catch (e) { setError(String(e)); await load(); }
+  };
 
   const doAiGenerate = () => { setConfirmAiGen(true); };
 
@@ -1001,6 +1107,10 @@ function SpecPanel({ projectId }: { projectId: string }) {
         </button>
         <div style={{ flex: 1 }} />
         {message && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message}</span>}
+        <button className="btn btn-sm" onClick={doScan} disabled={scanning} title="扫描 .autoforge/specs 目录，登记 Agent 写入的文件规格">
+          <Icon name="refresh" size={13} style={scanning ? { animation: 'spin 1s linear infinite' } : undefined} />
+          {scanning ? '扫描中…' : '重新扫描'}
+        </button>
         <button className="btn btn-sm" onClick={doAiGenerate} disabled={aiWorking}>
           <Icon name="brain" size={13} style={aiWorking ? { animation: 'spin 1s linear infinite' } : undefined} />
           {aiWorking ? 'AI 生成中…' : 'AI 一键生成'}
@@ -1031,10 +1141,6 @@ function SpecPanel({ projectId }: { projectId: string }) {
             );
           })}
           <div style={{ flex: 1 }} />
-          <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', lineHeight: 'var(--leading-normal)', padding: '8px 6px' }}>
-            规格文件存储于项目目录<br />
-            <code style={{ fontSize: 'var(--text-micro)' }}>.autoforge/specs/</code>
-          </div>
         </div>
 
         {/* spec list */}
@@ -1051,7 +1157,7 @@ function SpecPanel({ projectId }: { projectId: string }) {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {categorySpecs.map(s => (
-                <SpecCard key={s.id} spec={s} onEdit={s => setEditing(s)} onDelete={doDelete} />
+                <SpecCard key={s.id} spec={s} onEdit={s => setEditing(s)} onDelete={doDelete} onInjection={onInjection} />
               ))}
               <button className="btn btn-sm" style={{ alignSelf: 'flex-start', marginTop: 4 }} onClick={() => setEditing(null)}>
                 <Icon name="plus" size={12} />添加规格
@@ -1085,6 +1191,7 @@ function SpecPanel({ projectId }: { projectId: string }) {
       {confirmDelSpec && (
         <ConfirmModal
           msg={`确认删除规格「${confirmDelSpec.title}」？`}
+          sub={confirmDelSpec.source === 'file' ? '这是文件规格，将同时删除磁盘上的 .autoforge/specs/ 文件，不可恢复。' : undefined}
           okLabel="删除"
           onOk={() => execDeleteSpec(confirmDelSpec)}
           onCancel={() => setConfirmDelSpec(null)}
@@ -1255,7 +1362,7 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
               <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr 1.4fr auto', gap: 8, alignItems: 'center' }}>
                 <input value={r.table} onChange={e => setRow(i, { table: e.target.value })} placeholder="表名 users" style={{ fontFamily: 'var(--font-mono)' }} />
                 <input value={r.fields} onChange={e => setRow(i, { fields: e.target.value })} placeholder="字段，逗号分隔 email, phone" style={{ fontFamily: 'var(--font-mono)' }} />
-                <Select value={r.rule} onChange={v => setRow(i, { rule: v as MaskRule })} options={MASK_RULE_OPTS} />
+                <Select className="sm" value={r.rule} onChange={v => setRow(i, { rule: v as MaskRule })} options={MASK_RULE_OPTS} />
                 <button className="btn btn-sm btn-danger" onClick={() => delRow(i)} title="删除该行"><Icon name="trash" size={13} /></button>
               </div>
             ))}
@@ -1270,6 +1377,24 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
 // ── ProjectInfoTab ────────────────────────────────────────────────────────────
 
 function ProjectInfoTab({ project }: { project: Project }) {
+  const [codeAgents, setCodeAgents] = useState<CodeAgentT[]>([]);
+  const [agentSel, setAgentSel] = useState<string>(project.code_agent_id ?? '');
+  const [agentMsg, setAgentMsg] = useState('');
+  useEffect(() => { listCodeAgents().then(setCodeAgents).catch(() => setCodeAgents([])); }, []);
+  useEffect(() => { setAgentSel(project.code_agent_id ?? ''); }, [project.id, project.code_agent_id]);
+
+  const defaultAgent = codeAgents.find(a => a.is_default);
+  const agentOptions = [
+    { value: '', label: `跟随全局默认${defaultAgent ? `（${defaultAgent.label}）` : ''}` },
+    ...codeAgents.filter(a => a.enabled).map(a => ({ value: a.id, label: `${a.label}（${a.kind}）` })),
+  ];
+  const onAgentChange = async (val: string) => {
+    setAgentSel(val);
+    setAgentMsg('');
+    try { await setProjectCodeAgent(project.id, val || null); setAgentMsg('已保存'); }
+    catch (e) { setAgentMsg(String(e)); }
+  };
+
   const rows: { label: string; value: React.ReactNode }[] = [
     { label: '仓库路径', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.repo_path || '未配置'}</code> },
     { label: '开发分支', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.branch_dev}</code> },
@@ -1292,6 +1417,13 @@ function ProjectInfoTab({ project }: { project: Project }) {
             <div style={{ flex: 1 }}>{r.value}</div>
           </div>
         ))}
+        <div style={{ display: 'flex', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <div style={{ width: 90, fontSize: 'var(--text-label)', color: 'var(--text-faint)', flexShrink: 0 }}>代码 Agent</div>
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Select value={agentSel} onChange={onAgentChange} options={agentOptions} style={{ minWidth: 220 }} />
+            {agentMsg && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{agentMsg}</span>}
+          </div>
+        </div>
       </div>
 
       {project.config_yaml && (
@@ -1321,8 +1453,9 @@ function ProjectNavItem({ project, active, onClick }: {
         <div style={{ width: 26, height: 26, borderRadius: 7, background: active ? 'var(--ember)' : 'var(--bg-3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 'var(--text-label)', fontWeight: 800, color: active ? '#fff' : 'var(--text-3)', flexShrink: 0, fontFamily: 'var(--font-display)' }}>
           {project.name[0]}
         </div>
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-body)', fontWeight: 600 }}>
-          {project.name}
+        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-body)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 5 }}>
+          {project.is_default && <Icon name="star" size={12} style={{ color: 'var(--ember)', flexShrink: 0 }} />}
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</span>
         </span>
         <span className={'chip ' + (project.status === 'active' ? 'green' : '')} style={{ fontSize: 'var(--text-micro)', padding: '1px 5px', flexShrink: 0 }}>
           {project.status === 'active' ? '启用' : '停用'}
@@ -1349,6 +1482,10 @@ export default function ProjectsPage() {
   const [editProject, setEditProject]   = useState<Project | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [deleting, setDeleting]         = useState(false);
+  const [showRecycle, setShowRecycle]   = useState(false);
+  const [archived, setArchived]         = useState<Project[]>([]);
+  const [recycleBusy, setRecycleBusy]   = useState(false);
+  const [purgeTarget, setPurgeTarget]   = useState<Project | null>(null);
 
   const selectedProject = projects.find(p => p.id === selectedId) ?? null;
 
@@ -1386,12 +1523,54 @@ export default function ProjectsPage() {
     finally { setDeleting(false); }
   };
 
+  const loadArchived = useCallback(async () => {
+    try { setArchived(await listArchivedProjects()); }
+    catch (e) { setError(String(e)); }
+  }, []);
+
+  const openRecycle = async () => { setShowRecycle(true); await loadArchived(); };
+
+  const doRestore = async (project: Project) => {
+    setRecycleBusy(true);
+    try {
+      await restoreProject(project.id);
+      await loadArchived();
+      await load();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) { setError(String(e)); }
+    finally { setRecycleBusy(false); }
+  };
+
+  const doPurge = async () => {
+    if (!purgeTarget) return;
+    setRecycleBusy(true);
+    try {
+      await purgeProject(purgeTarget.id);
+      setPurgeTarget(null);
+      await loadArchived();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) { setError(String(e)); setPurgeTarget(null); }
+    finally { setRecycleBusy(false); }
+  };
+
   const doToggleStatus = async (project: Project) => {
     const nextStatus = project.status === 'active' ? 'inactive' : 'active';
     setError('');
     try {
       const saved = await updateProject(project.id, { status: nextStatus });
       setProjects(ps => ps.map(p => p.id === saved.id ? saved : p));
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const doSetDefault = async (project: Project) => {
+    setError('');
+    try {
+      // 已是默认则再次点击取消默认
+      await setDefaultProject(project.is_default ? '' : project.id);
+      await load();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
       setError(String(e));
@@ -1410,7 +1589,10 @@ export default function ProjectsPage() {
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">PROJECTS</span><span className="cn">· 项目管理</span>
         </div>
-        <button className="btn btn-primary btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setShowCreate(true)}>
+        <button className="btn btn-sm" style={{ marginLeft: 'auto' }} onClick={openRecycle} title="回收站：已归档项目可恢复或彻底删除">
+          <Icon name="trash" size={14} />回收站
+        </button>
+        <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
           <Icon name="plus" size={14} />新建项目
         </button>
       </div>
@@ -1455,12 +1637,26 @@ export default function ProjectsPage() {
                       <span className={'chip ' + (selectedProject.status === 'active' ? 'green' : '')} style={{ fontSize: 'var(--text-micro)', padding: '1px 7px' }}>
                         {selectedProject.status === 'active' ? '启用中' : '已停用'}
                       </span>
+                      {selectedProject.is_default && (
+                        <span className="chip ember" style={{ fontSize: 'var(--text-micro)', padding: '1px 7px', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <Icon name="star" size={11} />默认
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
                       {selectedProject.repo_path || '仓库路径未配置'}
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                    <button
+                      className="btn btn-sm"
+                      style={selectedProject.is_default ? { color: 'var(--ember)' } : undefined}
+                      onClick={() => doSetDefault(selectedProject)}
+                      title={selectedProject.is_default ? '取消默认项目' : '设为默认项目，其他页面将优先显示'}
+                    >
+                      <Icon name="star" size={13} />
+                      {selectedProject.is_default ? '默认项目' : '设为默认'}
+                    </button>
                     <button className="btn btn-sm" onClick={() => doToggleStatus(selectedProject)}>
                       <Icon name={selectedProject.status === 'active' ? 'pause' : 'play'} size={13} />
                       {selectedProject.status === 'active' ? '停用' : '启用'}
@@ -1468,8 +1664,8 @@ export default function ProjectsPage() {
                     <button className="btn btn-sm" onClick={() => setEditProject(selectedProject)}>
                       <Icon name="edit" size={13} />编辑
                     </button>
-                    <button className="btn btn-sm" style={{ color: 'var(--red)' }} onClick={() => setDeleteTarget(selectedProject)}>
-                      <Icon name="trash" size={13} />删除
+                    <button className="btn btn-sm" style={{ color: 'var(--red)' }} onClick={() => setDeleteTarget(selectedProject)} title="归档项目（移入回收站，数据保留）">
+                      <Icon name="trash" size={13} />归档
                     </button>
                   </div>
                 </div>
@@ -1533,6 +1729,49 @@ export default function ProjectsPage() {
           project={deleteTarget}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={doDelete}
+        />
+      )}
+      {showRecycle && (
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
+          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '20px 22px', width: 560, maxHeight: '76vh', display: 'flex', flexDirection: 'column', boxShadow: 'var(--shadow-lg)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--text-3)' }}>回收站 · 已归档项目</span>
+              <button className="icon-btn" style={{ marginLeft: 'auto', width: 30, height: 30 }} onClick={() => setShowRecycle(false)} aria-label="关闭"><Icon name="x" size={15} /></button>
+            </div>
+            <p style={{ margin: '0 0 14px', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', lineHeight: 'var(--leading-relaxed)' }}>
+              归档项目保留全部数据。重新添加同一仓库会按 <code style={{ fontFamily: 'var(--font-mono)' }}>.autoforge/project.json</code> 身份锚自动挂回；也可在此恢复或彻底删除。
+            </p>
+            <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {archived.length === 0 ? (
+                <div className="empty" style={{ padding: '28px 0' }}><Icon name="trash" size={28} style={{ opacity: .3 }} /><div>回收站为空</div></div>
+              ) : archived.map(p => (
+                <div key={p.id} className="panel" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 'var(--text-control)', fontWeight: 600 }}>{p.name}</div>
+                    <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {p.repo_path || '仓库路径未配置'}{p.archived_at ? ` · 归档于 ${fmtFull(p.archived_at)}` : ''}
+                    </div>
+                  </div>
+                  <button className="btn btn-sm" disabled={recycleBusy} onClick={() => doRestore(p)} title="恢复到在用项目列表">
+                    <Icon name="refresh" size={13} />恢复
+                  </button>
+                  <button className="btn btn-sm" style={{ color: 'var(--red)' }} disabled={recycleBusy} onClick={() => setPurgeTarget(p)} title="彻底删除，不可恢复">
+                    <Icon name="trash" size={13} />彻底删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {purgeTarget && (
+        <ConfirmModal
+          msg={`彻底删除项目「${purgeTarget.name}」？`}
+          sub="将级联清除该项目的需求、变更请求、审核记录、预览环境、测试记录和规格索引，不可恢复。仓库内 .autoforge/ 文件不受影响。"
+          okLabel="彻底删除"
+          danger
+          onOk={doPurge}
+          onCancel={() => setPurgeTarget(null)}
         />
       )}
     </div>

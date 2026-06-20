@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
 use tauri::State;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +53,25 @@ pub struct CrPreviewStatus {
     /// True when `kind` was inferred from the project's files (no explicit
     /// `dev.kind` in config_yaml) — used by the UI to hint the auto-detection.
     pub auto_detected: bool,
+    /// True when the native desktop app launched via `launch_cr_app`
+    /// (key `cr:app:{cr_id}`) is still alive — lets the UI flip「启动」→「停止」。
+    pub app_running: bool,
+}
+
+/// Whether the desktop app spawned by `launch_cr_app` for this CR is still alive.
+async fn cr_app_running(state: &AppState, cr_id: &str) -> bool {
+    let key = format!("cr:app:{cr_id}");
+    let child_arc = {
+        let servers = state.dev_servers.lock().await;
+        servers.get(&key).map(|h| h.child.clone())
+    };
+    match child_arc {
+        Some(arc) => {
+            let mut g = arc.lock().await;
+            matches!(g.as_mut().map(|c| c.try_wait()), Some(Ok(None)))
+        }
+        None => false,
+    }
 }
 
 /// Parse the raw `dev:` block without requiring a command — detection can fill the
@@ -152,7 +170,10 @@ fn effective_spec(config_yaml: Option<&str>, dir: &str) -> Option<EffectiveSpec>
         .as_ref()
         .and_then(|s| s.command.clone())
         .filter(|c| !c.trim().is_empty())
-        .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))?;
+        .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))
+        // 非 npm 栈（Java/Go/Python 后端、静态站）的兜底：用栈画像建议的 dev 命令，
+        // 使这些项目也能启动预览（端口探活），而不是直接 no_config。
+        .or_else(|| crate::core::stack::suggest_run_config(std::path::Path::new(dir)).dev_command)?;
 
     // Preview URL is fixed to localhost on the auto-allocated port (no longer configurable).
     let url = "http://localhost:{port}".to_string();
@@ -239,7 +260,7 @@ pub async fn get_cr_preview_log(cr_id: String) -> Result<String, String> {
 
 async fn url_reachable(url: &str) -> bool {
     let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(1))
         .danger_accept_invalid_certs(true)
         .build()
     else {
@@ -294,12 +315,14 @@ pub async fn get_cr_preview(
             can_launch_app: false,
             frontend_only: false,
             auto_detected: false,
+            app_running: false,
         });
     };
     let kind = spec.kind.clone();
     let can_launch_app = spec.can_launch_app;
     let frontend_only = spec.frontend_only;
     let auto_detected = spec.auto_detected;
+    let app_running = cr_app_running(&state, &cr_id).await;
     let key = format!("cr:{cr_id}");
 
     // If a server is already tracked for this CR, report its live status.
@@ -325,6 +348,7 @@ pub async fn get_cr_preview(
                 can_launch_app,
                 frontend_only,
                 auto_detected,
+                app_running,
             });
         }
         state.dev_servers.lock().await.remove(&key);
@@ -336,6 +360,7 @@ pub async fn get_cr_preview(
             can_launch_app,
             frontend_only,
             auto_detected,
+            app_running,
         });
     }
 
@@ -347,6 +372,7 @@ pub async fn get_cr_preview(
         can_launch_app,
         frontend_only,
         auto_detected,
+        app_running,
     })
 }
 
@@ -392,18 +418,15 @@ pub async fn start_cr_preview(
     }
 
     let (out, err) = log_stdio(&preview_log_path(&cr_id), &command, &session.worktree_path)?;
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&command)
-        .current_dir(&session.worktree_path)
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(&session.worktree_path)
         .env("PORT", port.to_string())
         .stdout(out)
-        .stderr(err)
-        // Own process group so the whole preview tree (sh → vite → node …) can be
-        // torn down together instead of orphaning grandchildren.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .stderr(err);
+    // Own process group so the whole preview tree (shell → vite → node …) can be
+    // torn down together instead of orphaning grandchildren.
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     state.dev_servers.lock().await.insert(
         key,
@@ -431,6 +454,7 @@ pub async fn start_cr_preview(
         can_launch_app,
         frontend_only,
         auto_detected,
+        app_running: false,
     })
 }
 
@@ -471,19 +495,27 @@ pub async fn launch_cr_app(cr_id: String, state: State<'_, AppState>) -> Result<
         }
     }
 
-    let (out, err) = log_stdio(&preview_log_path(&format!("app-{cr_id}")), &app_cmd, &session.worktree_path)?;
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&app_cmd)
-        .current_dir(&session.worktree_path)
+    // 分配独立空闲端口并注入（PORT 环境变量 + 命令内 {port} 占位）。必须做：
+    // tauri 应用的 beforeDevCommand（vite，strictPort:true）默认固定 1420，
+    // 与正在运行的主 AutoForge 实例冲突时会直接报「Port 1420 is already in use」
+    // 而中止启动，桌面窗口起不来。用 app: 前缀的 seed 避免与同 CR 的 web 预览撞端口。
+    let port =
+        crate::commands::dev_server::free_port_from(derive_port(&format!("app:{}", session.id)));
+    let app_cmd = crate::commands::dev_server::inject_port(&app_cmd, port);
+
+    // 写入与「查看启动日志」按钮一致的日志路径（get_cr_preview_log 读 cr_id），
+    // 否则启动失败时用户在 UI 看不到任何日志。
+    let (out, err) = log_stdio(&preview_log_path(&cr_id), &app_cmd, &session.worktree_path)?;
+    let mut cmd = crate::core::platform::shell(&app_cmd);
+    cmd.current_dir(&session.worktree_path)
         // 隔离 DB，避免与主 AutoForge 共享生产库导致迁移不一致 panic。
         .envs(isolated_app_env(&session.worktree_path))
+        .env("PORT", port.to_string())
         .stdout(out)
-        .stderr(err)
-        // Own process group so the launched app tree can be torn down together.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .stderr(err);
+    // Own process group so the launched app tree can be torn down together.
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     state.dev_servers.lock().await.insert(
         key,
@@ -617,13 +649,17 @@ async fn ensure_branch_worktree(repo_path: &str, branch: &str, wt_path: &str) ->
     if code != 0 {
         return Err(format!("git worktree add 失败: {err}"));
     }
-    // 软链 node_modules（gitignore 不在 worktree 内），免重复安装。
+    // 软链依赖缓存目录（gitignore 的 node_modules 等不在 worktree 内），免重复安装。
+    // 由栈画像决定要软链哪些目录：前端/Tauri/Node → node_modules；Java/Go/Python
+    // 走全局缓存（~/.m2、GOMODCACHE、pip cache），不在仓库内故无需软链。
     #[cfg(unix)]
     {
-        let src = std::path::Path::new(repo_path).join("node_modules");
-        let dst = std::path::Path::new(wt_path).join("node_modules");
-        if src.exists() && !dst.exists() {
-            let _ = std::os::unix::fs::symlink(&src, &dst);
+        for rel in crate::core::stack::dep_cache_dirs(std::path::Path::new(repo_path)) {
+            let src = std::path::Path::new(repo_path).join(&rel);
+            let dst = std::path::Path::new(wt_path).join(&rel);
+            if src.exists() && !dst.exists() {
+                let _ = std::os::unix::fs::symlink(&src, &dst);
+            }
         }
     }
     Ok(())
@@ -678,17 +714,14 @@ pub async fn start_branch_preview(
         &command,
         &wt_path,
     )?;
-    let child = Command::new("sh")
-        .arg("-lc")
-        .arg(&command)
-        .current_dir(&wt_path)
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(&wt_path)
         .env("PORT", port.to_string())
         .envs(isolated_app_env(&wt_path))
         .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .stderr(err);
+    crate::core::platform::detach_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     state.dev_servers.lock().await.insert(
         key,

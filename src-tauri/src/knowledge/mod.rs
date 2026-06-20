@@ -445,19 +445,56 @@ pub async fn kb_record(
     .await;
 }
 
-/// Look up the recall trace linked to a change request, write back its outcome
-/// via [`kb_record`], and consume the row. No-op if no trace was stored.
-/// Call at terminal outcome points: merge (success) / review_2 reject (failure).
-pub async fn consume_trace_outcome(
+/// Persist a recall trace for a pipeline target so its eventual real-world
+/// outcome can be written back, closing the calibration loop. `scope_kind` is
+/// `"issue"` (analysis recall → consumed at review_1) or `"change_request"`
+/// (code recall → consumed at merge / review_2 / terminal execution failure).
+/// Upsert keyed by (scope_kind, target_id): latest recall wins. No-op when the
+/// recall produced no project-db trace (nothing to calibrate).
+pub async fn store_recall_trace(
     db: &crate::db::Db,
-    change_request_id: &str,
+    scope_kind: &str,
+    target_id: &str,
+    project_id: &str,
+    recall: &Recall,
+) {
+    let Some(trace_id) = recall.trace_id.as_deref() else {
+        return;
+    };
+    let _ = sqlx::query(
+        "INSERT INTO kb_recall_traces (scope_kind, target_id, project_id, trace_id, used_ids, created_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(scope_kind, target_id) DO UPDATE SET
+             project_id=excluded.project_id, trace_id=excluded.trace_id,
+             used_ids=excluded.used_ids, created_at=excluded.created_at",
+    )
+    .bind(scope_kind)
+    .bind(target_id)
+    .bind(project_id)
+    .bind(trace_id)
+    .bind(recall.used_ids.join(","))
+    .execute(db)
+    .await;
+}
+
+/// Look up the recall trace linked to a pipeline target, write back its outcome
+/// via [`kb_record`], and consume the row. No-op if no trace was stored.
+/// `feedback` = `Some("up"|"down")` reinforces/demotes the used chunks; `None`
+/// records the outcome for evolution without touching confidence (use for
+/// ambiguous terminal failures). Call at terminal outcome points:
+/// review_1 (analysis) / merge / review_2 reject / execution failure (code).
+pub async fn consume_recall_trace(
+    db: &crate::db::Db,
+    scope_kind: &str,
+    target_id: &str,
     outcome: &str,
     feedback: Option<&str>,
 ) {
     let row = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT project_id, trace_id, used_ids FROM kb_traces WHERE change_request_id=?",
+        "SELECT project_id, trace_id, used_ids FROM kb_recall_traces WHERE scope_kind=? AND target_id=?",
     )
-    .bind(change_request_id)
+    .bind(scope_kind)
+    .bind(target_id)
     .fetch_optional(db)
     .await
     .ok()
@@ -469,8 +506,9 @@ pub async fn consume_trace_outcome(
         .map(str::to_string)
         .collect();
     kb_record(&project_id, &trace_id, &ids, outcome, feedback).await;
-    let _ = sqlx::query("DELETE FROM kb_traces WHERE change_request_id=?")
-        .bind(change_request_id)
+    let _ = sqlx::query("DELETE FROM kb_recall_traces WHERE scope_kind=? AND target_id=?")
+        .bind(scope_kind)
+        .bind(target_id)
         .execute(db)
         .await;
 }
