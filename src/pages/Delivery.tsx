@@ -14,7 +14,7 @@ import {
 } from '../services';
 
 const ART_NODE_OPTS = [
-  { value: 'requirement', label: '需求' }, { value: 'materials', label: '物料' },
+  { value: 'issue', label: '需求' }, { value: 'materials', label: '物料' },
   { value: 'prototype', label: '原型' }, { value: 'spec', label: 'Spec' },
   { value: 'code', label: '编码' }, { value: 'test', label: '测试' },
   { value: 'security', label: '安全' }, { value: 'deploy', label: '部署' },

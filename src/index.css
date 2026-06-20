@@ -2130,6 +2130,13 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
   line-height: var(--leading-normal); outline: none; transition: border-color .14s;
 }
 .dock-advice-row textarea:focus { border-color: var(--ember); }
+.dock-advice-row input {
+  flex: 1; min-width: 0;
+  background: var(--bg-3); border: 1px solid var(--border-strong); border-radius: 10px;
+  padding: 8px 11px; color: var(--text); font-family: var(--font-mono); font-size: var(--text-control);
+  line-height: var(--leading-normal); outline: none; transition: border-color .14s;
+}
+.dock-advice-row input:focus { border-color: var(--ember); }
 .dock-advice-row .btn { flex: none; }
 
 .iter-warn {

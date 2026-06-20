@@ -26,8 +26,8 @@ async fn land_on_dev(
     session: &crate::models::worktree::WorktreeSession,
     cr_id: &str,
     dev_is_live: bool,
+    merge_msg: &str,
 ) -> std::result::Result<(), (i32, String)> {
-    let merge_msg = format!("AutoForge merge: {}", cr_id);
 
     if !dev_is_live {
         // Fast path (all non-self-managed projects): in-place checkout + merge.
@@ -44,7 +44,7 @@ async fn land_on_dev(
                 "--no-ff",
                 &session.branch_name,
                 "-m",
-                &merge_msg,
+                merge_msg,
             ])
             .await
             .unwrap_or((-1, String::new(), "git not available".to_string()));
@@ -94,7 +94,7 @@ async fn land_on_dev(
             "--no-ff",
             &session.branch_name,
             "-m",
-            &merge_msg,
+            merge_msg,
         ])
         .await
         .unwrap_or((-1, String::new(), "git not available".to_string()));
@@ -217,7 +217,7 @@ async fn sync_dev_into_worktree(
     DevSync::Conflict { files, diff }
 }
 
-/// 方案 B：把合并冲突交给 code agent 自动消解，复跑测试后【回到审核 2】复审，
+/// 方案 B：把合并冲突交给 code agent 自动消解，复跑测试后【回到代码审核】复审，
 /// 绝不直接落 dev。手动「AI 解冲突并合并」按钮与 Phase 1 自动开关共用此函数。
 pub async fn ai_resolve_conflict(
     db: &Db,
@@ -392,11 +392,11 @@ pub async fn ai_resolve_conflict(
     }
 
     // Route back to human review 2 — never land an AI-resolved conflict directly.
-    sqlx::query("UPDATE change_requests SET status='pending_review_2', updated_at=datetime('now') WHERE id=?")
+    sqlx::query("UPDATE change_requests SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
         .bind(cr_id).execute(db).await?;
-    sqlx::query("UPDATE issues SET status='pending_review_2', updated_at=datetime('now') WHERE id=?")
+    sqlx::query("UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
         .bind(&cr.issue_id).execute(db).await?;
-    crate::core::notify::dispatch(db, "review_needed", &issue.title, "AI 已解决合并冲突，待审核 2 复审").await;
+    crate::core::notify::dispatch(db, "review_needed", &issue.title, "AI 已解决合并冲突，待代码审核 复审").await;
     event::emit(
         app,
         event::AppEvent::ReviewNeeded {
@@ -505,7 +505,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
 
             // 自动解冲突开关 ON → 交 AI 处理。**spawn 到后台**而非在持有合并锁时 await：
             // AI 解冲突可能跑数分钟（claude CLI），期间不应占着该项目的合并锁饿死其它 CR。
-            // ai_resolve 只在本 CR 自己的 worktree 内操作、解完回审核 2（绝不落 dev），与其它
+            // ai_resolve 只在本 CR 自己的 worktree 内操作、解完回代码审核（绝不落 dev），与其它
             // 合并无共享可变状态，脱锁后台执行安全。失败则维持 merge_conflict 等人。
             if crate::core::gate::auto_conflict_resolve_enabled(db).await {
                 info!("auto conflict-resolve enabled, handing cr {} to AI (background)", cr_id);
@@ -644,8 +644,17 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     );
 
+    // 人审填写的合并信息（持久化在 CR 上，retry/AI 解冲突回落均复用）；空则回退默认模板。
+    let merge_msg = cr
+        .merge_commit_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("AutoForge merge: {}", cr_id));
+
     if let Err((merge_code, merge_err)) =
-        land_on_dev(&git, &project, &session, cr_id, dev_is_live).await
+        land_on_dev(&git, &project, &session, cr_id, dev_is_live, &merge_msg).await
     {
         info!("merge failed ({}): {}", merge_code, merge_err);
         let fail_reason = format!(
@@ -744,7 +753,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     crate::core::notify::dispatch(db, "cr_merged", "已合并到 dev", cr_id).await;
 
     // Innate: capture the merged implementation as a SUCCESS exemplar (positive signal) —
-    // 它已通过审核 2 + 测试并合并，是"这类需求该怎么改"的高质量样本，供需求分析/代码实现角色召回。
+    // 它已通过代码审核 + 测试并合并，是"这类需求该怎么改"的高质量样本，供需求分析/代码实现角色召回。
     let issue_title: String = sqlx::query_as::<_, (String,)>("SELECT title FROM issues WHERE id=?")
         .bind(&cr.issue_id)
         .fetch_optional(db)
@@ -755,7 +764,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .unwrap_or_default();
     if let Some(report) = session.report_content.as_deref().filter(|r| !r.trim().is_empty()) {
         let content = format!(
-            "已合并需求「{}」的成功实现方案（通过审核 2 与测试）：\n\n{}",
+            "已合并需求「{}」的成功实现方案（通过代码审核 与测试）：\n\n{}",
             issue_title, report
         );
         let trigger = format!("实现该项目同类需求时可参考的成功改动方案；相关需求：{}", issue_title);

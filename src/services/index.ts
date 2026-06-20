@@ -101,7 +101,7 @@ export interface IssueAnalysisSpec {
     analysis_summary: string; confidence: number;
   };
   understanding: {
-    problem_type: string; restated_requirement: string; user_story: string | null;
+    problem_type: string; restated_issue: string; restated_requirement?: string; user_story: string | null;
     current_behavior: string | null; expected_behavior: string | null;
     reproduction_steps: string[]; background: string | null;
   };
@@ -143,6 +143,7 @@ export interface ChangeRequest {
   id: string; project_id: string; issue_id: string; status: string;
   admin_id: string | null; approved_at: string | null;
   admin_suggestions_1: string | null; admin_suggestions_2: string | null;
+  merge_commit_message: string | null;
   target_branch: string; created_at: string; updated_at: string;
 }
 export interface WorktreeSession {
@@ -385,7 +386,7 @@ export const listIssuesPage = (
 // 某项目出现过的全部需求状态（去重），用于总账筛选 chip。
 export const listIssueStatuses = (projectId: string) =>
   ipc<string[]>('list_issue_statuses', { projectId });
-// 按状态集合取需求（有界子集，如审核 1 队列），替代全量加载。
+// 按状态集合取需求（有界子集，如需求审核 队列），替代全量加载。
 export const listIssuesByStatuses = (projectId: string, statuses: string[]) =>
   ipc<Issue[]>('list_issues_by_statuses', { projectId, statuses });
 // 批量取需求标题（轻量），用于变更请求列表解析标题。
@@ -404,7 +405,7 @@ export const submitIssue = (payload: {
 export const retryAnalysis = (issueId: string) =>
   ipc<void>('retry_analysis', { issueId });
 
-// 审核 1 补充意见重评：带管理员补充意见重新分析当前需求，之后重回审核 1。
+// 需求审核 补充意见重评：带管理员补充意见重新分析当前需求，之后重回需求审核。
 export const reanalyzeWithFeedback = (issueId: string, feedback: string) =>
   ipc<void>('reanalyze_with_feedback', { issueId, feedback });
 
@@ -424,8 +425,26 @@ export const listChangeRequests = (projectId?: string, status?: string) =>
   ipc<ChangeRequest[]>('list_change_requests', {
     projectId: projectId ?? null, status: status ?? null,
   });
+// 分页查询变更请求（功能审计代码闸滚动加载）：按状态过滤，created_at 倒序，返回当前页 + 总数。
+// 活动集（非合并）一次取够（大 limit）；已合并历史按页滚动加载，total 供「已合并」徽标计数。
+export interface ChangeRequestPage { items: ChangeRequest[]; total: number }
+export const listChangeRequestsPage = (
+  projectId: string | undefined,
+  status: string | undefined,
+  excludeMerged: boolean,
+  limit: number,
+  offset: number,
+) => ipc<ChangeRequestPage>('list_change_requests_page', {
+  projectId: projectId || null,
+  status: status && status !== 'all' ? status : null,
+  excludeMerged,
+  limit, offset,
+});
 export const getChangeRequest = (id: string) =>
   ipc<ChangeRequest>('get_change_request', { id });
+// 按需求 id 取其最新 CR：左栏分批加载后从总账下钻到未载入的 CR 时按需补拉单条。
+export const getChangeRequestByIssue = (issueId: string) =>
+  ipc<ChangeRequest | null>('get_change_request_by_issue', { issueId });
 export const getWorktreeSession = (crId: string) =>
   ipc<WorktreeSession | null>('get_worktree_session', { crId });
 export const getCodeDiff = (crId: string) =>
@@ -440,16 +459,16 @@ export const aiResolveMergeConflict = (crId: string) =>
 export const review1 = (issueId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
 }) => ipc<ChangeRequest>('review_1', { issueId, decision });
-// 批量审核 1：一次性通过多条待需求审核的需求，快速清空审核 1 队列。
-// 非 pending_review_1 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
+// 批量需求审核：一次性通过多条待需求审核的需求，快速清空需求审核 队列。
+// 非 pending_issue_review 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
 export interface Review1BatchResult { approved: number; skipped: number; errors: number; }
 export const review1Batch = (issueIds: string[], suggestions?: string) =>
   ipc<Review1BatchResult>('review_1_batch', { issueIds, suggestions: suggestions || undefined });
 export const review2 = (crId: string, decision: {
-  decision: string; suggestions?: string; admin_id?: string;
+  decision: string; suggestions?: string; admin_id?: string; commit_message?: string;
 }) => ipc<ChangeRequest>('review_2', { crId, decision });
-// 批量审核 2：一次性通过多条待审核 2 的变更请求，各自排队合并，快速清空审核 2 队列。
-// 非 pending_review_2 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
+// 批量代码审核：一次性通过多条待代码审核 的变更请求，各自排队合并，快速清空代码审核 队列。
+// 非 pending_code_review 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
 export interface Review2BatchResult { approved: number; skipped: number; errors: number; }
 export const review2Batch = (crIds: string[], suggestions?: string) =>
   ipc<Review2BatchResult>('review_2_batch', { crIds, suggestions: suggestions || undefined });
@@ -662,11 +681,11 @@ export const asrRealtimeStop = (session_id: string) =>
   ipc<void>('asr_realtime_stop', { sessionId: session_id });
 
 // ── 会议录音：转写文本 → AI 提炼纪要 + 拆解需求（先审后入）────────────────────
-export interface MeetingRequirement {
+export interface MeetingIssue {
   title: string; category: string; severity: string; description: string;
 }
 export interface MeetingAnalysis {
-  summary_md: string; requirements: MeetingRequirement[];
+  summary_md: string; issues: MeetingIssue[];
 }
 // 分析会议转写：返回纪要 + 需求列表（不落盘、不入池）。
 export const analyzeMeeting = (transcript: string) =>
@@ -916,9 +935,9 @@ export const submitFromArtifact = (payload: {
 
 // 在会议室对话 card 内直接确认/拒绝一条整理好的需求草稿。
 // confirm → 入流水线并返回创建的 Issue；reject → 返回 null。决策持久化到该消息。
-export const decideRequirementDraft = (payload: {
+export const decideIssueDraft = (payload: {
   message_id: string; decision: 'confirm' | 'reject'; block_index?: number;
-}) => ipc<Issue | null>('decide_requirement_draft', { payload });
+}) => ipc<Issue | null>('decide_issue_draft', { payload });
 
 // ── Triage（待整理池）─────────────────────────────────────────────────────────
 export interface RefineResult { refined: number; discarded: number; errors: number; }
@@ -1126,6 +1145,10 @@ export const getAutoConflictResolveEnabled = () =>
   ipc<boolean>('get_auto_conflict_resolve_enabled');
 export const setAutoConflictResolveEnabled = (enabled: boolean) =>
   ipc<void>('set_auto_conflict_resolve_enabled', { enabled });
+export const getCustomMergeMessageEnabled = () =>
+  ipc<boolean>('get_custom_merge_message_enabled');
+export const setCustomMergeMessageEnabled = (enabled: boolean) =>
+  ipc<void>('set_custom_merge_message_enabled', { enabled });
 
 // M5 — preview data masking + container preview
 export const maskPreviewData = (crId: string) =>

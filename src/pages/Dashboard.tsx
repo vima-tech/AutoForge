@@ -26,10 +26,10 @@ const STATUS_LABEL: Record<string, string> = {
   triage: '待整理',
   pending_analysis: '分析中',
   analysis_failed: '分析失败',
-  pending_review_1: '待需求审核',
+  pending_issue_review: '待需求审核',
   pending_execution: '待执行',
   executing: 'AI 执行中',
-  pending_review_2: '待代码审核',
+  pending_code_review: '待代码审核',
   pending_merge: '待合并',
   execution_failed: '执行失败',
   merge_failed: '合并失败',
@@ -42,10 +42,10 @@ const STATUS_COLOR: Record<string, string> = {
   triage: '',
   pending_analysis: 'amber',
   analysis_failed: 'red',
-  pending_review_1: 'amber',
+  pending_issue_review: 'amber',
   pending_execution: 'amber',
   executing: 'blue',
-  pending_review_2: 'ember',
+  pending_code_review: 'ember',
   pending_merge: 'blue',
   execution_failed: 'red',
   merge_failed: 'red',
@@ -92,9 +92,9 @@ type StageCounts = {
 const buildPipeline = (p: StageCounts) => [
   { ic: 'inbox', name: '需求入口',   cnt: p.triage,           stage: 'triage',           state: p.triage > 0 ? 'active' : 'done' },
   { ic: 'search', name: '需求分析',  cnt: p.pending_analysis, stage: 'pending_analysis', state: p.pending_analysis > 0 ? 'active' : 'done' },
-  { ic: 'check', name: '需求审核',   cnt: p.pending_review_1, stage: 'pending_review_1', state: p.pending_review_1 > 0 ? 'active' : 'done' },
+  { ic: 'check', name: '需求审核',   cnt: p.pending_review_1, stage: 'pending_issue_review', state: p.pending_review_1 > 0 ? 'active' : 'done' },
   { ic: 'code', name: 'Claude Code', cnt: p.executing,        stage: 'executing',        state: p.executing > 0 ? 'active' : '' },
-  { ic: 'eye', name: '代码审核',     cnt: p.pending_review_2, stage: 'pending_review_2', state: p.pending_review_2 > 3 ? 'warn' : p.pending_review_2 > 0 ? 'active' : '' },
+  { ic: 'eye', name: '代码审核',     cnt: p.pending_review_2, stage: 'pending_code_review', state: p.pending_review_2 > 3 ? 'warn' : p.pending_review_2 > 0 ? 'active' : '' },
   { ic: 'merge', name: '合并 dev',   cnt: p.merged,           stage: 'merged',           state: p.merged > 0 ? 'done' : '' },
 ];
 const PIPE_CNT_COLOR: Record<string, string> = {
@@ -326,7 +326,7 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
                     <div className="slots">
                       {Array.from({ length: visibleSlot.max_slots }).map((_, i) => {
                         const occupant = visibleSlot.occupants[i];
-                        const isPending = occupant?.status === 'pending_review_2';
+                        const isPending = occupant?.status === 'pending_code_review';
                         return (
                           <div key={i} className={'slot' + (occupant ? ' busy' : '') + (isPending ? ' warn' : '')}>
                             {occupant ? (

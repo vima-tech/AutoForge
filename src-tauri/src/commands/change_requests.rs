@@ -53,6 +53,95 @@ pub async fn list_change_requests(
     }
 }
 
+/// 分页查询变更请求（功能审计左栏代码闸用）：按项目 + 状态过滤，按 created_at 倒序。
+/// 已合并 CR 会随项目生命周期无限累积，全量加载会拖垮列表，故走分页：
+/// - 活动集（非合并）天然有界，调用方一次取够（大 limit）；
+/// - 已合并历史按页滚动加载，total 同时供左栏「已合并」徽标计数。
+/// status 为空或 "all" 表示不过滤状态；exclude_merged 为 true 时排除已合并
+///（仅在未显式按 merged 筛选时生效，显式选 merged 说明主动要看）。
+#[derive(serde::Serialize)]
+pub struct ChangeRequestPage {
+    pub items: Vec<ChangeRequest>,
+    pub total: i64,
+}
+
+#[tauri::command]
+pub async fn list_change_requests_page(
+    project_id: Option<String>,
+    status: Option<String>,
+    exclude_merged: Option<bool>,
+    limit: i64,
+    offset: i64,
+    state: State<'_, AppState>,
+) -> Result<ChangeRequestPage, String> {
+    use sqlx::{QueryBuilder, Sqlite};
+    let limit = limit.clamp(1, 1000);
+    let offset = offset.max(0);
+    let status = status.filter(|s| !s.is_empty() && s != "all");
+    let exclude_merged =
+        exclude_merged.unwrap_or(false) && status.as_deref() != Some("merged");
+
+    // WHERE 子句在 COUNT 与取数两处各自内联拼装（push_bind 绑定值须与各自 qb 同寿命，
+    // 故不抽成闭包），两处条件保持一致。
+    let total: i64 = {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT COUNT(*) FROM change_requests WHERE 1=1");
+        if let Some(pid) = &project_id {
+            qb.push(" AND project_id = ").push_bind(pid);
+        }
+        if let Some(st) = &status {
+            qb.push(" AND status = ").push_bind(st);
+        }
+        if exclude_merged {
+            qb.push(" AND status != 'merged'");
+        }
+        qb.build_query_scalar()
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let items = {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT * FROM change_requests WHERE 1=1");
+        if let Some(pid) = &project_id {
+            qb.push(" AND project_id = ").push_bind(pid);
+        }
+        if let Some(st) = &status {
+            qb.push(" AND status = ").push_bind(st);
+        }
+        if exclude_merged {
+            qb.push(" AND status != 'merged'");
+        }
+        qb.push(" ORDER BY created_at DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        qb.build_query_as::<ChangeRequest>()
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    Ok(ChangeRequestPage { items, total })
+}
+
+/// 按需求 id 取其最新的变更请求——用于功能审计左栏分批加载后，从总账下钻到
+/// 一个尚未载入的（如较早的已合并）CR 时按需补拉单条，恢复全量加载时的下钻能力。
+#[tauri::command]
+pub async fn get_change_request_by_issue(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<ChangeRequest>, String> {
+    sqlx::query_as::<_, ChangeRequest>(
+        "SELECT * FROM change_requests WHERE issue_id=? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&issue_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_change_request(
     id: String,
@@ -257,7 +346,7 @@ pub async fn retry_merge(cr_id: String, state: State<'_, AppState>) -> Result<()
     Ok(())
 }
 
-/// 方案 B 手动入口：把当前 CR 的合并冲突交给 AI 自动解决（解完回审核 2 复审）。
+/// 方案 B 手动入口：把当前 CR 的合并冲突交给 AI 自动解决（解完回代码审核 复审）。
 /// 长任务，spawn 到后台执行，命令立即返回。
 #[tauri::command]
 pub async fn ai_resolve_merge_conflict(
@@ -346,7 +435,7 @@ async fn approve_issue_review_1(
         .map_err(|e| e.to_string())?;
 
     // Only requirements still awaiting review 1 may be approved (guards stale/batch ids).
-    if issue.status != "pending_review_1" {
+    if issue.status != "pending_issue_review" {
         return Err(format!("需求当前状态为 {}，不可审核通过", issue.status));
     }
 
@@ -429,7 +518,7 @@ pub struct Review1BatchResult {
 
 /// Review 1 (batch): approve many pending requirements at once to clear the
 /// review-1 queue quickly. Each id runs through the same `approve_issue_review_1`
-/// path as the single command; ids that are no longer `pending_review_1` are
+/// path as the single command; ids that are no longer `pending_issue_review` are
 /// skipped (not errored) so a stale selection doesn't fail the whole batch.
 #[tauri::command]
 pub async fn review_1_batch(
@@ -452,7 +541,7 @@ pub async fn review_1_batch(
         .await
         {
             Ok(_) => result.approved += 1,
-            // A requirement that left pending_review_1 (already approved/rejected
+            // A requirement that left pending_issue_review (already approved/rejected
             // elsewhere) is skipped rather than counted as a hard error.
             Err(e) if e.contains("不可审核通过") => result.skipped += 1,
             Err(e) => {
@@ -493,6 +582,7 @@ async fn approve_cr_review_2(
     concurrency: &crate::core::concurrency::ConcurrencyManager,
     cr_id: &str,
     suggestions: Option<&str>,
+    commit_message: Option<&str>,
     admin_id: &str,
 ) -> Result<ChangeRequest, String> {
     let cr = sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
@@ -502,7 +592,7 @@ async fn approve_cr_review_2(
         .map_err(|e| e.to_string())?;
 
     // Only CRs still awaiting review 2 may be approved (guards stale/batch ids).
-    if cr.status != "pending_review_2" {
+    if cr.status != "pending_code_review" {
         return Err(format!("变更请求当前状态为 {}，不可审核通过", cr.status));
     }
 
@@ -520,10 +610,22 @@ async fn approve_cr_review_2(
     )
     .await?;
 
+    // 规整人工提交信息：去空白、空串落 NULL（合并任务回退默认模板）、限长 2KB。
+    // 仅在「自定义提交信息」开关开启时采纳；关闭时强制 NULL，合并走默认模板。
+    let merge_msg = if crate::core::gate::custom_merge_message_enabled(db).await {
+        commit_message
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(2000).collect::<String>())
+    } else {
+        None
+    };
+
     sqlx::query(
-        "UPDATE change_requests SET status='pending_merge', admin_suggestions_2=?, admin_id=?, approved_at=datetime('now'), updated_at=datetime('now') WHERE id=?"
+        "UPDATE change_requests SET status='pending_merge', admin_suggestions_2=?, merge_commit_message=?, admin_id=?, approved_at=datetime('now'), updated_at=datetime('now') WHERE id=?"
     )
     .bind(suggestions.unwrap_or(""))
+    .bind(&merge_msg)
     .bind(admin_id)
     .bind(cr_id)
     .execute(db)
@@ -575,6 +677,7 @@ pub async fn review_2(
             &state.concurrency,
             &cr_id,
             decision.suggestions.as_deref(),
+            decision.commit_message.as_deref(),
             &admin_id,
         )
         .await
@@ -652,7 +755,7 @@ pub async fn review_2(
         )
         .await?;
 
-        // Leaving pending_review_2 back to execution frees the review slot.
+        // Leaving pending_code_review back to execution frees the review slot.
         state.concurrency.release_pending_review();
 
         // Send back to execution
@@ -715,7 +818,7 @@ pub struct Review2BatchResult {
 
 /// Review 2 (batch): approve many change requests awaiting review 2 at once to clear
 /// the code-review queue quickly. Each id runs through the same `approve_cr_review_2`
-/// path as the single command; ids that are no longer `pending_review_2` are skipped
+/// path as the single command; ids that are no longer `pending_code_review` are skipped
 /// (not errored) so a stale selection doesn't fail the whole batch.
 #[tauri::command]
 pub async fn review_2_batch(
@@ -734,12 +837,13 @@ pub async fn review_2_batch(
             &state.concurrency,
             &cr_id,
             suggestions.as_deref(),
+            None, // 批量审核不逐条填提交信息，合并任务回退默认模板
             &admin_id,
         )
         .await
         {
             Ok(_) => result.approved += 1,
-            // A CR that left pending_review_2 (already merged/rejected elsewhere) is
+            // A CR that left pending_code_review (already merged/rejected elsewhere) is
             // skipped rather than counted as a hard error.
             Err(e) if e.contains("不可审核通过") => result.skipped += 1,
             Err(e) => {
@@ -887,7 +991,7 @@ pub async fn delete_change_request(
     };
 
     // Keep the pending-review counter consistent if we delete a CR awaiting review 2.
-    if cr.status == "pending_review_2" {
+    if cr.status == "pending_code_review" {
         state.concurrency.release_pending_review();
     }
 

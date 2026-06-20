@@ -25,6 +25,7 @@ import {
   clawbotStartLogin, clawbotPollLogin,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   getAutoConflictResolveEnabled, setAutoConflictResolveEnabled,
+  getCustomMergeMessageEnabled, setCustomMergeMessageEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
@@ -1986,6 +1987,7 @@ function GatingSettings() {
   const [policies, setPolicies] = useState<AutoPassPolicy[]>([]);
   const [autoPassOn, setAutoPassOn] = useState(false);
   const [autoConflictOn, setAutoConflictOn] = useState(false);
+  const [customMsgOn, setCustomMsgOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -1993,6 +1995,7 @@ function GatingSettings() {
     listAutoPassPolicy().then(setPolicies).catch(() => setPolicies([]));
     getAutoPassEnabled().then(setAutoPassOn).catch(() => {});
     getAutoConflictResolveEnabled().then(setAutoConflictOn).catch(() => {});
+    getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {});
   };
   useEffect(() => { reload(); }, []);
 
@@ -2006,6 +2009,13 @@ function GatingSettings() {
   const toggleConflict = async () => {
     setErr(''); setBusy(true);
     try { const next = !autoConflictOn; await setAutoConflictResolveEnabled(next); setAutoConflictOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const toggleCustomMsg = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !customMsgOn; await setCustomMergeMessageEnabled(next); setCustomMsgOn(next); }
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   };
@@ -2052,6 +2062,20 @@ function GatingSettings() {
         </div>
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
           启用后，合并前自动把 dev 并入分支若发生代码冲突，将直接交由 AI 自动解冲突；解完仍会回到代码审核复审，不直接落 dev。关闭时冲突停在「合并冲突」态，可在审核页手动重试或点 AI 解冲突。
+        </div>
+      </div>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />自定义合并提交信息</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (customMsgOn ? 'green' : '')}>{customMsgOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggleCustomMsg}>
+              <Icon name={customMsgOn ? 'pause' : 'play'} size={13} />{customMsgOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>AutoForge merge: &lt;编号&gt;</code>，审核页不显示输入框。批量审核始终走默认模板。
         </div>
       </div>
     </div>

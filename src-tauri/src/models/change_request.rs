@@ -10,6 +10,7 @@ pub struct ChangeRequest {
     pub approved_at: Option<String>,
     pub admin_suggestions_1: Option<String>,
     pub admin_suggestions_2: Option<String>,
+    pub merge_commit_message: Option<String>,
     pub target_branch: String,
     pub created_at: String,
     pub updated_at: String,
@@ -27,4 +28,6 @@ pub struct Review2Decision {
     pub decision: String,
     pub suggestions: Option<String>,
     pub admin_id: Option<String>,
+    /// 人工填写的合并提交信息；空时合并任务回退默认模板。
+    pub commit_message: Option<String>,
 }

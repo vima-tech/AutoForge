@@ -50,10 +50,10 @@
       "type": "object",
       "description": "对需求的理解与还原。bug 类需求需补充复现与现状/预期。",
       "additionalProperties": false,
-      "required": ["problem_type", "restated_requirement"],
+      "required": ["problem_type", "restated_issue"],
       "properties": {
         "problem_type": { "type": "string", "enum": ["bug", "feature", "enhancement", "refactor", "tech_debt", "question"] },
-        "restated_requirement": { "type": "string", "description": "用实现视角重述需求，消除歧义。" },
+        "restated_issue": { "type": "string", "description": "用实现视角重述需求，消除歧义。" },
         "user_story": { "type": ["string", "null"], "description": "作为<角色>，我希望<能力>，以便<价值>。无则 null。" },
         "current_behavior": { "type": ["string", "null"], "description": "bug：当前的错误行为；非 bug 为 null。" },
         "expected_behavior": { "type": ["string", "null"], "description": "期望达到的行为/结果。" },

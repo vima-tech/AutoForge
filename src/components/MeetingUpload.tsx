@@ -4,7 +4,7 @@ import Icon from './Icon';
 import Select from './Select';
 import {
   transcribeRecordingSegment, transcribeRecordingFile, analyzeMeeting, saveMeetingDoc, submitIssue,
-  type Project, type MeetingRequirement,
+  type Project, type MeetingIssue,
 } from '../services';
 import { fileToPcmSegments } from '../lib/audioChunks';
 
@@ -19,7 +19,7 @@ function fileToBase64(file: File): Promise<string> {
 }
 
 type Phase = 'idle' | 'working' | 'review' | 'submitting' | 'done';
-type EditableReq = MeetingRequirement & { selected: boolean };
+type EditableReq = MeetingIssue & { selected: boolean };
 
 const CATEGORY_OPTS = [
   { value: 'Feature', label: 'Feature 功能' },
@@ -138,7 +138,7 @@ export default function MeetingUpload({
       const analysis = await analyzeMeeting(fullText);
       setSummary(analysis.summary_md);
       setTitle(deriveTitle(analysis.summary_md));
-      setReqs(analysis.requirements.map(r => ({ ...r, selected: true })));
+      setReqs(analysis.issues.map(r => ({ ...r, selected: true })));
       setPhase('review');
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e));

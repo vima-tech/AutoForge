@@ -5,7 +5,7 @@
 AutoForge 是一个"Human-Lite-in-the-Loop"自主软件工厂，**Tauri 桌面端应用**。
 AI 全自动处理需求分析→代码实现→测试；人类只在两个审核节点做决策。
 
-核心流程：需求提交 → AI 分析 → 人工审核 1 → AI 实现（Claude Code worktree）→ 人工审核 2 → 自动合并
+核心流程：需求提交 → AI 分析 → 人工需求审核 → AI 实现（Claude Code worktree）→ 人工代码审核 → 自动合并
 
 ---
 
