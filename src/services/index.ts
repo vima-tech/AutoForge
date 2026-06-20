@@ -66,6 +66,8 @@ export interface Project {
   id: string; name: string; slug: string; description: string;
   repo_path: string; branch_dev: string; branch_main: string;
   status: string; config_yaml: string | null;
+  is_default: boolean;
+  archived_at?: string | null;
   created_at: string; updated_at: string;
 }
 export interface Issue {
@@ -177,6 +179,7 @@ export interface ConversationAttachment {
   size_bytes: number; sha256: string; created_at: string;
 }
 export interface PipelineStats {
+  triage: number;
   pending_analysis: number; pending_review_1: number;
   executing: number; pending_review_2: number;
   merged: number; rejected: number; total_issues: number;
@@ -192,6 +195,7 @@ export interface PipelineStats {
   }>;
   project_pipelines: Array<{
     project_id: string; project_name: string; project_status: string;
+    triage: number;
     pending_analysis: number; pending_review_1: number;
     executing: number; pending_review_2: number;
     merged: number; rejected: number; total_issues: number;
@@ -234,6 +238,10 @@ export interface AdminDecision {
 
 export interface BadgeCounts { chat_unread: number; audit_pending: number; }
 
+export interface SystemResources {
+  cpu_pct: number; mem_pct: number; mem_used_mb: number; mem_total_mb: number;
+}
+
 export interface DevServerStatus {
   project_id: string;
   status: 'no_config' | 'idle' | 'starting' | 'running' | 'stopped';
@@ -242,6 +250,7 @@ export interface DevServerStatus {
 
 // ── System ───────────────────────────────────────────────────────────────────
 export const getSystemHealth = () => ipc<SystemHealth>('system_health');
+export const getSystemResources = () => ipc<SystemResources>('system_resources');
 export const checkClaudeAuth = () => ipc<boolean>('check_claude_auth');
 export const getPipelineStats = () => ipc<PipelineStats>('pipeline_stats');
 export const getBadgeCounts = () => ipc<BadgeCounts>('get_badge_counts');
@@ -322,7 +331,16 @@ export const updateProject = (id: string, payload: Partial<{
   name: string; description: string; repo_path: string;
   branch_dev: string; branch_main: string; status: string; config_yaml: string;
 }>) => ipc<Project>('update_project', { id, payload });
+/** 设为默认项目（全局唯一，其他页面置顶并优先选中）。传空串清除默认。 */
+export const setDefaultProject = (id: string) => ipc<void>('set_default_project', { id });
+/** 软删除：归档项目（保留 DB 数据，重新添加同仓库时按 .autoforge/project.json 身份锚挂回）。 */
 export const deleteProject = (id: string) => ipc<void>('delete_project', { id });
+/** 回收站：列出已归档项目。 */
+export const listArchivedProjects = () => ipc<Project[]>('list_archived_projects');
+/** 从回收站恢复一个已归档项目。 */
+export const restoreProject = (id: string) => ipc<Project>('restore_project', { id });
+/** 彻底删除（不可恢复）：级联清除该项目全部 DB 数据。 */
+export const purgeProject = (id: string) => ipc<void>('purge_project', { id });
 
 /** AI 推断的运行配置草稿（字段对齐 ProjectConfigForm，全部可选）。 */
 export interface RunConfigDraft {
@@ -412,12 +430,29 @@ export const getWorktreeSession = (crId: string) =>
   ipc<WorktreeSession | null>('get_worktree_session', { crId });
 export const getCodeDiff = (crId: string) =>
   ipc<string>('get_code_diff', { crId });
+export type MergeConflictView = { files: string[]; diff: string };
+export const getMergeConflict = (crId: string) =>
+  ipc<MergeConflictView>('get_merge_conflict', { crId });
+export const retryMerge = (crId: string) =>
+  ipc<void>('retry_merge', { crId });
+export const aiResolveMergeConflict = (crId: string) =>
+  ipc<void>('ai_resolve_merge_conflict', { crId });
 export const review1 = (issueId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
 }) => ipc<ChangeRequest>('review_1', { issueId, decision });
+// 批量审核 1：一次性通过多条待需求审核的需求，快速清空审核 1 队列。
+// 非 pending_review_1 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
+export interface Review1BatchResult { approved: number; skipped: number; errors: number; }
+export const review1Batch = (issueIds: string[], suggestions?: string) =>
+  ipc<Review1BatchResult>('review_1_batch', { issueIds, suggestions: suggestions || undefined });
 export const review2 = (crId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
 }) => ipc<ChangeRequest>('review_2', { crId, decision });
+// 批量审核 2：一次性通过多条待审核 2 的变更请求，各自排队合并，快速清空审核 2 队列。
+// 非 pending_review_2 的 id 会被跳过（skipped）而非报错，避免选区过期导致整批失败。
+export interface Review2BatchResult { approved: number; skipped: number; errors: number; }
+export const review2Batch = (crIds: string[], suggestions?: string) =>
+  ipc<Review2BatchResult>('review_2_batch', { crIds, suggestions: suggestions || undefined });
 export const retryChangeRequest = (crId: string) =>
   ipc<ChangeRequest>('retry_change_request', { crId });
 export const deleteChangeRequest = (crId: string) =>
@@ -646,6 +681,22 @@ export type SecretBackend = 'keychain' | 'file';
 export const getSecretBackendStatus = () =>
   ipc<SecretBackend>('secret_backend_status');
 
+// ── Settings — 配置备份（口令加密导出 / 导入）────────────────────────────────
+export interface BackupSummary {
+  llm_configs: number; agents: number; mcp_servers: number;
+  notify_channels: number; app_settings: number;
+}
+export interface ExportResult { path: string; summary: BackupSummary; }
+/** 口令加密导出全部配置到备份目录，返回文件路径与计数。 */
+export const exportConfig = (passphrase: string) =>
+  ipc<ExportResult>('export_config', { passphrase });
+/** 用口令解密备份文件内容并恢复配置（按主键 upsert）。 */
+export const importConfig = (content: string, passphrase: string) =>
+  ipc<BackupSummary>('import_config', { content, passphrase });
+/** 在系统文件管理器中定位备份文件。 */
+export const revealBackup = (path: string) =>
+  ipc<void>('reveal_backup', { path });
+
 // ── Settings — MCP servers ────────────────────────────────────────────────────
 export type McpTransport = 'stdio' | 'http';
 export interface McpServer {
@@ -758,6 +809,15 @@ export const getAgentOutput = (id: string) => ipc<AgentOutput | null>('get_agent
 export const listAgentOutputRoles = () => ipc<string[]>('list_agent_output_roles');
 export const clearAgentOutputs = (id?: string) => ipc<void>('clear_agent_outputs', { id: id ?? null });
 
+export interface FieldStat { path: string; filled: number; total: number; fill_rate: number; }
+export interface FieldHealth {
+  role: string; schema_version: string | null; total: number;
+  status_ok: number; status_partial: number; status_error: number;
+  fields: FieldStat[];
+}
+export const agentOutputFieldHealth = (role: string, schemaVersion?: string, projectId?: string) =>
+  ipc<FieldHealth>('agent_output_field_health', { role, schemaVersion: schemaVersion ?? null, projectId: projectId ?? null });
+
 export const openUrl = (url: string) => ipc<void>('open_url', { url });
 
 // ── Materials ─────────────────────────────────────────────────────────────────
@@ -841,8 +901,6 @@ export const updateIntakeConfig = (payload: Partial<{
 }>) => ipc<IntakeConfig>('update_intake_config', { payload });
 export const getWebhookStatus = () => ipc<WebhookStatus>('get_webhook_status');
 export const syncGithubIssues = () => ipc<SyncResult>('sync_github_issues');
-export const runCodeScan = (projectId: string, scanTypes?: string[]) =>
-  ipc<ScanResult>('run_code_scan', { projectId, scanTypes: scanTypes ?? [] });
 export const bulkImportIssues = (projectId: string, format: string, content: string) =>
   ipc<BulkResult>('bulk_import_issues', { projectId, format, content });
 // 文件批量导入（csv/xlsx/xls/ods）：文件内容以 base64 传入，后端按后缀解析。
@@ -1064,6 +1122,10 @@ export const getAutoPassEnabled = () =>
   ipc<boolean>('get_auto_pass_enabled');
 export const setAutoPassEnabled = (enabled: boolean) =>
   ipc<void>('set_auto_pass_enabled', { enabled });
+export const getAutoConflictResolveEnabled = () =>
+  ipc<boolean>('get_auto_conflict_resolve_enabled');
+export const setAutoConflictResolveEnabled = (enabled: boolean) =>
+  ipc<void>('set_auto_conflict_resolve_enabled', { enabled });
 
 // M5 — preview data masking + container preview
 export const maskPreviewData = (crId: string) =>
@@ -1104,13 +1166,14 @@ export const clawbotStartLogin = () => ipc<ClawbotQrStart>('clawbot_start_login'
 export const clawbotPollLogin = (qrcode: string, baseUrl: string, verifyCode?: string) =>
   ipc<ClawbotQrPoll>('clawbot_poll_login', { qrcode, baseUrl, verifyCode: verifyCode ?? null });
 
-// M10 — embeddable feedback widget
+// 项目级需求接入 token（统一承载 webhook 接入 flow / 反馈 widget triage 两类）
 export interface WidgetToken {
   id: string;
   project_id: string;
   token: string;
   label: string;
   enabled: boolean;
+  mode: string; // 'flow' | 'triage'
   created_at: string;
   expires_at: string | null;
   last_used_at: string | null;
@@ -1125,6 +1188,11 @@ export const setWidgetTokenEnabled = (id: string, enabled: boolean) =>
   ipc<void>('set_widget_token_enabled', { id, enabled });
 export const deleteWidgetToken = (id: string) =>
   ipc<void>('delete_widget_token', { id });
+// 项目 webhook 接入 token（mode=flow）：需求入口展示/轮换
+export const getProjectWebhookToken = (projectId: string) =>
+  ipc<WidgetToken>('get_project_webhook_token', { projectId });
+export const regenerateProjectWebhookToken = (projectId: string) =>
+  ipc<WidgetToken>('regenerate_project_webhook_token', { projectId });
 
 // Node 03 — prototype prompt edit / delete
 export const deletePrototypePrompt = (id: string) =>
@@ -1132,14 +1200,17 @@ export const deletePrototypePrompt = (id: string) =>
 export const updatePrototypePrompt = (id: string, title: string, prompt: string) =>
   ipc<PrototypePrompt>('update_prototype_prompt', { id, title, prompt });
 
-// OpenDesign 本地服务：可配置启动命令 + 访问 URL，一键拉起并打开浏览器
-export interface OpenDesignSettings { command: string; url: string }
+// OpenDesign 本地服务：默认自动模式（检测/克隆 nexu-io/open-design → install → tools-dev 启动）；
+// 填写「启动命令」则切到自定义模式（执行该命令并打开 URL）。repo_path 可显式指定本地检出。
+export interface OpenDesignSettings { command: string; url: string; repo_path: string }
 export const getOpenDesignSettings = () =>
   ipc<OpenDesignSettings>('get_opendesign_settings');
-export const setOpenDesignSettings = (command: string, url: string) =>
-  ipc<OpenDesignSettings>('set_opendesign_settings', { command, url });
-/** 拉起本地 OpenDesign 服务（detached），返回就绪后应打开的 URL（浏览器打开走 openUrl）。 */
+export const setOpenDesignSettings = (command: string, url: string, repoPath: string) =>
+  ipc<OpenDesignSettings>('set_opendesign_settings', { command, url, repoPath });
+/** 拉起本地 OpenDesign 服务，返回就绪后应打开的 URL（浏览器打开走 openUrl）。 */
 export const launchOpenDesign = () => ipc<string>('launch_opendesign');
+/** 取自动启动日志末尾，用于排查启动失败原因。 */
+export const getOpenDesignLog = () => ipc<string>('get_opendesign_log');
 
 // Delivery node artifacts (persisted to .autoforge/deliverables/<node>/)
 export interface DeliveryArtifact {

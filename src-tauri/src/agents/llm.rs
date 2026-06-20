@@ -248,6 +248,28 @@ pub async fn run_system_role_text(
     project_id: Option<&str>,
     recall_query: Option<&str>,
 ) -> Result<String> {
+    Ok(run_system_role_text_traced(
+        db,
+        system_kind,
+        prompt,
+        fallback_system_prompt,
+        project_id,
+        recall_query,
+    )
+    .await?
+    .0)
+}
+
+/// 同 [`run_system_role_text`]，但额外返回本次调用的 `trace_id`（若走自定义 LLM 并建立了 trace run）。
+/// 供 schema 驱动的环节 agent（triage / proposer）把结构化产出链回 `llm_traces` 做单步下钻。
+pub async fn run_system_role_text_traced(
+    db: &crate::db::Db,
+    system_kind: &str,
+    prompt: &str,
+    fallback_system_prompt: Option<&str>,
+    project_id: Option<&str>,
+    recall_query: Option<&str>,
+) -> Result<(String, Option<String>)> {
     let agent = sqlx::query_as::<_, Agent>(
         "SELECT * FROM agents
          WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
@@ -293,10 +315,25 @@ pub async fn run_system_role_text(
         project_id: project_id.map(|s| s.to_string()),
         ..Default::default()
     };
-    crate::core::trace::with_tags(
-        trace_tags,
-        run_agent_text_with_tools(db, &agent, prompt, system_prompt.as_deref(), &[], &registry),
-    )
+    // 包一层 scope_run 捕获 trace_id：run_agent_text_with_tools 内部的 scope_run 会复用本 RUN，
+    // 故内外共享同一 trace_id，可在调用返回后读到（用于 agent_outputs.trace_id 下钻）。
+    let agent_cl = agent.clone();
+    crate::core::trace::with_tags(trace_tags, async move {
+        crate::core::trace::scope_run(db, &agent_cl, async {
+            let out = run_agent_text_with_tools(
+                db,
+                &agent_cl,
+                prompt,
+                system_prompt.as_deref(),
+                &[],
+                &registry,
+            )
+            .await?;
+            let tid = crate::core::trace::current_trace_id();
+            Ok::<_, anyhow::Error>((out, tid))
+        })
+        .await
+    })
     .await
 }
 

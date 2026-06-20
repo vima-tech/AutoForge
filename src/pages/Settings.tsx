@@ -3,9 +3,12 @@ import { listen } from '@tauri-apps/api/event';
 import { createPortal } from 'react-dom';
 import Icon from '../components/Icon';
 import { Avatar } from '../components/Avatar';
+import { refreshAgents } from '../agents-store';
 import Select from '../components/Select';
+import { fmtFull } from '../utils/datetime';
 import {
   THEME_PALETTES, RAIL_STORAGE_KEY, applyRailMode, parseRailMode,
+  RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, parseResMonitor,
   QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT,
   DEFAULT_QUICK_CAPTURE_SHORTCUT, DEFAULT_VOICE_INPUT_SHORTCUT,
   parseQuickCaptureShortcut, parseVoiceInputShortcut, formatCombo, isModifierCode, comboHasModifier,
@@ -21,16 +24,18 @@ import {
   listNotifyChannels, createNotifyChannel, updateNotifyChannel, deleteNotifyChannel, testNotifyChannel,
   clawbotStartLogin, clawbotPollLogin,
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
+  getAutoConflictResolveEnabled, setAutoConflictResolveEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   getWebSearchSettings, setWebSearchSettings,
-  getOpenDesignSettings, setOpenDesignSettings, type OpenDesignSettings,
+  getOpenDesignSettings, setOpenDesignSettings, getOpenDesignLog, type OpenDesignSettings,
   getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
   getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, autosupplyIsRunning, type AutosupplySettings as AutosupplyT,
   getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
   listBuiltinTools, type BuiltinToolInfo,
   getSecretBackendStatus, type SecretBackend,
+  exportConfig, importConfig, revealBackup, type BackupSummary, type ExportResult,
   listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
   type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
@@ -600,21 +605,27 @@ function ToolsSettings() {
   );
 }
 
-// OpenDesign 本地服务：可配置启动命令 + 访问 URL，交付页一键拉起并打开浏览器。
+// OpenDesign 本地服务：默认自动模式（检测/克隆 nexu-io/open-design → 安装 → tools-dev 启动）。
 function OpenDesignSettingsCard() {
-  const [od, setOd] = useState<OpenDesignSettings>({ command: '', url: '' });
+  const [od, setOd] = useState<OpenDesignSettings>({ command: '', url: '', repo_path: '' });
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
+  const [log, setLog] = useState('');
 
   useEffect(() => { getOpenDesignSettings().then(setOd).catch(e => setStatus(String(e))); }, []);
 
   const save = async () => {
     setBusy(true);
     try {
-      const r = await setOpenDesignSettings(od.command, od.url);
+      const r = await setOpenDesignSettings(od.command, od.url, od.repo_path);
       setOd(r); setStatus('已保存');
     } catch (e) { setStatus(String(e)); }
     finally { setBusy(false); }
+  };
+
+  const viewLog = async () => {
+    try { setLog((await getOpenDesignLog()) || '（暂无日志：尚未触发过自动启动）'); }
+    catch (e) { setLog(String(e)); }
   };
 
   return (
@@ -625,26 +636,36 @@ function OpenDesignSettingsCard() {
           <div className="cfg-name cfg-name-line"><span className="cfg-name-text">OpenDesign · 本地服务</span>
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>DESIGN</span>
           </div>
-          <div className="cfg-sub">交付流水线「原型设计提示词」可一键拉起本地 OpenDesign 服务并打开浏览器</div>
+          <div className="cfg-sub">默认自动拉起：检测本地 open-design 检出（无则克隆）→ pnpm install → tools-dev 启动，就绪后打开浏览器</div>
         </div>
       </div>
 
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
-        <div className="field full"><label>启动命令</label>
-          <input type="text" className="mono" value={od.command} placeholder="npx opendesign（留空则仅打开 URL，不启动）"
+        <div className="field full"><label>本地检出路径（可选）</label>
+          <input type="text" className="mono" value={od.repo_path} placeholder="留空则自动探测 ~/projects/open-design 等，找不到再克隆到自管目录"
+            onChange={e => setOd(o => ({ ...o, repo_path: e.target.value }))} />
+        </div>
+        <div className="field full"><label>自定义启动命令（高级 · 留空走自动模式）</label>
+          <input type="text" className="mono" value={od.command} placeholder="留空＝自动模式；填写则改为执行该命令并打开下方 URL"
             onChange={e => setOd(o => ({ ...o, command: e.target.value }))} />
         </div>
-        <div className="field full"><label>访问 URL</label>
-          <input type="text" className="mono" value={od.url} placeholder="http://localhost:5173"
+        <div className="field full"><label>访问 URL（仅自定义模式需要）</label>
+          <input type="text" className="mono" value={od.url} placeholder="自动模式下由 tools-dev 解析，无需填写"
             onChange={e => setOd(o => ({ ...o, url: e.target.value }))} />
         </div>
         <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
           <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存 OpenDesign 配置</button>
+          <button className="btn" onClick={viewLog}><Icon name="file" size={14} />查看启动日志</button>
           {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
         </div>
+        {log && (
+          <div className="field full">
+            <pre className="mono" style={{ maxHeight: 240, overflow: 'auto', background: 'var(--code-bg)', padding: 10, borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{log}</pre>
+          </div>
+        )}
         <div className="field full">
           <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
-            点击交付页的「OpenDesign」按钮时：若服务已在运行则直接打开；否则执行启动命令（独立进程组，关闭 AutoForge 不连带退出），等待就绪后在系统浏览器打开上述 URL。
+            自动模式需要本机有 Node 24 + pnpm（建议 corepack）。首次会克隆并 pnpm install（较慢），随后用 `pnpm tools-dev start web` 启动并轮询就绪。失败时点「查看启动日志」排查。
           </span>
         </div>
       </div>
@@ -830,6 +851,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
     try {
       const updated = await updateAgent(id, d);
       setAgents(as => as.map(a => a.id === id ? updated : a));
+      void refreshAgents();  // 同步全局 store：名称/可见性变更即时反映到 @提及与头像
       setDrafts(d2 => { const n = { ...d2 }; delete n[id]; return n; });
       setSaveStatus(s => ({ ...s, [id]: '已保存' }));
       setTimeout(() => setSaveStatus(s => { const n = { ...s }; delete n[id]; return n; }), 2500);
@@ -841,6 +863,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const doDelete = async (id: string) => {
     await deleteAgent(id);
     setAgents(as => as.filter(a => a.id !== id));
+    void refreshAgents();
     setConfirmDel(null);
     onChanged();
   };
@@ -848,6 +871,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const addNew = async () => {
     const a = await createAgent({ name: '新对话角色', system_prompt: AGENT_TEMPLATES[0].prompt, prompt_mode: 'custom', role_type: 'business' });
     setAgents(as => [...as, a]);
+    void refreshAgents();
     setExp(a.id);
     onChanged();
   };
@@ -1196,7 +1220,7 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   }, []);
 
   const apply = async (kind: string, payload: Parameters<typeof setRoleSlot>[1]) => {
-    try { setSlots(await setRoleSlot(kind, payload)); onChanged(); }
+    try { setSlots(await setRoleSlot(kind, payload)); void refreshAgents(); onChanged(); }
     catch (e) { setErr(String(e)); }
   };
 
@@ -1462,6 +1486,17 @@ function ThemeSettings({
     applyRailMode(railMode);
   }, [railMode]);
 
+  // 标题栏系统资源（CPU/内存）监视开关：默认开启，落 localStorage 并广播给 App 实时生效。
+  const [resMon, setResMon] = useState<boolean>(() => parseResMonitor(localStorage.getItem(RES_MONITOR_KEY)));
+  const toggleResMon = () => {
+    setResMon(prev => {
+      const next = !prev;
+      localStorage.setItem(RES_MONITOR_KEY, next ? 'on' : 'off');
+      window.dispatchEvent(new Event(RES_MONITOR_CHANGED_EVENT));
+      return next;
+    });
+  };
+
   return (
     <div className="set-inner set-inner-wide rise">
       <div className="set-h">主题设置</div>
@@ -1477,6 +1512,19 @@ function ThemeSettings({
             </div>
           </div>
           <Switch on={railMode === 'hover'} onToggle={() => setRailMode(m => (m === 'hover' ? 'locked' : 'hover'))} />
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head"><div className="panel-title"><Icon name="cpu" size={16} />标题栏</div></div>
+        <div style={{ padding: '12px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text)', marginBottom: 3 }}>显示系统资源占用</div>
+            <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+              在标题栏右侧实时显示当前系统 CPU 与内存占用（每 3 秒刷新）。关闭后不再轮询。
+            </div>
+          </div>
+          <Switch on={resMon} onToggle={toggleResMon} />
         </div>
       </div>
 
@@ -1568,7 +1616,7 @@ function SecuritySettings() {
         <div style={{ padding: '12px 18px', display: 'grid', gap: 8, fontSize: 'var(--text-control)', color: 'var(--text-2)' }}>
           <div>输入消毒：拦截明显 prompt injection 片段</div>
           <div>Git 代理：阻止 push main/master、force push、remote set-url、global config</div>
-          <div>合并入口：只有审核 2 批准后可入队 merge</div>
+          <div>合并入口：只有代码审核批准后可入队 merge</div>
           <div>审计链：review_1 / review_2 决策写入 admin_decisions</div>
         </div>
       </div>
@@ -1581,7 +1629,7 @@ function SecuritySettings() {
             </div>
             <div style={{ flex: 1 }}>
               <div className="cfg-name">{d.stage} · {d.decision}</div>
-              <div className="cfg-sub">{d.issue_id.slice(0, 10)} · {new Date(d.created_at).toLocaleString('zh')}</div>
+              <div className="cfg-sub">{d.issue_id.slice(0, 10)} · {fmtFull(d.created_at)}</div>
             </div>
           </div>
           {d.suggestions && <div style={{ padding: '0 2px 2px', fontSize: 'var(--text-control)', color: 'var(--text-3)' }}>{d.suggestions}</div>}
@@ -1683,7 +1731,7 @@ function AboutSettings() {
             <div key={f.id} style={{ display: 'grid', gap: 3, paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}>{f.job_type}</span>
-                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>第 {f.attempt} 次 · {new Date(f.updated_at).toLocaleString('zh')}</span>
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>第 {f.attempt} 次 · {fmtFull(f.updated_at)}</span>
               </div>
               {f.last_error && <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 'var(--leading-snug)' }}>{f.last_error.slice(0, 400)}</div>}
             </div>
@@ -1895,8 +1943,7 @@ function NotifySettings() {
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginRight: 4 }}>订阅事件</span>
             {NOTIFY_EVENTS.map(ev => (
-              <button key={ev.value} type="button" className={`chip${form.events.includes(ev.value) ? ' ember' : ''}`}
-                style={{ cursor: 'pointer', border: form.events.includes(ev.value) ? 'none' : '1px solid var(--border-strong)' }}
+              <button key={ev.value} type="button" className={`filter-chip${form.events.includes(ev.value) ? ' on' : ''}`}
                 onClick={() => toggleEvent(ev.value)}>{ev.label}</button>
             ))}
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{form.events.length === 0 ? '（全部）' : ''}</span>
@@ -1938,12 +1985,14 @@ function NotifySettings() {
 function GatingSettings() {
   const [policies, setPolicies] = useState<AutoPassPolicy[]>([]);
   const [autoPassOn, setAutoPassOn] = useState(false);
+  const [autoConflictOn, setAutoConflictOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
   const reload = () => {
     listAutoPassPolicy().then(setPolicies).catch(() => setPolicies([]));
     getAutoPassEnabled().then(setAutoPassOn).catch(() => {});
+    getAutoConflictResolveEnabled().then(setAutoConflictOn).catch(() => {});
   };
   useEffect(() => { reload(); }, []);
 
@@ -1954,10 +2003,17 @@ function GatingSettings() {
     finally { setBusy(false); }
   };
 
+  const toggleConflict = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !autoConflictOn; await setAutoConflictResolveEnabled(next); setAutoConflictOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="set-inner rise">
       <div className="set-h">门控降级</div>
-      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过审核 2 自动合并。</div>
+      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过代码审核自动合并。</div>
       {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
       <div className="panel">
         <div className="panel-head">
@@ -1970,7 +2026,7 @@ function GatingSettings() {
           </div>
         </div>
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过审核 2 直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
+          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过代码审核直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
         </div>
         {policies.length === 0
           ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
@@ -1984,6 +2040,20 @@ function GatingSettings() {
             </div>
           ))}
       </div>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head">
+          <div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />冲突自动解决（AI）</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (autoConflictOn ? 'green' : '')}>{autoConflictOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggleConflict}>
+              <Icon name={autoConflictOn ? 'pause' : 'play'} size={13} />{autoConflictOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，合并前自动把 dev 并入分支若发生代码冲突，将直接交由 AI 自动解冲突；解完仍会回到代码审核复审，不直接落 dev。关闭时冲突停在「合并冲突」态，可在审核页手动重试或点 AI 解冲突。
+        </div>
+      </div>
     </div>
   );
 }
@@ -1991,7 +2061,7 @@ function GatingSettings() {
 function WebhookSettings() {
   const [cfg, setCfg]     = useState<IntakeConfig | null>(null);
   const [status, setStatus] = useState<WebhookStatus | null>(null);
-  const [form, setForm]   = useState({ enabled: false, port: '27182', token: '' });
+  const [form, setForm]   = useState({ enabled: false, port: '27182' });
   const [saving, setSaving]   = useState(false);
   const [copied, setCopied]   = useState(false);
   const [saveOk, setSaveOk]   = useState<boolean | null>(null);
@@ -2002,7 +2072,7 @@ function WebhookSettings() {
       .then(([c, s]) => {
         setCfg(c);
         setStatus(s);
-        setForm({ enabled: c.webhook_enabled, port: String(c.webhook_port), token: c.webhook_token });
+        setForm({ enabled: c.webhook_enabled, port: String(c.webhook_port) });
       })
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -2014,7 +2084,6 @@ function WebhookSettings() {
       const updated = await updateIntakeConfig({
         webhook_enabled: form.enabled,
         webhook_port: parseInt(form.port) || 27182,
-        webhook_token: form.token,
       });
       setCfg(updated);
       setSaveOk(true);
@@ -2024,16 +2093,11 @@ function WebhookSettings() {
     finally { setSaving(false); }
   };
 
-  const genToken = () => {
-    const bytes = new Uint8Array(24);
-    crypto.getRandomValues(bytes);
-    setForm(f => ({ ...f, token: btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '') }));
-  };
-
+  // token 不再全局设置：项目级 webhook token 在「项目管理 → 需求入口 → Webhook」签发。
   const curlExample = `curl -X POST http://127.0.0.1:${form.port}/webhook/issues \\
-  -H "Authorization: Bearer ${form.token || '<token>'}" \\
+  -H "Authorization: Bearer <项目 webhook token>" \\
   -H "Content-Type: application/json" \\
-  -d '{"project_id":"<uuid>","title":"需求标题","description":"详细描述"}'`;
+  -d '{"title":"需求标题","description":"详细描述"}'`;
 
   if (loading) return <div className="set-inner" style={{ color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>加载中…</div>;
 
@@ -2074,21 +2138,11 @@ function WebhookSettings() {
             <label>监听端口</label>
             <input value={form.port} onChange={e => setForm(f => ({ ...f, port: e.target.value }))} placeholder="27182" />
           </div>
-          <div className="field" style={{ margin: 0 }}>
-            <label>访问 Token</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input value={form.token} onChange={e => setForm(f => ({ ...f, token: e.target.value }))}
-                placeholder="Bearer 令牌" style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }} />
-              <button className="btn btn-sm" onClick={genToken} style={{ flexShrink: 0 }}>
-                <Icon name="refresh" size={13} />生成
-              </button>
-            </div>
-          </div>
         </div>
 
         <div style={{ background: 'rgba(139,122,216,.08)', border: '1px solid rgba(139,122,216,.22)', borderRadius: 10, padding: '10px 14px', fontSize: 'var(--text-label)', color: 'var(--text-2)', display: 'flex', gap: 8, marginBottom: 14 }}>
           <Icon name="bell" size={13} style={{ flexShrink: 0, marginTop: 1, color: 'var(--violet)' }} />
-          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)' }}>127.0.0.1</code>（本机），不暴露公网。更改配置后点击「保存并应用」以重启服务。</div>
+          <div>Webhook 仅监听 <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)' }}>127.0.0.1</code>（本机），不暴露公网。接入凭证已改为<strong>项目级 token</strong>——每个项目在「项目管理 → 需求入口 → Webhook」各自签发、可独立吊销；请求落到哪个项目由 token 决定。更改端口/开关后点击「保存并应用」以重启服务。</div>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -2225,6 +2279,145 @@ function SelfUpdateSettings() {
   );
 }
 
+// ── 配置备份：口令加密导出 / 一键导入 ─────────────────────────────────────────
+function BackupSettings() {
+  const [secretBackend, setSecretBackend] = useState<SecretBackend | null>(null);
+  const [exportPass, setExportPass] = useState('');
+  const [exportPass2, setExportPass2] = useState('');
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [exportErr, setExportErr] = useState('');
+
+  const [importPass, setImportPass] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<BackupSummary | null>(null);
+  const [importErr, setImportErr] = useState('');
+  const [pickedName, setPickedName] = useState('');
+  const fileRef = useRef<HTMLInputElement>(null);
+  const pickedContent = useRef<string>('');
+
+  useEffect(() => { getSecretBackendStatus().then(setSecretBackend).catch(() => {}); }, []);
+
+  const summaryLine = (s: BackupSummary) =>
+    `${s.llm_configs} 个 LLM · ${s.agents} 个 Agent · ${s.mcp_servers} 个 MCP · ${s.notify_channels} 个通知 · ${s.app_settings} 项系统设置`;
+
+  const doExport = async () => {
+    setExportErr(''); setExportResult(null);
+    if (exportPass.length < 6) { setExportErr('口令至少 6 位'); return; }
+    if (exportPass !== exportPass2) { setExportErr('两次输入的口令不一致'); return; }
+    setExporting(true);
+    try {
+      const r = await exportConfig(exportPass);
+      setExportResult(r);
+      setExportPass(''); setExportPass2('');
+    } catch (e) {
+      setExportErr(String(e));
+    } finally { setExporting(false); }
+  };
+
+  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = ''; // 允许再次选择同一文件
+    if (!f) return;
+    setImportErr(''); setImportResult(null);
+    try {
+      pickedContent.current = await f.text();
+      setPickedName(f.name);
+    } catch {
+      setImportErr('读取文件失败');
+      setPickedName('');
+      pickedContent.current = '';
+    }
+  };
+
+  const doImport = async () => {
+    setImportErr(''); setImportResult(null);
+    if (!pickedContent.current) { setImportErr('请先选择备份文件'); return; }
+    if (importPass.length < 6) { setImportErr('请输入导出时设置的口令'); return; }
+    setImporting(true);
+    try {
+      const s = await importConfig(pickedContent.current, importPass);
+      setImportResult(s);
+      setImportPass('');
+    } catch (e) {
+      setImportErr(String(e));
+    } finally { setImporting(false); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">配置备份</div>
+      <div className="set-desc">
+        把 LLM 配置、角色 Agent、工具 / MCP、通知通道与系统设置（含 API Key 等密钥）整包口令加密导出。
+        换机或重装后用同一口令一键导入，快速进入生产。
+      </div>
+      {secretBackend && (
+        <div className="chip" style={{ marginBottom: 14 }}
+          title="导出会用本机主密钥还原密钥明文，再以你设置的口令重新加密；导出文件不含本机主密钥，仅口令可解。">
+          <Icon name={secretBackend === 'keychain' ? 'shield' : 'alert'} size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
+          密钥随包加密 · 仅凭口令可解
+        </div>
+      )}
+
+      {/* 导出 */}
+      <div className="cfg-card" style={{ padding: 16 }}>
+        <div className="cfg-name" style={{ marginBottom: 4 }}><Icon name="download" size={15} style={{ verticalAlign: -2, marginRight: 6 }} />加密导出</div>
+        <div className="cfg-sub" style={{ marginBottom: 12 }}>设置一个加密口令（至少 6 位）。请牢记口令——丢失则无法解开备份。</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div className="field"><label>加密口令</label>
+            <input type="password" autoComplete="new-password" value={exportPass}
+              onChange={e => setExportPass(e.target.value)} placeholder="至少 6 位" /></div>
+          <div className="field"><label>确认口令</label>
+            <input type="password" autoComplete="new-password" value={exportPass2}
+              onChange={e => setExportPass2(e.target.value)} placeholder="再次输入" /></div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
+          <button className="btn btn-primary" disabled={exporting} onClick={doExport}>
+            <Icon name="download" size={14} />{exporting ? '导出中…' : '加密导出'}
+          </button>
+          {exportErr && <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>{exportErr}</span>}
+        </div>
+        {exportResult && (
+          <div className="chip green" style={{ display: 'block', marginTop: 12, padding: '10px 12px', lineHeight: 1.6 }}>
+            <div>已导出：{summaryLine(exportResult.summary)}</div>
+            <div style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', wordBreak: 'break-all', marginTop: 4 }}>{exportResult.path}</div>
+            <button className="btn btn-sm" style={{ marginTop: 8 }} onClick={() => revealBackup(exportResult.path).catch(() => {})}>
+              <Icon name="folderOpen" size={13} />在文件夹中显示
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* 导入 */}
+      <div className="cfg-card" style={{ padding: 16, marginTop: 14 }}>
+        <div className="cfg-name" style={{ marginBottom: 4 }}><Icon name="upload" size={15} style={{ verticalAlign: -2, marginRight: 6 }} />导入恢复</div>
+        <div className="cfg-sub" style={{ marginBottom: 12 }}>选择 .afbackup 备份文件并输入当时的口令。按主键合并恢复，不会删除现有未涉及的配置。</div>
+        <input ref={fileRef} type="file" accept=".afbackup,application/json" style={{ display: 'none' }} onChange={onPick} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => fileRef.current?.click()}>
+            <Icon name="folderOpen" size={14} />选择备份文件
+          </button>
+          {pickedName && <span className="chip" style={{ fontFamily: 'var(--font-mono)' }}>{pickedName}</span>}
+        </div>
+        <div className="field" style={{ marginTop: 12, maxWidth: 320 }}><label>解密口令</label>
+          <input type="password" autoComplete="off" value={importPass}
+            onChange={e => setImportPass(e.target.value)} placeholder="导出时设置的口令" /></div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
+          <button className="btn" disabled={importing || !pickedName} onClick={doImport}>
+            <Icon name="upload" size={14} />{importing ? '导入中…' : '导入并恢复'}
+          </button>
+          {importErr && <span style={{ color: 'var(--red)', fontSize: 'var(--text-label)' }}>{importErr}</span>}
+        </div>
+        {importResult && (
+          <div className="chip green" style={{ display: 'block', marginTop: 12, padding: '10px 12px', lineHeight: 1.6 }}>
+            已恢复：{summaryLine(importResult)}。部分设置（并发等）将在下次启动后生效。
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string }[] }[] = [
   {
     group: 'AI 核心', // 搭建智能体的地基（模型 → 能力 → 角色 → 记忆）
@@ -2256,6 +2449,7 @@ const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string
     group: '系统',
     items: [
       { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
+      { id: 'backup',      name: '配置备份',     ic: 'download' },
       { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
       { id: 'theme',       name: '主题设置',     ic: 'palette' },
       { id: 'about',       name: '关于 AutoForge', ic: 'box' },
@@ -2335,6 +2529,7 @@ export default function SettingsPage({
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
+          {sec === 'backup'      && <BackupSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'asr'         && <AsrSettings />}
@@ -2343,7 +2538,7 @@ export default function SettingsPage({
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','shortcuts','llm','tools','roles','concurrency','selfupdate','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','shortcuts','llm','tools','roles','concurrency','selfupdate','backup','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

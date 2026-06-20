@@ -11,6 +11,11 @@ pub struct Project {
     pub branch_main: String,
     pub status: String,
     pub config_yaml: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    /// 软删除时间戳；NULL = 在用，非空 = 已归档（回收站）。
+    #[serde(default)]
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

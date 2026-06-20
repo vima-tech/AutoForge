@@ -39,3 +39,19 @@ pub async fn set_auto_pass_enabled(
         .await
         .map_err(|e| e.to_string())
 }
+
+/// 自动 AI 解冲突开关（与门控降级并排放在 Settings 门控降级面板）。OFF by default.
+#[tauri::command]
+pub async fn get_auto_conflict_resolve_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(crate::core::gate::auto_conflict_resolve_enabled(&state.db).await)
+}
+
+#[tauri::command]
+pub async fn set_auto_conflict_resolve_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::core::gate::set_auto_conflict_resolve_enabled(&state.db, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}

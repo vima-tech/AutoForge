@@ -275,7 +275,10 @@ fn detect_tauri(dir: &Path) -> Option<DetectedStack> {
     s.test_unit = Some("cargo test --manifest-path src-tauri/Cargo.toml".to_string());
     s.lint = Some("cargo clippy --manifest-path src-tauri/Cargo.toml".to_string());
     s.security = Some("cargo audit --file src-tauri/Cargo.lock".to_string());
-    s.dep_cache_dirs = vec!["node_modules".to_string()];
+    // 软链 node_modules 免重装；软链 src-tauri/target 复用主仓库的编译产物——
+    // 否则每个分支预览 worktree 都要从零全量编译 Rust（数分钟），这是「拉起很慢」主因。
+    // cargo 对 target 目录有文件锁，并发构建会串行而非损坏，安全。
+    s.dep_cache_dirs = vec!["node_modules".to_string(), "src-tauri/target".to_string()];
     s.scanners = vec!["npm_audit", "cargo_audit"];
     s.analyzers = vec!["clippy", "eslint"];
     Some(s)
@@ -292,6 +295,8 @@ fn detect_rust(dir: &Path) -> Option<DetectedStack> {
     s.test_unit = Some("cargo test".to_string());
     s.lint = Some("cargo clippy --all-targets".to_string());
     s.security = Some("cargo audit".to_string());
+    // 软链 target 复用主仓库编译缓存，避免分支预览每次冷构建（同 tauri 理由）。
+    s.dep_cache_dirs = vec!["target".to_string()];
     s.scanners = vec!["cargo_audit"];
     s.analyzers = vec!["clippy"];
     Some(s)
@@ -475,21 +480,8 @@ pub fn dep_cache_dirs(dir: &Path) -> Vec<String> {
     seen
 }
 
-/// 适用于该仓库的内置安全扫描器标识（去重）。
-pub fn security_scanners(dir: &Path) -> Vec<&'static str> {
-    let mut seen: Vec<&'static str> = Vec::new();
-    for s in detect_stacks(dir) {
-        for sc in s.scanners {
-            if !seen.contains(&sc) {
-                seen.push(sc);
-            }
-        }
-    }
-    seen
-}
-
 /// 适用于该仓库的内置**静态代码分析器**标识（去重）——clippy/ruff/go_vet/eslint。
-/// 供自喂料/扫描发现真实代码问题（区别于只查依赖漏洞的 [`security_scanners`]）。
+/// 供自喂料/扫描发现真实代码问题（区别于只查依赖漏洞的安全扫描器）。
 pub fn code_analyzers(dir: &Path) -> Vec<&'static str> {
     let mut seen: Vec<&'static str> = Vec::new();
     for s in detect_stacks(dir) {

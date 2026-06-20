@@ -140,6 +140,19 @@ impl NotificationDraft {
                 link_ref: Some(cr_id.clone()),
                 thread_key: Some(cr_id.clone()),
             }),
+            AppEvent::MergeConflict { cr_id, files } => Some(NotificationDraft {
+                category: "intervene",
+                kind: "merge_conflict",
+                title: "合并冲突待处理".into(),
+                body: if files.is_empty() {
+                    format!("{cr_id} 合并 dev 时冲突，需人工解决或 AI 解冲突")
+                } else {
+                    format!("{} 个文件冲突：{}", files.len(), files.join("、"))
+                },
+                link_page: Some("audit"),
+                link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
+            }),
             // 心跳 / 高频 / 已有独立角标覆盖 —— 不入收件箱。
             AppEvent::WorktreeUpdate { .. }
             | AppEvent::TaskProgress { .. }

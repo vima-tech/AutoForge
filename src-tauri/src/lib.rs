@@ -33,10 +33,14 @@ pub fn run() {
             let attachments = data_dir.join("attachments").to_string_lossy().to_string();
             let materials = data_dir.join("materials").to_string_lossy().to_string();
             let kb = data_dir.join("kb").to_string_lossy().to_string();
+            let backups = data_dir.join("backups").to_string_lossy().to_string();
+            let opendesign = data_dir.join("opendesign").to_string_lossy().to_string();
             state::init_worktrees_base(worktrees);
             state::init_attachments_base(attachments);
             state::init_materials_base(materials);
             state::init_kb_base(kb);
+            state::init_backups_base(backups);
+            state::init_opendesign_base(opendesign);
 
             // 凭据加密：注入主密钥兜底文件路径并预热（确定 keychain/file 后端），
             // 必须在任何加解密与迁移之前。
@@ -56,6 +60,12 @@ pub fn run() {
                     Err(e) => eprintln!("[secrets] 明文密钥迁移失败: {}", e),
                 }
             });
+            // 一次性为已有项目补全仓库内身份锚 .autoforge/project.json（幂等、非破坏，
+            // 不动 DB；使旧项目也能在「删除后重新添加同一仓库」时挂回历史数据）。
+            tauri::async_runtime::block_on(async {
+                commands::projects::backfill_project_identities(&db).await;
+            });
+
             let (max_slots, pause_threshold, queue_strategy) =
                 tauri::async_runtime::block_on(commands::system::load_concurrency_settings(&db))
                     .expect("load concurrency settings failed");
@@ -178,20 +188,14 @@ pub fn run() {
                 .fetch_one(&db_for_wh)
                 .await
                 {
-                    if cfg.webhook_enabled && !cfg.webhook_token.is_empty() {
+                    if cfg.webhook_enabled {
                         let port = cfg.webhook_port as u16;
-                        let token = cfg.webhook_token.clone();
                         let db_clone = db_for_wh.clone();
                         let app_clone = app_for_wh.clone();
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = intake::webhook::start(
-                                port,
-                                token,
-                                db_clone,
-                                job_tx.clone(),
-                                app_clone,
-                            )
-                            .await
+                            if let Err(e) =
+                                intake::webhook::start(port, db_clone, job_tx.clone(), app_clone)
+                                    .await
                             {
                                 tracing::error!("[webhook] server error: {}", e);
                             }
@@ -245,7 +249,11 @@ pub fn run() {
             commands::projects::create_local_project,
             commands::projects::clone_project_from_git,
             commands::projects::update_project,
+            commands::projects::set_default_project,
             commands::projects::delete_project,
+            commands::projects::restore_project,
+            commands::projects::purge_project,
+            commands::projects::list_archived_projects,
             commands::issues::list_issues,
             commands::issues::list_issues_page,
             commands::issues::list_issue_statuses,
@@ -262,7 +270,6 @@ pub fn run() {
             commands::intake::update_intake_config,
             commands::intake::get_webhook_status,
             commands::intake::sync_github_issues,
-            commands::intake::run_code_scan,
             commands::intake::bulk_import_issues,
             commands::intake::bulk_import_file,
             commands::intake::export_bulk_template,
@@ -283,8 +290,13 @@ pub fn run() {
             commands::change_requests::get_change_request,
             commands::change_requests::get_worktree_session,
             commands::change_requests::get_code_diff,
+            commands::change_requests::get_merge_conflict,
+            commands::change_requests::retry_merge,
+            commands::change_requests::ai_resolve_merge_conflict,
             commands::change_requests::review_1,
+            commands::change_requests::review_1_batch,
             commands::change_requests::review_2,
+            commands::change_requests::review_2_batch,
             commands::change_requests::retry_change_request,
             commands::change_requests::delete_change_request,
             commands::conversations::list_conversations,
@@ -355,8 +367,12 @@ pub fn run() {
             commands::agent_outputs::list_agent_outputs,
             commands::agent_outputs::get_agent_output,
             commands::agent_outputs::list_agent_output_roles,
+            commands::agent_outputs::agent_output_field_health,
             commands::agent_outputs::clear_agent_outputs,
             commands::settings::secret_backend_status,
+            commands::backup::export_config,
+            commands::backup::import_config,
+            commands::backup::reveal_backup,
             commands::mcp::list_mcp_servers,
             commands::mcp::create_mcp_server,
             commands::mcp::update_mcp_server,
@@ -370,6 +386,7 @@ pub fn run() {
             commands::settings::list_role_catalog,
             commands::settings::set_role_slot,
             commands::system::system_health,
+            commands::system::system_resources,
             commands::system::check_claude_auth,
             commands::system::pipeline_stats,
             commands::system::get_badge_counts,
@@ -434,6 +451,7 @@ pub fn run() {
             commands::prototype::get_opendesign_settings,
             commands::prototype::set_opendesign_settings,
             commands::prototype::launch_opendesign,
+            commands::prototype::get_opendesign_log,
             commands::artifacts::list_delivery_artifacts,
             commands::artifacts::import_delivery_artifact,
             commands::artifacts::update_delivery_artifact_meta,
@@ -447,6 +465,8 @@ pub fn run() {
             commands::grading::list_auto_pass_policy,
             commands::grading::get_auto_pass_enabled,
             commands::grading::set_auto_pass_enabled,
+            commands::grading::get_auto_conflict_resolve_enabled,
+            commands::grading::set_auto_conflict_resolve_enabled,
             commands::notify::list_notify_channels,
             commands::notify::create_notify_channel,
             commands::notify::update_notify_channel,
@@ -457,6 +477,8 @@ pub fn run() {
             commands::widget::get_widget_snippet,
             commands::widget::list_widget_tokens,
             commands::widget::create_widget_token,
+            commands::widget::get_project_webhook_token,
+            commands::widget::regenerate_project_webhook_token,
             commands::widget::set_widget_token_enabled,
             commands::widget::delete_widget_token,
             commands::preview::mask_preview_data,

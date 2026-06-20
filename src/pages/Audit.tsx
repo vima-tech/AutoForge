@@ -4,16 +4,19 @@ import Icon from '../components/Icon';
 import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
 import { ConfirmModal } from '../components/ProjectDialogs';
+import { ReaderToc } from '../components/ReaderToc';
+import { fmtShort, fmtFull } from '../utils/datetime';
 import {
-  listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, getCrGrade,
+  listActiveProjects, listChangeRequests, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
-  getIssueAnalysis, review1, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
+  getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
+  getMergeConflict, retryMerge, aiResolveMergeConflict,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
   type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
-  type BranchInfo, type BranchPreviewStatus,
+  type BranchInfo, type BranchPreviewStatus, type MergeConflictView,
 } from '../services';
 
 type Sel = { kind: 'issue' | 'cr'; id: string };
@@ -50,6 +53,7 @@ const STATUS_LABEL: Record<string, string> = {
   pending_merge: '待合并',
   execution_failed: '执行失败',
   merge_failed: '合并失败',
+  merge_conflict: '合并冲突',
   no_change_needed: '无需改动',
   merged: '已合并',
   rejected: '已拒绝',
@@ -63,15 +67,16 @@ const STATUS_COLOR: Record<string, string> = {
   pending_merge: 'blue',
   execution_failed: 'red',
   merge_failed: 'red',
+  merge_conflict: 'amber',
   no_change_needed: 'blue',
   merged: 'green',
   rejected: 'red',
 };
 // Failed states float to the top so abnormal requirements are easy to find and resolve.
-const STATUS_ORDER = ['execution_failed', 'merge_failed', 'pending_review_2', 'executing', 'pending_execution', 'pending_merge', 'pending_review_1', 'no_change_needed', 'merged', 'rejected'];
+const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_review_2', 'executing', 'pending_execution', 'pending_merge', 'pending_review_1', 'no_change_needed', 'merged', 'rejected'];
 
 // Stuck/abnormal CR states that the user can recover (retry) or remove (delete).
-const FAILED_STATUSES = ['execution_failed', 'merge_failed'];
+const FAILED_STATUSES = ['execution_failed', 'merge_failed', 'merge_conflict'];
 // Ran cleanly but ended without a diff — recoverable via retry/delete like a
 // failure, but shown neutrally (info) rather than as a red error.
 const NO_CHANGE_STATUSES = ['no_change_needed'];
@@ -191,30 +196,47 @@ function parseLogLines(raw: string): { text: string; tone: string }[] {
   return arr;
 }
 
+// 预览进程生命周期阶段（喂给日志窗口头部状态灯，让用户分清「仍在启动」与「已退出/报错」）。
+type LogPhase = 'starting' | 'running' | 'stopped' | null;
+const LOG_PHASE_META: Record<'starting' | 'running' | 'stopped', { dot: string; label: string }> = {
+  starting: { dot: 'amber', label: '启动中…' },
+  running: { dot: 'green', label: '运行中' },
+  stopped: { dot: 'red', label: '进程已退出 · 见日志末尾确认是否报错' },
+};
+
 // 实时日志窗口：定时拉取、按行高亮、跟随底部自动滚动（用户上滚则暂停跟随）。
-function LiveLogModal({ title, load, onClose }: {
-  title: string; load: () => Promise<string>; onClose: () => void;
+// `phase` 由父组件的状态轮询喂入，使头部状态灯能区分「启动中 / 运行中 / 已退出」——
+// 否则进程崩溃后日志只是停更，用户无从判断是仍在编译还是已经报错退出。
+function LiveLogModal({ title, load, phase, onClose }: {
+  title: string; load: () => Promise<string>; phase?: () => LogPhase; onClose: () => void;
 }) {
   const [raw, setRaw] = useState('');
+  const [livePhase, setLivePhase] = useState<LogPhase>('starting');
   const bodyRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
   const loadRef = useRef(load);
   loadRef.current = load;
+  const phaseRef = useRef(phase);
+  phaseRef.current = phase;
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
 
   // 仅挂载时启动轮询（组件按 sig key 重挂载切换目标），避免父组件 re-render 重置定时器
   useEffect(() => {
     let alive = true;
-    const tick = () => { loadRef.current().then(t => { if (alive) setRaw(t); }).catch(() => {}); };
+    const tick = () => {
+      loadRef.current().then(t => { if (alive) setRaw(t); }).catch(() => {});
+      if (alive && phaseRef.current) setLivePhase(phaseRef.current());
+    };
     tick();
-    const id = window.setInterval(tick, 1200);
+    const id = window.setInterval(tick, 1000);
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeRef.current(); };
     window.addEventListener('keydown', onKey);
     return () => { alive = false; window.clearInterval(id); window.removeEventListener('keydown', onKey); };
   }, []);
 
   const lines = useMemo(() => parseLogLines(raw), [raw]);
+  const meta = livePhase ? LOG_PHASE_META[livePhase] : null;
 
   // 跟随底部：内容更新后若仍处于跟随态则滚到底
   useEffect(() => {
@@ -231,10 +253,10 @@ function LiveLogModal({ title, load, onClose }: {
     <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
       <div style={{ width: 820, maxWidth: 'calc(100vw - 32px)', height: 'min(78vh, 640px)', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 16, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span className="dot green" style={{ flexShrink: 0 }} />
+          <span className={'dot ' + (meta?.dot ?? 'green')} style={{ flexShrink: 0 }} />
           <span className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">{title}</span></span>
-          <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)' }}>
-            {raw ? `${lines.length} 行 · ` : ''}实时跟随
+          <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: livePhase === 'stopped' ? 'var(--red)' : 'var(--text-faint)' }}>
+            {raw ? `${lines.length} 行 · ` : ''}{meta ? meta.label : '实时跟随'}
           </span>
           <button className="icon-btn" onClick={onClose}><Icon name="x" size={18} /></button>
         </div>
@@ -350,16 +372,61 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
-  onSelectCr, onSelectIssue, onOpenLedger,
+  onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, gate,
   width }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
   issueTitles: Record<string, string>; sel: Sel | null;
   onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void; onOpenLedger: () => void;
+  // 批量审核 1：通过选中的待审核需求，返回 Promise 供调用方等待刷新。
+  onBatchApprove: (ids: string[]) => Promise<void> | void;
+  // 批量审核 2：通过选中的待审核 2 变更请求（各自排队合并）。
+  onBatchApproveCrs: (ids: string[]) => Promise<void> | void;
+  // 当前审核闸口：'requirement' 只显示待需求审核，'code' 只显示变更请求各态。
+  gate: 'requirement' | 'code';
   width: number;
 }) {
   const [open, setOpen] = useState(false);
   const menuRef = React.useRef<HTMLDivElement>(null);
+  // 批量审核选区：审核需求闸作用于 pending_review_1 需求，审核代码闸作用于 pending_review_2 CR。
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmBatch, setConfirmBatch] = useState(false);
+  const [batching, setBatching] = useState(false);
+
+  // 仅 pending_review_1 可批量通过（analysis_failed 需先重分析，不可直接过审）。
+  const selectablePending = useMemo(() => pendingIssues.filter(i => i.status === 'pending_review_1'), [pendingIssues]);
+  // 仅 pending_review_2 的 CR 可批量通过（执行中/已合并等态不可直接过审）。
+  const selectableCrs = useMemo(() => crs.filter(r => r.status === 'pending_review_2'), [crs]);
+  // 当前闸口下可批量操作的目标 id 集合。
+  const selectableIds = useMemo(
+    () => (gate === 'requirement' ? selectablePending.map(i => i.id) : selectableCrs.map(r => r.id)),
+    [gate, selectablePending, selectableCrs],
+  );
+  // 列表刷新后剔除已离开队列的选中项，避免对幽灵 id 批量操作。
+  useEffect(() => {
+    setSelected(prev => {
+      const valid = new Set(selectableIds);
+      const next = new Set([...prev].filter(id => valid.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [selectableIds]);
+  // 切换闸口时清空批量选区，避免跨闸口选区残留与底部操作条错位。
+  useEffect(() => { setSelected(new Set()); }, [gate]);
+  const allSelectableSelected = selectableIds.length > 0 && selectableIds.every(id => selected.has(id));
+  const toggleSel = (id: string) => setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const toggleAllSelectable = () => setSelected(prev => {
+    const n = new Set(prev);
+    if (allSelectableSelected) selectableIds.forEach(id => n.delete(id));
+    else selectableIds.forEach(id => n.add(id));
+    return n;
+  });
+  const runBatch = () => {
+    if (batching || selected.size === 0) return;
+    setBatching(true);
+    const fn = gate === 'requirement' ? onBatchApprove : onBatchApproveCrs;
+    Promise.resolve(fn([...selected]))
+      .finally(() => { setBatching(false); setConfirmBatch(false); setSelected(new Set()); });
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -373,6 +440,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   }, [open]);
 
   return (
+    <>
     <div className="list-col" style={{ width, flex: `0 0 ${width}px` }}>
       <div className="audit-proj" ref={menuRef}>
         <div style={{ position: 'relative' }}>
@@ -417,35 +485,55 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       </div>
 
       <div className="list-body scroll" style={{ paddingTop: 0 }}>
-        {crs.length === 0 && pendingIssues.length === 0 && (
+        {(gate === 'requirement' ? pendingIssues.length === 0 : crs.length === 0) && (
           <button className="ledger-empty-cta" onClick={onOpenLedger} title="打开全量需求总账（全屏查看所有状态需求）">
             <div className="ledger-empty-cta-icon"><Icon name="list" size={26} /></div>
-            <div className="ledger-empty-cta-title">暂无待审需求</div>
+            <div className="ledger-empty-cta-title">{gate === 'requirement' ? '暂无待审需求' : '暂无待审代码'}</div>
             <div className="ledger-empty-cta-sub">打开「全量需求总账」<br />全屏查看并管理所有状态需求</div>
             <span className="ledger-empty-cta-go">进入总账<Icon name="chevRight" size={15} /></span>
           </button>
         )}
 
         {/* 审核 1：待需求审核（Issue，尚未生成 CR） */}
-        {pendingIssues.length > 0 && (
-          <div style={{ padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
-            {STATUS_LABEL.pending_review_1}
+        {gate === 'requirement' && pendingIssues.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
+            <span>{STATUS_LABEL.pending_review_1}</span>
+            <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{pendingIssues.length}</span>
+            {/* 批量审核：全选 / 取消全选可批量通过的待审核需求 */}
+            {selectablePending.length > 0 && (
+              <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选待审核需求'}
+                style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
+                <LedgerCheck on={allSelectableSelected} /> 全选
+              </button>
+            )}
           </div>
         )}
-        {pendingIssues.map(issue => (
-          <div key={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
-            <div className="req-item-top">
-              <span className="req-id">{issue.id.slice(0, 8)}</span>
-              <span className="chip amber" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>审核 1</span>
-              <span className="req-time">{new Date(issue.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+        {gate === 'requirement' && pendingIssues.map(issue => {
+          const canSelect = issue.status === 'pending_review_1';
+          return (
+            <div key={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
+              <div className="req-item-top">
+                {canSelect && (
+                  <span onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
+                    <LedgerCheck on={selected.has(issue.id)} />
+                  </span>
+                )}
+                <span className="req-id">{issue.id.slice(0, 8)}</span>
+                <span className="chip amber" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>需求审核</span>
+                <span className="req-time">{fmtShort(issue.updated_at)}</span>
+              </div>
+              <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
             </div>
-            <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
-          </div>
-        ))}
+          );
+        })}
 
         {/* 审核 2 及其它 CR 状态 */}
-        {(() => {
+        {gate === 'code' && (() => {
           const sorted = sortedCrs(crs);
+          const statusCounts = sorted.reduce<Record<string, number>>((acc, r) => {
+            acc[r.status] = (acc[r.status] ?? 0) + 1;
+            return acc;
+          }, {});
           let lastStatus = '';
           return sorted.map(r => {
             const showLabel = r.status !== lastStatus;
@@ -453,15 +541,28 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             return (
               <React.Fragment key={r.id}>
                 {showLabel && (
-                  <div style={{ padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
-                    {STATUS_LABEL[r.status] ?? r.status}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
+                    <span>{STATUS_LABEL[r.status] ?? r.status}</span>
+                    <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{statusCounts[r.status]}</span>
+                    {/* 批量审核 2：仅 pending_review_2 分组显示全选，可批量通过进入合并 */}
+                    {r.status === 'pending_review_2' && selectableCrs.length > 0 && (
+                      <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选待审核代码'}
+                        style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
+                        <LedgerCheck on={allSelectableSelected} /> 全选
+                      </button>
+                    )}
                   </div>
                 )}
                 <div className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
                   <div className="req-item-top">
+                    {r.status === 'pending_review_2' && (
+                      <span onClick={e => { e.stopPropagation(); toggleSel(r.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
+                        <LedgerCheck on={selected.has(r.id)} />
+                      </span>
+                    )}
                     <span className="req-id">{r.id.slice(0, 8)}</span>
                     <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
-                    <span className="req-time">{new Date(r.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                    <span className="req-time">{fmtShort(r.updated_at)}</span>
                   </div>
                   <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}>{issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}</div>
                 </div>
@@ -470,7 +571,36 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           });
         })()}
       </div>
+
+      {/* 批量审核操作条：选中后出现，一键全部通过（需求→编码 / 代码→合并） */}
+      {selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: '1px solid var(--border)', background: 'var(--bg-2)' }}>
+          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>已选 {selected.size}</span>
+          <span style={{ flex: 1 }} />
+          <button className="btn btn-sm" disabled={batching} onClick={() => setConfirmBatch(true)}
+            title={gate === 'requirement' ? '批量通过选中的待审核需求（进入编码）' : '批量通过选中的待审核代码（进入合并）'}
+            style={{ color: 'var(--green)' }}>
+            <Icon name={batching ? 'brain' : 'check'} size={13} className={batching ? 'spin' : undefined} />
+            {batching ? '通过中…' : `批量通过 (${selected.size})`}
+          </button>
+          <button className="btn btn-sm btn-ghost" disabled={batching} onClick={() => setSelected(new Set())}>清空</button>
+        </div>
+      )}
     </div>
+    {confirmBatch && (
+      <ConfirmModal
+        msg={gate === 'requirement'
+          ? `确定批量通过选中的 ${selected.size} 条需求？`
+          : `确定批量通过选中的 ${selected.size} 条变更请求？`}
+        sub={gate === 'requirement'
+          ? '通过后将各自生成变更请求并进入 AI 编码，无法撤销。'
+          : '通过后将各自执行测试并进入自动合并，无法撤销。'}
+        okLabel="批量通过"
+        onOk={runBatch}
+        onCancel={() => setConfirmBatch(false)}
+      />
+    )}
+    </>
   );
 }
 
@@ -478,14 +608,14 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 // 只「看 / 下钻 / 整理」：所有状态可见 + 筛选搜索；状态只读、优先级不可拖；无拖拽/改状态/指派。
 const LEDGER_STATUS_LABEL: Record<string, string> = {
   triage: '待整理', pending_analysis: '分析中', analysis_failed: '分析失败',
-  pending_review_1: '待审核 1', pending_execution: '待编码', executing: '编码中',
-  pending_review_2: '待审核 2', pending_merge: '待合并', merged: '已合并',
-  rejected: '已拒绝', merge_failed: '合并失败', execution_failed: '执行失败', no_change_needed: '无需改动',
+  pending_review_1: '需求审核', pending_execution: '待编码', executing: '编码中',
+  pending_review_2: '代码审核', pending_merge: '待合并', merged: '已合并',
+  rejected: '已拒绝', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
 };
 const LEDGER_STATUS_CHIP: Record<string, string> = {
   triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_review_1: 'amber',
   executing: 'blue', pending_review_2: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
-  no_change_needed: 'blue',
+  merge_conflict: 'amber', no_change_needed: 'blue',
 };
 // 不可拒绝的状态：运行中 / 待合并 / 已合并 / 已拒绝（与后端 reject_issues 跳过集一致）。
 const REJECT_SKIP = ['executing', 'building', 'running', 'pending_execution', 'pending_merge', 'merged', 'rejected'];
@@ -501,16 +631,20 @@ function LedgerCheck({ on }: { on: boolean }) {
 
 const LEDGER_PAGE = 50;   // 总账每次滚动加载的条数
 
-function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage, onRejectIssues, showMerged, onToggleMerged, mergedCount }: {
+function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage, onRejectIssues, showMerged, onToggleMerged, mergedCount, initialStatus }: {
   projectId: string; refreshKey: number; sel: Sel | null; onSelectIssue: (id: string) => void;
   onRefineTriage: (ids: string[]) => Promise<void> | void;
   onRejectIssues: (ids: string[]) => Promise<void> | void;
   // 与功能审计页共享的「显示已合并需求」开关（默认隐藏）。
   showMerged: boolean; onToggleMerged: () => void; mergedCount: number;
+  // 流水线节点跳转预置的初始状态筛选（缺省 'all'）。
+  initialStatus?: string;
 }) {
   const [search, setSearch] = useState('');
   const [dq, setDq] = useState('');            // 防抖后的查询串（喂给后端）
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState(initialStatus ?? 'all');
+  // 预置筛选变化时（如已打开的总账被再次定向到另一环节）同步应用。
+  useEffect(() => { if (initialStatus) setStatusFilter(initialStatus); }, [initialStatus]);
   const [statuses, setStatuses] = useState<string[]>([]);
   const [items, setItems] = useState<Issue[]>([]);   // 已加载的页（累加）
   const [total, setTotal] = useState(0);             // 当前筛选下的总数
@@ -602,14 +736,15 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
     setBusy(true);
     Promise.resolve(fn()).finally(() => { setBusy(false); if (clear) setSelected(new Set()); });
   };
-  // 整理专用：在置 busy 的同时即时标记被整理的行，跑完再清除并按需清空选择。
+  // 整理可并发：每条碎片独立跑 triage Agent，互不阻塞（后端按 id 处理且带 status='triage'
+  // 守卫，并发安全）。仅把本批未在途的 id 并入 refiningIds 标记 spinner，跑完只摘除自己这批，
+  // 因此点一条整理时仍可点另一条同时跑。不占用全局 busy（busy 只留给拒绝等串行操作）。
   const runRefine = (ids: string[], clear: boolean) => {
-    if (busy || !ids.length) return;
-    setBusy(true);
-    setRefiningIds(new Set(ids));
-    Promise.resolve(onRefineTriage(ids)).finally(() => {
-      setBusy(false);
-      setRefiningIds(new Set());
+    const fresh = ids.filter(id => !refiningIds.has(id));
+    if (!fresh.length) return;
+    setRefiningIds(prev => new Set([...prev, ...fresh]));
+    Promise.resolve(onRefineTriage(fresh)).finally(() => {
+      setRefiningIds(prev => { const n = new Set(prev); fresh.forEach(id => n.delete(id)); return n; });
       if (clear) setSelected(new Set());
     });
   };
@@ -660,7 +795,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
             <span className="req-id">{i.id.slice(0, 8)}</span>
             <span className="req-title" title={i.title}>{i.title}</span>
             {i.status === 'triage' && (
-              <button className="btn btn-sm" style={{ padding: '2px 8px' }} disabled={busy}
+              <button className="btn btn-sm" style={{ padding: '2px 8px' }} disabled={refiningIds.has(i.id)}
                 onClick={e => { e.stopPropagation(); runRefine([i.id], false); }}
                 title={refiningIds.has(i.id) ? 'triage Agent 整理中…' : 'triage Agent 整理成正经需求'}>
                 {refiningIds.has(i.id)
@@ -669,14 +804,14 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
               </button>
             )}
             {canReject(i.status) && (
-              <button className="btn btn-sm btn-ghost" style={{ padding: '2px 6px', color: 'var(--red)' }} disabled={busy}
+              <button className="btn btn-sm btn-ghost" style={{ padding: '2px 6px', color: 'var(--red)' }} disabled={busy || refiningIds.has(i.id)}
                 onClick={e => { e.stopPropagation(); setConfirmReject({ ids: [i.id], clear: false }); }}
                 title={i.status === 'triage' ? '拒绝（删除碎片）' : '拒绝（归档为已拒绝）'}>
                 <Icon name="x" size={13} />
               </button>
             )}
             <span className={'chip ' + (LEDGER_STATUS_CHIP[i.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{LEDGER_STATUS_LABEL[i.status] ?? i.status}</span>
-            <span className="req-time">{new Date(i.updated_at).toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+            <span className="req-time">{fmtShort(i.updated_at)}</span>
           </div>
         ))}
         {/* 触底哨兵：进入视口即拉下一页 */}
@@ -690,9 +825,9 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: '1px solid var(--border)', background: 'var(--bg-2)' }}>
           <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>已选 {selected.size}</span>
           <span style={{ flex: 1 }} />
-          <button className="btn btn-sm" disabled={busy || !selectedTriage.length}
+          <button className="btn btn-sm" disabled={!selectedTriage.some(id => !refiningIds.has(id))}
             onClick={() => runRefine(selectedTriage, true)} title="批量整理选中的待整理碎片">
-            {busy && refiningIds.size
+            {refiningIds.size
               ? <><Icon name="brain" size={13} className="spin" />整理中… ({refiningIds.size})</>
               : <><Icon name="inbox" size={13} />批量整理{selectedTriage.length ? ` (${selectedTriage.length})` : ''}</>}
           </button>
@@ -742,7 +877,8 @@ function SpecH2({ icon, color, children }: { icon: string; color: string; childr
   return <h2><Icon name={icon} size={18} style={{ color }} />{children}</h2>;
 }
 
-const liStyle: React.CSSProperties = { fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' };
+// 正文/列表项统一继承 .report 的基准字号（16px 衬线 prose），只补颜色，避免与段落大小不一致
+const liStyle: React.CSSProperties = { color: 'var(--text-2)', lineHeight: 'var(--leading-prose)' };
 const monoPath: React.CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text)' };
 
 function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
@@ -982,8 +1118,8 @@ function AcceptancePanel({ issue }: { issue: Issue }) {
         <Icon name="check" size={18} style={{ color: 'var(--green)' }} />验收标准
         <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontWeight: 400 }}>AI 生成 · 可审改</span>
         {!editing && (
-          <button className="btn btn-sm btn-ghost" style={{ marginLeft: 'auto' }} onClick={() => { setText(JSON.stringify(criteria, null, 2)); setEditing(true); }}>
-            <Icon name="code" size={12} />编辑
+          <button className="btn btn-sm btn-accent" style={{ marginLeft: 'auto' }} onClick={() => { setText(JSON.stringify(criteria, null, 2)); setEditing(true); }}>
+            <Icon name="edit" size={13} />编辑
           </button>
         )}
       </h2>
@@ -1026,6 +1162,94 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
   // already satisfied / pure question). Don't recommend sending it to coding —
   // demote 批准 from the primary action and surface the reason. Human still decides.
   const notRecommended = spec?.triage?.needs_changes === false;
+
+  // 全屏阅读模式（与审核 2 / 会议室阅读模式风格一致）：衬线字体 + 报纸波点底纹
+  const [fsReader, setFsReader] = useState(false);
+  const reqReaderScrollRef = useRef<HTMLDivElement>(null);
+  const [readerScale, setReaderScale] = useState(() => {
+    const v = Number(localStorage.getItem('audit.diffScale'));
+    return v >= 0.85 && v <= 2 ? v : 1.1;
+  });
+  const bumpScale = (delta: number) => setReaderScale(s => {
+    const next = Math.min(2, Math.max(0.85, Math.round((s + delta) * 100) / 100));
+    localStorage.setItem('audit.diffScale', String(next));
+    return next;
+  });
+  useEffect(() => {
+    if (!fsReader) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFsReader(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fsReader]);
+  // 切换需求时退出全屏，避免残留覆盖到新选中项
+  useEffect(() => { setFsReader(false); }, [issue.id]);
+
+  // 需求描述 + 分析结果正文——内嵌视图与全屏阅读共用（全屏时不限 760，交由 CSS --measure 控制）
+  const renderReportBody = () => (
+    <div className="report">
+      <h2><Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />需求描述</h2>
+      <p style={{ whiteSpace: 'pre-line' }}>{issue.description || '（无描述）'}</p>
+
+      <BugCarrier issue={issue} />
+      <AcceptancePanel issue={issue} />
+
+      {analysisFailed && (
+        <div className="chip red" style={{ display: 'block', padding: '12px 14px', margin: '12px 0', lineHeight: 'var(--leading-normal)' }}>
+          <strong>自动分析失败</strong> · 可能是 LLM 超时、限流或未配置可用模型。已保留原始错误（见下方分析摘要），可点击右上角「重新分析」重试。
+        </div>
+      )}
+
+      {analysisLoading ? (
+        <div className="empty-compact" style={{ padding: '20px 0' }}>加载分析…</div>
+      ) : analysis ? (
+        <>
+          {notRecommended && (
+            <div className="iter-warn" style={{ marginBottom: 12 }}>
+              <Icon name="alert" size={20} />
+              <div>
+                <b>AI 不建议执行</b>：分析判定该需求无需改动代码{spec?.triage?.no_change_reason ? `——${spec.triage.no_change_reason}` : '（疑似误报 / 已实现 / 纯属提问）'}。建议「拒绝」关闭；如确认确有遗漏，仍可手动「批准 · 进入编码」。
+              </div>
+            </div>
+          )}
+          <h2><Icon name="search" size={18} style={{ color: 'var(--blue)' }} />分析摘要</h2>
+          <p style={{ whiteSpace: 'pre-line' }}>{analysis.analysis_summary || '（无摘要）'}</p>
+
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '12px 0' }}>
+            <ScorePill label="真实性" value={analysis.authenticity_score} />
+            <ScorePill label="可行性" value={analysis.feasibility_score} />
+            {analysis.priority_suggestion !== null && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, background: 'var(--bg-3)', borderRadius: 10, padding: '10px 14px', minWidth: 100 }}>
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', letterSpacing: '.06em', textTransform: 'uppercase' }}>建议优先级</span>
+                <span style={{ fontSize: 'var(--text-section)', fontWeight: 700, color: 'var(--ember)', fontFamily: 'var(--font-display)' }}>{analysis.priority_suggestion}</span>
+              </div>
+            )}
+          </div>
+
+          {(analysis.category_suggestion || analysis.severity_suggestion) && (
+            <p style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: 'var(--text-3)' }}>AI 建议：</span>
+              {analysis.category_suggestion && <span className={'chip ' + (SEV_COLOR[analysis.category_suggestion] || 'blue')}>{analysis.category_suggestion}</span>}
+              {analysis.severity_suggestion && <span className={'chip ' + (SEV_COLOR[analysis.severity_suggestion] || '')}>{analysis.severity_suggestion}</span>}
+            </p>
+          )}
+
+          {spec
+            ? <AnalysisSpecView spec={spec} />
+            : analysis.affected_modules && (
+                <><h2><Icon name="layers" size={18} style={{ color: 'var(--violet)' }} />影响模块</h2><p style={{ whiteSpace: 'pre-line' }}>{analysis.affected_modules}</p></>
+              )}
+
+          {analysis.duplicate_of && (
+            <div className="iter-warn"><Icon name="alert" size={20} /><div>疑似重复需求：<b>{analysis.duplicate_of.slice(0, 10)}</b>。批准前请确认是否与既有需求重叠。</div></div>
+          )}
+        </>
+      ) : (
+        <div className="empty-compact" style={{ padding: '20px 0' }}>暂无分析结果</div>
+      )}
+
+    </div>
+  );
+
   return (
     <>
       <div className="audit-top">
@@ -1034,12 +1258,12 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
             <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{issue.id.slice(0, 10)}</span>
             <CopyIdButton value={issue.id} title="复制需求编号" />
             <span className="audit-top-title" style={{ fontWeight: 700, fontSize: 'var(--text-title)' }} title={issue.title}>{issue.title}</span>
-            <span className={'chip ' + (analysisFailed ? 'red' : 'amber')}>{analysisFailed ? '分析失败' : '审核 1 · 需求审核'}</span>
+            <span className={'chip ' + (analysisFailed ? 'red' : 'amber')}>{analysisFailed ? '分析失败' : '需求审核'}</span>
           </div>
           <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8 }}>
             <span className={'chip ' + (SEV_COLOR[issue.category] || 'blue')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.category}</span>
             <span className={'chip ' + (SEV_COLOR[issue.severity] || '')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.severity}</span>
-            <span>{new Date(issue.updated_at).toLocaleString('zh')}</span>
+            <span>{fmtFull(issue.updated_at)}</span>
           </div>
         </div>
         <div className="audit-decide">
@@ -1062,70 +1286,46 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
         </div>
       </div>
 
-      <div className="diff-viewport scroll" style={{ flex: 1 }}>
-        <div className="report" style={{ maxWidth: 760 }}>
-          <h2><Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />需求描述</h2>
-          <p style={{ whiteSpace: 'pre-line' }}>{issue.description || '（无描述）'}</p>
-
-          <BugCarrier issue={issue} />
-          <AcceptancePanel issue={issue} />
-
-          {analysisFailed && (
-            <div className="chip red" style={{ display: 'block', padding: '12px 14px', margin: '12px 0', lineHeight: 'var(--leading-normal)' }}>
-              <strong>自动分析失败</strong> · 可能是 LLM 超时、限流或未配置可用模型。已保留原始错误（见下方分析摘要），可点击右上角「重新分析」重试。
-            </div>
-          )}
-
-          {analysisLoading ? (
-            <div className="empty-compact" style={{ padding: '20px 0' }}>加载分析…</div>
-          ) : analysis ? (
-            <>
-              {notRecommended && (
-                <div className="iter-warn" style={{ marginBottom: 12 }}>
-                  <Icon name="alert" size={20} />
-                  <div>
-                    <b>AI 不建议执行</b>：分析判定该需求无需改动代码{spec?.triage?.no_change_reason ? `——${spec.triage.no_change_reason}` : '（疑似误报 / 已实现 / 纯属提问）'}。建议「拒绝」关闭；如确认确有遗漏，仍可手动「批准 · 进入编码」。
-                  </div>
-                </div>
-              )}
-              <h2><Icon name="search" size={18} style={{ color: 'var(--blue)' }} />分析摘要</h2>
-              <p style={{ whiteSpace: 'pre-line' }}>{analysis.analysis_summary || '（无摘要）'}</p>
-
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '12px 0' }}>
-                <ScorePill label="真实性" value={analysis.authenticity_score} />
-                <ScorePill label="可行性" value={analysis.feasibility_score} />
-                {analysis.priority_suggestion !== null && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, background: 'var(--bg-3)', borderRadius: 10, padding: '10px 14px', minWidth: 100 }}>
-                    <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', letterSpacing: '.06em', textTransform: 'uppercase' }}>建议优先级</span>
-                    <span style={{ fontSize: 'var(--text-section)', fontWeight: 700, color: 'var(--ember)', fontFamily: 'var(--font-display)' }}>{analysis.priority_suggestion}</span>
-                  </div>
-                )}
-              </div>
-
-              {(analysis.category_suggestion || analysis.severity_suggestion) && (
-                <p style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ color: 'var(--text-3)' }}>AI 建议：</span>
-                  {analysis.category_suggestion && <span className={'chip ' + (SEV_COLOR[analysis.category_suggestion] || 'blue')}>{analysis.category_suggestion}</span>}
-                  {analysis.severity_suggestion && <span className={'chip ' + (SEV_COLOR[analysis.severity_suggestion] || '')}>{analysis.severity_suggestion}</span>}
-                </p>
-              )}
-
-              {spec
-                ? <AnalysisSpecView spec={spec} />
-                : analysis.affected_modules && (
-                    <><h2><Icon name="layers" size={18} style={{ color: 'var(--violet)' }} />影响模块</h2><p style={{ whiteSpace: 'pre-line' }}>{analysis.affected_modules}</p></>
-                  )}
-
-              {analysis.duplicate_of && (
-                <div className="iter-warn"><Icon name="alert" size={20} /><div>疑似重复需求：<b>{analysis.duplicate_of.slice(0, 10)}</b>。批准前请确认是否与既有需求重叠。</div></div>
-              )}
-            </>
-          ) : (
-            <div className="empty-compact" style={{ padding: '20px 0' }}>暂无分析结果</div>
-          )}
-
+      {/* 报告区：全屏按钮改为右上角悬浮，不再占整行工具栏 */}
+      <div style={{ flex: 1, minHeight: 0, position: 'relative', display: 'flex', flexDirection: 'column' }}>
+        <button className="icon-btn" title="全屏阅读" onClick={() => setFsReader(true)}
+          style={{ position: 'absolute', top: 8, right: 14, zIndex: 5 }}>
+          <Icon name="maximize" size={15} />
+        </button>
+        <div className="diff-viewport scroll" style={{ flex: 1 }}>
+          {renderReportBody()}
         </div>
       </div>
+
+      {/* 全屏阅读：单栏文档铺开，衬线字体 + 报纸波点底纹（对齐会议室阅读模式） */}
+      {fsReader && (
+        <div className="reader-overlay diff-reader req-reader" style={{ ['--rs' as string]: String(readerScale) }}>
+          <div className="reader-bar">
+            <div className="reader-bar-info">
+              <Icon name="maximize" size={15} />
+              <span className="reader-bar-title">{issue.title}</span>
+              <span className="reader-bar-time">{analysisFailed ? '分析失败' : '需求审核'}</span>
+            </div>
+            <div className="reader-bar-tools">
+              <button className="icon-btn" title="缩小字号" onClick={() => bumpScale(-0.1)} disabled={readerScale <= 0.85}>
+                <span style={{ fontSize: 'var(--text-label)', fontWeight: 700 }}>A−</span>
+              </button>
+              <span className="reader-scale-val">{Math.round(readerScale * 100)}%</span>
+              <button className="icon-btn" title="放大字号" onClick={() => bumpScale(0.1)} disabled={readerScale >= 2}>
+                <span style={{ fontSize: 'var(--text-section)', fontWeight: 700 }}>A+</span>
+              </button>
+              <div className="chat-head-sep" />
+              <button className="icon-btn" title="退出全屏阅读 (Esc)" onClick={() => setFsReader(false)}>
+                <Icon name="x" size={18} />
+              </button>
+            </div>
+          </div>
+          <div ref={reqReaderScrollRef} className="reader-scroll scroll">
+            {renderReportBody()}
+            <ReaderToc scrollRef={reqReaderScrollRef} watch={(analysisLoading ? 'l' : '') + (analysis?.id ?? '') + (spec ? 's' : '')} />
+          </div>
+        </div>
+      )}
 
       {/* 底部悬浮 dock：单一管理员意见输入框，支持两种操作——
           「批准 · 进入编码」时作为给编码 Agent 的实现建议随同提交；
@@ -1142,7 +1342,7 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
             />
             <button className="btn btn-sm" onClick={onReanalyze}
               disabled={(!canReview && !analysisFailed) || submitting || !advice.trim()}
-              title={(canReview || analysisFailed) ? '带此补充意见重新分析，完成后回到审核 1' : '仅「待需求审核」或「分析失败」可重新评估'}>
+              title={(canReview || analysisFailed) ? '带此补充意见重新分析，完成后回到需求审核' : '仅「待需求审核」或「分析失败」可重新评估'}>
               <Icon name="refresh" size={14} />重新评估
             </button>
           </div>
@@ -1154,12 +1354,15 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
 
 // ── AuditPage ────────────────────────────────────────────────────────────────
 
-export default function AuditPage({ target, onTargetConsumed, openLedger, onLedgerConsumed }: {
+export default function AuditPage({ target, onTargetConsumed, openLedger, onLedgerConsumed, stageTarget, onStageConsumed }: {
   target: { projectId: string; issueId: string } | null;
   onTargetConsumed: () => void;
   /** 由通知导航请求自动打开「全量需求总账」弹窗（新需求录入）。 */
   openLedger?: boolean;
   onLedgerConsumed?: () => void;
+  /** 主页完整流水线节点跳转：按项目 + 环节定位（gate 切换或总账筛选）。 */
+  stageTarget?: { projectId: string; stage: string } | null;
+  onStageConsumed?: () => void;
 }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
@@ -1168,6 +1371,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [showMerged, setShowMerged] = useState(false);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
   const [showLedger, setShowLedger] = useState(false);
+  // 总账打开时的初始状态筛选：流水线节点跳到 triage/分析中/已合并等只读环节时预置。
+  const [ledgerStatus, setLedgerStatus] = useState<string | undefined>(undefined);
   // 总账刷新信号：整理/拒绝后自增，触发总账重载首页（背景事件刷新不动它，避免浏览中被重置）。
   const [ledgerRefresh, setLedgerRefresh] = useState(0);
   // 通知导航请求时自动打开总账弹窗，并立即消费该意图（避免再次进入本页时重复弹出）。
@@ -1178,6 +1383,11 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [issuesById, setIssuesById] = useState<Record<string, Issue>>({});
   const [origReqOpen, setOrigReqOpen] = useState(false);
   const [sel, setSel] = useState<Sel | null>(null);
+  // 审核闸口：'requirement'=审核需求（review 1）/ 'code'=审核代码（review 2）。
+  // 列表与详情都随它切换，把两步审核分开，互不干扰。
+  const [gate, setGate] = useState<'requirement' | 'code'>('requirement');
+  // 已按项目初始化过 gate 的 projectId（每项目只自动落位一次，不覆盖用户手动切换）。
+  const gateInitRef = useRef<string>('');
   const [loadedProjectId, setLoadedProjectId] = useState('');
   const [issueAnalysis, setIssueAnalysis] = useState<IssueAnalysis | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
@@ -1185,10 +1395,28 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [crPreview, setCrPreview] = useState<CrPreviewStatus | null>(null);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [branchPreviews, setBranchPreviews] = useState<BranchPreviewStatus[]>([]);
+  // 日志窗口阶段灯从这两个 ref 取实时状态：logModal.phase 只在打开时存一次，
+  // 而预览状态由后台轮询持续更新，必须经 ref 才能让阶段灯跟着进程生死翻灯。
+  const branchPreviewsRef = useRef<BranchPreviewStatus[]>([]);
+  branchPreviewsRef.current = branchPreviews;
+  const crPreviewRef = useRef<CrPreviewStatus | null>(null);
+  crPreviewRef.current = crPreview;
   const [diff, setDiff] = useState('');
+  const [conflict, setConflict] = useState<MergeConflictView | null>(null);
+  const [conflictBusy, setConflictBusy] = useState(false);
   const [grade, setGrade] = useState<CrGrade | null>(null);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [tab, setTab] = useState<'report' | 'diff'>('report');
+  const [fsReader, setFsReader] = useState(false);   // 全屏阅读模式（与会议室阅读模式风格一致）
+  const [diffScale, setDiffScale] = useState(() => {
+    const v = Number(localStorage.getItem('audit.diffScale'));
+    return v >= 0.85 && v <= 2 ? v : 1.1;
+  });
+  const bumpDiffScale = (delta: number) => setDiffScale(s => {
+    const next = Math.min(2, Math.max(0.85, Math.round((s + delta) * 100) / 100));
+    localStorage.setItem('audit.diffScale', String(next));
+    return next;
+  });
   const [advice, setAdvice] = useState('');
   const [decided, setDecided] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -1200,7 +1428,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [crProgress, setCrProgress] = useState<Record<string, { phase: string; note?: string }>>({});
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
   const [intakeOpen, setIntakeOpen] = useState(false);
-  const [logModal, setLogModal] = useState<{ title: string; sig: string; load: () => Promise<string> } | null>(null);
+  const [logModal, setLogModal] = useState<{ title: string; sig: string; load: () => Promise<string>; phase?: () => LogPhase } | null>(null);
   const [toast, setToast] = useState<ToastData | null>(null);
   // 统一系统内提示框：替代浏览器原生 alert()
   const showError = useCallback((msg: string) => setToast({ msg, tone: 'error' }), []);
@@ -1212,15 +1440,41 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
 
   // Advice textarea ref for auto-focus
   const adviceRef = useRef<HTMLTextAreaElement>(null);
+  const crReportReaderScrollRef = useRef<HTMLDivElement>(null);
   // Monotonic token to discard stale CR-detail responses (handles same-id refetches after a revision)
   const loadReqRef = useRef(0);
   // web 预览：startCrPreview 后服务还在 starting，置位以便就绪时自动打开浏览器
   const autoOpenRef = useRef(false);
   // tauri 桌面应用：spawn 即返回但窗口需编译后才出现，置位给「启动中…」即时反馈
   const [crAppLaunching, setCrAppLaunching] = useState(false);
+  const crAppLaunchingRef = useRef(false);
+  crAppLaunchingRef.current = crAppLaunching;
+  // 已发起 start_branch_preview 但后端尚未返回（worktree 首次检出可能耗时数秒）的分支。
+  // 让阶段灯在这段「无任何输出」的空窗期也显示「启动中」而非误判为已退出。
+  const startingBranchesRef = useRef<Set<string>>(new Set());
+  // 分支预览阶段灯：进程在 branchPreviews 里就取其 status（running/starting），
+  // 仍在检出/启动途中取「启动中」，都不在则视作已退出（死句柄已被后台 list 清理）。
+  const branchPhase = useCallback((branch: string): LogPhase => {
+    const p = branchPreviewsRef.current.find(x => x.branch === branch);
+    if (p) return p.status === 'running' ? 'running' : 'starting';
+    if (startingBranchesRef.current.has(branch)) return 'starting';
+    return 'stopped';
+  }, []);
+  // CR「本次改动」预览阶段灯：web 看 dev server 状态；tauri 看桌面进程是否存活。
+  const crPhase = useCallback((): LogPhase => {
+    const p = crPreviewRef.current;
+    if (!p) return 'starting';
+    if (p.kind === 'tauri') return p.app_running ? 'running' : (crAppLaunchingRef.current ? 'starting' : 'stopped');
+    if (p.status === 'running') return 'running';
+    if (p.status === 'starting') return 'starting';
+    return 'stopped';
+  }, []);
 
   const activeCr = sel?.kind === 'cr' ? sel.id : '';
   const activeIssueId = sel?.kind === 'issue' ? sel.id : '';
+  // 两闸口的待办计数，喂给页头分段控件的徽标。
+  const reqPendingCount = pendingIssues.filter(i => i.status === 'pending_review_1').length;
+  const codePendingCount = crs.filter(c => c.status === 'pending_review_2').length;
   // 选中 CR 的 updated_at：修改/重新执行后会变化，用作 diff 重新拉取的信号
   const activeCrUpdatedAt = sel?.kind === 'cr' ? crs.find(c => c.id === sel.id)?.updated_at : undefined;
 
@@ -1316,21 +1570,33 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
 
   useEffect(() => { if (activeProject) loadList(activeProject.id); }, [activeProject, loadList]);
 
-  // 默认选中 / 校验当前选择仍有效（target 导航时跳过，交由 target effect 处理）
+  // 默认选中 / 校验当前选择仍有效（target 导航时跳过，交由 target effect 处理）。
+  // 选择被约束在当前闸口内：审核需求闸只选 issue，审核代码闸只选 CR；
+  // 切换闸口时本 effect 会重新落到该闸口的首项。
   useEffect(() => {
     if (target) return;
     if (loadedProjectId !== activeProject?.id) return;
+
+    // 每项目首次进入：按「哪边有活」自动落到对应闸口（之后不再覆盖用户手动切换）。
+    let g = gate;
+    if (gateInitRef.current !== loadedProjectId) {
+      gateInitRef.current = loadedProjectId;
+      g = reqPendingCount === 0 && codePendingCount > 0 ? 'code' : 'requirement';
+      if (g !== gate) setGate(g);
+    }
+
     // 默认选中只能落在左栏「可见」的 CR 上：默认隐藏已合并需求，否则会出现
-    // 列表为空（暂无待审需求）但 .content 仍自动选中并展示某条已合并 CR 的错位。
-    // 已有选择若仍存在于全量 crs（含已合并，如刚批准合并/手动开启显示已合并查看）则保留。
+    // 列表为空但 .content 仍自动展示某条已合并 CR 的错位。
     const visibleCrs = showMerged ? crs : crs.filter(c => c.status !== 'merged');
-    const stillValid = sel && (sel.kind === 'cr' ? crs.some(c => c.id === sel.id) : pendingIssues.some(i => i.id === sel.id));
-    if (stillValid) return;
-    if (pendingIssues.length) setSel({ kind: 'issue', id: pendingIssues[0].id });
-    else if (visibleCrs.length) setSel({ kind: 'cr', id: sortedCrs(visibleCrs)[0].id });
-    else setSel(null);
+    if (g === 'requirement') {
+      if (sel?.kind === 'issue' && pendingIssues.some(i => i.id === sel.id)) return;
+      setSel(pendingIssues.length ? { kind: 'issue', id: pendingIssues[0].id } : null);
+    } else {
+      if (sel?.kind === 'cr' && crs.some(c => c.id === sel.id)) return;
+      setSel(visibleCrs.length ? { kind: 'cr', id: sortedCrs(visibleCrs)[0].id } : null);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [crs, pendingIssues, loadedProjectId, activeProject, target, showMerged]);
+  }, [crs, pendingIssues, loadedProjectId, activeProject, target, showMerged, gate, reqPendingCount, codePendingCount]);
 
   // 跨页跳转：切到目标项目
   useEffect(() => {
@@ -1349,10 +1615,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     const tid = target.issueId;
     const pending = pendingIssues.find(i => i.id === tid);
     const cr = crs.find(c => c.issue_id === tid);
+    // 标记本项目 gate 已定，避免默认落位 effect 把跳转目标的闸口覆盖掉。
+    gateInitRef.current = loadedProjectId;
     if (pending) {
+      setGate('requirement');
       setSel({ kind: 'issue', id: pending.id });
       setDecided(null); onTargetConsumed();
     } else if (cr) {
+      setGate('code');
       setSel({ kind: 'cr', id: cr.id });
       setDecided(null); onTargetConsumed();
     } else {
@@ -1363,6 +1633,41 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target, loadedProjectId, crs, pendingIssues]);
+
+  // 流水线节点跳转（按项目 + 环节）：先切到目标项目。
+  useEffect(() => {
+    if (!stageTarget) return;
+    if (!projects.length) return;
+    const proj = projects.find(p => p.id === stageTarget.projectId);
+    if (!proj) { onStageConsumed?.(); return; }
+    if (proj.id !== activeProject?.id) setActiveProject(proj);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stageTarget, projects]);
+
+  // 流水线节点跳转：目标项目数据就绪后，按环节定位到对应视图。
+  //   审核 1 → 审核需求闸口；审核 2 / 执行中 → 审核代码闸口；
+  //   待整理 / 分析中 / 已合并 → 打开总账并预置状态筛选（这些是只读/非审核态）。
+  useEffect(() => {
+    if (!stageTarget) return;
+    if (loadedProjectId !== stageTarget.projectId) return;
+    const stage = stageTarget.stage;
+    // 标记本项目 gate 已定，避免默认落位 effect 覆盖跳转意图。
+    gateInitRef.current = loadedProjectId;
+    if (stage === 'pending_review_1') {
+      setShowLedger(false); setGate('requirement');
+    } else if (stage === 'pending_review_2' || stage === 'executing') {
+      setShowLedger(false); setGate('code');
+    } else {
+      // triage / pending_analysis / merged：总账按状态筛选浏览。
+      if (stage === 'merged') setShowMerged(true);
+      setLedgerStatus(stage); setShowLedger(true);
+    }
+    onStageConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stageTarget, loadedProjectId]);
+
+  // 总账关闭后清掉预置筛选，下次从常规入口打开时回到「全部」。
+  useEffect(() => { if (!showLedger) setLedgerStatus(undefined); }, [showLedger]);
 
   useEffect(() => {
     if (!activeCr) {
@@ -1377,6 +1682,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     setAdvice('');
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
+    setConflict(null);  // 清掉上一条 CR 的冲突现场
     autoOpenRef.current = false;  // 切换 CR 时取消上一条未完成的自动打开
     setCrAppLaunching(false);     // 切换 CR 时清掉上一条桌面应用「启动中」反馈
     setTimeout(() => adviceRef.current?.focus(), 120);
@@ -1398,6 +1704,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       setGrade(g);
       if (origIssue) setIssuesById(prev => ({ ...prev, [origIssue.id]: origIssue }));
       setCrLoading(false);
+      // 合并冲突态：按需拉取冲突现场（文件列表 + 带标记 diff）供三方视图渲染。
+      if (crs.find(c => c.id === crId)?.status === 'merge_conflict') {
+        getMergeConflict(crId).then(c => { if (loadReqRef.current === reqId) setConflict(c); }).catch(() => {});
+      }
     })();
     // activeCrUpdatedAt 入依赖：同一 CR 修改/重新执行后 updated_at 变化即重新拉取
   }, [activeCr, activeProject, activeCrUpdatedAt]);
@@ -1501,6 +1811,31 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setSubmitting(false); }
   };
 
+  // 合并冲突闭环：一键重试合并（走 Phase 1 自动 merge-dev，dev 已含解则干净落地）。
+  const doRetryMerge = async () => {
+    if (!activeCr || conflictBusy) return;
+    setConflictBusy(true);
+    try {
+      await retryMerge(activeCr);
+      if (activeProject) await loadList(activeProject.id);
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      showError('重试合并失败：' + String(e));
+    } finally { setConflictBusy(false); }
+  };
+
+  // 合并冲突闭环：交 AI 自动解冲突（解完回审核 2 复审，不直接落 dev）。
+  const doAiResolve = async () => {
+    if (!activeCr || conflictBusy) return;
+    setConflictBusy(true);
+    try {
+      await aiResolveMergeConflict(activeCr);
+      if (activeProject) await loadList(activeProject.id);
+    } catch (e) {
+      showError('AI 解冲突启动失败：' + String(e));
+    } finally { setConflictBusy(false); }
+  };
+
   // 失败需求闭环：彻底删除需求及其执行数据。
   const doDelete = async () => {
     if (!activeCr || submitting) return;
@@ -1559,9 +1894,43 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       if (activeProject) await loadList(activeProject.id);
       await loadProjectReviewCounts();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
-      // 批准后自动跳到新生成的 CR
-      if (decision === 'approved' && newCr) setSel({ kind: 'cr', id: newCr.id });
+      // 批准后自动切到「审核代码」闸口并跳到新生成的 CR
+      if (decision === 'approved' && newCr) { setGate('code'); setSel({ kind: 'cr', id: newCr.id }); }
       setSubmitting(false);
+    }
+  };
+
+  // 审核 1（批量）：一键通过选中的待审核需求，快速清空审核 1 队列。
+  const doBatchReview1 = async (ids: string[]) => {
+    if (!ids.length) return;
+    try {
+      const r = await review1Batch(ids);
+      showOk(`批量通过：进入编码 ${r.approved}`
+        + (r.skipped ? ` · 跳过 ${r.skipped}` : '')
+        + (r.errors ? ` · 失败 ${r.errors}` : ''));
+    } catch (e) {
+      showError('批量通过失败：' + String(e));
+    } finally {
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    }
+  };
+
+  // 审核 2（批量）：一键通过选中的待审核 2 变更请求，各自排队合并，快速清空审核 2 队列。
+  const doBatchReview2 = async (ids: string[]) => {
+    if (!ids.length) return;
+    try {
+      const r = await review2Batch(ids);
+      showOk(`批量通过：进入合并 ${r.approved}`
+        + (r.skipped ? ` · 跳过 ${r.skipped}` : '')
+        + (r.errors ? ` · 失败 ${r.errors}` : ''));
+    } catch (e) {
+      showError('批量通过失败：' + String(e));
+    } finally {
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     }
   };
 
@@ -1577,11 +1946,13 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const doStartBranch = useCallback(async (branch: string) => {
     if (!activeProject) return;
     const pid = activeProject.id;
+    // 立即开日志窗口 + 标记「启动中」：worktree 首次检出在 start 返回前可能耗时数秒，
+    // 这段空窗期先给用户「启动中…」的即时反馈，而非点完毫无动静。
+    startingBranchesRef.current.add(branch);
+    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch), phase: () => branchPhase(branch) });
     try {
       const st = await startBranchPreview(pid, branch);
       setBranchPreviews(prev => [...prev.filter(p => p.branch !== branch), st].sort((a, b) => a.branch.localeCompare(b.branch)));
-      // 启动即打开实时日志窗口，便于观察编译/启动进度
-      setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch) });
       if (st.kind === 'web' && st.url) {
         // 轮询直到可达再开浏览器，避免打开尚未就绪的空白页
         const open = async (tries: number) => {
@@ -1592,8 +1963,12 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         };
         open(20);
       }
-    } catch (e) { showError('启动失败：' + String(e)); }
-  }, [activeProject, showError]);
+    } catch (e) {
+      showError('启动失败：' + String(e));
+    } finally {
+      startingBranchesRef.current.delete(branch);
+    }
+  }, [activeProject, branchPhase, showError]);
 
   const doStopBranch = useCallback(async (branch: string) => {
     if (!activeProject) return;
@@ -1606,19 +1981,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const showBranchLog = useCallback((branch: string) => {
     if (!activeProject) return;
     const pid = activeProject.id;
-    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch) });
-  }, [activeProject]);
+    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch), phase: () => branchPhase(branch) });
+  }, [activeProject, branchPhase]);
 
   // web 项目：在 worktree 启动 dev server，就绪后自动打开浏览器（starting 时交给轮询补打开）
   const doStartCrPreview = useCallback(async () => {
     if (!activeCr) return;
+    const id = activeCr;
     try {
-      const st = await startCrPreview(activeCr);
+      const st = await startCrPreview(id);
       setCrPreview(st);
+      // 与分支启动/桌面应用一致：起 dev server 即打开实时日志，
+      // 让用户看到编译/启动进度，并在进程报错退出时由阶段灯翻红提示。
+      setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}`, load: () => getCrPreviewLog(id), phase: crPhase });
       if (st.status === 'running' && st.url) openUrl(st.url).catch(() => {});
       else if (st.status === 'starting') autoOpenRef.current = true;
     } catch (e) { showError('启动预览失败：' + String(e)); }
-  }, [activeCr]);
+  }, [activeCr, crPhase, showError]);
 
   const doStopCrPreview = useCallback(async () => {
     if (!activeCr) return;
@@ -1636,7 +2015,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     // 立刻置「启动中」防重复点击、弹出实时日志看编译进度、给一条提示说明等待。
     setCrAppLaunching(true);
     showInfo('正在启动桌面应用，首次编译可能需要数十秒，下方日志可跟踪进度…');
-    setLogModal({ title: '启动日志 · 桌面应用', sig: `cr:${id}`, load: () => getCrPreviewLog(id) });
+    setLogModal({ title: '启动日志 · 桌面应用', sig: `cr:${id}`, load: () => getCrPreviewLog(id), phase: crPhase });
     try {
       await launchCrApp(id);
     } catch (e) {
@@ -1646,13 +2025,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     }
     // 无「窗口已打开」信号，维持一段「启动中」反馈窗口；真实进度以日志为准。
     setTimeout(() => setCrAppLaunching(false), 12000);
-  }, [activeCr, showError, showInfo]);
+  }, [activeCr, crPhase, showError, showInfo]);
 
   const showCrPreviewLog = useCallback(() => {
     if (!activeCr) return;
     const id = activeCr;
-    setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}`, load: () => getCrPreviewLog(id) });
-  }, [activeCr]);
+    setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}`, load: () => getCrPreviewLog(id), phase: crPhase });
+  }, [activeCr, crPhase]);
+
+  // 切换需求时退出全屏阅读，避免残留覆盖到新选中项
+  useEffect(() => { setFsReader(false); }, [activeCr]);
+  // 全屏阅读模式：Esc 退出
+  useEffect(() => {
+    if (!fsReader) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFsReader(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fsReader]);
 
   const cr = crs.find(c => c.id === activeCr);
   // 「本次改动」预览：worktree 存在才可启动（合并后 no_session → 隐藏预览按钮）
@@ -1724,12 +2113,185 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     );
   };
 
+  // 报告正文（实现报告 / 无改动说明 / 合并冲突 / 失败原因）——内嵌视图与全屏分栏共用
+  const renderReportBody = () => (
+    <div className="report">
+      {origReqOpen && (() => {
+        const oi = issuesById[cr!.issue_id];
+        if (!oi) return null;
+        return (
+          <div className="panel" style={{ marginBottom: 12, padding: '12px 14px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+              <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>{oi.title}</span>
+              <span className={'chip ' + (SEV_COLOR[oi.category] || 'blue')} style={{ fontSize: 'var(--text-micro)' }}>{oi.category}</span>
+              <span className={'chip ' + (SEV_COLOR[oi.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{oi.severity}</span>
+              <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{oi.source_type} · {fmtFull(oi.created_at)}</span>
+            </div>
+            <p style={{ margin: 0, whiteSpace: 'pre-line', fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' }}>{oi.description || '（无描述）'}</p>
+          </div>
+        );
+      })()}
+      {NO_CHANGE_STATUSES.includes(cr!.status) ? (
+        <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--blue)', borderRadius: 10, padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--blue)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
+            <Icon name="check" size={18} />无需改动 · Agent 说明
+          </div>
+          <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.6 }}>
+            {crLoading ? '加载中…' : (session?.report_content || 'Agent 执行完成但未产生代码改动，且未给出说明。')}
+          </pre>
+          <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
+            这通常意味着需求是误报或已实现，无需进入代码改动。可「删除需求」清除该条，或在确认确有遗漏时「重新执行」。
+          </div>
+        </div>
+      ) : cr!.status === 'merge_conflict' ? (
+        <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--amber)', borderRadius: 10, padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--amber)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
+            <Icon name="alert" size={18} />{conflict && conflict.files.length > 0 ? '合并冲突 · 并入 dev 时发生代码冲突' : '合并受阻 · 并入 dev 后集成校验未通过'}
+          </div>
+          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 12 }}>
+            {conflict && conflict.files.length > 0
+              ? '该需求分支与 dev 上的其他改动冲突。可一键重试合并（dev 已含解时即可干净落地），或交由 AI 自动解决冲突（解完回到代码审核复审，不直接落 dev）。'
+              : '该需求分支并入最新 dev 后测试未通过（集成破坏）。可一键重试合并，或交由 AI 修复后回到代码审核复审；也可在右上角「重新执行」基于最新 dev 重新实现。'}
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+            <button className="btn btn-primary btn-sm" disabled={conflictBusy} onClick={doAiResolve}>
+              <Icon name="zap" size={13} />AI 解冲突并合并
+            </button>
+            <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
+              <Icon name="refresh" size={13} />重试合并
+            </button>
+          </div>
+          {conflict && conflict.files.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.14em', marginBottom: 6 }}>冲突文件（{conflict.files.length}）</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {conflict.files.map((f, i) => (
+                  <span className="chip amber" key={i} style={{ fontSize: 'var(--text-micro)' }}><Icon name="file" size={12} />{f}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {conflict && conflict.diff && (
+            <details>
+              <summary style={{ cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.14em' }}>查看带冲突标记的三方差异</summary>
+              <pre style={{ margin: '8px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-2)', lineHeight: 1.5, maxHeight: 360, overflow: 'auto', background: 'var(--code-bg)', borderRadius: 8, padding: '10px 12px' }}>
+                {conflict.diff}
+              </pre>
+            </details>
+          )}
+        </div>
+      ) : FAILED_STATUSES.includes(cr!.status) ? (
+        <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--red)', borderRadius: 10, padding: '14px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--red)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
+            <Icon name="alert" size={18} />{STATUS_LABEL[cr!.status] ?? '执行失败'}原因
+          </div>
+          <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.6 }}>
+            {crLoading ? '加载中…' : (session?.report_content || '未捕获到失败详情，请重新执行或查看日志。')}
+          </pre>
+          <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
+            可使用右上角「重新执行」重试，或「删除需求」清除该条异常数据。
+          </div>
+        </div>
+      ) : (<>
+      {session && (session.iteration_count ?? 0) >= 3 && (
+        <div className="iter-warn"><Icon name="alert" size={20} /><div>已迭代 <b>{session.iteration_count}</b> 轮（软上限 3）。建议手动介入或重新描述需求。</div></div>
+      )}
+      {report ? (
+        <>
+          <h2><Icon name="zap" size={18} style={{ color: 'var(--ember)' }} />改动摘要</h2>
+          <p>{report.summary}</p>
+          {report.files.length > 0 && (
+            <><h2><Icon name="file" size={18} style={{ color: 'var(--blue)' }} />修改文件</h2>
+              <div>{report.files.map((f, i) => (
+                <span className="file-pill" key={i}><Icon name="file" size={13} />{f.name}<span className="add">+{f.add}</span>{f.del > 0 && <span className="del">-{f.del}</span>}</span>
+              ))}</div></>
+          )}
+          {report.testsSection && (
+            <><h2><Icon name="flask" size={18} style={{ color: 'var(--green)' }} />测试情况</h2><p style={{ whiteSpace: 'pre-line' }}>{report.testsSection}</p></>
+          )}
+          {report.risk && (
+            <><h2><Icon name="shield" size={18} style={{ color: 'var(--violet)' }} />潜在风险</h2><p>{report.risk}</p></>
+          )}
+        </>
+      ) : (
+        <div className="empty-compact" style={{ padding: '20px 0' }}>{session ? '报告内容为空' : '加载中…'}</div>
+      )}
+      </>)}
+    </div>
+  );
+
+  // 代码 Diff 正文——内嵌视图与全屏分栏共用
+  const renderDiffBody = () => (
+    <div className="diff">
+      {hunks.length === 0
+        ? <div className="empty-compact" style={{ padding: '20px 22px' }}>{crLoading ? '加载中…' : 'Diff 为空或 worktree 不存在'}</div>
+        : hunks.map((h, hi) => (
+          <div key={hi}>
+            <div className="diff-toolbar">
+              <Icon name="file" size={15} style={{ color: 'var(--text-3)' }} />
+              <span className="diff-file">{h.file}</span>
+            </div>
+            <div className="diff-hunk">{h.hunk}</div>
+            {diffMode === 'unified'
+              ? h.lines.map((l, i) => (
+                <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : l.t === 'del' ? 'del' : '')}>
+                  <span className="gut">{l.n1}</span><span className="gut">{l.n2}</span>
+                  <span className="code">{l.t === 'add' ? '+ ' : l.t === 'del' ? '- ' : '  '}{l.code}</span>
+                </div>
+              ))
+              : <div className="diff-split-wrap">
+                  <div>{h.lines.filter(l => l.t !== 'add').map((l, i) => (
+                    <div key={i} className={'diff-line ' + (l.t === 'del' ? 'del' : '')}>
+                      <span className="gut">{l.n1}</span><span className="code">{l.code}</span>
+                    </div>
+                  ))}</div>
+                  <div>{h.lines.filter(l => l.t !== 'del').map((l, i) => (
+                    <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : '')}>
+                      <span className="gut">{l.n2}</span><span className="code">{l.code}</span>
+                    </div>
+                  ))}</div>
+                </div>
+            }
+          </div>
+        ))}
+    </div>
+  );
+
+  // 全屏阅读模式头部工具：字号缩放 + 退出（与会议室阅读模式一致）
+  const renderFsTools = () => (
+    <>
+      <button className="icon-btn" title="缩小字号" onClick={() => bumpDiffScale(-0.1)} disabled={diffScale <= 0.85}>
+        <span style={{ fontSize: 'var(--text-label)', fontWeight: 700 }}>A−</span>
+      </button>
+      <span className="reader-scale-val">{Math.round(diffScale * 100)}%</span>
+      <button className="icon-btn" title="放大字号" onClick={() => bumpDiffScale(0.1)} disabled={diffScale >= 2}>
+        <span style={{ fontSize: 'var(--text-section)', fontWeight: 700 }}>A+</span>
+      </button>
+      <div className="chat-head-sep" />
+      <button className="icon-btn" title="退出全屏阅读 (Esc)" onClick={() => setFsReader(false)}>
+        <Icon name="x" size={18} />
+      </button>
+    </>
+  );
+
   return (
     <div className="audit-page">
       <div className="audit-top audit-head-main" style={{ height: 56 }}>
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">AUDIT</span><span className="cn">· 功能审计</span>
         </div>
+        {activeProject && (
+          <div className="seg" style={{ marginLeft: 6 }}>
+            <button className={gate === 'requirement' ? 'on' : ''} onClick={() => setGate('requirement')} title="审核需求：决定要不要做（review 1）">
+              审核需求
+              {reqPendingCount > 0 && <span className="chip amber" style={{ marginLeft: 6, padding: '0 6px', fontSize: 'var(--text-micro)' }}>{reqPendingCount}</span>}
+            </button>
+            <button className={gate === 'code' ? 'on' : ''} onClick={() => setGate('code')} title="审核代码：决定做得对不对（review 2）">
+              审核代码
+              {codePendingCount > 0 && <span className="chip amber" style={{ marginLeft: 6, padding: '0 6px', fontSize: 'var(--text-micro)' }}>{codePendingCount}</span>}
+            </button>
+          </div>
+        )}
         {activeProject && (
           <BranchLauncher
             branches={branches} branchPreviews={branchPreviews}
@@ -1750,6 +2312,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           onSelectCr={id => { setSel({ kind: 'cr', id }); setDecided(null); }}
           onSelectIssue={id => { setSel({ kind: 'issue', id }); setDecided(null); }}
           onOpenLedger={() => setShowLedger(true)}
+          onBatchApprove={doBatchReview1}
+          onBatchApproveCrs={doBatchReview2}
+          gate={gate}
           width={listWidth}
         />
         <ResizeHandle onDrag={dx => setListWidth(w => Math.max(180, Math.min(520, w + dx)))} />
@@ -1776,7 +2341,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                     {grade && <span className={'chip ' + (grade.tier === 'T3' ? 'red' : grade.tier === 'T2' ? 'amber' : grade.tier === 'T1' ? 'blue' : 'green')} title={grade.rationale}>风险 {grade.tier} · {grade.change_class}</span>}
                   </div>
                   <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <span>{STATUS_LABEL[cr.status] ?? cr.status} · {new Date(cr.updated_at).toLocaleString('zh')}</span>
+                    <span>{STATUS_LABEL[cr.status] ?? cr.status} · {fmtFull(cr.updated_at)}</span>
                     {(cr.status === 'executing' || cr.status === 'pending_merge') && crProgress[cr.id]?.note && (
                       <span style={{ color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <span className="dot amber" /> {crProgress[cr.id].note}
@@ -1818,125 +2383,29 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                       <button className={tab === 'report' ? 'on' : ''} onClick={() => setTab('report')}>实现报告</button>
                       <button className={tab === 'diff' ? 'on' : ''} onClick={() => setTab('diff')}>代码 Diff</button>
                     </div>
-                    {tab === 'report' && issuesById[cr.issue_id] && (
-                      <button className="btn btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setOrigReqOpen(o => !o)}>
-                        <Icon name={origReqOpen ? 'eye-off' : 'eye'} size={13} />{origReqOpen ? '收起' : '查看'}需求原文
+                    <div className="diff-tab-tools">
+                      {tab === 'report' && issuesById[cr.issue_id] && (
+                        <button className="btn btn-sm" onClick={() => setOrigReqOpen(o => !o)}>
+                          <Icon name={origReqOpen ? 'eye-off' : 'eye'} size={13} />{origReqOpen ? '收起' : '查看'}需求原文
+                        </button>
+                      )}
+                      {tab === 'diff' && (
+                        <div className="seg">
+                          <button className={diffMode === 'unified' ? 'on' : ''} onClick={() => setDiffMode('unified')}>
+                            <Icon name="rows" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />统一
+                          </button>
+                          <button className={diffMode === 'split' ? 'on' : ''} onClick={() => setDiffMode('split')}>
+                            <Icon name="columns" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />分栏
+                          </button>
+                        </div>
+                      )}
+                      <button className="icon-btn" title="全屏阅读（报告 + Diff 分栏）" onClick={() => setFsReader(true)}>
+                        <Icon name="maximize" size={15} />
                       </button>
-                    )}
-                    {tab === 'diff' && (
-                      <div className="seg" style={{ marginLeft: 'auto' }}>
-                        <button className={diffMode === 'unified' ? 'on' : ''} onClick={() => setDiffMode('unified')}>
-                          <Icon name="rows" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />统一
-                        </button>
-                        <button className={diffMode === 'split' ? 'on' : ''} onClick={() => setDiffMode('split')}>
-                          <Icon name="columns" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />分栏
-                        </button>
-                      </div>
-                    )}
+                    </div>
                   </div>
                   <div className="diff-viewport scroll">
-                    {tab === 'report' ? (
-                      <div className="report">
-                        {origReqOpen && (() => {
-                          const oi = issuesById[cr.issue_id];
-                          if (!oi) return null;
-                          return (
-                            <div className="panel" style={{ marginBottom: 12, padding: '12px 14px' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-                                <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>{oi.title}</span>
-                                <span className={'chip ' + (SEV_COLOR[oi.category] || 'blue')} style={{ fontSize: 'var(--text-micro)' }}>{oi.category}</span>
-                                <span className={'chip ' + (SEV_COLOR[oi.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{oi.severity}</span>
-                                <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{oi.source_type} · {new Date(oi.created_at).toLocaleString('zh')}</span>
-                              </div>
-                              <p style={{ margin: 0, whiteSpace: 'pre-line', fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' }}>{oi.description || '（无描述）'}</p>
-                            </div>
-                          );
-                        })()}
-                        {NO_CHANGE_STATUSES.includes(cr.status) ? (
-                          <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--blue)', borderRadius: 10, padding: '14px 16px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--blue)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
-                              <Icon name="check" size={18} />无需改动 · Agent 说明
-                            </div>
-                            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.6 }}>
-                              {crLoading ? '加载中…' : (session?.report_content || 'Agent 执行完成但未产生代码改动，且未给出说明。')}
-                            </pre>
-                            <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
-                              这通常意味着需求是误报或已实现，无需进入代码改动。可「删除需求」清除该条，或在确认确有遗漏时「重新执行」。
-                            </div>
-                          </div>
-                        ) : FAILED_STATUSES.includes(cr.status) ? (
-                          <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--red)', borderRadius: 10, padding: '14px 16px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--red)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
-                              <Icon name="alert" size={18} />{STATUS_LABEL[cr.status] ?? '执行失败'}原因
-                            </div>
-                            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.6 }}>
-                              {crLoading ? '加载中…' : (session?.report_content || '未捕获到失败详情，请重新执行或查看日志。')}
-                            </pre>
-                            <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
-                              可使用右上角「重新执行」重试，或「删除需求」清除该条异常数据。
-                            </div>
-                          </div>
-                        ) : (<>
-                        {session && (session.iteration_count ?? 0) >= 3 && (
-                          <div className="iter-warn"><Icon name="alert" size={20} /><div>已迭代 <b>{session.iteration_count}</b> 轮（软上限 3）。建议手动介入或重新描述需求。</div></div>
-                        )}
-                        {report ? (
-                          <>
-                            <h2><Icon name="zap" size={18} style={{ color: 'var(--ember)' }} />改动摘要</h2>
-                            <p>{report.summary}</p>
-                            {report.files.length > 0 && (
-                              <><h2><Icon name="file" size={18} style={{ color: 'var(--blue)' }} />修改文件</h2>
-                                <div>{report.files.map((f, i) => (
-                                  <span className="file-pill" key={i}><Icon name="file" size={13} />{f.name}<span className="add">+{f.add}</span>{f.del > 0 && <span className="del">-{f.del}</span>}</span>
-                                ))}</div></>
-                            )}
-                            {report.testsSection && (
-                              <><h2><Icon name="flask" size={18} style={{ color: 'var(--green)' }} />测试情况</h2><p style={{ whiteSpace: 'pre-line' }}>{report.testsSection}</p></>
-                            )}
-                            {report.risk && (
-                              <><h2><Icon name="shield" size={18} style={{ color: 'var(--violet)' }} />潜在风险</h2><p>{report.risk}</p></>
-                            )}
-                          </>
-                        ) : (
-                          <div className="empty-compact" style={{ padding: '20px 0' }}>{session ? '报告内容为空' : '加载中…'}</div>
-                        )}
-                        </>)}
-                      </div>
-                    ) : (
-                      <div className="diff">
-                        {hunks.length === 0
-                          ? <div className="empty-compact" style={{ padding: '20px 22px' }}>{crLoading ? '加载中…' : 'Diff 为空或 worktree 不存在'}</div>
-                          : hunks.map((h, hi) => (
-                            <div key={hi}>
-                              <div className="diff-toolbar">
-                                <Icon name="file" size={15} style={{ color: 'var(--text-3)' }} />
-                                <span className="diff-file">{h.file}</span>
-                              </div>
-                              <div className="diff-hunk">{h.hunk}</div>
-                              {diffMode === 'unified'
-                                ? h.lines.map((l, i) => (
-                                  <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : l.t === 'del' ? 'del' : '')}>
-                                    <span className="gut">{l.n1}</span><span className="gut">{l.n2}</span>
-                                    <span className="code">{l.t === 'add' ? '+ ' : l.t === 'del' ? '- ' : '  '}{l.code}</span>
-                                  </div>
-                                ))
-                                : <div className="diff-split-wrap">
-                                    <div>{h.lines.filter(l => l.t !== 'add').map((l, i) => (
-                                      <div key={i} className={'diff-line ' + (l.t === 'del' ? 'del' : '')}>
-                                        <span className="gut">{l.n1}</span><span className="code">{l.code}</span>
-                                      </div>
-                                    ))}</div>
-                                    <div>{h.lines.filter(l => l.t !== 'del').map((l, i) => (
-                                      <div key={i} className={'diff-line ' + (l.t === 'add' ? 'add' : '')}>
-                                        <span className="gut">{l.n2}</span><span className="code">{l.code}</span>
-                                      </div>
-                                    ))}</div>
-                                  </div>
-                              }
-                            </div>
-                          ))}
-                      </div>
-                    )}
+                    {tab === 'report' ? renderReportBody() : renderDiffBody()}
                   </div>
 
                   {/* 底部悬浮 dock：左 = 本次改动预览启动；右 = 管理员建议 + 修改 */}
@@ -1974,6 +2443,48 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         </div>
       </div>
 
+      {/* 全屏阅读模式：报告 + 代码 Diff 双栏并排，铺满整窗，可调字号（风格对齐会议室阅读模式） */}
+      {fsReader && cr && (
+        <div className="reader-overlay diff-reader" style={{ ['--rs' as string]: String(diffScale) }}>
+          <div className="reader-bar">
+            <div className="reader-bar-info">
+              <Icon name="maximize" size={15} />
+              <span className="reader-bar-title">{issueTitles[cr.issue_id] || issuesById[cr.issue_id]?.title || '变更详情'}</span>
+              <span className="reader-bar-time">{STATUS_LABEL[cr.status] ?? cr.status}</span>
+            </div>
+            <div className="reader-bar-tools">
+              {issuesById[cr.issue_id] && (
+                <button className="btn btn-sm" onClick={() => setOrigReqOpen(o => !o)}>
+                  <Icon name={origReqOpen ? 'eye-off' : 'eye'} size={13} />{origReqOpen ? '收起' : '查看'}需求原文
+                </button>
+              )}
+              <div className="seg">
+                <button className={diffMode === 'unified' ? 'on' : ''} onClick={() => setDiffMode('unified')}>
+                  <Icon name="rows" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />统一
+                </button>
+                <button className={diffMode === 'split' ? 'on' : ''} onClick={() => setDiffMode('split')}>
+                  <Icon name="columns" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />分栏
+                </button>
+              </div>
+              {renderFsTools()}
+            </div>
+          </div>
+          <div className="diff-reader-cols">
+            <section className="diff-reader-col">
+              <div className="diff-reader-col-head"><Icon name="file" size={13} />实现报告</div>
+              <div ref={crReportReaderScrollRef} className="diff-reader-col-scroll scroll">
+                {renderReportBody()}
+                <ReaderToc scrollRef={crReportReaderScrollRef} watch={(cr?.id ?? '') + cr?.status + (report ? 'r' : '') + (origReqOpen ? 'o' : '')} className="reader-toc-compact" />
+              </div>
+            </section>
+            <section className="diff-reader-col diff-reader-col-code">
+              <div className="diff-reader-col-head"><Icon name="code" size={13} />代码 Diff</div>
+              <div className="diff-reader-col-scroll scroll">{renderDiffBody()}</div>
+            </section>
+          </div>
+        </div>
+      )}
+
       {intakeOpen && activeProject && (
         <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
           <div style={{ width: 720, maxHeight: 'min(800px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
@@ -2006,22 +2517,30 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
               <LedgerView projectId={activeProject?.id ?? ''} refreshKey={ledgerRefresh} sel={sel}
                 onSelectIssue={id => {
-                  // 下钻到该需求：有变更请求(已编码及之后状态)就选中其 CR，否则选审核1阶段需求；
-                  // triage/分析中等无可下钻目标的状态保持总账打开（行内整理/拒绝即可）。
+                  // 下钻到该需求并对齐审核闸口：有变更请求(已进入代码阶段，含已合并)→切「审核代码」选中其 CR；
+                  // 否则仍在需求阶段→切「审核需求」选中该需求；triage/分析中等无可下钻目标的状态保持总账打开。
+                  // 标记 gate 已定，避免默认落位 effect 覆盖此次跳转意图。
                   const cr = crs.find(c => c.issue_id === id);
-                  if (cr) { setSel({ kind: 'cr', id: cr.id }); setDecided(null); setShowLedger(false); }
-                  else if (pendingIssues.some(i => i.id === id)) { setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false); }
+                  if (cr) {
+                    gateInitRef.current = loadedProjectId;
+                    if (cr.status === 'merged') setShowMerged(true);  // 已合并 CR 需开启显示才会出现在左栏
+                    setGate('code'); setSel({ kind: 'cr', id: cr.id }); setDecided(null); setShowLedger(false);
+                  } else if (pendingIssues.some(i => i.id === id)) {
+                    gateInitRef.current = loadedProjectId;
+                    setGate('requirement'); setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false);
+                  }
                 }}
                 onRefineTriage={refineTriageItems} onRejectIssues={rejectIssuesItems}
                 showMerged={showMerged} onToggleMerged={() => setShowMerged(v => !v)}
-                mergedCount={crs.filter(c => c.status === 'merged').length} />
+                mergedCount={crs.filter(c => c.status === 'merged').length}
+                initialStatus={ledgerStatus} />
             </div>
           </div>
         </div>
       )}
 
       {logModal && (
-        <LiveLogModal key={logModal.sig} title={logModal.title} load={logModal.load} onClose={() => setLogModal(null)} />
+        <LiveLogModal key={logModal.sig} title={logModal.title} load={logModal.load} phase={logModal.phase} onClose={() => setLogModal(null)} />
       )}
 
       {confirmDelete && (

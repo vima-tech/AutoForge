@@ -107,7 +107,12 @@ async fn write_category_file(
         if i > 0 {
             buf.push_str("\n---\n\n");
         }
-        buf.push_str(&format!("## {}\n\n{}\n", s.title, s.content));
+        // 嵌入不可见锚（HTML 注释），让聚合文件可被 parse_aggregate_file 反向解析回
+        // 多条 db 源规格，保留 injection/order；AI 读取时锚为透明注释，无副作用。
+        buf.push_str(&format!(
+            "## {}\n<!-- autoforge:spec injection={} order={} -->\n\n{}\n",
+            s.title, s.injection, s.sort_order, s.content
+        ));
     }
 
     let file = dir.join(format!("{}.md", category));
@@ -388,30 +393,139 @@ fn derive_description(content: &str) -> String {
     heading.unwrap_or_default().chars().take(120).collect()
 }
 
-/// 扫描 `.autoforge/specs/*.md`，与索引对账：
-/// - 跳过 5 个聚合产物文件（tech_stack.md…testing.md）。
-/// - 未登记的自由 .md 文件插入为 source='file'、category='reference'、injection='on_demand'。
-/// - file 源行对应文件已消失 → 删除该行。
-/// 返回新登记数量的提示文案。
-#[tauri::command]
-pub async fn scan_spec_files(
-    project_id: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let repo_path = project_repo_path(&project_id, &state).await?;
-    if repo_path.is_empty() {
-        return Err("项目未设置仓库路径".into());
-    }
-    let specs_dir = match autoforge_specs_dir(&repo_path) {
-        Some(d) => d,
-        None => return Ok("项目目录不存在，未扫描".into()),
+/// 聚合文件解析出的一条规格（标题 / 正文 / 注入档位）。
+struct ParsedSpec {
+    title: String,
+    content: String,
+    injection: String,
+}
+
+/// 把聚合产物文件（`# 显示名` + 多个 `## 标题` 段，段间 `---` 分隔）解析回多条规格。
+/// 容忍带或不带 `<!-- autoforge:spec injection=.. order=.. -->` 锚：有锚则取其 injection，
+/// 无锚（旧文件/手写）默认 'always'。供跨机器/清库后从磁盘恢复 db 源规格。
+fn parse_aggregate_file(text: &str) -> Vec<ParsedSpec> {
+    let mut out: Vec<ParsedSpec> = Vec::new();
+    let mut title: Option<String> = None;
+    let mut injection = String::from("always");
+    let mut buf: Vec<&str> = Vec::new();
+
+    let flush = |out: &mut Vec<ParsedSpec>, title: &mut Option<String>, injection: &mut String, buf: &mut Vec<&str>| {
+        if let Some(t) = title.take() {
+            let content = buf.join("\n").trim_matches(|c| c == '\n' || c == '\r').to_string();
+            let inj = normalize_injection(injection).unwrap_or_else(|_| "always".to_string());
+            out.push(ParsedSpec { title: t.trim().to_string(), content, injection: inj });
+        }
+        buf.clear();
+        *injection = String::from("always");
     };
 
+    for line in text.lines() {
+        let t = line.trim();
+        if t == "---" {
+            flush(&mut out, &mut title, &mut injection, &mut buf);
+            continue;
+        }
+        if let Some(h) = t.strip_prefix("## ") {
+            flush(&mut out, &mut title, &mut injection, &mut buf);
+            title = Some(h.to_string());
+            continue;
+        }
+        // 顶层文档标题（`# 显示名`）在尚未进入任何规格段时跳过。
+        if title.is_none() && t.starts_with("# ") {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("<!-- autoforge:spec").and_then(|s| s.strip_suffix("-->")) {
+            for tok in rest.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("injection=") {
+                    injection = v.to_string();
+                }
+            }
+            continue;
+        }
+        if title.is_some() {
+            buf.push(line);
+        }
+    }
+    flush(&mut out, &mut title, &mut injection, &mut buf);
+    out
+}
+
+/// A) 解析 5 个聚合文件，把缺失的 db 源规格按标题回灌（跨机器/清库后恢复 AI 生成的规格）。
+/// 幂等：仅插入 DB 中尚不存在的标题。返回恢复条数。
+async fn recover_db_specs_from_disk(
+    project_id: &str,
+    specs_dir: &std::path::Path,
+    state: &AppState,
+) -> Result<usize, String> {
+    let now = now_str();
+    let mut recovered = 0usize;
+    for cat in AGGREGATE_CATEGORIES {
+        let file = specs_dir.join(format!("{}.md", cat));
+        let Ok(text) = std::fs::read_to_string(&file) else { continue; };
+        let parsed = parse_aggregate_file(&text);
+        if parsed.is_empty() {
+            continue;
+        }
+        let existing_titles: Vec<(String,)> = sqlx::query_as(
+            "SELECT title FROM project_specs WHERE project_id = ? AND category = ? AND source = 'db'",
+        )
+        .bind(project_id)
+        .bind(cat)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        let have: std::collections::HashSet<String> =
+            existing_titles.into_iter().map(|(t,)| t).collect();
+        let (mut order,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM project_specs WHERE project_id = ? AND category = ?",
+        )
+        .bind(project_id)
+        .bind(cat)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        for item in parsed {
+            if item.title.is_empty() || have.contains(&item.title) {
+                continue;
+            }
+            let id = Uuid::new_v4().to_string();
+            let description = derive_description(&item.content);
+            sqlx::query(
+                "INSERT INTO project_specs
+                 (id, project_id, category, title, content, sort_order, source, rel_path, description, injection, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'db', '', ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(project_id)
+            .bind(cat)
+            .bind(&item.title)
+            .bind(&item.content)
+            .bind(order)
+            .bind(&description)
+            .bind(&item.injection)
+            .bind(&now)
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            order += 1;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+/// B) 自由 .md 文件 → source='file' reference 对账。返回 (新登记, 清理)。
+async fn scan_reference_files(
+    project_id: &str,
+    specs_dir: &std::path::Path,
+    state: &AppState,
+) -> Result<(usize, usize), String> {
     // 现有 file 源行：rel_path -> id（用于去重与清理）。
     let existing: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, rel_path FROM project_specs WHERE project_id = ? AND source = 'file'",
     )
-    .bind(&project_id)
+    .bind(project_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -424,7 +538,7 @@ pub async fn scan_spec_files(
     // 1) 扫描磁盘 .md 文件，收集自由文件的 workspace 相对路径。
     let mut on_disk: Vec<(String, String, String)> = Vec::new(); // (rel `specs/x.md`, file_name, full_path)
     if specs_dir.is_dir() {
-        let mut rd = tokio::fs::read_dir(&specs_dir).await.map_err(|e| e.to_string())?;
+        let mut rd = tokio::fs::read_dir(specs_dir).await.map_err(|e| e.to_string())?;
         while let Ok(Some(entry)) = rd.next_entry().await {
             let path = entry.path();
             if !path.is_file() {
@@ -454,7 +568,7 @@ pub async fn scan_spec_files(
         "SELECT COALESCE(MAX(sort_order), -1) + 1
          FROM project_specs WHERE project_id = ? AND category = 'reference'",
     )
-    .bind(&project_id)
+    .bind(project_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -474,7 +588,7 @@ pub async fn scan_spec_files(
              VALUES (?, ?, 'reference', ?, '', ?, 'file', ?, ?, 'on_demand', ?, ?)",
         )
         .bind(&id)
-        .bind(&project_id)
+        .bind(project_id)
         .bind(&title)
         .bind(order)
         .bind(rel)
@@ -503,7 +617,44 @@ pub async fn scan_spec_files(
         }
     }
 
-    Ok(format!("扫描完成：新登记 {} 个文件规格，清理 {} 个失效条目", added, removed))
+    Ok((added, removed))
+}
+
+/// 把磁盘 `.autoforge/specs/` 反向对账回 DB（A 聚合 db 源 + B 自由 file 源），幂等。
+/// 由「重新扫描」命令与项目创建/重挂时调用，是规格内容跨机器/清库恢复的唯一入口。
+pub async fn reconcile_specs_from_disk(
+    project_id: &str,
+    state: &AppState,
+) -> Result<String, String> {
+    let repo_path = project_repo_path(project_id, state).await?;
+    if repo_path.is_empty() {
+        return Err("项目未设置仓库路径".into());
+    }
+    let specs_dir = match autoforge_specs_dir(&repo_path) {
+        Some(d) => d,
+        None => return Ok("项目目录不存在，未扫描".into()),
+    };
+    let recovered = recover_db_specs_from_disk(project_id, &specs_dir, state).await?;
+    let (added, removed) = scan_reference_files(project_id, &specs_dir, state).await?;
+    // 恢复了 db 源规格则刷新聚合文件 + CLAUDE.md @import，保持磁盘与 DB 一致。
+    if recovered > 0 {
+        for cat in AGGREGATE_CATEGORIES {
+            write_category_file(project_id, cat, state).await?;
+        }
+    }
+    Ok(format!(
+        "对账完成：恢复 {} 条 DB 规格，新登记 {} 个文件规格，清理 {} 个失效条目",
+        recovered, added, removed
+    ))
+}
+
+/// 扫描 / 反向对账 `.autoforge/specs/*.md` 与索引（薄命令，委托 reconcile）。
+#[tauri::command]
+pub async fn scan_spec_files(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    reconcile_specs_from_disk(&project_id, &state).await
 }
 
 /// 取规格全文：db 源返回内联 content；file 源经守卫读盘。

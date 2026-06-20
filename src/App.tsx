@@ -14,14 +14,21 @@ import TracePage from './pages/Trace';
 import QuickCapture from './components/QuickCapture';
 import OperatorPanel from './components/OperatorPanel';
 import { loadOperator } from './operator';
-import { getSystemHealth, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, type SystemHealth } from './services';
-import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
+import { getSystemHealth, getSystemResources, checkClaudeAuth, getBadgeCounts, unreadNotificationCount, type SystemHealth, type SystemResources } from './services';
+import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseResMonitor, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
 import { triggerVoiceInput } from './lib/voiceInput';
 
 type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
+
+// 资源占用配色：高负载用语义状态色（≥90% 危险红 / ≥75% 进行中琥珀），其余沿用次要文本色。
+function resBadgeColor(pct: number): string {
+  if (pct >= 90) return 'var(--red)';
+  if (pct >= 75) return 'var(--amber)';
+  return 'var(--text-2)';
+}
 
 // ---- Traffic light buttons ----
 function TrafficLights({ maximized, setMaximized }: { maximized: boolean; setMaximized: (v: boolean) => void }) {
@@ -121,6 +128,8 @@ export default function App() {
   });
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [resMonEnabled, setResMonEnabled] = useState(() => parseResMonitor(localStorage.getItem(RES_MONITOR_KEY)));
+  const [resources, setResources] = useState<SystemResources | null>(null);
   const [badges, setBadges] = useState({ chat: 0, audit: 0 });
   // Window maximize state drives the .os-window shadow gutter (collapse it when maximized).
   const [maximized, setMaximized] = useState(false);
@@ -128,8 +137,15 @@ export default function App() {
   const [auditTarget, setAuditTarget] = useState<{ projectId: string; issueId: string } | null>(null);
   // 通知导航请求自动打开「全量需求总账」弹窗（新需求录入）。
   const [auditOpenLedger, setAuditOpenLedger] = useState(false);
+  // 主页完整流水线节点跳转：按项目 + 环节定位功能审计视图（gate 或总账筛选）。
+  const [auditStage, setAuditStage] = useState<{ projectId: string; stage: string } | null>(null);
   const goToAudit = useCallback((target: { projectId: string; issueId: string }) => {
     setAuditTarget(target);
+    setPage('audit');
+    sessionStorage.setItem('AutoForge:page', 'audit');
+  }, []);
+  const goToAuditStage = useCallback((projectId: string, stage: string) => {
+    setAuditStage({ projectId, stage });
     setPage('audit');
     sessionStorage.setItem('AutoForge:page', 'audit');
   }, []);
@@ -175,6 +191,28 @@ export default function App() {
   useEffect(() => {
     applyRailMode(parseRailMode(localStorage.getItem(RAIL_STORAGE_KEY)));
   }, []);
+
+  // Re-read the titlebar resource-monitor preference when Settings toggles it (live).
+  useEffect(() => {
+    const reread = () => setResMonEnabled(parseResMonitor(localStorage.getItem(RES_MONITOR_KEY)));
+    window.addEventListener(RES_MONITOR_CHANGED_EVENT, reread);
+    return () => window.removeEventListener(RES_MONITOR_CHANGED_EVENT, reread);
+  }, []);
+
+  // Poll CPU/memory usage for the titlebar monitor. CPU% is a delta between
+  // samples, so the first tick reads ~0 and subsequent ticks are accurate.
+  useEffect(() => {
+    if (!isTauri || !resMonEnabled) { setResources(null); return; }
+    let alive = true;
+    const tick = () => {
+      getSystemResources()
+        .then(r => { if (alive) setResources(r); })
+        .catch(() => { if (alive) setResources(null); });
+    };
+    tick();
+    const timer = setInterval(tick, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [resMonEnabled]);
 
   // Re-read the quick-capture shortcut whenever Settings changes it (live, no reload).
   useEffect(() => {
@@ -348,6 +386,26 @@ export default function App() {
         <TrafficLights maximized={maximized} setMaximized={setMaximized} />
         <div className="tb-title">AUTO<b>FORGE</b> · 通用软件工厂</div>
         <div className="tb-right">
+          {resMonEnabled && resources && (
+            <span
+              className="tb-res"
+              title={`CPU ${resources.cpu_pct.toFixed(0)}% · 内存 ${resources.mem_used_mb} / ${resources.mem_total_mb} MB`}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 10,
+                fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)',
+                color: 'var(--text-3)', letterSpacing: '.04em',
+              }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: 'var(--text-faint)' }}>CPU</span>
+                <span style={{ color: resBadgeColor(resources.cpu_pct) }}>{resources.cpu_pct.toFixed(0)}%</span>
+              </span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: 'var(--text-faint)' }}>MEM</span>
+                <span style={{ color: resBadgeColor(resources.mem_pct) }}>{resources.mem_pct.toFixed(0)}%</span>
+              </span>
+            </span>
+          )}
           <span className={'chip ' + (health?.stage === 'paused' ? 'red' : health?.stage === 'throttled' ? 'amber' : 'green')} style={{ padding: '3px 9px' }}>
             <span className={'dot ' + (health?.stage === 'paused' ? 'red' : 'green')} style={{ width: 6, height: 6, boxShadow: 'none' }} />
             {stageLabel}
@@ -427,11 +485,11 @@ export default function App() {
           </div>
         </div>
 
-        {page === 'home'     && <Dashboard onOpenInAudit={goToAudit} />}
+        {page === 'home'     && <Dashboard onOpenInAudit={goToAudit} onOpenStage={goToAuditStage} />}
         {page === 'chat'     && <ConversationsPage />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'delivery' && <DeliveryPage />}
-        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} openLedger={auditOpenLedger} onLedgerConsumed={() => setAuditOpenLedger(false)} />}
+        {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} openLedger={auditOpenLedger} onLedgerConsumed={() => setAuditOpenLedger(false)} stageTarget={auditStage} onStageConsumed={() => setAuditStage(null)} />}
         {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}
       </div>

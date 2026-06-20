@@ -47,6 +47,7 @@ pub struct ProjectPipelineStats {
     pub project_id: String,
     pub project_name: String,
     pub project_status: String,
+    pub triage: i64,
     pub pending_analysis: i64,
     pub pending_review_1: i64,
     pub executing: i64,
@@ -58,6 +59,7 @@ pub struct ProjectPipelineStats {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PipelineStats {
+    pub triage: i64,
     pub pending_analysis: i64,
     pub pending_review_1: i64,
     pub executing: i64,
@@ -185,6 +187,44 @@ pub async fn system_health(state: State<'_, AppState>) -> Result<SystemHealth, S
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SystemResources {
+    /// 整机 CPU 占用百分比（0–100，所有核心平均）。
+    pub cpu_pct: f32,
+    /// 内存占用百分比（0–100）。
+    pub mem_pct: f32,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+}
+
+/// 常驻 System 实例：CPU 占用是「两次采样之间的增量」，必须复用同一实例才能算出
+/// 真实利用率。前端按固定间隔轮询本命令，每次返回的就是「距上次轮询」的 CPU 占用。
+static SYS_MONITOR: std::sync::OnceLock<std::sync::Mutex<sysinfo::System>> =
+    std::sync::OnceLock::new();
+
+/// 标题栏系统资源监视：返回当前整机 CPU / 内存占用。跨平台（Linux/macOS/Windows），
+/// 与 Tauri 无关，仅读 /proc 等系统接口，开销极小。
+#[tauri::command]
+pub async fn system_resources() -> Result<SystemResources, String> {
+    let lock = SYS_MONITOR.get_or_init(|| std::sync::Mutex::new(sysinfo::System::new()));
+    let mut sys = lock.lock().map_err(|e| e.to_string())?;
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    let mem_total = sys.total_memory();
+    let mem_used = sys.used_memory();
+    let mem_pct = if mem_total > 0 {
+        (mem_used as f64 / mem_total as f64 * 100.0) as f32
+    } else {
+        0.0
+    };
+    Ok(SystemResources {
+        cpu_pct: sys.global_cpu_usage(),
+        mem_pct,
+        mem_used_mb: mem_used / 1024 / 1024,
+        mem_total_mb: mem_total / 1024 / 1024,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BadgeCounts {
     pub chat_unread: i64,
     pub audit_pending: i64,
@@ -238,7 +278,8 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
     let concurrency = state.concurrency.status();
 
     // Batch all issue status counts into a single query.
-    let (pending_analysis, pending_review_1, executing_issues, rejected_issues, total_issues): (
+    let (triage, pending_analysis, pending_review_1, executing_issues, rejected_issues, total_issues): (
+        i64,
         i64,
         i64,
         i64,
@@ -246,13 +287,13 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         i64,
     ) = sqlx::query_as(
         "SELECT
+           SUM(CASE WHEN status='triage'             THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='pending_analysis'  THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='pending_review_1'  THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='executing'          THEN 1 ELSE 0 END),
            SUM(CASE WHEN status='rejected'           THEN 1 ELSE 0 END),
-           COUNT(*)
-         FROM issues
-         WHERE status != 'triage'",
+           SUM(CASE WHEN status != 'triage'          THEN 1 ELSE 0 END)
+         FROM issues",
     )
     .fetch_one(&state.db)
     .await
@@ -314,15 +355,15 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
             .push(SlotOccupant { id, status });
     }
 
-    let issue_pipeline_rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+    let issue_pipeline_rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, i64)>(
         "SELECT project_id,
+                SUM(CASE WHEN status='triage' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='pending_analysis' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='pending_review_1' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='executing' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
-                COUNT(*)
+                SUM(CASE WHEN status != 'triage' THEN 1 ELSE 0 END)
          FROM issues
-         WHERE status != 'triage'
          GROUP BY project_id",
     )
     .fetch_all(&state.db)
@@ -347,6 +388,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         .map(
             |(
                 project_id,
+                triage,
                 pending_analysis,
                 pending_review_1,
                 executing,
@@ -356,6 +398,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
                 (
                     project_id,
                     (
+                        triage,
                         pending_analysis,
                         pending_review_1,
                         executing,
@@ -406,6 +449,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
         .iter()
         .map(|(project_id, project_name, project_status)| {
             let (
+                issue_triage,
                 issue_pending_analysis,
                 issue_pending_review_1,
                 issue_executing,
@@ -414,7 +458,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
             ) = issue_pipeline_by_project
                 .get(project_id)
                 .copied()
-                .unwrap_or((0, 0, 0, 0, 0));
+                .unwrap_or((0, 0, 0, 0, 0, 0));
             let (cr_executing, cr_pending_review_2, cr_merged, cr_rejected) =
                 cr_pipeline_by_project
                     .get(project_id)
@@ -425,6 +469,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
                 project_id: project_id.clone(),
                 project_name: project_name.clone(),
                 project_status: project_status.clone(),
+                triage: issue_triage,
                 pending_analysis: issue_pending_analysis,
                 pending_review_1: issue_pending_review_1,
                 executing: issue_executing.max(cr_executing),
@@ -451,6 +496,7 @@ pub async fn pipeline_stats(state: State<'_, AppState>) -> Result<PipelineStats,
     };
 
     let result = Ok(PipelineStats {
+        triage,
         pending_analysis,
         pending_review_1,
         executing: executing_crs.max(executing_issues),

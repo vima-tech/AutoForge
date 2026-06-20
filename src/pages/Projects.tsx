@@ -4,8 +4,10 @@ import Icon from '../components/Icon';
 import Select from '../components/Select';
 import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, ConfirmModal } from '../components/ProjectDialogs';
 import IntakePanel from '../components/IntakePanel';
+import { parseTs, fmtFull } from '../utils/datetime';
 import {
-  listProjects, updateProject, deleteProject, type Project,
+  listProjects, updateProject, deleteProject, setDefaultProject, type Project,
+  listArchivedProjects, restoreProject, purgeProject,
   listMaterialFolders, createMaterialFolder, renameMaterialFolder, deleteMaterialFolder,
   listMaterialFiles, searchMaterialFiles, importMaterialFile, moveMaterialFile, deleteMaterialFile,
   openMaterialFile, aiOrganizeMaterials, backupMaterialFiles,
@@ -31,8 +33,8 @@ function formatSize(bytes: number): string {
 }
 
 function formatMaterialTime(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return '—';
+  const d = parseTs(value);
+  if (!d) return '—';
   return d.toLocaleString('zh-CN', {
     month: '2-digit',
     day: '2-digit',
@@ -243,7 +245,7 @@ function FileCard({ file, searchMeta, onOpen, onDelete, onMove }: {
   onOpen: () => void; onDelete: () => void; onMove: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const updatedTitle = new Date(file.updated_at).toLocaleString('zh-CN');
+  const updatedTitle = fmtFull(file.updated_at);
   const backupChip = file.backup_status === 'synced'
     ? <span className="chip green" style={{ fontSize: 'var(--text-micro)', padding: '1px 5px' }}>已备份</span>
     : file.backup_status === 'error'
@@ -1425,8 +1427,9 @@ function ProjectNavItem({ project, active, onClick }: {
         <div style={{ width: 26, height: 26, borderRadius: 7, background: active ? 'var(--ember)' : 'var(--bg-3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 'var(--text-label)', fontWeight: 800, color: active ? '#fff' : 'var(--text-3)', flexShrink: 0, fontFamily: 'var(--font-display)' }}>
           {project.name[0]}
         </div>
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-body)', fontWeight: 600 }}>
-          {project.name}
+        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--text-body)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 5 }}>
+          {project.is_default && <Icon name="star" size={12} style={{ color: 'var(--ember)', flexShrink: 0 }} />}
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</span>
         </span>
         <span className={'chip ' + (project.status === 'active' ? 'green' : '')} style={{ fontSize: 'var(--text-micro)', padding: '1px 5px', flexShrink: 0 }}>
           {project.status === 'active' ? '启用' : '停用'}
@@ -1453,6 +1456,10 @@ export default function ProjectsPage() {
   const [editProject, setEditProject]   = useState<Project | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [deleting, setDeleting]         = useState(false);
+  const [showRecycle, setShowRecycle]   = useState(false);
+  const [archived, setArchived]         = useState<Project[]>([]);
+  const [recycleBusy, setRecycleBusy]   = useState(false);
+  const [purgeTarget, setPurgeTarget]   = useState<Project | null>(null);
 
   const selectedProject = projects.find(p => p.id === selectedId) ?? null;
 
@@ -1490,12 +1497,54 @@ export default function ProjectsPage() {
     finally { setDeleting(false); }
   };
 
+  const loadArchived = useCallback(async () => {
+    try { setArchived(await listArchivedProjects()); }
+    catch (e) { setError(String(e)); }
+  }, []);
+
+  const openRecycle = async () => { setShowRecycle(true); await loadArchived(); };
+
+  const doRestore = async (project: Project) => {
+    setRecycleBusy(true);
+    try {
+      await restoreProject(project.id);
+      await loadArchived();
+      await load();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) { setError(String(e)); }
+    finally { setRecycleBusy(false); }
+  };
+
+  const doPurge = async () => {
+    if (!purgeTarget) return;
+    setRecycleBusy(true);
+    try {
+      await purgeProject(purgeTarget.id);
+      setPurgeTarget(null);
+      await loadArchived();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) { setError(String(e)); setPurgeTarget(null); }
+    finally { setRecycleBusy(false); }
+  };
+
   const doToggleStatus = async (project: Project) => {
     const nextStatus = project.status === 'active' ? 'inactive' : 'active';
     setError('');
     try {
       const saved = await updateProject(project.id, { status: nextStatus });
       setProjects(ps => ps.map(p => p.id === saved.id ? saved : p));
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const doSetDefault = async (project: Project) => {
+    setError('');
+    try {
+      // 已是默认则再次点击取消默认
+      await setDefaultProject(project.is_default ? '' : project.id);
+      await load();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
       setError(String(e));
@@ -1514,7 +1563,10 @@ export default function ProjectsPage() {
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">PROJECTS</span><span className="cn">· 项目管理</span>
         </div>
-        <button className="btn btn-primary btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setShowCreate(true)}>
+        <button className="btn btn-sm" style={{ marginLeft: 'auto' }} onClick={openRecycle} title="回收站：已归档项目可恢复或彻底删除">
+          <Icon name="trash" size={14} />回收站
+        </button>
+        <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
           <Icon name="plus" size={14} />新建项目
         </button>
       </div>
@@ -1559,12 +1611,26 @@ export default function ProjectsPage() {
                       <span className={'chip ' + (selectedProject.status === 'active' ? 'green' : '')} style={{ fontSize: 'var(--text-micro)', padding: '1px 7px' }}>
                         {selectedProject.status === 'active' ? '启用中' : '已停用'}
                       </span>
+                      {selectedProject.is_default && (
+                        <span className="chip ember" style={{ fontSize: 'var(--text-micro)', padding: '1px 7px', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <Icon name="star" size={11} />默认
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
                       {selectedProject.repo_path || '仓库路径未配置'}
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                    <button
+                      className="btn btn-sm"
+                      style={selectedProject.is_default ? { color: 'var(--ember)' } : undefined}
+                      onClick={() => doSetDefault(selectedProject)}
+                      title={selectedProject.is_default ? '取消默认项目' : '设为默认项目，其他页面将优先显示'}
+                    >
+                      <Icon name="star" size={13} />
+                      {selectedProject.is_default ? '默认项目' : '设为默认'}
+                    </button>
                     <button className="btn btn-sm" onClick={() => doToggleStatus(selectedProject)}>
                       <Icon name={selectedProject.status === 'active' ? 'pause' : 'play'} size={13} />
                       {selectedProject.status === 'active' ? '停用' : '启用'}
@@ -1572,8 +1638,8 @@ export default function ProjectsPage() {
                     <button className="btn btn-sm" onClick={() => setEditProject(selectedProject)}>
                       <Icon name="edit" size={13} />编辑
                     </button>
-                    <button className="btn btn-sm" style={{ color: 'var(--red)' }} onClick={() => setDeleteTarget(selectedProject)}>
-                      <Icon name="trash" size={13} />删除
+                    <button className="btn btn-sm" style={{ color: 'var(--red)' }} onClick={() => setDeleteTarget(selectedProject)} title="归档项目（移入回收站，数据保留）">
+                      <Icon name="trash" size={13} />归档
                     </button>
                   </div>
                 </div>
@@ -1637,6 +1703,49 @@ export default function ProjectsPage() {
           project={deleteTarget}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={doDelete}
+        />
+      )}
+      {showRecycle && (
+        <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
+          <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '20px 22px', width: 560, maxHeight: '76vh', display: 'flex', flexDirection: 'column', boxShadow: 'var(--shadow-lg)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--text-3)' }}>回收站 · 已归档项目</span>
+              <button className="icon-btn" style={{ marginLeft: 'auto', width: 30, height: 30 }} onClick={() => setShowRecycle(false)} aria-label="关闭"><Icon name="x" size={15} /></button>
+            </div>
+            <p style={{ margin: '0 0 14px', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', lineHeight: 'var(--leading-relaxed)' }}>
+              归档项目保留全部数据。重新添加同一仓库会按 <code style={{ fontFamily: 'var(--font-mono)' }}>.autoforge/project.json</code> 身份锚自动挂回；也可在此恢复或彻底删除。
+            </p>
+            <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {archived.length === 0 ? (
+                <div className="empty" style={{ padding: '28px 0' }}><Icon name="trash" size={28} style={{ opacity: .3 }} /><div>回收站为空</div></div>
+              ) : archived.map(p => (
+                <div key={p.id} className="panel" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 'var(--text-control)', fontWeight: 600 }}>{p.name}</div>
+                    <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {p.repo_path || '仓库路径未配置'}{p.archived_at ? ` · 归档于 ${fmtFull(p.archived_at)}` : ''}
+                    </div>
+                  </div>
+                  <button className="btn btn-sm" disabled={recycleBusy} onClick={() => doRestore(p)} title="恢复到在用项目列表">
+                    <Icon name="refresh" size={13} />恢复
+                  </button>
+                  <button className="btn btn-sm" style={{ color: 'var(--red)' }} disabled={recycleBusy} onClick={() => setPurgeTarget(p)} title="彻底删除，不可恢复">
+                    <Icon name="trash" size={13} />彻底删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {purgeTarget && (
+        <ConfirmModal
+          msg={`彻底删除项目「${purgeTarget.name}」？`}
+          sub="将级联清除该项目的需求、变更请求、审核记录、预览环境、测试记录和规格索引，不可恢复。仓库内 .autoforge/ 文件不受影响。"
+          okLabel="彻底删除"
+          danger
+          onOk={doPurge}
+          onCancel={() => setPurgeTarget(null)}
         />
       )}
     </div>

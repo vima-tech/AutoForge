@@ -6,8 +6,9 @@
   --font-display: "Archivo", "Noto Sans SC", system-ui, sans-serif;
   --font-sans: "Noto Sans SC", "Archivo", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
-  /* 阅读字体：中文衬线（报纸质感），仅用于会议室气泡正文，提升长文阅读舒适度 */
-  --font-reading: "Noto Serif SC", "Noto Sans SC", Georgia, serif;
+  /* 阅读字体：霞鹜文楷 LXGW WenKai（lxgw/LxgwWenkai），手写楷体质感，长文阅读更舒适；
+     未加载到时回退中文衬线。用于会议室气泡正文与功能审计页报告/阅读模式（.report）。 */
+  --font-reading: "LXGW WenKai", "Noto Serif SC", "Noto Sans SC", Georgia, serif;
 
   /* Typography scale
      - display: dashboard hero/page emphasis
@@ -69,7 +70,7 @@
   --doc-wide: clamp(760px, 82vw, 1240px); /* 文档面板外层上限：表格/代码/图可破栏吃满横向空间 */
   --thread-max: 1280px;    /* 消息线程居中带最大宽度（全屏不浪费空间又不至过宽） */
   /* 报纸波点纹理：极淡的网点底纹，随主题自动适配（中性气泡用文本色网点） */
-  --paper-dot: color-mix(in srgb, var(--text) 5%, transparent);
+  --paper-dot: color-mix(in srgb, var(--text) 3%, transparent);
 }
 
 /* Dark (default) */
@@ -1050,6 +1051,10 @@ button { font-family: inherit; cursor: pointer; }
 .btn-ghost:hover { background: var(--surface-hover); border-color: transparent; }
 .btn-danger { color: var(--red); border-color: color-mix(in oklab, var(--red) 38%, transparent); background: rgba(219,90,64,.10); }
 .btn-danger:hover { background: rgba(219,90,64,.18); }
+/* ember 强调次按钮：比默认 .btn 更醒目，但不抢主操作（.btn-primary 熔岩渐变）的位置。
+   呼应 seg 选中态——ember 淡底 + ember 描边 + ember-soft 字。 */
+.btn-accent { color: var(--ember-soft); border-color: var(--ember); background: var(--ember-tint-strong); }
+.btn-accent:hover { color: var(--ember); border-color: var(--ember-soft); background: var(--ember-tint-strong); filter: brightness(1.06); }
 .btn-sm { padding: 5px 10px; font-size: var(--text-label); border-radius: 8px; }
 .icon-btn {
   width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center;
@@ -1795,7 +1800,31 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 18px; border-bottom: 1px solid var(--border); }
 .panel-title { font-weight: 700; font-size: var(--text-title); display: flex; align-items: center; gap: 9px; }
 .panel-sub { font-size: var(--text-label); color: var(--text-3); }
-.dash-cols { display: grid; grid-template-columns: 1.55fr 1fr; gap: 16px; margin-bottom: 16px; }
+/* 两列等高：右「产线运行」按内容自然定高并驱动行高；左「需求队列」列表可收缩，
+   故不撑高行高，转而拉伸到右侧同高、内部滚动浏览全部需求——左右齐平且都不留空洞 */
+.dash-cols { display: grid; grid-template-columns: 1.55fr 1fr; gap: 16px; margin-bottom: 16px; align-items: stretch; }
+.dash-cols > .panel { display: flex; flex-direction: column; min-height: 0; }
+.dash-cols .q-list { flex: 1 1 0; min-height: 0; max-height: none; }
+/* 右列：供料信号在上、产线运行在下；整列自然高度驱动行高，左侧队列拉伸跟齐 */
+.dash-side { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.ops-panel { display: flex; flex-direction: column; }
+
+/* 产线运行：槽位展示区按内容自然高度，背压与供料信号紧随其后，整体紧凑不留空 */
+.ops-slots {
+  min-height: 138px;
+  display: flex; flex-direction: column; justify-content: center;
+  padding: 14px 16px;
+}
+.ops-foot { border-top: 1px solid var(--border); padding: 14px 18px 16px; display: flex; flex-direction: column; gap: 12px; }
+.ops-foot-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.ops-foot-kicker { font-family: var(--font-mono); font-size: var(--text-caption); letter-spacing: .12em; text-transform: uppercase; color: var(--text-3); }
+.ops-foot-scale { display: flex; justify-content: space-between; margin-top: 6px; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-faint); }
+.ops-sig { display: flex; gap: 8px; }
+/* 两枚信号 chip 按 4:6 分整列宽度、内容居中，撑满右侧空间 */
+.ops-sig > .ops-chip { justify-content: center; }
+.ops-sig > .ops-chip:first-child { flex: 4 1 0; }
+.ops-sig > .ops-chip:last-child { flex: 6 1 0; }
+.ops-chip { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; border-radius: 10px; background: var(--bg-2); border: 1px solid var(--border); font-size: var(--text-control); }
 
 .project-pipelines {
   height: 164px; overflow: hidden; padding: 12px 14px 14px; position: relative;
@@ -1820,6 +1849,11 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .pipe-node.done { color: var(--green-soft); border-color: rgba(79,157,107,.4); }
 .pipe-cnt { font-family: var(--font-mono); font-size: var(--text-caption); font-weight: 700; }
 .pipe-name { font-size: var(--text-caption); color: var(--text-3); line-height: var(--leading-snug); }
+/* 完整流水线节点：计数 > 0 时可点击跳转到对应环节，悬停给 ember 光环 + 微抬升 */
+.pipe-stage.pipe-clickable { cursor: pointer; }
+.pipe-stage.pipe-clickable .pipe-node { transition: transform .12s, box-shadow .12s, border-color .12s; }
+.pipe-stage.pipe-clickable:hover .pipe-node { border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); transform: translateY(-1px); }
+.pipe-stage.pipe-clickable:hover .pipe-name { color: var(--text); }
 
 .q-list { max-height: 420px; overflow-y: auto; }
 .q-row { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); transition: background .12s; }
@@ -1957,28 +1991,126 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .resize-handle:hover::after { left: 1px; width: 3px; background: var(--ember); }
 .resize-handle.active::after { left: 1px; width: 3px; background: var(--ember); }
 
-.report { padding: 14px 24px 22px; }
-.report h2 { font-family: var(--font-display); font-size: var(--text-heading); margin: 22px 0 10px; display: flex; align-items: center; gap: 8px; }
+/* 审核报告阅读面：填满整宽 + 响应式留白（侧边距随视口温和增长），叠加会议室同款
+   「报纸波点」底纹（随主题自适应），铺满整个可视区。
+   统一正文排版下沉到容器：中文衬线 + 16px + prose 行高 + text-2，所有正文（含
+   p / li / div）一律继承，避免大小/字族不一致；标签/代码/chip 仍由各自样式覆盖。 */
+.report {
+  width: 100%; box-sizing: border-box; min-height: 100%;
+  padding: 16px clamp(20px, 3.2vw, 64px) 28px;
+  font-family: var(--font-reading);
+  /* 正文基准字号随窗口状态切换：普通窗 14px，窗口最大化后升到 16px（见下方 .maximized 规则）。
+     全屏阅读沿用同一变量再叠加 --rs 缩放，三处统一。 */
+  --report-fs: var(--text-body);
+  font-size: var(--report-fs);
+  font-weight: 700; /* 报告正文加粗：report 标签页与全屏阅读模式共用 .report，阅读体验更扎实 */
+  line-height: var(--leading-prose);
+  color: var(--text-2);
+  background:
+    radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 8px 8px,
+    transparent;
+}
+.os-window.maximized .report { --report-fs: var(--text-section); }
+.report h2 { font-family: var(--font-display); font-size: var(--text-heading); line-height: var(--leading-snug); color: var(--text); margin: 22px 0 10px; display: flex; align-items: center; gap: 8px; }
 .report h2:first-child { margin-top: 0; }
-.report p { font-size: var(--text-body); line-height: var(--leading-prose); color: var(--text-2); margin: 8px 0; }
-.report ul { font-size: var(--text-body); line-height: var(--leading-prose); color: var(--text-2); padding-left: 20px; }
+.report p { margin: 9px 0; }
+.report ul, .report ol { padding-left: 22px; }
 .file-pill { display: inline-flex; align-items: center; gap: 7px; font-family: var(--font-mono); font-size: var(--text-label); padding: 5px 10px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; margin: 3px 6px 3px 0; }
 .file-pill .add { color: var(--green-soft); } .file-pill .del { color: var(--red); }
 
 .diff-toolbar { display: flex; align-items: center; gap: 10px; padding: 12px 22px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 5; min-width: max-content; }
 .diff-file { font-family: var(--font-mono); font-size: var(--text-control); color: var(--text-2); }
-.diff { font-family: var(--font-mono); font-size: var(--text-control); min-width: max-content; }
+.diff {
+  font-family: var(--font-mono); font-size: var(--text-control); min-width: max-content;
+  tab-size: 2; -moz-tab-size: 2; font-variant-ligatures: none;
+}
 .diff-hunk { padding: 5px 22px; color: var(--blue); background: rgba(79,142,209,.07); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); font-size: var(--text-label); min-width: max-content; }
-.diff-line { display: flex; line-height: var(--leading-prose); min-width: max-content; }
-.diff-line .gut { width: 46px; flex: none; text-align: right; padding-right: 10px; color: var(--text-faint); user-select: none; font-size: var(--text-caption); }
-.diff-line .code { flex: none; padding: 0 14px; white-space: pre; }
+/* diff 行：等宽行号 + 高对比正文 + 行级悬浮跟踪，便于逐行阅读 */
+.diff-line { display: flex; line-height: var(--leading-relaxed, 1.62); min-width: max-content; }
+.diff-line:hover { background: var(--surface-hover); }
+.diff-line.add:hover { background: var(--diff-add-gutter); }
+.diff-line.del:hover { background: var(--diff-del-gutter); }
+.diff-line .gut {
+  width: 48px; flex: none; text-align: right; padding-right: 10px; margin-right: 12px;
+  color: var(--text-faint); user-select: none; font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums; border-right: 1px solid var(--border);
+}
+.diff-line .code { flex: none; padding: 0 14px 0 0; white-space: pre; color: var(--text); }
+.diff-line.ctx .code, .diff-line:not(.add):not(.del) .code { color: var(--text-2); }
 .diff-line.add { background: var(--diff-add-bg); }
-.diff-line.add .gut { background: var(--diff-add-gutter); color: var(--green-soft); }
+.diff-line.add .gut { background: var(--diff-add-gutter); color: var(--green-soft); border-right-color: transparent; }
+.diff-line.add .code { color: var(--green-soft); }
 .diff-line.del { background: var(--diff-del-bg); }
-.diff-line.del .gut { background: var(--diff-del-gutter); color: var(--red); }
+.diff-line.del .gut { background: var(--diff-del-gutter); color: var(--red); border-right-color: transparent; }
+.diff-line.del .code { color: var(--red-soft, var(--red)); }
 .diff-split-wrap { display: flex; min-width: max-content; align-items: flex-start; }
 .diff-split-wrap > div { flex: 1; min-width: 0; border-right: 1px solid var(--border); }
 .diff-split-wrap > div:last-child { border-right: none; }
+
+/* diff 工具栏右侧工具组（报告/diff 切换之外的操作：需求原文、统一/分栏、全屏） */
+.diff-tab-tools { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: none; }
+
+/* ── 全屏阅读模式（审计页）：报告 + 代码 Diff 双栏并排 ──────────────────────
+   复用会议室 .reader-overlay 外壳；--rs 字号缩放因子；窄屏自动堆叠为单列。 */
+.reader-overlay.diff-reader { box-shadow: var(--shadow-lg); }
+.diff-reader-cols { flex: 1; min-height: 0; display: flex; align-items: stretch; }
+.diff-reader-col {
+  flex: 1 1 0; min-width: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+.diff-reader-col:last-child { border-right: none; }
+.diff-reader-col-head {
+  flex: none; display: flex; align-items: center; gap: 7px;
+  padding: 10px 18px; background: var(--bg-1); border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-3);
+  text-transform: uppercase; letter-spacing: .14em;
+}
+.diff-reader-col-scroll { flex: 1; min-height: 0; overflow: auto; }
+/* 代码列底色更深，呼应终端/代码区 */
+.diff-reader-col-code .diff-reader-col-scroll { background: var(--bg-1); }
+/* 报告列：叠加会议室同款「报纸波点」网点纹理，营造纸张阅读质感（随主题自适应） */
+.diff-reader-col:not(.diff-reader-col-code) .diff-reader-col-scroll {
+  background:
+    radial-gradient(var(--paper-dot) 1px, transparent 1.6px) 0 0 / 8px 8px,
+    var(--bg-2);
+}
+/* --rs 缩放 + 中文衬线阅读字体：报告正文像文档一样易读，diff 代码保持等宽。
+   全屏阅读时报告填满所在栏（不再收束到 --measure），仅保留响应式留白。
+   字号缩放挂在容器基准上，正文整体（p/li/div）随 A−/A+ 一起放大，保持一致。 */
+.diff-reader .report { max-width: none; margin: 0; padding: 28px clamp(24px, 3vw, 56px) 44px; font-size: calc(var(--report-fs, var(--text-body)) * var(--rs, 1)); }
+.diff-reader .report h2 { font-size: calc(var(--text-heading) * var(--rs, 1)); }
+.diff-reader .diff { font-size: calc(var(--text-control) * var(--rs, 1)); }
+.diff-reader .diff-hunk { font-size: calc(var(--text-label) * var(--rs, 1)); }
+/* 窄窗（窗口未最大化/小屏）下双栏堆叠为上下两段，避免内容被压成半幅 */
+@media (max-width: 1040px) {
+  .diff-reader-cols { flex-direction: column; }
+  .diff-reader-col { border-right: none; border-bottom: 1px solid var(--border); }
+  .diff-reader-col:last-child { border-bottom: none; }
+}
+/* 审核 1（需求审核）单栏全屏阅读：报告自适应整宽 + 右侧大纲并排（无大纲时仍居中铺满）。
+   留白交给 .report 自身的响应式 padding，底纹由 .report 自带。 */
+.req-reader .reader-scroll { display: flex; align-items: flex-start; justify-content: center; padding: 0; gap: clamp(12px, 2vw, 32px); }
+.req-reader .report { flex: 1 1 auto; min-width: 0; width: 100%; max-width: calc(var(--measure) + 220px); }
+.req-reader .reader-toc { margin: 18px clamp(8px, 1.5vw, 20px) 0 0; }
+
+/* ── 全屏阅读模式大纲（.reader-toc）─────────────────────────────────────────────
+   会议室「阅读模式」与审计页全屏阅读复用 .doc-toc 视觉，但容器是滚动区本身，
+   故 sticky 贴顶 0、自带纵向滚动；隐藏阈值比内嵌更宽松（全屏更值得留导航）。 */
+.reader-toc {
+  position: sticky; top: 0; align-self: flex-start;
+  margin-top: 0; max-height: calc(100vh - var(--win-gutter, 0px) * 2 - 120px); overflow-y: auto;
+}
+/* 会议室阅读模式：reader-scroll 居中布局，大纲作为右侧栏与正文成组居中 */
+.reader-scroll { gap: clamp(8px, 1.5vw, 24px); }
+.bubble.doc.reader-doc { min-width: 0; }
+.reader-scroll .reader-toc { margin-top: 8px; }
+/* 审核 2（变更详情）报告列：列内并排一条更紧凑的大纲（不影响代码 Diff 列） */
+.diff-reader-col:not(.diff-reader-col-code) .diff-reader-col-scroll { display: flex; align-items: flex-start; }
+.diff-reader .report { flex: 1 1 auto; min-width: 0; }
+.reader-toc-compact { width: clamp(140px, 11vw, 190px); min-width: 132px; margin-top: 16px; padding-right: 8px; }
+/* 全屏阅读空间更充裕：1180px 以下仍保留大纲，窄到 820px 才隐藏 */
+@media (max-width: 1180px) { .reader-toc { display: flex; } }
+@media (max-width: 820px)  { .reader-toc { display: none; } }
 
 /* audit-left 底部悬浮 dock：左=本次改动预览启动，右=管理员建议+修改 */
 .audit-dock {

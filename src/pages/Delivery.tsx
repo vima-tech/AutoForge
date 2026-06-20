@@ -545,7 +545,7 @@ export default function Delivery() {
               <div className="panel-title">
                 <Icon name="code" size={17} style={{ color: 'var(--blue)' }} />反馈 Widget
                 {!webhookReachable
-                  ? <InfoHint variant="warn" text="反馈 Widget 依赖本地 Webhook 服务，当前未运行，嵌入脚本里的 localhost 地址不可达。请在「设置 → 需求接收」启用 Webhook（需同时设置端口与 Token）。" />
+                  ? <InfoHint variant="warn" text="反馈 Widget 依赖本地 Webhook 服务，当前未运行，嵌入脚本里的 localhost 地址不可达。请在「设置 → Webhook 集成」启用 Webhook（只需开启开关，凭证已按项目自动签发）。" />
                   : <InfoHint variant="ok" text={`Webhook 服务运行中（端口 ${webhook?.port}），嵌入脚本可正常接收反馈。`} />}
               </div>
               <button className="btn btn-sm" disabled={busy === 'widget'}

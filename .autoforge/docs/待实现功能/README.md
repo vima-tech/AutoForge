@@ -3,33 +3,30 @@
 本目录收录对 AutoForge 现有代码库做「空占位 / TODO / 未实现 / 残留 mock」全量梳理后，
 **甄别为值得做**的功能提案。每份文档独立、自包含，含背景证据（file:line）、方案、验收与风险。
 
-> 复评日期：2026-06-18（代码已迭代：文档阅读模式、长文档渲染、全链路加密/追踪、MCP 工具、
-> 会话归档、运行配置文件化、ASR 语音录入、交付/原型/部署/评分/通知等模块）。
-> 扫描范围：全仓 Rust + 前端 TS/TSX 的 TODO/FIXME/占位/降级/硬报错、后端 189 个注册命令 vs
-> 前端 services 接线交叉核对、mock 数据生产泄露、CLAUDE.md 登记的延期项。
+> **复评日期：2026-06-20**（与代码现状交叉核对后重整：删除已落地的提案，更新部分落地项的状态）。
+> 核对方式：迁移文件实际序号、关键符号 grep、前端组件 import 真源比对。
 
 ## 当前有效提案
 
-| 优先级 | 提案 | 一句话 |
-|--------|------|--------|
-| P0 | [并发合并冲突解决](AutoForge-并发合并冲突解决-功能提案.md) | 修 `runner.rs:28` 合并不串行的竞态 + 合并前自动 merge-dev/rerere/重测，真冲突走三方视图与可选 AI 解冲突（任务清单 `并发合并冲突解决-tasks.json`） |
-| P1 | [操作者身份卡 + 通知中心](AutoForge-操作者身份卡与通知中心-功能提案-v2.md) | 激活 `App.tsx:338` 静态 rail-me：操作者身份配置 + 把 13 类 AppEvent 中被丢弃的 9 类汇成活动收件箱 |
-| P2 | [自定义 LLM 图片输入](AutoForge-自定义LLM图片输入支持-功能提案-v2.md) | 移除 `llm.rs:54-58` 对图片附件的一刀切硬报错，anthropic/openai 走多模态 |
-| P2 | [@提及/头像脱离 mock](AutoForge-提及与头像脱离Mock改用DB真源-功能提案-v2.md) | `Markdown.tsx:25` / `Avatar.tsx:18` 改用 DB 真源，修自建 Agent 提及/头像渲染缺陷 |
+| 优先级 | 提案 | 状态 | 一句话 |
+|--------|------|------|--------|
+| P2 | [代码 Agent 可插拔](AutoForge-代码Agent可插拔-功能提案.md) | 📝 待实现 | 抽 `CodeAgent` trait，claude/codex/opencode 配置驱动互换 + per-project 选择（任务清单 `代码Agent可插拔-tasks.json`；尚无迁移 0053 / 无 trait） |
+| P2 | [@提及/头像脱离 mock](AutoForge-提及与头像脱离Mock改用DB真源-功能提案-v2.md) | 📝 待实现 | `Avatar.tsx:19` / `Markdown.tsx:25` 仍 import `mock` 写死的 5 个 Agent，自建 Agent 的提及/头像渲染失败 |
+| P3 | [Schema 驱动 Agent](schema-driven-agents.md) | 🟢 主体落地 | 脚手架+`agent_outputs`(0040)+analysis/test 样板已有；**本批(2026-06-20)新增**批量(1→N)解析、triage/proposer 升级为 schema 驱动并落库、字段级体检命令+Trace「schema 体检」面板（cargo test 104 passed）；剩版本 A/B·失败回灌·其余角色接入 |
+| — | [脏输入压测 Dogfooding](dirty-input-dogfooding.md) | 🧪 方法论·待执行 | 把工厂往真实外包脏输入里摔、排序崩点 = 阶段二 roadmap；是验证流程而非单一代码特性 |
 
-## 已完成（从清单移除）
+## 已完成（本次复评从清单移除其提案文档）
 
-- ✅ **API Key 系统级加密落库**（2026-06-16 完成）—— `core/secrets.rs` 信封加密：主密钥进系统钥匙环
-  （`keyring`，无钥匙环退化 0600 文件），LLM/MCP/web_search 密钥经 AES-256-GCM 加密为 `enc:v1:` 密文落 SQLite；
-  `migrate_plaintext_secrets` 幂等搬迁；`secret_backend_status` 命令 + Settings 兜底 chip。CLAUDE.md 安全规则#6 / api.md 已同步。
-  （此前的「迁移系统 keychain」提案已由该实现覆盖，故不再单列。）
+- ✅ **并发合并冲突解决**（迁移 `0050_merge_conflict`，`state::merge_lock` 同项目串行 + 合并前自动 merge-dev/rerere/重测，真冲突走 `merge_conflict` 态 + 可选 AI 解冲突回 review_2）。
+- ✅ **操作者身份卡 + 通知中心**（迁移 `0042_notifications`，`App.tsx` rail-me 激活，`OperatorPanel.tsx` 身份卡 + 活动收件箱，事件持久化挂 `event::emit` 适配层）。
+- ✅ **自定义 LLM 图片输入**（迁移 `0049_llm_supports_vision`，`llm.rs` 按 `supports_vision` 内联 base64 图片，未标记则静默丢图按纯文本，移除了旧一刀切硬报错）。
+- ✅ **需求供给丝滑化 + AI 原生需求管理全案**（A 语音速录 `agents/asr.rs`+`QuickCapture.tsx`、B 捕获/分析解耦 `intake/gateway.rs`+`triage` 池、C 工厂自喂料 `tasks/autosupply.rs`+`intake/proposer.rs`、D 需求载体增强 bug 字段/`acceptance_json`+`cr_test_runs`；迁移 `0038_intake_triage`/`0039_cr_test_runs`）。
+- ✅ **API Key 系统级加密落库**（`core/secrets.rs` 信封加密：主密钥进系统钥匙环，无钥匙环退化 0600 文件，密钥 AES-256-GCM 为 `enc:v1:` 密文落库）。
 
 ## 已甄别为「不值得成文」的命中（设计如此 / 正常状态）
 
 - 端口 `{port}` 占位、`core/mask.rs` 掩码占位 —— 功能性占位，非待办。
 - `intake/scanner.rs` 扫描 TODO/FIXME —— 这是「识别 TODO 作为需求入队」的功能本身。
 - 各页 `尚未生成 / 尚未发布 / 暂无日志` —— 正常空态文案。
-- 嵌入模型未配置时「dummy embedder / heuristic 召回」—— Innate 的优雅降级，升级路径已实现（配置模型即可）。
-- 部署/原型脚本「无 LLM agent 时走 heuristic」、ASR「未配置报错」、CR 预览「缺命令报错」—— 合理兜底，非半成品。
-- `load_concurrency_settings` / `load_knowledge_settings` —— 前端用 get/set 等价命令，非缺口。
-- MCP、会话归档、追踪、运行配置 —— 均已完整实现，非占位。
+- 嵌入模型未配置时「dummy embedder / heuristic 召回」、部署/原型「无 LLM agent 走 heuristic」、ASR「未配置报错」、CR 预览「缺命令报错」—— 合理优雅降级/兜底，非半成品。
+- MCP、会话归档、链路追踪、运行配置文件化、栈画像、配置备份 —— 均已完整实现，非占位。

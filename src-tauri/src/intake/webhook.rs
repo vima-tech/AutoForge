@@ -22,15 +22,16 @@ struct WebhookState {
     db: Db,
     job_tx: JobSender,
     app: AppHandle,
-    /// 主 token：GitHub 同步 / 通用 webhook 共用，命中即按 Flow 自动分析（保持原行为）。
-    token: String,
     /// 进程内限流器（per-IP / per-project / global 滑窗）。
     limiter: Arc<RateLimiter>,
 }
 
 #[derive(Deserialize)]
 struct WebhookPayload {
-    project_id: String,
+    /// 可选：仅用于防误投校验。真正的项目归属由 token 单向推导，
+    /// 若提供且与 token 绑定项目不一致则拒绝（捕获配置错误，杜绝跨项目伪造）。
+    #[serde(default)]
+    project_id: Option<String>,
     title: String,
     description: Option<String>,
     category: Option<String>,
@@ -38,19 +39,14 @@ struct WebhookPayload {
     source_ref: Option<String>,
 }
 
-/// 启动 webhook HTTP 服务（绑定 127.0.0.1:{port}，仅本机可访问）
-pub async fn start(
-    port: u16,
-    token: String,
-    db: Db,
-    job_tx: JobSender,
-    app: AppHandle,
-) -> anyhow::Result<()> {
+/// 启动 webhook HTTP 服务（绑定 127.0.0.1:{port}，仅本机可访问）。
+/// 不再需要全局主 token：每个入站请求按项目级 token（widget_tokens 表）鉴权，
+/// 项目与落库模式均由命中的 token 推导。
+pub async fn start(port: u16, db: Db, job_tx: JobSender, app: AppHandle) -> anyhow::Result<()> {
     let state = WebhookState {
         db,
         job_tx,
         app,
-        token,
         limiter: Arc::new(RateLimiter::new(ratelimit::WINDOW)),
     };
     let router = Router::new()
@@ -87,36 +83,28 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
         .unwrap_or_else(|| peer.ip().to_string())
 }
 
-/// widget token 鉴权后的来源判定。
-enum AuthSource {
-    /// 主 token：GitHub/通用 webhook，自动进分析队列。
-    Master,
-    /// widget token：匿名反馈，强制进 Triage 待整理池，且限定其绑定项目。
-    Widget(WidgetToken),
-}
-
 async fn handle_issue(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(ws): State<WebhookState>,
     headers: HeaderMap,
     Json(payload): Json<WebhookPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // ── ③ 限流：先于一切重活，与 token 是否泄露无关 ──────────────────────────
+    // ── ③ 限流：先于一切重活（含鉴权 DB 查询），与 token 是否泄露无关 ─────────
+    // 此刻项目尚未鉴权确定，per-project 键用 payload 提示值（不可信，仅作粗粒度兜底）。
     let ip = client_ip(&headers, peer);
+    let proj_hint = payload.project_id.as_deref().unwrap_or("unknown");
     let allowed = ws.limiter.check(&format!("ip:{ip}"), ratelimit::IP_MAX)
-        && ws
-            .limiter
-            .check(&format!("proj:{}", payload.project_id), ratelimit::PROJECT_MAX)
+        && ws.limiter.check(&format!("proj:{proj_hint}"), ratelimit::PROJECT_MAX)
         && ws.limiter.check("global", ratelimit::GLOBAL_MAX);
     if !allowed {
-        warn!("[webhook] rate limited ip={} project={}", ip, payload.project_id);
+        warn!("[webhook] rate limited ip={} project={}", ip, proj_hint);
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "请求过于频繁，请稍后再试"})),
         );
     }
 
-    // ── ② 鉴权：主 token(Flow) 或 widget token(Triage + 项目归属) ───────────
+    // ── ② 鉴权：项目级 token；项目与落库模式由命中的 token 推导 ───────────────
     let bearer = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -124,8 +112,8 @@ async fn handle_issue(
         .map(|s| s.trim())
         .unwrap_or("");
 
-    let source = match authenticate(&ws, bearer, &payload.project_id).await {
-        Some(s) => s,
+    let token = match authenticate(&ws, bearer, payload.project_id.as_deref()).await {
+        Some(t) => t,
         None => {
             warn!("[webhook] unauthorized request ip={}", ip);
             return (
@@ -142,14 +130,16 @@ async fn handle_issue(
         );
     }
 
-    // ── ① 来源决定落库模式：widget → Triage 待整理池（不自动烧 AI 预算）──────
-    let (source_type, mode) = match &source {
-        AuthSource::Master => ("webhook", IntakeMode::Flow),
-        AuthSource::Widget(_) => ("widget", IntakeMode::Triage),
+    // ── ① token.mode 决定落库模式：flow → 自动分析；triage → 待整理池（不烧 AI）──
+    let (source_type, mode) = if token.mode == "flow" {
+        ("webhook", IntakeMode::Flow)
+    } else {
+        ("widget", IntakeMode::Triage)
     };
 
     let intake = IntakePayload {
-        project_id: payload.project_id,
+        // 项目由 token 单向推导，忽略 payload.project_id（已在鉴权阶段校验一致性）。
+        project_id: token.project_id.clone(),
         title: payload.title,
         description: payload.description,
         category: payload.category,
@@ -160,10 +150,10 @@ async fn handle_issue(
 
     let result = super::gateway::receive(&ws.db, &ws.job_tx, &ws.app, intake, mode).await;
 
-    // widget token 投递成功后记录最近使用时间（best-effort，不阻断响应）。
-    if let (AuthSource::Widget(wt), Ok(_)) = (&source, &result) {
+    // 投递成功后记录 token 最近使用时间（best-effort，不阻断响应）。
+    if result.is_ok() {
         let _ = sqlx::query("UPDATE widget_tokens SET last_used_at = datetime('now') WHERE id=?")
-            .bind(&wt.id)
+            .bind(&token.id)
             .execute(&ws.db)
             .await;
     }
@@ -177,17 +167,17 @@ async fn handle_issue(
     }
 }
 
-/// 校验 Bearer token：先比主 token（常数时间），未命中再查 widget_tokens。
-/// widget token 必须 enabled、未过期，且绑定项目与提交项目一致。
-async fn authenticate(ws: &WebhookState, bearer: &str, project_id: &str) -> Option<AuthSource> {
+/// 校验 Bearer token：按 token 精确查 widget_tokens（已发布的 token 无需防时序）。
+/// token 必须 enabled、未过期。项目由 token 推导；若 payload 提供了 project_id，
+/// 则必须与 token 绑定项目一致（防误投/捕获配置错误），否则拒绝。
+async fn authenticate(
+    ws: &WebhookState,
+    bearer: &str,
+    payload_project: Option<&str>,
+) -> Option<WidgetToken> {
     if bearer.is_empty() {
         return None;
     }
-    // 主 token：仅在已配置时才尝试，空主 token 不得授权。
-    if !ws.token.is_empty() && constant_time_eq(bearer.as_bytes(), ws.token.as_bytes()) {
-        return Some(AuthSource::Master);
-    }
-    // widget token：直接按 token 精确查（已发布的 token 无需防时序）。
     let wt = sqlx::query_as::<_, WidgetToken>(
         "SELECT * FROM widget_tokens
          WHERE token = ? AND enabled = 1
@@ -198,22 +188,17 @@ async fn authenticate(ws: &WebhookState, bearer: &str, project_id: &str) -> Opti
     .await
     .ok()
     .flatten()?;
-    // 项目归属校验：一个 widget token 只能为它绑定的项目投递反馈。
-    if wt.project_id != project_id {
-        warn!(
-            "[webhook] widget token project mismatch: token-bound={} submitted={}",
-            wt.project_id, project_id
-        );
-        return None;
+    // 若调用方显式带了 project_id，必须与 token 绑定项目一致（空串视为未提供）。
+    if let Some(p) = payload_project {
+        if !p.is_empty() && p != wt.project_id {
+            warn!(
+                "[webhook] token project mismatch: token-bound={} submitted={}",
+                wt.project_id, p
+            );
+            return None;
+        }
     }
-    Some(AuthSource::Widget(wt))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    Some(wt)
 }
 
 // ── M10 embeddable widget ──────────────────────────────────────────────────────

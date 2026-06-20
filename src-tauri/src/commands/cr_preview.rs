@@ -260,7 +260,7 @@ pub async fn get_cr_preview_log(cr_id: String) -> Result<String, String> {
 
 async fn url_reachable(url: &str) -> bool {
     let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(1))
         .danger_accept_invalid_certs(true)
         .build()
     else {

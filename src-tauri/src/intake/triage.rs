@@ -8,20 +8,93 @@
 //! 解耦铁律：本模块只依赖 `Db` 与 `Issue`，不触碰 `AppHandle`/`State`/事件发射。
 //! 命令层负责在整理结果上做「进流水线 + 发事件」这类带 Tauri 类型的动作。
 
+use crate::agents::schema::{self, StructuredSchema};
 use crate::db::Db;
 use crate::models::issue::Issue;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// 一条碎片整理后的归一化结果。
-#[derive(Clone)]
+fn default_category() -> String {
+    "Feature".to_string()
+}
+fn default_severity() -> String {
+    "medium".to_string()
+}
+
+/// 一条碎片整理后的归一化结果（triage schema v1.0）。
+/// 兼作 [`StructuredSchema`] 的强类型 spec：批量时为数组元素，单条时为对象。
+/// 所有字段带 `#[serde(default)]`，模型漏字段时降质量而非报错。
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TriageParsed {
+    /// 批量模式下回指输入序号（落库时换成 issue.id）；单条模式可空。
+    #[serde(default)]
+    pub idx: Option<usize>,
+    #[serde(default)]
     pub title: String,
+    #[serde(default = "default_category")]
     pub category: String,
+    #[serde(default = "default_severity")]
     pub severity: String,
+    #[serde(default)]
     pub description: String,
+    /// 0~1：原始输入的可执行清晰度。
+    #[serde(default)]
+    pub clarity_score: Option<f64>,
+    /// 红线字段：信息不足应追问澄清而非静默猜测。
+    #[serde(default)]
+    pub needs_clarification: bool,
+    /// 为可执行所缺失的关键信息点。
+    #[serde(default)]
+    pub missing_info: Vec<String>,
+    /// 疑似重复的需求线索（或 null）。
+    #[serde(default)]
+    pub duplicate_of: Option<String>,
     /// triage Agent 判定该碎片为噪音/无价值，应直接丢弃。
+    #[serde(default)]
     pub is_noise: bool,
+}
+
+impl Default for TriageParsed {
+    fn default() -> Self {
+        Self {
+            idx: None,
+            title: String::new(),
+            category: default_category(),
+            severity: default_severity(),
+            description: String::new(),
+            clarity_score: None,
+            needs_clarification: false,
+            missing_info: vec![],
+            duplicate_of: None,
+            is_noise: false,
+        }
+    }
+}
+
+const TRIAGE_SCHEMA_TEMPLATE: &str = r#"{
+  "title": "<简洁需求标题>", "category": "<Feature|Bug|Improvement|Debt>",
+  "severity": "<critical|high|medium|low>", "description": "<补全后的清晰描述>",
+  "clarity_score": <0.0-1.0>, "needs_clarification": <bool>,
+  "missing_info": ["<缺失的关键信息>"], "duplicate_of": <线索或 null>,
+  "is_noise": <bool>
+}"#;
+
+impl StructuredSchema for TriageParsed {
+    const ROLE: &'static str = "triage";
+    const VERSION: &'static str = "1.0";
+    fn schema_template() -> &'static str {
+        TRIAGE_SCHEMA_TEMPLATE
+    }
+}
+
+/// 校验解析结果：trim title；title 为空且非噪音视为无效（返回 None）。
+fn validate(mut p: TriageParsed) -> Option<TriageParsed> {
+    p.title = p.title.trim().to_string();
+    if p.title.is_empty() && !p.is_noise {
+        return None;
+    }
+    Some(p)
 }
 
 /// 前置去噪的统计结果。
@@ -35,57 +108,16 @@ pub struct DenoiseStats {
     pub errors: u32,
 }
 
-/// 从单个 JSON 对象抽取 triage 字段（容错缺省）。title 为空且非噪音视为无效。
-fn triage_from_value(v: &serde_json::Value) -> Option<TriageParsed> {
-    let is_noise = v.get("is_noise").and_then(|x| x.as_bool()).unwrap_or(false);
-    let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    if title.is_empty() && !is_noise {
-        return None;
-    }
-    Some(TriageParsed {
-        title,
-        category: v.get("category").and_then(|x| x.as_str()).unwrap_or("Feature").to_string(),
-        severity: v.get("severity").and_then(|x| x.as_str()).unwrap_or("medium").to_string(),
-        description: v.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        is_noise,
-    })
-}
-
-/// 解析 triage Agent 输出的单个 JSON 对象（容忍 ```json 围栏与前后噪声）。
-fn parse_triage_json(out: &str) -> Option<TriageParsed> {
-    let start = out.find('{')?;
-    let end = out.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(&out[start..=end]).ok()?;
-    triage_from_value(&v)
-}
-
-/// 解析批量 triage 输出的 JSON 数组：返回 `idx -> TriageParsed` 映射。
-/// 每个元素需带 `idx`（或 `index`/`id`）整数指向输入序号；缺失/坏元素被跳过，
-/// 由上层对未命中的 idx 回退到单条整理，保证不丢需求。
+/// 解析批量 triage 输出的 JSON 数组：返回 `idx -> TriageParsed` 映射（类型化 + 校验）。
+/// 每个元素需带 `idx` 整数指向输入序号；缺失/坏元素被跳过，由上层对未命中的 idx
+/// 回退到单条整理，保证不丢需求。
 fn parse_triage_batch(out: &str) -> HashMap<usize, TriageParsed> {
+    let (items, _status) = schema::parse_array_or_empty::<TriageParsed>(out);
     let mut map = HashMap::new();
-    let (Some(start), Some(end)) = (out.find('['), out.rfind(']')) else {
-        return map;
-    };
-    if end <= start {
-        return map;
-    }
-    let Ok(serde_json::Value::Array(arr)) =
-        serde_json::from_str::<serde_json::Value>(&out[start..=end])
-    else {
-        return map;
-    };
-    for el in &arr {
-        let idx = el
-            .get("idx")
-            .or_else(|| el.get("index"))
-            .or_else(|| el.get("id"))
-            .and_then(|x| x.as_u64());
-        if let (Some(idx), Some(parsed)) = (idx, triage_from_value(el)) {
-            map.insert(idx as usize, parsed);
+    for item in items {
+        let idx = item.idx;
+        if let (Some(idx), Some(parsed)) = (idx, validate(item)) {
+            map.insert(idx, parsed);
         }
     }
     map
@@ -100,9 +132,10 @@ fn triage_raw(issue: &Issue) -> String {
         .unwrap_or_else(|| format!("{}\n{}", issue.title, issue.description))
 }
 
-/// 单条整理：调 triage Agent → 解析单 JSON 对象。失败返回 None（计为出错）。
+/// 单条整理：调 triage Agent → 类型化解析 + 校验，并把结构化产出落 `agent_outputs`。
+/// 失败返回 None（计为出错）。
 async fn refine_triage_one(db: &Db, issue: &Issue) -> Option<TriageParsed> {
-    crate::agents::llm::run_system_role_text(
+    let (raw, trace_id) = crate::agents::llm::run_system_role_text_traced(
         db,
         "triage",
         &triage_raw(issue),
@@ -111,8 +144,40 @@ async fn refine_triage_one(db: &Db, issue: &Issue) -> Option<TriageParsed> {
         None,
     )
     .await
-    .ok()
-    .and_then(|out| parse_triage_json(&out))
+    .ok()?;
+
+    let (parsed, mut status) = schema::parse_or_default::<TriageParsed>(&raw);
+    let valid = validate(parsed.clone());
+    if valid.is_none() {
+        status = "error";
+    }
+    record_triage(db, issue, &parsed, status, trace_id.as_deref(), &raw).await;
+    valid
+}
+
+/// 把一条 triage 结构化产出落 `agent_outputs`（role=triage, target=issue）。best-effort。
+async fn record_triage(
+    db: &Db,
+    issue: &Issue,
+    parsed: &TriageParsed,
+    status: &str,
+    trace_id: Option<&str>,
+    raw: &str,
+) {
+    let output_json = serde_json::to_string(parsed).unwrap_or_else(|_| "{}".to_string());
+    schema::record(
+        db,
+        TriageParsed::ROLE,
+        TriageParsed::VERSION,
+        "issue",
+        &issue.id,
+        Some(&issue.project_id),
+        trace_id,
+        status,
+        &output_json,
+        raw,
+    )
+    .await;
 }
 
 /// 一个小批的整理：单条直接走单请求；多条拼成一次批请求（输出 JSON 数组），
@@ -133,7 +198,7 @@ async fn refine_triage_batch(db: &Db, batch: Vec<Issue>) -> Vec<(Issue, Option<T
     prompt.push_str(&format!(
         "本次为**批量整理模式**（忽略系统提示中「只输出一个对象」的约束）。下面是 {} 条待整理的原始碎片，每条以 [序号] 开头。\n\
          请对每条按同样的整理规则处理，输出一个**严格 JSON 数组**（不要 Markdown、不要解释文字），\n\
-         数组每个元素字段：idx（整数，对应下面的序号）、title、category、severity、description、is_noise（含义同单条规则）。\n\
+         数组每个元素字段：idx（整数，对应下面的序号）、title、category、severity、description、clarity_score、needs_clarification、missing_info、duplicate_of、is_noise（含义同单条规则）。\n\
          务必为每个序号都返回恰好一个元素，只输出 JSON 数组。\n",
         batch.len()
     ));
@@ -142,20 +207,22 @@ async fn refine_triage_batch(db: &Db, batch: Vec<Issue>) -> Vec<(Issue, Option<T
     }
 
     let project_id = batch[0].project_id.clone();
-    let map = match crate::agents::llm::run_system_role_text(
+    let (raw, trace_id) = crate::agents::llm::run_system_role_text_traced(
         db, "triage", &prompt, None, Some(&project_id), None,
     )
     .await
-    {
-        Ok(out) => parse_triage_batch(&out),
-        Err(_) => HashMap::new(),
-    };
+    .unwrap_or_else(|_| (String::new(), None));
+    let map = parse_triage_batch(&raw);
 
     let mut results = Vec::with_capacity(batch.len());
     for (i, issue) in batch.into_iter().enumerate() {
         match map.get(&i) {
-            Some(p) => results.push((issue, Some(p.clone()))),
-            // 批响应漏了这条 → 回退单条整理，绝不丢需求。
+            Some(p) => {
+                // 批量命中：用本批共享 trace_id 落库该 issue 的结构化产出。
+                record_triage(db, &issue, p, "ok", trace_id.as_deref(), &raw).await;
+                results.push((issue, Some(p.clone())));
+            }
+            // 批响应漏了这条 → 回退单条整理（其内部自行落库），绝不丢需求。
             None => {
                 let parsed = refine_triage_one(db, &issue).await;
                 results.push((issue, parsed));
@@ -266,4 +333,43 @@ pub async fn denoise_in_place(db: &Db, issue_ids: Vec<String>) -> DenoiseStats {
         stats.normalized += 1;
     }
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // §3.5 防漂移：规范样例必须能解析进 struct 且关键字段非默认，
+    // 改 struct/字段名而忘改 prompt（或反之）时此测试会失败。
+    #[test]
+    fn triage_item_parses_canonical_example() {
+        let ex = r#"[{"idx":0,"title":"修复登录偶发失败","category":"Bug","severity":"high",
+          "description":"登录在弱网下偶发失败","clarity_score":0.8,"needs_clarification":false,
+          "missing_info":["复现步骤"],"duplicate_of":null,"is_noise":false}]"#;
+        let (items, st) = schema::parse_array_or_empty::<TriageParsed>(ex);
+        assert_eq!(st, "ok");
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.title, "修复登录偶发失败");
+        assert_eq!(it.category, "Bug");
+        assert_eq!(it.idx, Some(0));
+        assert_eq!(it.clarity_score, Some(0.8));
+        assert_eq!(it.missing_info.len(), 1);
+    }
+
+    #[test]
+    fn validate_rejects_empty_non_noise_keeps_noise() {
+        let empty = TriageParsed::default();
+        assert!(validate(empty).is_none()); // title 空且非噪音 → 无效
+        let noise = TriageParsed { is_noise: true, ..TriageParsed::default() };
+        assert!(validate(noise).is_some()); // 噪音可无标题
+    }
+
+    #[test]
+    fn default_keeps_category_severity() {
+        let d = TriageParsed::default();
+        assert_eq!(d.category, "Feature");
+        assert_eq!(d.severity, "medium");
+        assert_eq!(<TriageParsed as StructuredSchema>::ROLE, "triage");
+    }
 }

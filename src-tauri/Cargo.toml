@@ -49,6 +49,8 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac
 futures-util = "0.3"
 axum = "0.8"
 once_cell = "1"
+# 标题栏系统资源监视（CPU/内存占用）：跨平台纯 Rust，零系统依赖。
+sysinfo = "0.33"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

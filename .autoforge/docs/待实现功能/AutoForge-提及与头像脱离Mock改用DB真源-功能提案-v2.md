@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |------|----|
-| 状态 | 待实现（提案 v2，2026-06-18 复核仍成立） |
+| 状态 | ✅ 已实现（2026-06-20）— 新增 `src/agents-store.ts` 全局 store，`Markdown`/`Avatar` 改用 DB 真源，已删 `mock.ts` 的 `AGENTS`/`AGENT_MAP` |
 | 优先级 | P2（中 — 用户自建 Agent 体验缺陷 + 违反 CLAUDE.md「接入 IPC 后删 mock」） |
 | 涉及层 | 前端 `components/Markdown.tsx`、`components/Avatar.tsx`、`data/mock.ts` |
 | 工作量 | 小（约 0.5 天 — 把 mock 查表换成已加载的 DB agents） |

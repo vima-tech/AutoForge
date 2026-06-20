@@ -93,15 +93,13 @@ async fn restart_webhook(
         info!("[webhook] 已停止旧 server");
     }
 
-    if cfg.webhook_enabled && !cfg.webhook_token.is_empty() {
+    // 不再要求主 token：启用即起服务，入站请求按项目级 token 鉴权。
+    if cfg.webhook_enabled {
         let port = cfg.webhook_port as u16;
-        let token = cfg.webhook_token.clone();
         let db_clone = db.clone();
         let app_clone = app.clone();
         let new_handle = tokio::spawn(async move {
-            if let Err(e) =
-                intake::webhook::start(port, token, db_clone, job_tx, app_clone).await
-            {
+            if let Err(e) = intake::webhook::start(port, db_clone, job_tx, app_clone).await {
                 tracing::error!("[webhook] server error: {}", e);
             }
         });
@@ -208,77 +206,6 @@ pub async fn sync_github_issues(
     .map_err(|e| e.to_string())?;
 
     Ok(SyncResult { imported, skipped, errors })
-}
-
-// ── Code scan ───────────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn run_code_scan(
-    project_id: String,
-    scan_types: Vec<String>,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<ScanResult, String> {
-    let db = state.db.clone();
-    let job_tx = state.job_tx.clone();
-
-    let project = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT * FROM projects WHERE id=?",
-    )
-    .bind(&project_id)
-    .fetch_optional(&db)
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "项目不存在".to_string())?;
-
-    if project.repo_path.is_empty() {
-        return Err("项目未配置仓库路径".to_string());
-    }
-    let repo_path = project.repo_path.clone();
-
-    // scan_types 为空 = 自动模式：todo 总跑，安全扫描器按栈画像自动启用
-    // （cargo_audit/npm_audit/pip_audit/govulncheck）。显式指定时按 token 各自启用。
-    let auto = scan_types.is_empty();
-    let detected: Vec<&str> = if auto {
-        crate::core::stack::security_scanners(std::path::Path::new(&repo_path))
-    } else {
-        vec![]
-    };
-    let enabled = |id: &str| {
-        if auto {
-            detected.contains(&id)
-        } else {
-            scan_types.iter().any(|t| t == id)
-        }
-    };
-    let do_todo = auto || scan_types.iter().any(|t| t == "todo");
-
-    let mut all_payloads: Vec<IntakePayload> = vec![];
-    if do_todo {
-        all_payloads.extend(intake::scanner::scan_todos(&project_id, &repo_path).await);
-    }
-    if enabled("cargo_audit") {
-        all_payloads.extend(intake::scanner::scan_cargo_audit(&project_id, &repo_path).await);
-    }
-    if enabled("npm_audit") {
-        all_payloads.extend(intake::scanner::scan_npm_audit(&project_id, &repo_path).await);
-    }
-    if enabled("pip_audit") {
-        all_payloads.extend(intake::scanner::scan_pip_audit(&project_id, &repo_path).await);
-    }
-    if enabled("govulncheck") {
-        all_payloads.extend(intake::scanner::scan_govulncheck(&project_id, &repo_path).await);
-    }
-
-    let found = all_payloads.len() as u32;
-    let mut new_issues = 0u32;
-    for payload in all_payloads {
-        if gateway::receive(&db, &job_tx, &app, payload, IntakeMode::Flow).await.is_ok() {
-            new_issues += 1;
-        }
-    }
-
-    Ok(ScanResult { found, new_issues })
 }
 
 // ── Bulk import ──────────────────────────────────────────────────────────────

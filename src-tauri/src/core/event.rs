@@ -84,6 +84,12 @@ pub enum AppEvent {
     AutosupplyStatus {
         running: bool,
     },
+    /// 合并前自动把 dev 并入 CR 分支时发生代码冲突：CR 已置 `merge_conflict` 态，
+    /// 等待人工三方解决 / 一键重试 / AI 自动解冲突。
+    MergeConflict {
+        cr_id: String,
+        files: Vec<String>,
+    },
 }
 
 impl AppEvent {
@@ -98,7 +104,8 @@ impl AppEvent {
             | AppEvent::ReviewNeeded { cr_id, .. }
             | AppEvent::CrMerged { cr_id, .. }
             | AppEvent::SecurityAuditCompleted { cr_id, .. }
-            | AppEvent::IterationWarning { cr_id, .. } => Some(cr_id),
+            | AppEvent::IterationWarning { cr_id, .. }
+            | AppEvent::MergeConflict { cr_id, .. } => Some(cr_id),
             _ => None,
         }
     }

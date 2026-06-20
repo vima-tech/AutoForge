@@ -3,7 +3,9 @@ import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import { Avatar, MeAvatar } from '../components/Avatar';
 import { useOperator } from '../operator';
+import { primeAgents } from '../agents-store';
 import Block from '../components/Block';
+import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
@@ -1774,6 +1776,7 @@ export default function ConversationsPage() {
   const toggleList = () => setListCollapsed(v => { localStorage.setItem('conv.listCollapsed', v ? '0' : '1'); return !v; });
 
   const scrollRef       = useRef<HTMLDivElement>(null);
+  const readerScrollRef = useRef<HTMLDivElement>(null);
   const headerActionsRef= useRef<HTMLDivElement>(null);
   const searchInputRef  = useRef<HTMLInputElement>(null);
   const messageRefs     = useRef<Record<string, HTMLDivElement | null>>({});
@@ -1788,6 +1791,7 @@ export default function ConversationsPage() {
     const [cs, as, ps] = await Promise.all([listConversations(), listAgents(), listProjects()]);
     setConvs(cs);
     setAgents(as);
+    primeAgents(as);  // 同步全局 Agent store（Markdown @提及 / Avatar 查表的真源）
     setProjects(ps);
     // Keep the current/persisted conversation if it still exists; otherwise fall back
     // to the first group conversation (groups listed before directs in the UI).
@@ -2060,7 +2064,7 @@ export default function ConversationsPage() {
       // 成功无任何提示会让用户以为「没反应」：沉淀走 flow 模式，需求立即开始分析，
       // 不会在当前会议室出现，必须显式回馈一次，并指引去哪里看。
       // 审核 1 / 全量需求总账都在「功能审计」页（Audit.tsx），不是「交付流水线」。
-      flashActivity('done', '已沉淀为需求，开始分析（功能审计 → 审核 1）');
+      flashActivity('done', '已沉淀为需求，开始分析（功能审计 → 需求审核）');
     } catch (e) { setLoadError(String(e)); }
   };
 
@@ -2743,12 +2747,13 @@ export default function ConversationsPage() {
               </button>
             </div>
           </div>
-          <div className="reader-scroll scroll">
+          <div ref={readerScrollRef} className="reader-scroll scroll">
             <div className="bubble doc reader-doc" style={{ ['--rs' as string]: String(readerScale) }}>
               {visibleMessageBlocks(reader.message).map((b, i) => (
                 <Block key={i} b={b} projectId={conv?.project_id ?? undefined} messageId={reader.message.id} blockIndex={i} />
               ))}
             </div>
+            <ReaderToc scrollRef={readerScrollRef} watch={reader.message.id} />
           </div>
         </div>
       )}

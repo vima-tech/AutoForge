@@ -4,8 +4,9 @@ import Select from '../components/Select';
 import {
   listLlmTraces, getLlmTrace, listTraceAgentNames, clearLlmTraces,
   listAgentOutputs, getAgentOutput, listAgentOutputRoles, clearAgentOutputs,
+  agentOutputFieldHealth,
   type LlmTraceSummary, type LlmTrace, type TraceFilter,
-  type AgentOutputSummary, type AgentOutput,
+  type AgentOutputSummary, type AgentOutput, type FieldHealth,
 } from '../services';
 
 // span 类型 → chip 语义色（仅语义状态色，遵循设计系统）。
@@ -108,7 +109,7 @@ function SpanRow({ span }: { span: LlmTrace }) {
           {span.innate_triggered && <InnateChip />}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
-          {span.total_tokens != null && <span title="tokens">{span.total_tokens} tok</span>}
+          {span.total_tokens != null && <span title="tokens">{span.total_tokens} tokens</span>}
           <span title="耗时">{fmtMs(span.latency_ms)}</span>
           <Icon name={open ? 'chevDown' : 'chevRight'} size={14} />
         </div>
@@ -299,9 +300,82 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
   );
 }
 
+// schema 体检：选 role → 字段填充率 + 状态分布，暴露长期空着的弱字段（优化循环）。
+function SchemaHealth() {
+  const [roles, setRoles] = useState<string[]>([]);
+  const [role, setRole] = useState('');
+  const [data, setData] = useState<FieldHealth | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    listAgentOutputRoles().then(rs => {
+      setRoles(rs);
+      setRole(prev => prev || rs[0] || '');
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!role) { setData(null); return; }
+    setLoading(true);
+    agentOutputFieldHealth(role).then(setData).catch(() => setData(null)).finally(() => setLoading(false));
+  }, [role]);
+
+  const pct = (n: number) => `${Math.round(n * 100)}%`;
+  // 填充率 → 语义色：低=红（弱字段）、中=琥珀、高=绿。
+  const barColor = (r: number) => r < 0.34 ? 'var(--red)' : r < 0.67 ? 'var(--amber)' : 'var(--green)';
+
+  return (
+    <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+      <div className="list-col" style={{ width: 220, flex: '0 0 220px', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)' }}>
+          <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">ROLE</span></div>
+          <Select value={role} onChange={setRole} style={{ width: '100%' }}
+            options={roles.map(r => ({ value: r, label: r }))} placeholder="选择环节" />
+        </div>
+      </div>
+      <div style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 18 }}>
+        {!role ? (
+          <div className="empty"><Icon name="log" size={32} /><div style={{ marginTop: 10 }}>暂无可体检的环节产出</div></div>
+        ) : loading ? (
+          <div className="empty"><div>体检中…</div></div>
+        ) : !data || data.total === 0 ? (
+          <div className="empty"><Icon name="log" size={28} /><div style={{ marginTop: 8 }}>该环节暂无产出样本</div></div>
+        ) : (
+          <>
+            <div className="panel" style={{ marginBottom: 14 }}>
+              <div className="panel-head"><span>样本与解析状态 · {data.role} v{data.schema_version ?? '—'}</span></div>
+              <div style={{ display: 'flex', gap: 8, padding: 14, flexWrap: 'wrap' }}>
+                <span className="chip">样本 {data.total}</span>
+                <span className="chip green">ok {data.status_ok}</span>
+                <span className="chip amber">partial {data.status_partial}</span>
+                <span className="chip red">error {data.status_error}</span>
+              </div>
+            </div>
+            <div className="panel">
+              <div className="panel-head"><span>字段填充率（升序 · 越靠前越该关注）</span></div>
+              <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {data.fields.map(f => (
+                  <div key={f.path} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', flex: '0 0 200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.path}</code>
+                    <div style={{ flex: 1, height: 8, background: 'var(--bg-3)', borderRadius: 'var(--radius-sm)', overflow: 'hidden' }}>
+                      <div style={{ width: pct(f.fill_rate), height: '100%', background: barColor(f.fill_rate) }} />
+                    </div>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', flex: '0 0 64px', textAlign: 'right' }}>{pct(f.fill_rate)} · {f.filled}/{f.total}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function TracePage() {
-  const [tab, setTab] = useState<'trace' | 'outputs'>('trace');
+  const [tab, setTab] = useState<'trace' | 'outputs' | 'health'>('trace');
   const [outputsKey, setOutputsKey] = useState(0);
+  const [healthKey, setHealthKey] = useState(0);
   const [issueId, setIssueId] = useState('');
   const [conversationId, setConversationId] = useState('');
   const [agentName, setAgentName] = useState('');
@@ -360,6 +434,7 @@ export default function TracePage() {
         <div className="seg" style={{ marginLeft: 16 }}>
           <button className={tab === 'trace' ? 'on' : ''} onClick={() => setTab('trace')}>调用链路</button>
           <button className={tab === 'outputs' ? 'on' : ''} onClick={() => setTab('outputs')}>环节产出</button>
+          <button className={tab === 'health' ? 'on' : ''} onClick={() => setTab('health')}>schema 体检</button>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
           {tab === 'trace' ? (
@@ -369,13 +444,15 @@ export default function TracePage() {
                 <Icon name="trash" size={14} />清空
               </button>
             </>
-          ) : (
+          ) : tab === 'outputs' ? (
             <>
               <button className="btn btn-sm" onClick={() => setOutputsKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
               <button className="btn btn-sm btn-danger" onClick={() => { if (confirm('确认清空全部环节产出记录？')) clearAgentOutputs().then(() => setOutputsKey(k => k + 1)); }}>
                 <Icon name="trash" size={14} />清空
               </button>
             </>
+          ) : (
+            <button className="btn btn-sm" onClick={() => setHealthKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
           )}
         </div>
       </div>
@@ -383,6 +460,8 @@ export default function TracePage() {
       {tab === 'outputs' && (
         <AgentOutputsExplorer key={outputsKey} onDrill={(tid) => { setTab('trace'); openTrace(tid); }} />
       )}
+
+      {tab === 'health' && <SchemaHealth key={healthKey} />}
 
       {tab === 'trace' && (
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
@@ -441,7 +520,7 @@ export default function TracePage() {
                 </div>
                 <div style={{ display: 'flex', gap: 10, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)' }}>
                   <span>{t.span_count} spans</span>
-                  {t.total_tokens != null && <span>{t.total_tokens} tok</span>}
+                  {t.total_tokens != null && <span>{t.total_tokens} tokens</span>}
                   <span style={{ marginLeft: 'auto' }}>{fmtTime(t.created_at)}</span>
                 </div>
               </div>

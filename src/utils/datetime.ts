@@ -47,6 +47,13 @@ export function fmtMsgTime(value: string | null | undefined): string {
   return `${d.toLocaleDateString('zh', opts)} ${time}`;
 }
 
+// 简短日期时间：月日 + 时分（本地时区），用于列表项。
+export function fmtShort(value: string | null | undefined): string {
+  const d = parseTs(value);
+  if (!d) return '';
+  return d.toLocaleString('zh', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 // 完整日期时间，用于 title 悬浮提示。
 export function fmtFull(value: string | null | undefined): string {
   const d = parseTs(value);

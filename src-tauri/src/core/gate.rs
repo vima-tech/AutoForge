@@ -35,6 +35,33 @@ pub async fn set_auto_pass_enabled(db: &Db, on: bool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// Global switch: on a pre-merge conflict, automatically hand the conflict to the
+/// code agent to resolve (then re-test and route back to review 2). OFF by default.
+/// Co-located with `auto_pass_enabled` in the Settings 门控降级 panel.
+pub async fn auto_conflict_resolve_enabled(db: &Db) -> bool {
+    sqlx::query_as::<_, (String,)>(
+        "SELECT value FROM app_settings WHERE key='auto_conflict_resolve_enabled'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(v,)| v == "1" || v.eq_ignore_ascii_case("true"))
+    .unwrap_or(false)
+}
+
+pub async fn set_auto_conflict_resolve_enabled(db: &Db, on: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('auto_conflict_resolve_enabled', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+    )
+    .bind(if on { "1" } else { "0" })
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Whether a graded change may skip human review 2.
 /// Requires: globally enabled, tier T0/T1 (never T2/T3), and the class is `auto`.
 pub async fn should_auto_pass(db: &Db, tier: &str, change_class: &str) -> bool {

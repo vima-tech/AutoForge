@@ -276,11 +276,11 @@ export function ConfirmProjectDeleteModal({ project, onCancel, onConfirm }: {
   return (
     <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
       <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '22px 24px', width: 420, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
-        <p style={{ margin: '0 0 8px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>确认删除项目「{project.name}」？</p>
-        <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>这会同时删除该项目的需求、变更请求、审核记录、预览环境和测试记录。</p>
+        <p style={{ margin: '0 0 8px', fontSize: 'var(--text-body)', lineHeight: 'var(--leading-relaxed)' }}>归档项目「{project.name}」？</p>
+        <p style={{ margin: '0 0 20px', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-3)' }}>项目将移入回收站，需求、变更请求、审核记录与规格等数据全部保留。重新添加同一仓库会自动挂回；如需彻底清除，请到回收站操作。</p>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onCancel}>取消</button>
-          <button className="btn btn-danger" onClick={onConfirm}><Icon name="trash" size={15} />确认删除</button>
+          <button className="btn btn-danger" onClick={onConfirm}><Icon name="trash" size={15} />归档</button>
         </div>
       </div>
     </div>

@@ -156,6 +156,16 @@ export function applyRailMode(mode: RailMode): void {
   document.documentElement.setAttribute('data-rail', mode);
 }
 
+// ---- 标题栏系统资源监视（CPU/内存占用）----
+// 纯前端偏好，沿用主题/导航栏模式落 localStorage。默认开启；关闭后标题栏不再轮询/显示。
+export const RES_MONITOR_KEY = 'AutoForge:resMonitor';
+export const RES_MONITOR_CHANGED_EVENT = 'AutoForge:res-monitor-changed';
+
+export function parseResMonitor(value: string | null | undefined): boolean {
+  // 缺省（从未设置）视为开启；仅显式存 'off' 才关闭。
+  return value !== 'off';
+}
+
 // ---- 速录念头全局快捷键 ----
 // 组合键基于 KeyboardEvent.code（与键盘布局无关的物理键，如 'KeyN' / 'Space'），
 // 配合四个修饰键标志。存为 JSON 落 localStorage，沿用主题/导航栏的纯前端偏好模式。

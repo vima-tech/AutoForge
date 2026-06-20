@@ -1,0 +1,180 @@
+{
+  "meta": {
+    "title": "代码 Agent 可插拔（claude / codex / opencode 互换）任务清单",
+    "plan_ref": ".autoforge/docs/待实现功能/AutoForge-代码Agent可插拔-功能提案.md",
+    "created": "2026-06-20",
+    "status": "待实现（方案已评审；本地实测 claude 2.1.183 / codex-cli 0.139.0 / opencode 1.16.0 三 CLI 调用方式已确认，见提案 §3）。",
+    "decisions": [
+      "仅解耦层 A 重型 code agent（execution.rs:341 / merge.rs:322 两个调用点）；层 B 文本 LLM 已有 llm_id 回退接缝，不动",
+      "单一配置驱动 CliCodeAgent 覆盖三 kind，新增 agent 优先填配置而非写新类",
+      "git 禁用以传输层 env（GIT_ALLOW_PROTOCOL='')为通用护栏，所有 kind 强制；各家 flag 为额外加固",
+      "build_prompt/extract_report 保持共享；统一要求 '## 改动摘要'，extract_report marker 缺失退化为全文",
+      "选择优先级：projects.code_agent_id → 全局 is_default → 硬兜底 claude；per-project 放 P3",
+      "check_claude_auth 保留为兼容别名，内部转 kind=claude"
+    ],
+    "migration_note": "下一序号 0053（0050=merge_conflict、0051=project_default、0052=project_archive 已占用）；projects 加可空列 code_agent_id；新表 code_agents",
+    "global_constraints": [
+      "迁移仅追加不改已有；下一序号 0053",
+      "新增 command 四步：commands/code_agents.rs → mod.rs 导出 → lib.rs invoke_handler 注册 → services/index.ts 封装；前端禁直接 invoke",
+      "adapter/trait 层零 Tauri 类型（CLAUDE.md 铁律#1）；agents/tasks/core/models 不出现 AppHandle/State/tauri::*",
+      "command 保持薄包装：取 state → 调纯 async fn → 返回",
+      "所有 git 操作走 GitProxy；code agent 在 worktree 内禁 remote git（传输层 env + 各家 flag）",
+      "code agent 输出回灌/留档前过 core/security::has_obvious_injection()",
+      "进程启动走 core/platform（program/detach_process_group），禁直接裸 Command::new 拼平台路径",
+      "前端只用 src/index.css CSS 变量，禁硬编码色值/px；图标走 <Icon/>；下拉用 proj-select+mention-pop，禁原生 select；每屏 ≤1 主按钮",
+      "涉及 IPC/进程/文件的功能须在 npm run tauri:dev 完整环境验证"
+    ],
+    "verify_default": "cargo build (src-tauri) 通过 + npm run build 通过 + npm run tauri:dev 手动走查相关交互",
+    "execution_order": "P0-1..2 → P1-1..3 → P2-1..3 → P3-1..2；标 depends_on 的须前置完成"
+  },
+  "phases": [
+    {
+      "id": "P0",
+      "name": "纯重构：抽 CodeAgent 抽象",
+      "goal": "把现有 claude 包成首个 CodeAgent 实现，两调用点走 resolve，行为零变化",
+      "tasks": [
+        {
+          "id": "P0-1",
+          "title": "定义 CodeAgent trait + CliCodeAgent（claude kind）",
+          "intent": "纯重构，可独立 build 验证",
+          "desc": "新建 agents/code_agent/ 目录：mod.rs 放 trait CodeAgent（run/check_auth/kind）+ 迁入旧 build_prompt/extract_report（extract_report 加 marker 缺失返回全文的兜底）；cli.rs 放 CliCodeAgent + CliProfile。claude kind 复刻现有 code_agent.rs::run 行为（--print --permission-mode acceptEdits --disallowedTools 'Bash(git *)'，prompt 走 stdin，cwd=worktree，GIT_ALLOW_PROTOCOL='' / GIT_TERMINAL_PROMPT=0，detach_process_group）。旧 agents/code_agent.rs 改为 re-export 或删除并更新 mod.rs。",
+          "creates": ["src-tauri/src/agents/code_agent/mod.rs", "src-tauri/src/agents/code_agent/cli.rs"],
+          "edits": ["src-tauri/src/agents/mod.rs", "src-tauri/src/agents/code_agent.rs"],
+          "depends_on": [],
+          "acceptance": "cargo build 通过；CliCodeAgent{kind:claude} 行为与旧 run 等价",
+          "verify": "cargo build；对照旧 code_agent.rs:274 run 的 flag/env 逐项核对",
+          "ref": "agents/code_agent.rs:274 run、:241 build_prompt、:319 extract_report；local_claude.rs:20 isolated_claude_cmd"
+        },
+        {
+          "id": "P0-2",
+          "title": "两调用点改走 resolve()（硬编码默认 claude）",
+          "intent": "接缝就位，仍零行为变化",
+          "desc": "mod.rs 加 resolve(db, project) -> Box<dyn CodeAgent>，P0 阶段恒返回 CliCodeAgent{kind:claude, program:'claude'}（暂不读 DB）。execution.rs:341 与 merge.rs:322 改为 let agent = resolve(db,&project).await; agent.run(&wt,&prompt,timeout).await。注入检测保持在 merge.rs 既有位置。",
+          "creates": [],
+          "edits": ["src-tauri/src/agents/code_agent/mod.rs", "src-tauri/src/tasks/execution.rs", "src-tauri/src/tasks/merge.rs"],
+          "depends_on": ["P0-1"],
+          "acceptance": "需求实现 + AI 解冲突两条路径仍用 claude 正常跑通",
+          "verify": "cargo build + tauri:dev 跑一个 CR 到 completed",
+          "ref": "execution.rs:341、merge.rs:322、merge.rs:326 has_obvious_injection"
+        }
+      ]
+    },
+    {
+      "id": "P1",
+      "name": "配置链路：DB + command + Settings",
+      "goal": "code agent 可在设置页管理与切换全局默认（仅 claude 可用时即可打通链路）",
+      "tasks": [
+        {
+          "id": "P1-1",
+          "title": "迁移 0053：code_agents 表 + projects.code_agent_id",
+          "intent": "为配置与选择备好存储",
+          "desc": "新增 0053_code_agents.sql：建 code_agents(id,kind,label,program,model,extra_args_json DEFAULT '[]',enabled DEFAULT 1,is_default DEFAULT 0,created_at)；种子三条 claude(is_default=1)/codex/opencode，program 同 kind、model 空；ALTER TABLE projects ADD COLUMN code_agent_id TEXT。models/code_agent.rs 定义 CodeAgentRow(FromRow+Serialize)，models/mod.rs 导出；models/project.rs Project 加 code_agent_id: Option<String>。",
+          "creates": ["src-tauri/migrations/0053_code_agents.sql", "src-tauri/src/models/code_agent.rs"],
+          "edits": ["src-tauri/src/models/mod.rs", "src-tauri/src/models/project.rs"],
+          "depends_on": ["P0-2"],
+          "acceptance": "迁移幂等执行；三条种子可查；Project 反序列化含新字段",
+          "verify": "cargo build + 启动观察迁移日志 + SELECT * FROM code_agents",
+          "ref": "migrations 末序号 0052；models/project.rs Project 结构"
+        },
+        {
+          "id": "P1-2",
+          "title": "resolve 读 DB + commands/code_agents.rs",
+          "intent": "选择优先级落地 + 后端 CRUD/auth 命令",
+          "desc": "resolve 改为按 projects.code_agent_id → 全局 is_default → 兜底 claude 取 CliProfile（含 program/model/extra_args/kind）。新建 commands/code_agents.rs（薄包装→纯 async fn）：list_code_agents/upsert_code_agent/delete_code_agent/set_default_code_agent/set_project_code_agent/check_code_agent_auth(id)。check_code_agent_auth 调对应 CliCodeAgent::check_auth。mod.rs 导出 + lib.rs invoke_handler 注册。check_claude_auth 保留，内部转 check kind=claude。",
+          "creates": ["src-tauri/src/commands/code_agents.rs"],
+          "edits": ["src-tauri/src/agents/code_agent/mod.rs", "src-tauri/src/commands/mod.rs", "src-tauri/src/lib.rs", "src-tauri/src/commands/system.rs"],
+          "depends_on": ["P1-1"],
+          "acceptance": "命令注册无遗漏；切默认后 resolve 取到新默认；claude auth 检查仍工作",
+          "verify": "cargo build + tauri:dev 调用各命令",
+          "ref": "commands/system.rs:198 check_claude_auth；lib.rs invoke_handler"
+        },
+        {
+          "id": "P1-3",
+          "title": "前端 services + Settings「代码 Agent」区块",
+          "intent": "设置页可管理与切换，健康灯可见",
+          "desc": "services/index.ts 加 listCodeAgents/upsertCodeAgent/deleteCodeAgent/setDefaultCodeAgent/setProjectCodeAgent/checkCodeAgentAuth 封装。Settings.tsx 新增「代码 Agent」区块：proj-select 选全局默认；每条 agent 显示 program/model 可编辑 + 启用 switch + 健康灯（复用 claude auth chip 样式）。禁原生 select，用 proj-select+mention-pop+mention-row；CSS 变量；<Icon/>；每屏 ≤1 主按钮。",
+          "creates": [],
+          "edits": ["src/services/index.ts", "src/pages/Settings.tsx"],
+          "depends_on": ["P1-2"],
+          "acceptance": "设置页见三条 agent、可切默认、可改 program/model、健康灯反映 claude 安装状态",
+          "verify": "npm run build + tauri:dev 操作 Settings 区块",
+          "ref": "Settings.tsx 现有 claude auth chip / 门控降级面板布局"
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "name": "接 codex + opencode",
+      "goal": "三种 agent 可实际互换跑 CR，安全不变量在三者上均成立",
+      "tasks": [
+        {
+          "id": "P2-1",
+          "title": "CliCodeAgent 补 codex / opencode kind 分支",
+          "intent": "三 kind flag 映射 + 通用 git env 护栏",
+          "desc": "按提案 §3 矩阵补 run 分支：codex=`codex exec -C <wt> [-m model] -s workspace-write --skip-git-repo-check <prompt>`（prompt 走 arg 或 stdin via -）；opencode=`opencode run --dir <wt> [-m provider/model] <prompt>`。所有 kind 强制套 GIT_ALLOW_PROTOCOL='' / GIT_TERMINAL_PROMPT=0 + detach_process_group + cwd=worktree。图片：claude --image / codex -i / opencode -f（沿用现有 image_paths 通道，可后置）。extra_args 追加在固定 flag 之后。",
+          "creates": [],
+          "edits": ["src-tauri/src/agents/code_agent/cli.rs"],
+          "depends_on": ["P1-2"],
+          "acceptance": "切 codex/opencode 各能在 worktree 内改文件；构造 git push 必失败（remote 被禁）",
+          "verify": "tauri:dev 切 agent 跑 CR + worktree 内手动 git push 验证被拒",
+          "ref": "提案 §3 调用矩阵、§4.3 安全不变量"
+        },
+        {
+          "id": "P2-2",
+          "title": "泛化 check_auth（三 kind）",
+          "intent": "健康灯对三者都准确",
+          "desc": "CliCodeAgent::check_auth 按 kind：claude=沿用 local_claude 逻辑（--version + auth status）；opencode=`opencode auth list` 解析有无已配置 provider；codex=`codex --version` 存在 + 近似判据（login 痕迹/doctor），无干净 status 时以『已安装』为底线并标注。复用 60s 缓存思路（可每 agent 独立）。",
+          "creates": [],
+          "edits": ["src-tauri/src/agents/code_agent/cli.rs"],
+          "depends_on": ["P2-1"],
+          "acceptance": "三者健康灯分别反映安装/登录状态，未装显灰",
+          "verify": "tauri:dev 分别在装/未登录态观察健康灯",
+          "ref": "local_claude.rs:98 check_auth / :116 check_auth_inner"
+        },
+        {
+          "id": "P2-3",
+          "title": "报告解析与 prompt 跨 agent 校准",
+          "intent": "三者输出都能进审核页",
+          "desc": "build_prompt 强化对所有 agent 的 '## 改动摘要' 约束措辞；确认 extract_report 在 codex/opencode 无 marker 时返回全文兜底。observe 三者真实输出，必要时按 kind 微调 prompt 尾注（不破坏 claude 既有效果）。",
+          "creates": [],
+          "edits": ["src-tauri/src/agents/code_agent/mod.rs"],
+          "depends_on": ["P2-1"],
+          "acceptance": "codex/opencode 跑出的 CR，审核页报告区有内容（摘要或全文），diff 正常",
+          "verify": "tauri:dev 用 codex/opencode 各跑一 CR 看审核页",
+          "ref": "code_agent extract_report 原 :319"
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "name": "per-project 覆盖",
+      "goal": "不同项目可绑不同 code agent 并行",
+      "tasks": [
+        {
+          "id": "P3-1",
+          "title": "Projects 页 per-project agent 下拉",
+          "intent": "项目级覆盖入口",
+          "desc": "Projects.tsx 项目编辑/详情加 code agent 下拉（proj-select），选项含『跟随全局默认』+ 各 enabled agent，调 setProjectCodeAgent(project_id, id|null)。空值写回 NULL。",
+          "creates": [],
+          "edits": ["src/pages/Projects.tsx", "src/services/index.ts"],
+          "depends_on": ["P1-3", "P2-1"],
+          "acceptance": "项目可设/清覆盖，刷新后保持",
+          "verify": "npm run build + tauri:dev 设两项目不同 agent",
+          "ref": "P1-2 set_project_code_agent 命令"
+        },
+        {
+          "id": "P3-2",
+          "title": "merge.rs 解冲突也按项目 resolve + 端到端并行验证",
+          "intent": "AI 解冲突沿用项目所选 agent",
+          "desc": "确认 merge.rs:322 的 ai_resolve_conflict 同样走 resolve(db,&project)（P0-2 已统一则仅复核）。端到端验证：两项目分别绑 codex / opencode，各并发跑通一个 CR 到 completed，且各自 remote git 被禁。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs"],
+          "depends_on": ["P3-1"],
+          "acceptance": "两项目不同 agent 并行各跑通；解冲突用各自项目 agent",
+          "verify": "tauri:dev 双项目并行走查",
+          "ref": "merge.rs:322 ai_resolve_conflict run 调用点"
+        }
+      ]
+    }
+  ]
+}

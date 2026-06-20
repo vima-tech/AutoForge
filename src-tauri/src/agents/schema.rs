@@ -46,6 +46,48 @@ pub fn parse_or_default<T: DeserializeOwned + Default>(text: &str) -> (T, ParseS
     }
 }
 
+/// 从任意 LLM 文本中切出最外层 `[...]` 数组（容忍前后解释文字 / 代码块围栏）。
+/// 供 1→N 的环节 agent（triage / proposer）解析批量产出。
+pub fn extract_json_array(text: &str) -> Option<&str> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    if start >= end {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+/// 把 LLM 文本解析为元素类型 `T` 的数组；坏元素逐个跳过，绝不因个别坏元素丢全部。
+/// 返回 `(已解析元素, status)`：`ok`=数组完整解析；`partial`=部分元素坏；`error`=非数组/全坏（回退空 Vec）。
+/// 供 triage / proposer 等批量（1→N）schema agent 使用。
+pub fn parse_array_or_empty<T: DeserializeOwned>(text: &str) -> (Vec<T>, ParseStatus) {
+    let Some(arr_text) = extract_json_array(text) else {
+        return (vec![], "error");
+    };
+    let Ok(serde_json::Value::Array(items)) =
+        serde_json::from_str::<serde_json::Value>(arr_text)
+    else {
+        return (vec![], "error");
+    };
+    let total = items.len();
+    let mut out = Vec::with_capacity(total);
+    for el in items {
+        if let Ok(v) = serde_json::from_value::<T>(el) {
+            out.push(v);
+        }
+    }
+    let status = if total == 0 {
+        "ok" // 模型明确返回空数组（如「无可整理项」）是合法结论，非错误。
+    } else if out.is_empty() {
+        "error"
+    } else if out.len() < total {
+        "partial"
+    } else {
+        "ok"
+    };
+    (out, status)
+}
+
 /// schema 驱动 agent 的输出契约：版本 + 模板 + 由模板派生的 prompt 块。
 /// 让"执行标准（prompt）"与"落库结构（struct）"同源，杜绝两者漂移。
 pub trait StructuredSchema: DeserializeOwned + Default {
@@ -109,4 +151,54 @@ pub async fn record(
         eprintln!("[agent_outputs] 写入失败（已忽略）：{}", e);
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    struct Sample {
+        #[serde(default)]
+        a: String,
+        #[serde(default)]
+        n: i64,
+    }
+
+    #[test]
+    fn extract_json_tolerates_surrounding_text() {
+        let t = "解释\n```json\n{\"a\":\"x\",\"n\":3}\n```\n尾部";
+        assert_eq!(extract_json(t), Some("{\"a\":\"x\",\"n\":3}"));
+    }
+
+    #[test]
+    fn parse_or_default_falls_back_on_garbage() {
+        let (v, st) = parse_or_default::<Sample>("not json at all");
+        assert_eq!(st, "error");
+        assert_eq!(v, Sample::default());
+    }
+
+    #[test]
+    fn parse_array_ok_partial_and_error() {
+        // 全部合法 → ok
+        let (v, st) = parse_array_or_empty::<Sample>("前缀 [{\"a\":\"x\"},{\"n\":2}] 后缀");
+        assert_eq!(st, "ok");
+        assert_eq!(v.len(), 2);
+
+        // 含一个坏元素（数组里塞标量）→ partial，坏元素被跳过
+        let (v, st) = parse_array_or_empty::<Sample>("[{\"a\":\"ok\"}, 42]");
+        assert_eq!(st, "partial");
+        assert_eq!(v.len(), 1);
+
+        // 非数组 → error 且空
+        let (v, st) = parse_array_or_empty::<Sample>("{\"a\":\"x\"}");
+        assert_eq!(st, "error");
+        assert!(v.is_empty());
+
+        // 空数组是合法结论 → ok
+        let (v, st) = parse_array_or_empty::<Sample>("[]");
+        assert_eq!(st, "ok");
+        assert!(v.is_empty());
+    }
 }
