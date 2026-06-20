@@ -1,0 +1,10 @@
+{
+  // 团队推荐扩展。打开工作区时 VS Code 会提示安装这些扩展。
+  "recommendations": [
+    "rust-lang.rust-analyzer",
+    "tauri-apps.tauri-vscode",
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "EditorConfig.EditorConfig"
+  ]
+}

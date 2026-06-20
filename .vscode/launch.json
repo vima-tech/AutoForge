@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 一键启动完整 Tauri 开发模式（等价 npm run tauri:dev）。
+      // 使用内置的 node-terminal 调试类型，在集成终端运行命令并自动附加 JS 调试器，
+      // 无需额外扩展即可工作；窗口/IPC 等特性需此完整模式（npm run dev 浏览器模式不可替代）。
+      "type": "node-terminal",
+      "request": "launch",
+      "name": "Tauri Dev",
+      "command": "npm run tauri:dev",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      // 仅启动前端 Vite dev server（用于纯 UI 开发，无 Tauri 能力）。
+      "type": "node-terminal",
+      "request": "launch",
+      "name": "Frontend Dev (Vite)",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      // 附加 Chrome/WebView 前端调试器到 Vite dev server。
+      // 端口默认 1420；如用 PORT/AUTOFORGE_DEV_PORT 改了端口，请同步修改此 url。
+      // 需先运行 "Frontend Dev (Vite)" 或 "Tauri Dev"，并使用 VS Code 自带 JS 调试器。
+      "type": "chrome",
+      "request": "launch",
+      "name": "Frontend (Chrome attach)",
+      "url": "http://localhost:1420",
+      "webRoot": "${workspaceFolder}/src"
+    }
+  ]
+}

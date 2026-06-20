@@ -1,0 +1,25 @@
+# EditorConfig —— 统一团队编辑器基础格式
+# https://editorconfig.org
+#
+# 缩进规则与现有代码保持一致：TS/TSX/JSON/CSS 用 2 空格，Rust 用 4 空格。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Rust 源码：4 空格缩进（与现有 .rs 代码及 rustfmt 默认一致）
+[*.rs]
+indent_size = 4
+
+# Markdown：保留行尾空格（两个尾随空格表示硬换行）
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefile：必须用 tab 缩进
+[Makefile]
+indent_style = tab
