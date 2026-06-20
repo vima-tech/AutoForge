@@ -318,10 +318,11 @@ pub async fn ai_resolve_conflict(
                 .join("\n"),
             diff = conflict_view.chars().take(12000).collect::<String>(),
         );
-        let (_code, report, _err) =
-            crate::agents::code_agent::run(&session.worktree_path, &prompt, 600)
-                .await
-                .unwrap_or((-1, String::new(), String::new()));
+        let code_agent = crate::agents::code_agent::resolve(db, &project).await;
+        let (_code, report, _err) = code_agent
+            .run(&session.worktree_path, &prompt, 600)
+            .await
+            .unwrap_or((-1, String::new(), String::new()));
         // agent 输出视为外部输入：留档/回灌前过注入检测（命中只记录，文件改动才是结果）。
         if crate::core::security::has_obvious_injection(&report) {
             info!(

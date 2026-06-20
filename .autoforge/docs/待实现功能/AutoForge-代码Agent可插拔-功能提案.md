@@ -2,9 +2,9 @@
 
 | 字段 | 值 |
 |------|----|
-| 状态 | 📝 待实现（方案已评审，本地三 CLI 已实测调用方式） |
+| 状态 | ✅ 已实现（2026-06-20；cargo test 107 passed、clippy 新文件零告警、npm run build 通过；P0–P3 全落地）。实测结论：① `GIT_ALLOW_PROTOCOL=""` 把 `git push` 拦在网络之前（`传输 'https' 不允许`），本地 commit 不受影响——对仅靠该护栏的 opencode 关键；② codex `-s workspace-write`/`-C`/`--skip-git-repo-check` 与 opencode `run --dir` 均经各自 CLI 校验接受。实际迁移序号 **0057**（0053–0056 已占用）。优化：Settings 编辑表单加 kind 选择器（可建 codex/opencode 自定义变体，改 kind 自动同步 program）+ 后端禁止禁用当前默认 agent。待运行期微调：codex/opencode 真实 CR 跑通与 auth 探测精度（需 tauri:dev + 登录态）。 |
 | 优先级 | P2（架构解耦，非阻塞 bug；为后端独立化愿景铺路） |
-| 涉及层 | 后端（agents·tasks·commands·models）+ DB（迁移 0053）+ 前端（Settings·services·Projects） |
+| 涉及层 | 后端（agents·tasks·commands·models）+ DB（迁移 0057）+ 前端（Settings·services·Projects） |
 | 工作量 | 中（P0 重构 0.5 天；P1 配置链路 0.5 天；P2 接两个 agent 1 天；P3 per-project 0.5 天） |
 | 相关 | `src-tauri/src/agents/code_agent.rs`、`src-tauri/src/agents/local_claude.rs`、`tasks/execution.rs:341`、`tasks/merge.rs:322`、本目录 `代码Agent可插拔-tasks.json` |
 | 长期对齐 | 呼应 CLAUDE.md「后端独立化 + MCP」愿景——code agent 抽象层零 Tauri 类型，未来可在非 Tauri 入口复用 |
@@ -69,7 +69,7 @@ AutoForge 把代码实现交给本地 `claude` CLI 在隔离 worktree 内执行�
 
 ## 4. 设计
 
-### 4.1 数据模型（迁移 `0053_code_agents.sql`）
+### 4.1 数据模型（迁移 `0057_code_agents.sql`）
 
 ```sql
 CREATE TABLE code_agents (
@@ -174,7 +174,7 @@ pub struct CliCodeAgent { profile: CliProfile }
 | 阶段 | 内容 | 可验证点 |
 |---|---|---|
 | **P0** 纯重构 | 抽 `CodeAgent` trait，claude 包成 `CliCodeAgent{kind:claude}`，两调用点走 `resolve()` | 行为零变化，build + 流程通 |
-| **P1** 配置链路 | 迁移 0053 + `commands/code_agents.rs` + Settings 区块 | 设置页可管理/切默认，claude 仍正常 |
+| **P1** 配置链路 | 迁移 0057 + `commands/code_agents.rs` + Settings 区块 | 设置页可管理/切默认，claude 仍正常 |
 | **P2** 接 codex + opencode | 补两 kind flag 映射 + 泛化 auth + 通用 git env 护栏 | 各跑通真实 CR，安全四项验证 |
 | **P3** per-project 覆盖 | `projects.code_agent_id` + Projects 下拉 + merge.rs 解冲突也走 resolve | 两项目不同 agent 并行 |
 

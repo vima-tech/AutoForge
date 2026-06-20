@@ -5,6 +5,7 @@ pub mod spec;
 pub mod intake;
 pub mod agent;
 pub mod change_request;
+pub mod code_agent;
 pub mod conversation;
 pub mod conversation_archive;
 pub mod cr_grade;

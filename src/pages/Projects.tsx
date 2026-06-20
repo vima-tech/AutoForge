@@ -8,6 +8,7 @@ import { parseTs, fmtFull } from '../utils/datetime';
 import {
   listProjects, updateProject, deleteProject, setDefaultProject, type Project,
   listArchivedProjects, restoreProject, purgeProject,
+  listCodeAgents, setProjectCodeAgent, type CodeAgent as CodeAgentT,
   listMaterialFolders, createMaterialFolder, renameMaterialFolder, deleteMaterialFolder,
   listMaterialFiles, searchMaterialFiles, importMaterialFile, moveMaterialFile, deleteMaterialFile,
   openMaterialFile, aiOrganizeMaterials, backupMaterialFiles,
@@ -1376,6 +1377,24 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
 // ── ProjectInfoTab ────────────────────────────────────────────────────────────
 
 function ProjectInfoTab({ project }: { project: Project }) {
+  const [codeAgents, setCodeAgents] = useState<CodeAgentT[]>([]);
+  const [agentSel, setAgentSel] = useState<string>(project.code_agent_id ?? '');
+  const [agentMsg, setAgentMsg] = useState('');
+  useEffect(() => { listCodeAgents().then(setCodeAgents).catch(() => setCodeAgents([])); }, []);
+  useEffect(() => { setAgentSel(project.code_agent_id ?? ''); }, [project.id, project.code_agent_id]);
+
+  const defaultAgent = codeAgents.find(a => a.is_default);
+  const agentOptions = [
+    { value: '', label: `跟随全局默认${defaultAgent ? `（${defaultAgent.label}）` : ''}` },
+    ...codeAgents.filter(a => a.enabled).map(a => ({ value: a.id, label: `${a.label}（${a.kind}）` })),
+  ];
+  const onAgentChange = async (val: string) => {
+    setAgentSel(val);
+    setAgentMsg('');
+    try { await setProjectCodeAgent(project.id, val || null); setAgentMsg('已保存'); }
+    catch (e) { setAgentMsg(String(e)); }
+  };
+
   const rows: { label: string; value: React.ReactNode }[] = [
     { label: '仓库路径', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.repo_path || '未配置'}</code> },
     { label: '开发分支', value: <code style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)' }}>{project.branch_dev}</code> },
@@ -1398,6 +1417,13 @@ function ProjectInfoTab({ project }: { project: Project }) {
             <div style={{ flex: 1 }}>{r.value}</div>
           </div>
         ))}
+        <div style={{ display: 'flex', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+          <div style={{ width: 90, fontSize: 'var(--text-label)', color: 'var(--text-faint)', flexShrink: 0 }}>代码 Agent</div>
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Select value={agentSel} onChange={onAgentChange} options={agentOptions} style={{ minWidth: 220 }} />
+            {agentMsg && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{agentMsg}</span>}
+          </div>
+        </div>
       </div>
 
       {project.config_yaml && (

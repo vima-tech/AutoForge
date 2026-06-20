@@ -10,7 +10,7 @@
 
 | 优先级 | 提案 | 状态 | 一句话 |
 |--------|------|------|--------|
-| P2 | [代码 Agent 可插拔](AutoForge-代码Agent可插拔-功能提案.md) | 📝 待实现 | 抽 `CodeAgent` trait，claude/codex/opencode 配置驱动互换 + per-project 选择（任务清单 `代码Agent可插拔-tasks.json`；尚无迁移 0053 / 无 trait） |
+| P2 | [代码 Agent 可插拔](AutoForge-代码Agent可插拔-功能提案.md) | ✅ 已实现 | 抽 `CodeAgent` trait，claude/codex/opencode 配置驱动互换 + 全局默认/per-project 选择（2026-06-20 落地，迁移 0057，107 测试通过；任务清单 `代码Agent可插拔-tasks.json`） |
 | P2 | [@提及/头像脱离 mock](AutoForge-提及与头像脱离Mock改用DB真源-功能提案-v2.md) | 📝 待实现 | `Avatar.tsx:19` / `Markdown.tsx:25` 仍 import `mock` 写死的 5 个 Agent，自建 Agent 的提及/头像渲染失败 |
 | P3 | [Schema 驱动 Agent](schema-driven-agents.md) | 🟢 主体落地 | 脚手架+`agent_outputs`(0040)+analysis/test 样板已有；**本批(2026-06-20)新增**批量(1→N)解析、triage/proposer 升级为 schema 驱动并落库、字段级体检命令+Trace「schema 体检」面板（cargo test 104 passed）；剩版本 A/B·失败回灌·其余角色接入 |
 | — | [脏输入压测 Dogfooding](dirty-input-dogfooding.md) | 🧪 方法论·待执行 | 把工厂往真实外包脏输入里摔、排序崩点 = 阶段二 roadmap；是验证流程而非单一代码特性 |

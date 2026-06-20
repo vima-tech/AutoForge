@@ -45,6 +45,8 @@ import {
   type WebSearchSettings,
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
   type JobFailure,
+  listCodeAgents, upsertCodeAgent, deleteCodeAgent, setDefaultCodeAgent,
+  setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1286,6 +1288,172 @@ function RolesPage() {
   );
 }
 
+interface CodeAgentDraft { kind: string; label: string; program: string; model: string; extra: string; enabled: boolean; }
+const CODE_AGENT_KINDS = [
+  { value: 'claude', label: 'claude（Claude Code）' },
+  { value: 'codex', label: 'codex（Codex CLI）' },
+  { value: 'opencode', label: 'opencode' },
+];
+
+function CodeAgentSettings() {
+  const [agents, setAgents] = useState<CodeAgentT[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, CodeAgentDraft>>({});
+  const [auth, setAuth] = useState<Record<string, boolean | null | 'loading'>>({});
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState('');
+  // 默认全部折叠，只显示头部摘要；点击头部展开编辑。
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpand = (id: string) => setExpanded(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const toDraft = (a: CodeAgentT): CodeAgentDraft => {
+    let extra: string[] = [];
+    try { extra = JSON.parse(a.extra_args_json || '[]'); } catch { extra = []; }
+    return { kind: a.kind, label: a.label, program: a.program, model: a.model ?? '', extra: extra.join(' '), enabled: a.enabled };
+  };
+
+  const load = (autoCheck = false) => {
+    setLoading(true);
+    listCodeAgents()
+      .then(list => {
+        setAgents(list);
+        setDrafts(Object.fromEntries(list.map(a => [a.id, toDraft(a)])));
+        // 进入页面自动检测每个 agent 的可用性，避免一直停在「未检测」。
+        // 检测命令走进程组隔离（detach_process_group），可安全在此调用。
+        if (autoCheck) list.forEach(a => checkAuth(a.id));
+      })
+      .catch(() => setAgents([]))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { load(true); }, []);
+
+  const defaultId = agents.find(a => a.is_default)?.id ?? '';
+  const enabledOptions = agents.filter(a => a.enabled).map(a => ({ value: a.id, label: `${a.label}（${a.kind}）` }));
+
+  const setDraft = (id: string, patch: Partial<CodeAgentDraft>) =>
+    setDrafts(d => ({ ...d, [id]: { ...d[id], ...patch } }));
+
+  const save = async (a: CodeAgentT) => {
+    const d = drafts[a.id];
+    if (!d) return;
+    setMsg('');
+    try {
+      await upsertCodeAgent({
+        id: a.id, kind: d.kind, label: d.label.trim() || d.kind,
+        program: d.program.trim() || d.kind, model: d.model.trim() || null,
+        extra_args: d.extra.split(/\s+/).filter(Boolean), enabled: d.enabled,
+      });
+      setMsg(`已保存 ${d.label || a.kind}`);
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  const makeDefault = async (id: string) => { await setDefaultCodeAgent(id); load(); };
+
+  const remove = async (a: CodeAgentT) => {
+    if (!confirm(`删除代码 Agent「${a.label}」？引用它的项目将回落全局默认。`)) return;
+    try { await deleteCodeAgent(a.id); load(); } catch (e) { setMsg(String(e)); }
+  };
+
+  const checkAuth = async (id: string) => {
+    setAuth(s => ({ ...s, [id]: 'loading' }));
+    try { const ok = await checkCodeAgentAuth(id); setAuth(s => ({ ...s, [id]: ok })); }
+    catch { setAuth(s => ({ ...s, [id]: null })); }
+  };
+
+  const addCustom = async () => {
+    setMsg('');
+    try {
+      const created = await upsertCodeAgent({ kind: 'claude', label: '自定义 Agent', program: 'claude', enabled: true });
+      setExpanded(prev => new Set(prev).add(created.id)); // 新建即展开，便于立刻编辑
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">代码 Agent</div>
+      <div className="set-desc">
+        选择驱动「代码实现」与「AI 解冲突」的 CLI 编码 agent。所有 agent 都在隔离 worktree 内执行，
+        并被统一禁止 remote git 操作。项目可在「项目管理」单独覆盖；未覆盖时跟随这里的全局默认。
+      </div>
+
+      <div className="cfg-card" style={{ marginBottom: 16 }}>
+        <div className="field full">
+          <label>全局默认代码 Agent</label>
+          <Select value={defaultId} onChange={makeDefault} options={enabledOptions}
+            placeholder={loading ? '加载中…' : '选择默认 agent'} />
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="empty"><Icon name="code" /><div>加载中…</div></div>
+      ) : agents.map(a => {
+        const d = drafts[a.id]; if (!d) return null;
+        const st = auth[a.id];
+        const dotColor = st === true ? 'var(--green)' : st === false || st === null ? 'var(--red)' : 'var(--text-faint)';
+        const authText = st === 'loading' ? '检测中…' : st === true ? '可用' : st === false ? '未就绪' : st === null ? '检测失败' : '未检测';
+        const isOpen = expanded.has(a.id);
+        return (
+          <div className="panel" key={a.id} style={{ marginBottom: 12 }}>
+            <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', userSelect: 'none' }}
+              onClick={() => toggleExpand(a.id)}>
+              <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }} />
+              <span className="chip ember" style={{ fontFamily: 'var(--font-mono)' }}>{d.kind}</span>
+              <span style={{ fontWeight: 600 }}>{d.label || d.kind}</span>
+              {a.is_default && <span className="chip green">默认</span>}
+              {!isOpen && !d.enabled && <span className="chip" style={{ color: 'var(--text-faint)' }}>已停用</span>}
+              <span className="dot" style={{ background: dotColor, marginLeft: 'auto' }} />
+              <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{authText}</span>
+            </div>
+            {isOpen && (
+            <div className="cfg-fields" style={{ padding: '12px 14px' }}>
+              <div className="field"><label>类型（适配逻辑）</label>
+                <Select value={d.kind} onChange={val => {
+                  // 改类型时，若 program 仍是某个 kind 的默认名（未自定义路径），一并同步，
+                  // 避免出现「类型 codex 但程序仍指向 claude」的错配。
+                  const synced = ['claude', 'codex', 'opencode', ''].includes(d.program.trim());
+                  setDraft(a.id, synced ? { kind: val, program: val } : { kind: val });
+                }} options={CODE_AGENT_KINDS} />
+              </div>
+              <div className="field"><label>显示名</label>
+                <input value={d.label} onChange={e => setDraft(a.id, { label: e.target.value })} />
+              </div>
+              <div className="field"><label>可执行程序（PATH 名或绝对路径）</label>
+                <input value={d.program} onChange={e => setDraft(a.id, { program: e.target.value })} placeholder={d.kind} />
+              </div>
+              <div className="field"><label>模型（可空，{d.kind === 'opencode' ? 'provider/model' : '裸名'}）</label>
+                <input value={d.model} onChange={e => setDraft(a.id, { model: e.target.value })} placeholder="默认" />
+              </div>
+              <div className="field"><label>额外参数（空格分隔，可空）</label>
+                <input value={d.extra} onChange={e => setDraft(a.id, { extra: e.target.value })} placeholder="--flag value" />
+              </div>
+              <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Switch on={d.enabled} onToggle={() => setDraft(a.id, { enabled: !d.enabled })} />
+                  <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)' }}>启用</span>
+                </div>
+                <button className="btn btn-primary btn-sm" onClick={() => save(a)}><Icon name="check" size={13} />保存</button>
+                <button className="btn btn-sm" onClick={() => checkAuth(a.id)}><Icon name="shield" size={13} />检测可用性</button>
+                {!a.is_default && <button className="btn btn-sm btn-danger" style={{ marginLeft: 'auto' }} onClick={() => remove(a)}><Icon name="trash" size={13} />删除</button>}
+              </div>
+            </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+        <button className="btn" onClick={addCustom}><Icon name="plus" size={14} />新增自定义 Agent</button>
+        {msg && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
 function ConcurrencySettings() {
   const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority' });
   const [result, setResult] = useState('');
@@ -2467,6 +2635,7 @@ const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string
     group: '运行与流控',
     items: [
       { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+      { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
       { id: 'autosupply',  name: '自动供料',     ic: 'refresh' },
       { id: 'gating',      name: '门控降级',     ic: 'sliders' },
       { id: 'security',    name: '安全与权限',   ic: 'shield' },
@@ -2563,6 +2732,7 @@ export default function SettingsPage({
           {sec === 'tools'       && <ToolsSettings />}
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
+          {sec === 'codeagent'   && <CodeAgentSettings />}
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
           {sec === 'backup'      && <BackupSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}
@@ -2573,7 +2743,7 @@ export default function SettingsPage({
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','shortcuts','llm','tools','roles','concurrency','selfupdate','backup','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','shortcuts','llm','tools','roles','concurrency','codeagent','selfupdate','backup','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

@@ -3,7 +3,7 @@
     "title": "代码 Agent 可插拔（claude / codex / opencode 互换）任务清单",
     "plan_ref": ".autoforge/docs/待实现功能/AutoForge-代码Agent可插拔-功能提案.md",
     "created": "2026-06-20",
-    "status": "待实现（方案已评审；本地实测 claude 2.1.183 / codex-cli 0.139.0 / opencode 1.16.0 三 CLI 调用方式已确认，见提案 §3）。",
+    "status": "已实现（2026-06-20；cargo test 107 passed、clippy 新文件零告警、npm run build 通过；P0–P3 全落地）。实际迁移序号 0057（0053-0056 已占用，原拟 0053 撞车）。实测：GIT_ALLOW_PROTOCOL='' 确实拦 git push 在网络前、本地 commit 不受影响；codex/opencode flag 经 CLI 校验。优化：Settings 加 kind 选择器+改 kind 自动同步 program；后端禁止禁用当前默认 agent。待运行期微调：codex/opencode 真实 CR 与 auth 精度（需 tauri:dev+登录态）。",
     "decisions": [
       "仅解耦层 A 重型 code agent（execution.rs:341 / merge.rs:322 两个调用点）；层 B 文本 LLM 已有 llm_id 回退接缝，不动",
       "单一配置驱动 CliCodeAgent 覆盖三 kind，新增 agent 优先填配置而非写新类",
@@ -12,9 +12,9 @@
       "选择优先级：projects.code_agent_id → 全局 is_default → 硬兜底 claude；per-project 放 P3",
       "check_claude_auth 保留为兼容别名，内部转 kind=claude"
     ],
-    "migration_note": "下一序号 0053（0050=merge_conflict、0051=project_default、0052=project_archive 已占用）；projects 加可空列 code_agent_id；新表 code_agents",
+    "migration_note": "实际下一序号 0057（0053=intake_token_mode、0054=rename_review_status、0055=rename_delivery_node、0056=cr_merge_message 已占用）；projects 加可空列 code_agent_id；新表 code_agents",
     "global_constraints": [
-      "迁移仅追加不改已有；下一序号 0053",
+      "迁移仅追加不改已有；下一序号 0057",
       "新增 command 四步：commands/code_agents.rs → mod.rs 导出 → lib.rs invoke_handler 注册 → services/index.ts 封装；前端禁直接 invoke",
       "adapter/trait 层零 Tauri 类型（CLAUDE.md 铁律#1）；agents/tasks/core/models 不出现 AppHandle/State/tauri::*",
       "command 保持薄包装：取 state → 调纯 async fn → 返回",
@@ -66,10 +66,10 @@
       "tasks": [
         {
           "id": "P1-1",
-          "title": "迁移 0053：code_agents 表 + projects.code_agent_id",
+          "title": "迁移 0057：code_agents 表 + projects.code_agent_id",
           "intent": "为配置与选择备好存储",
-          "desc": "新增 0053_code_agents.sql：建 code_agents(id,kind,label,program,model,extra_args_json DEFAULT '[]',enabled DEFAULT 1,is_default DEFAULT 0,created_at)；种子三条 claude(is_default=1)/codex/opencode，program 同 kind、model 空；ALTER TABLE projects ADD COLUMN code_agent_id TEXT。models/code_agent.rs 定义 CodeAgentRow(FromRow+Serialize)，models/mod.rs 导出；models/project.rs Project 加 code_agent_id: Option<String>。",
-          "creates": ["src-tauri/migrations/0053_code_agents.sql", "src-tauri/src/models/code_agent.rs"],
+          "desc": "新增 0057_code_agents.sql：建 code_agents(id,kind,label,program,model,extra_args_json DEFAULT '[]',enabled DEFAULT 1,is_default DEFAULT 0,created_at)；种子三条 claude(is_default=1)/codex/opencode，program 同 kind、model 空；ALTER TABLE projects ADD COLUMN code_agent_id TEXT。models/code_agent.rs 定义 CodeAgentRow(FromRow+Serialize)，models/mod.rs 导出；models/project.rs Project 加 code_agent_id: Option<String>。",
+          "creates": ["src-tauri/migrations/0057_code_agents.sql", "src-tauri/src/models/code_agent.rs"],
           "edits": ["src-tauri/src/models/mod.rs", "src-tauri/src/models/project.rs"],
           "depends_on": ["P0-2"],
           "acceptance": "迁移幂等执行；三条种子可查；Project 反序列化含新字段",

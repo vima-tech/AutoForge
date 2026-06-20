@@ -68,6 +68,7 @@ export interface Project {
   status: string; config_yaml: string | null;
   is_default: boolean;
   archived_at?: string | null;
+  code_agent_id?: string | null;
   created_at: string; updated_at: string;
 }
 export interface Issue {
@@ -269,6 +270,25 @@ export const listScanFindings = (testSessionId?: string) =>
   ipc<ScanFinding[]>('list_scan_findings', { testSessionId: testSessionId ?? null });
 export const listAdminDecisions = (projectId?: string) =>
   ipc<AdminDecision[]>('list_admin_decisions', { projectId: projectId ?? null });
+
+// ── Code Agents（可插拔代码实现 agent：claude / codex / opencode） ──────────────
+export interface CodeAgent {
+  id: string; kind: string; label: string; program: string;
+  model: string | null; extra_args_json: string;
+  enabled: boolean; is_default: boolean; created_at: string;
+}
+export interface UpsertCodeAgentPayload {
+  id?: string | null; kind: string; label: string; program: string;
+  model?: string | null; extra_args?: string[]; enabled?: boolean;
+}
+export const listCodeAgents = () => ipc<CodeAgent[]>('list_code_agents');
+export const upsertCodeAgent = (payload: UpsertCodeAgentPayload) =>
+  ipc<CodeAgent>('upsert_code_agent', { payload });
+export const deleteCodeAgent = (id: string) => ipc<void>('delete_code_agent', { id });
+export const setDefaultCodeAgent = (id: string) => ipc<void>('set_default_code_agent', { id });
+export const setProjectCodeAgent = (projectId: string, codeAgentId: string | null) =>
+  ipc<void>('set_project_code_agent', { projectId, codeAgentId });
+export const checkCodeAgentAuth = (id: string) => ipc<boolean>('check_code_agent_auth', { id });
 
 // 错误历史：后端后台任务失败记录（runner 持久化的 last_error），供设置页排错。
 export interface JobFailure {

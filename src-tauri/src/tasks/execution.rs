@@ -335,12 +335,15 @@ pub async fn run(
         },
     );
 
-    // Run claude code agent
+    // Run the configured code agent (claude / codex / opencode), resolved per
+    // project → global default → claude fallback.
     let timeout_secs = 1800; // 30 minutes
-    let (exit_code, stdout, stderr) =
-        crate::agents::code_agent::run(&worktree_path, &prompt, timeout_secs)
-            .await
-            .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
+    let code_agent = crate::agents::code_agent::resolve(db, &project).await;
+    info!("cr {} 使用代码 Agent: {}", cr_id, code_agent.kind());
+    let (exit_code, stdout, stderr) = code_agent
+        .run(&worktree_path, &prompt, timeout_secs)
+        .await
+        .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
 
     let report = crate::agents::code_agent::extract_report(&stdout).to_string();
 
