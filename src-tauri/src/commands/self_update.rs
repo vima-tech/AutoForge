@@ -3,6 +3,7 @@ use crate::models::project::Project;
 use crate::state::AppState;
 use serde::Serialize;
 use tauri::State;
+use tracing::{info, warn};
 
 /// Status of a project's working tree relative to `origin/<dev>`, powering the
 /// in-app "同步更新" (self-update) control. Only meaningful for the project whose
@@ -42,12 +43,56 @@ async fn load_project(db: &crate::db::Db, project_id: &str) -> Result<Project, S
 }
 
 /// Count commits in `range` (e.g. `HEAD..origin/dev`). Returns 0 on any error.
+/// Failures here silently skew behind/ahead (and thus disable the UI button),
+/// so every non-happy path is logged for diagnosis.
 async fn count_range(git: &GitProxy, range: &str) -> i64 {
-    git.run(&["rev-list", "--count", range])
-        .await
-        .ok()
-        .and_then(|(c, out, _)| (c == 0).then(|| out.trim().parse::<i64>().ok()).flatten())
-        .unwrap_or(0)
+    match git.run(&["rev-list", "--count", range]).await {
+        Ok((0, out, _)) => match out.trim().parse::<i64>() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    "self_update: rev-list {} 输出无法解析为数字 ({:?}): {}",
+                    range,
+                    out.trim(),
+                    e
+                );
+                0
+            }
+        },
+        Ok((code, _, err)) => {
+            warn!(
+                "self_update: rev-list {} 失败 (code={}): {}",
+                range,
+                code,
+                err.trim()
+            );
+            0
+        }
+        Err(e) => {
+            warn!("self_update: rev-list {} 执行错误: {}", range, e);
+            0
+        }
+    }
+}
+
+/// Fetch `origin/<branch>` and log the outcome. The callers previously discarded
+/// this result (`let _ = ...`), which hid network/SSH failures that leave
+/// behind/ahead stale — exactly the silent failure mode we need visibility into.
+async fn fetch_and_log(git: &GitProxy, branch: &str, ctx: &str) {
+    match git.run(&["fetch", "origin", branch]).await {
+        Ok((0, _, _)) => info!("self_update[{}]: fetch origin/{} 成功", ctx, branch),
+        Ok((code, _, err)) => warn!(
+            "self_update[{}]: fetch origin/{} 失败 (code={}): {}",
+            ctx,
+            branch,
+            code,
+            err.trim()
+        ),
+        Err(e) => warn!(
+            "self_update[{}]: fetch origin/{} 执行错误: {}",
+            ctx, branch, e
+        ),
+    }
 }
 
 /// Behind-count for the self-managed project (the one whose working tree is
@@ -68,6 +113,11 @@ pub async fn self_update_pending(
         .await
         .map_err(|e| format!("查询项目失败: {}", e))?;
 
+    info!(
+        "self_update_pending: 扫描 {} 个项目寻找自管理仓库",
+        projects.len()
+    );
+
     for p in projects {
         let git = GitProxy::new(&p.repo_path);
         let branch = git
@@ -80,14 +130,20 @@ pub async fn self_update_pending(
             continue;
         }
         // Self-managed project found — refresh and measure how far behind it is.
-        let _ = git.run(&["fetch", "origin", &p.branch_dev]).await;
+        info!(
+            "self_update_pending: 命中自管理仓库 {} ({}), 当前分支={}",
+            p.name, p.repo_path, branch
+        );
+        fetch_and_log(&git, &p.branch_dev, "pending").await;
         let behind = count_range(&git, &format!("HEAD..origin/{}", p.branch_dev)).await;
+        info!("self_update_pending: 项目 {} 落后 {} 个提交", p.id, behind);
         return Ok(SelfUpdatePending {
             project_id: Some(p.id),
             behind,
         });
     }
 
+    info!("self_update_pending: 未找到自管理仓库（无项目当前停在其 dev 分支）");
     Ok(SelfUpdatePending {
         project_id: None,
         behind: 0,
@@ -101,6 +157,10 @@ pub async fn self_update_status(
 ) -> Result<SelfUpdateStatus, String> {
     let project = load_project(&state.db, &project_id).await?;
     let git = GitProxy::new(&project.repo_path);
+    info!(
+        "self_update_status: 项目 {} repo={}",
+        project_id, project.repo_path
+    );
 
     let branch = git
         .run(&["branch", "--show-current"])
@@ -109,6 +169,12 @@ pub async fn self_update_status(
         .map(|(_, out, _)| out.trim().to_string())
         .unwrap_or_default();
     let is_self_managed = !branch.is_empty() && branch == project.branch_dev;
+    info!(
+        "self_update_status: 当前分支={} branch_dev={} is_self_managed={}",
+        if branch.is_empty() { "<空/游离HEAD>" } else { &branch },
+        project.branch_dev,
+        is_self_managed
+    );
 
     let dirty = git
         .run(&["status", "--porcelain"])
@@ -117,10 +183,14 @@ pub async fn self_update_status(
         .unwrap_or(false);
 
     // Best-effort refresh so behind/ahead reflect the real remote tip.
-    let _ = git.run(&["fetch", "origin", &project.branch_dev]).await;
+    fetch_and_log(&git, &project.branch_dev, "status").await;
     let remote = format!("origin/{}", project.branch_dev);
     let behind = count_range(&git, &format!("HEAD..{}", remote)).await;
     let ahead = count_range(&git, &format!("{}..HEAD", remote)).await;
+    info!(
+        "self_update_status: behind={} ahead={} dirty={}",
+        behind, ahead, dirty
+    );
 
     Ok(SelfUpdateStatus {
         repo_path: project.repo_path,
@@ -139,11 +209,17 @@ pub async fn self_update_pull(
 ) -> Result<SelfUpdateResult, String> {
     let project = load_project(&state.db, &project_id).await?;
     let git = GitProxy::new(&project.repo_path);
+    info!(
+        "self_update_pull: 项目 {} repo={} 开始拉取",
+        project_id, project.repo_path
+    );
 
-    let _ = git.run(&["fetch", "origin", &project.branch_dev]).await;
+    fetch_and_log(&git, &project.branch_dev, "pull").await;
     let remote = format!("origin/{}", project.branch_dev);
     let behind = count_range(&git, &format!("HEAD..{}", remote)).await;
+    info!("self_update_pull: behind={}", behind);
     if behind == 0 {
+        info!("self_update_pull: 已是最新，跳过 pull");
         return Ok(SelfUpdateResult {
             ok: true,
             pulled: 0,
@@ -159,8 +235,13 @@ pub async fn self_update_pull(
         .run(&["pull", "--ff-only", "origin", &project.branch_dev])
         .await
         .unwrap_or((-1, String::new(), "git not available".to_string()));
+    info!(
+        "self_update_pull: git pull --ff-only origin {} 退出码={}",
+        project.branch_dev, code
+    );
 
     if code == 0 {
+        info!("self_update_pull: 成功快进 {} 个提交", behind);
         return Ok(SelfUpdateResult {
             ok: true,
             pulled: behind,
@@ -172,6 +253,11 @@ pub async fn self_update_pull(
         });
     }
 
+    warn!(
+        "self_update_pull: ff-only 拉取失败 (code={}): {}",
+        code,
+        err.trim()
+    );
     let lowered = err.to_lowercase();
     let hint = if lowered.contains("local changes")
         || lowered.contains("would be overwritten")

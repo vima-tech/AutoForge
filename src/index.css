@@ -518,6 +518,40 @@
   color-scheme: light;
 }
 
+/* Breeze — 清爽天空蓝：低饱和、明亮通透，作为暖色系外的清爽选项。
+   暗色基调偏冷石板蓝且比其它 palette 更轻盈；浅色近白、空气感强。 */
+[data-theme="dark"][data-palette="breeze"] {
+  --bg: #121a22; --bg-1: #18222c; --bg-2: #1f2c38; --bg-3: #283744;
+  --surface-hover: #314250; --surface-active: #3b4f5f;
+  --titlebar: rgba(20,30,40,.74); --rail-bg: #0e151c; --rail-border: rgba(0,0,0,.4);
+  --rail-item-color: #7c8e9e; --rail-item-hover-bg: rgba(255,255,255,.06); --rail-item-hover-color: #dce9f5;
+  --me-avatar-bg: linear-gradient(135deg,#273c4d,#18222c); --me-avatar-color: #6fbaee; --av-status-border: var(--bg-1);
+  --border: rgba(168,210,242,.12); --border-strong: rgba(168,210,242,.22);
+  --text: #eaf2fa; --text-2: #b5c7d8; --text-3: #8294a6; --text-faint: #586a7a;
+  --ember: #3d9be0; --ember-soft: #6fbaee; --ember-deep: #2a78b6; --ember-tint: rgba(61,155,224,.15); --ember-tint-strong: rgba(61,155,224,.24);
+  --molten: linear-gradient(135deg,#7cc5f3 0%,#3d9be0 58%,#2a78b6 100%);
+  --green: #5ea8a0; --green-soft: #7cc6bd; --blue: #5891cf; --violet: #8a82c8; --red: #d2675a; --amber: #c79b48;
+  --bubble-me: linear-gradient(135deg,#7cc5f3,#3d9be0); --bubble-me-text: #06151f; --bubble-them: #1d2935; --bubble-them-text: #eaf2fa;
+  --code-bg: #0b1117;
+  color-scheme: dark;
+}
+
+[data-theme="light"][data-palette="breeze"] {
+  --bg: #eaf2fa; --bg-1: #f2f7fc; --bg-2: #fbfdff; --bg-3: #ffffff;
+  --surface-hover: #e4eef7; --surface-active: #d6e6f2;
+  --titlebar: rgba(249,252,255,.84); --rail-bg: #f2f7fc; --rail-border: rgba(38,78,118,.12);
+  --rail-item-color: #74879a; --rail-item-hover-bg: rgba(38,78,118,.07); --rail-item-hover-color: #14222f;
+  --me-avatar-bg: linear-gradient(135deg,#ffffff,#e7f1fb); --me-avatar-color: #2a78b6; --av-status-border: var(--bg-3);
+  --border: rgba(38,78,118,.12); --border-strong: rgba(38,78,118,.21);
+  --text: #14222f; --text-2: #4f6478; --text-3: #7e91a4; --text-faint: #a5b4c3;
+  --ember: #2f88cf; --ember-soft: #57a5de; --ember-deep: #216aa6; --ember-tint: rgba(47,136,207,.12); --ember-tint-strong: rgba(47,136,207,.20);
+  --molten: linear-gradient(135deg,#63b1e8 0%,#2f88cf 58%,#216aa6 100%);
+  --green: #549b8e; --green-soft: #6fbaad; --blue: #4d87c3; --violet: #7d74bb; --red: #c95d52; --amber: #b98e3a;
+  --bubble-me: linear-gradient(135deg,#63b1e8,#2f88cf); --bubble-me-text: #06151f; --bubble-them: #ffffff; --bubble-them-text: #14222f;
+  --code-bg: #e4eef7;
+  color-scheme: light;
+}
+
 /* Theme polish pass: small tonal corrections without changing the theme system. */
 [data-theme="dark"] {
   --shadow-sm: 0 1px 2px rgba(0,0,0,.28), 0 1px 1px rgba(0,0,0,.16);

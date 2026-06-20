@@ -93,6 +93,15 @@ pub fn run() {
                 autosupply_running: autosupply_running.clone(),
             });
 
+            // 启动恢复：上次进程退出（崩溃/重启）时在途的代码实现任务，其内存轮询任务已
+            // 随进程消失，但 CR 仍停在 pending_execution/executing 且无人再去抢槽位——批量
+            // 合并腾空槽位也救不回。这里在任何 driver 任务产生前重排它们，使流水线自愈。
+            let db_for_requeue = db.clone();
+            let tx_for_requeue = job_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                tasks::runner::requeue_orphaned_executions(&db_for_requeue, &tx_for_requeue).await;
+            });
+
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
             let db_for_scan = db.clone();
             let tx_for_scan = job_tx.clone();

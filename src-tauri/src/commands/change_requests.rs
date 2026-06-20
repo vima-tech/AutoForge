@@ -905,6 +905,19 @@ async fn cleanup_cr_worktrees(db: &crate::db::Db, cr: &ChangeRequest) {
     .await;
 }
 
+/// Worktree/preview cleanup by CR id. The startup reconciler
+/// (`tasks::runner::requeue_orphaned_executions`) only has the id, so it loads the
+/// CR then delegates to [`cleanup_cr_worktrees`].
+pub(crate) async fn cleanup_cr_worktrees_by_id(db: &crate::db::Db, cr_id: &str) {
+    if let Ok(cr) = sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(cr_id)
+        .fetch_one(db)
+        .await
+    {
+        cleanup_cr_worktrees(db, &cr).await;
+    }
+}
+
 /// Recover a stuck change request: re-run code implementation from a clean
 /// worktree. Only failed terminal states are retryable so in-flight tasks are
 /// never disturbed. This is the closure path for `execution_failed` /

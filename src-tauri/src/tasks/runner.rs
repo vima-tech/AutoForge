@@ -245,3 +245,86 @@ pub async fn enqueue(
 
     Ok(actual_id)
 }
+
+/// Recover executions orphaned by a previous process exit (crash or quit).
+///
+/// A queued CR only advances `pending_execution → executing` via the in-memory
+/// [`wait_for_execution_slot`] task that [`enqueue`] spawns. That task lives only
+/// in this process: if AutoForge restarts while executions are queued or running,
+/// the tasks die but the CRs persist at `pending_execution` / `executing` with
+/// nothing left to poll for a free slot. Freeing slots afterwards (e.g. a batch
+/// merge) then does NOTHING for them — they stall forever, and
+/// `retry_change_request` refuses `pending_execution`, so they can't be recovered
+/// by hand either.
+///
+/// Run ONCE at startup, before any driver task exists, so there is never a live
+/// task to double up with. Keyed on CR state (not job rows) so it also recovers a
+/// CR whose execution job died inside the slot wait (job row `failed`, CR still
+/// `pending_execution`):
+///   1. roll any half-run `executing` CR back to `pending_execution`, removing its
+///      now-stale worktree so the re-dispatched run forks a fresh branch;
+///   2. retire the dead execution job rows so stale `waiting`/`running` entries
+///      don't linger;
+///   3. enqueue a fresh execution job for every `pending_execution` CR, which
+///      spawns a new driver task that re-enters the slot gate.
+///
+/// Returns how many executions were re-enqueued.
+pub async fn requeue_orphaned_executions(db: &Db, tx: &JobSender) -> usize {
+    // 1) Roll back CRs caught mid-execution; clean the stale worktree.
+    let executing: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM change_requests WHERE status='executing'")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+    for (cr_id,) in &executing {
+        let _ = sqlx::query(
+            "UPDATE change_requests SET status='pending_execution', updated_at=datetime('now') WHERE id=? AND status='executing'",
+        )
+        .bind(cr_id)
+        .execute(db)
+        .await;
+        crate::commands::change_requests::cleanup_cr_worktrees_by_id(db, cr_id).await;
+    }
+
+    // 2) Retire dead execution job rows; the fresh enqueue below creates the live one.
+    let _ = sqlx::query(
+        "UPDATE job_executions SET status='failed', last_error='superseded by restart recovery', updated_at=datetime('now')
+         WHERE job_type='execution' AND status IN ('pending','waiting','running')",
+    )
+    .execute(db)
+    .await;
+
+    // 3) Enqueue a fresh execution job for every queued CR (incl. those just rolled back).
+    let pending: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, project_id FROM change_requests WHERE status='pending_execution'")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+    let mut requeued = 0usize;
+    for (cr_id, project_id) in pending {
+        // Unique key so INSERT OR IGNORE never swallows the recovery enqueue.
+        let idem_key = format!("execution:{}:restart:{}", cr_id, Uuid::new_v4());
+        if enqueue(
+            db,
+            tx,
+            "execution",
+            &idem_key,
+            JobPayload::Execution {
+                change_request_id: cr_id.clone(),
+                project_id,
+            },
+        )
+        .await
+        .is_ok()
+        {
+            requeued += 1;
+        }
+    }
+    if requeued > 0 {
+        info!(
+            "startup recovery: re-enqueued {} orphaned execution(s)",
+            requeued
+        );
+    }
+    requeued
+}

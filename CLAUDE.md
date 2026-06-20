@@ -202,7 +202,7 @@ listen('autoforge://event', (e) => { /* message_received | conversation_task_upd
 `tasks/runner.rs` 维护一个 Tokio mpsc channel，任务入队后异步执行：
 - `Analysis` → `agents/analysis.rs` 调用 LLM 分析需求
 - `Execution` → 创建 git worktree，调用 `claude --permission-mode acceptEdits`
-- `Merge` → `git merge --no-ff` 合并到 dev 分支
+- `Merge` → `git merge --squash` 合并到 dev 分支（每个 CR 压成一个提交，避免批量合并产生大量提交记录）
 - 幂等键写入 `job_executions` 表防重复执行
 
 ### AI 编排（会议室任务）

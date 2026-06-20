@@ -38,20 +38,47 @@ async fn land_on_dev(
         if cc != 0 {
             return Err((cc, format!("checkout {} 失败：{}", project.branch_dev, ce)));
         }
+        // Squash-merge: collapse the CR branch (impl commits + Phase-1 dev-sync
+        // merge) into a SINGLE commit on dev, so a batch of N CRs leaves N commits
+        // instead of ~3N. Phase 1 already merged dev into the branch, so this
+        // squash applies only the CR's own changes (dev parts are already in dev).
         let (mc, _, me) = git
+            .run(&["merge", "--squash", &session.branch_name])
+            .await
+            .unwrap_or((-1, String::new(), "git not available".to_string()));
+        if mc != 0 {
+            // --squash never sets MERGE_HEAD, so `merge --abort` can't undo a
+            // conflicted squash; reset hard to restore dev for a retry.
+            let _ = git.run(&["reset", "--hard", "HEAD"]).await;
+            return Err((mc, me));
+        }
+        // Branch already fully contained in dev (e.g. its change landed via an
+        // earlier CR in the same batch) ⇒ squash stages nothing. `git commit` would
+        // fail with "nothing to commit"; `--no-ff` used to report "Already up to
+        // date" and succeed here, so mirror that — succeed WITHOUT an empty commit.
+        let nothing_staged = git
+            .run(&["diff", "--cached", "--quiet"])
+            .await
+            .map(|(c, _, _)| c == 0)
+            .unwrap_or(false);
+        if nothing_staged {
+            return Ok(());
+        }
+        let (cc2, _, ce2) = git
             .run(&[
-                "merge",
-                "--no-ff",
-                &session.branch_name,
+                "-c",
+                "user.name=AutoForge",
+                "-c",
+                "user.email=autoforge@local",
+                "commit",
                 "-m",
                 merge_msg,
             ])
             .await
             .unwrap_or((-1, String::new(), "git not available".to_string()));
-        if mc != 0 {
-            // Abort the half-applied merge so dev/worktree stay clean for a retry.
-            let _ = git.run(&["merge", "--abort"]).await;
-            return Err((mc, me));
+        if cc2 != 0 {
+            let _ = git.run(&["reset", "--hard", "HEAD"]).await;
+            return Err((cc2, ce2));
         }
         return Ok(());
     }
@@ -88,21 +115,45 @@ async fn land_on_dev(
     }
 
     let tmp_git = GitProxy::new(&tmp_path);
+    // Squash-merge into the throwaway branch (same rationale as the fast path):
+    // the push lands ONE commit on origin/<dev> per CR, not the branch's full history.
     let (mc, _, me) = tmp_git
-        .run(&[
-            "merge",
-            "--no-ff",
-            &session.branch_name,
-            "-m",
-            merge_msg,
-        ])
+        .run(&["merge", "--squash", &session.branch_name])
         .await
         .unwrap_or((-1, String::new(), "git not available".to_string()));
     if mc != 0 {
-        let _ = tmp_git.run(&["merge", "--abort"]).await;
+        // --squash sets no MERGE_HEAD; reset hard to restore the tmp branch.
+        let _ = tmp_git.run(&["reset", "--hard", "HEAD"]).await;
         let _ = git.run(&["worktree", "remove", "--force", &tmp_path]).await;
         let _ = git.run(&["branch", "-D", &tmp_branch]).await;
         return Err((mc, me));
+    }
+    // Nothing staged ⇒ already in origin/<dev>; skip the (empty) commit and let the
+    // push below be a no-op fast-forward, mirroring `--no-ff`'s "Already up to date".
+    let nothing_staged = tmp_git
+        .run(&["diff", "--cached", "--quiet"])
+        .await
+        .map(|(c, _, _)| c == 0)
+        .unwrap_or(false);
+    if !nothing_staged {
+        let (cc2, _, ce2) = tmp_git
+            .run(&[
+                "-c",
+                "user.name=AutoForge",
+                "-c",
+                "user.email=autoforge@local",
+                "commit",
+                "-m",
+                merge_msg,
+            ])
+            .await
+            .unwrap_or((-1, String::new(), "git not available".to_string()));
+        if cc2 != 0 {
+            let _ = tmp_git.run(&["reset", "--hard", "HEAD"]).await;
+            let _ = git.run(&["worktree", "remove", "--force", &tmp_path]).await;
+            let _ = git.run(&["branch", "-D", &tmp_branch]).await;
+            return Err((cc2, ce2));
+        }
     }
 
     // Push the merge to origin/<dev>. This is what makes it durable, since the
@@ -901,6 +952,119 @@ mod tests {
             !diff.contains("DEV-CHANGE"),
             "dev's change must NOT leak into the CR diff:\n{diff}"
         );
+
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    fn dummy_project(repo_path: &str) -> crate::models::project::Project {
+        crate::models::project::Project {
+            id: "p1".into(),
+            name: "p".into(),
+            slug: "p".into(),
+            description: String::new(),
+            repo_path: repo_path.into(),
+            branch_dev: "dev".into(),
+            branch_main: "main".into(),
+            status: "active".into(),
+            config_yaml: None,
+            is_default: false,
+            archived_at: None,
+            code_agent_id: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn dummy_session(worktree_path: &str, branch: &str) -> crate::models::worktree::WorktreeSession {
+        crate::models::worktree::WorktreeSession {
+            id: "s1".into(),
+            change_request_id: "cr1".into(),
+            worktree_path: worktree_path.into(),
+            branch_name: branch.into(),
+            status: "review".into(),
+            prompt_snapshot: None,
+            iteration_count: 1,
+            report_content: None,
+            diff_content: None,
+            base_commit: None,
+            conflict_files: None,
+            conflict_diff: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    fn commit_count(dir: &Path, rev: &str) -> usize {
+        let out = Command::new("git")
+            .args(["rev-list", "--count", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+    }
+
+    /// Fast-path land squashes the CR branch (multiple impl commits) into a SINGLE
+    /// commit on dev carrying the human-written merge message.
+    #[tokio::test]
+    async fn land_on_dev_squashes_to_one_commit() {
+        let (repo, wt) = setup("squash");
+        // CR makes TWO commits on a DIFFERENT file (no conflict with dev's line2).
+        std::fs::write(wt.join("g.txt"), "g1\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qam", "cr commit 1"]);
+        std::fs::write(wt.join("g.txt"), "g1\ng2\n").unwrap();
+        git(&wt, &["commit", "-qam", "cr commit 2"]);
+
+        let before = commit_count(&repo, "dev");
+        let g = GitProxy::new(repo.to_str().unwrap());
+        let project = dummy_project(repo.to_str().unwrap());
+        let session = dummy_session(wt.to_str().unwrap(), "cr");
+
+        let res = land_on_dev(&g, &project, &session, "cr1", false, "merge msg X").await;
+        assert!(res.is_ok(), "land should succeed: {res:?}");
+
+        // Exactly ONE new commit on dev (squash collapses the two CR commits).
+        assert_eq!(commit_count(&repo, "dev"), before + 1, "squash must add 1 commit");
+        // That commit carries the human merge message, not a "Merge branch" default.
+        let msg = {
+            let out = Command::new("git")
+                .args(["log", "-1", "--pretty=%s", "dev"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(msg, "merge msg X");
+        // The CR's change is actually present on dev.
+        git(&repo, &["checkout", "-q", "dev"]);
+        assert_eq!(std::fs::read_to_string(repo.join("g.txt")).unwrap(), "g1\ng2\n");
+
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// Regression: when the CR branch is already contained in dev (its change
+    /// landed via an earlier CR in the same batch), squash stages nothing. Land
+    /// must SUCCEED without an empty commit — not fail like a naive squash+commit.
+    #[tokio::test]
+    async fn land_on_dev_noop_when_already_merged() {
+        let (repo, wt) = setup("noop");
+        std::fs::write(wt.join("g.txt"), "g1\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qam", "cr commit"]);
+        // Land the CR's change into dev first (simulates an earlier batch sibling).
+        git(&repo, &["checkout", "-q", "dev"]);
+        git(&repo, &["merge", "--squash", "cr"]);
+        git(&repo, &["commit", "-qam", "earlier sibling"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let before = commit_count(&repo, "dev");
+        let g = GitProxy::new(repo.to_str().unwrap());
+        let project = dummy_project(repo.to_str().unwrap());
+        let session = dummy_session(wt.to_str().unwrap(), "cr");
+
+        let res = land_on_dev(&g, &project, &session, "cr1", false, "merge msg").await;
+        assert!(res.is_ok(), "no-op land should succeed, got {res:?}");
+        assert_eq!(commit_count(&repo, "dev"), before, "must NOT create an empty commit");
 
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
