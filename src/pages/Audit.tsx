@@ -394,6 +394,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   // 已合并 CR 滚动加载：滚动容器 + 触底哨兵。
   const listScrollRef = React.useRef<HTMLDivElement>(null);
   const mergedSentinelRef = React.useRef<HTMLDivElement>(null);
+  // 选中行：跨页跳转/切换选中后把该行滚动进视口（block:nearest 只在必要时滚动，不打扰已可见的选中项）。
+  const activeRowRef = React.useRef<HTMLDivElement>(null);
   // 批量审核选区：审核需求闸作用于 pending_issue_review 需求，审核代码闸作用于 pending_code_review CR。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBatch, setConfirmBatch] = useState(false);
@@ -436,6 +438,11 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   }, [selectableIds]);
   // 切换闸口时清空批量选区，避免跨闸口选区残留与底部操作条错位。
   useEffect(() => { setSelected(new Set()); }, [gate]);
+  // 选中变化（含跨页跳转）后，把选中行滚动进视口。依赖列表数据，确保跳转时
+  // 行渲染完成后再滚动；ref 仅挂在 active 行，未渲染时为空、安全跳过。
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [sel?.kind, sel?.id, gate, pendingIssues, crs]);
 
   // 已合并 CR 触底哨兵进入视口即加载下一页（仅代码闸 + 还有更多时；提前 240px 预取）。
   useEffect(() => {
@@ -561,7 +568,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         {gate === 'issue' && filteredIssues.map(issue => {
           const canSelect = issue.status === 'pending_issue_review';
           return (
-            <div key={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
+            <div key={issue.id} ref={sel?.kind === 'issue' && sel.id === issue.id ? activeRowRef : undefined} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
               <div className="req-item-top">
                 {canSelect && (
                   <span onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
@@ -603,7 +610,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                     )}
                   </div>
                 )}
-                <div className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
+                <div ref={sel?.kind === 'cr' && sel.id === r.id ? activeRowRef : undefined} className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
                   <div className="req-item-top">
                     {r.status === 'pending_code_review' && (
                       <span onClick={e => { e.stopPropagation(); toggleSel(r.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
@@ -721,6 +728,11 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   const reqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  // 选中行：跨页跳转到总账后把该行滚动进视口。
+  const activeRowRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [sel?.kind, sel?.id, items]);
 
   // 搜索防抖：停顿 250ms 再打后端，避免逐字查询。
   useEffect(() => {
@@ -849,7 +861,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
         </div>
         {items.length === 0 && !loading && <div className="empty-compact">无匹配需求</div>}
         {items.map(i => (
-          <div key={i.id} className={'req-item ledger-row' + (sel?.kind === 'issue' && sel.id === i.id ? ' active' : '')} onClick={() => onSelectIssue(i.id)}>
+          <div key={i.id} ref={sel?.kind === 'issue' && sel.id === i.id ? activeRowRef : undefined} className={'req-item ledger-row' + (sel?.kind === 'issue' && sel.id === i.id ? ' active' : '')} onClick={() => onSelectIssue(i.id)}>
             <span onClick={e => { e.stopPropagation(); toggle(i.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择">
               <LedgerCheck on={selected.has(i.id)} />
             </span>
