@@ -65,7 +65,7 @@ impl GitProxy {
             break;
         }
         let subcmd = args.get(idx).copied().unwrap_or("");
-        let rest = if idx + 1 <= args.len() {
+        let rest = if idx < args.len() {
             &args[idx..]
         } else {
             &[][..]
