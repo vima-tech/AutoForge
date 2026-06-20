@@ -354,13 +354,11 @@ pub fn parse_agent_file_writes(text: &str) -> (String, Vec<(String, String)>) {
         let raw_path = caps[1].trim().to_string();
         let content = caps[2].trim().to_string();
         // Normalise path: strip leading ".autoforge/" prefix if present
-        let rel = if raw_path.starts_with(".autoforge/") {
-            raw_path[".autoforge/".len()..].to_string()
-        } else if raw_path.starts_with("autoforge/") {
-            raw_path["autoforge/".len()..].to_string()
-        } else {
-            raw_path.clone()
-        };
+        let rel = raw_path
+            .strip_prefix(".autoforge/")
+            .or_else(|| raw_path.strip_prefix("autoforge/"))
+            .unwrap_or(&raw_path)
+            .to_string();
         // Only keep writes targeting docs/ or specs/
         if rel.starts_with("docs/") || rel.starts_with("specs/") {
             writes.push((rel, content));
