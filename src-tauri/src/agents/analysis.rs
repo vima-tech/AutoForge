@@ -709,22 +709,27 @@ pub fn parse_spec(text: &str) -> Option<IssueAnalysisSpec> {
         duplicate_hint: Option<String>,
     }
     let l: LegacyFlat = serde_json::from_str(json_str).ok()?;
-    let mut spec = IssueAnalysisSpec::default();
-    spec.triage = Triage {
-        authenticity_score: l.authenticity_score.unwrap_or(0.5),
-        feasibility_score: l.feasibility_score.unwrap_or(0.5),
-        priority_suggestion: l.priority_suggestion.unwrap_or(5),
-        category_suggestion: l.category_suggestion.unwrap_or_else(|| "Feature".to_string()),
-        severity_suggestion: l.severity_suggestion.unwrap_or_else(|| "medium".to_string()),
-        is_duplicate: l.is_duplicate.unwrap_or(false),
-        duplicate_of: None,
-        duplicate_hint: l.duplicate_hint.unwrap_or_default(),
-        needs_changes: true,
-        no_change_reason: String::new(),
-        analysis_summary: l.analysis_summary.unwrap_or_default(),
-        confidence: 0.5,
+    let spec = IssueAnalysisSpec {
+        triage: Triage {
+            authenticity_score: l.authenticity_score.unwrap_or(0.5),
+            feasibility_score: l.feasibility_score.unwrap_or(0.5),
+            priority_suggestion: l.priority_suggestion.unwrap_or(5),
+            category_suggestion: l.category_suggestion.unwrap_or_else(|| "Feature".to_string()),
+            severity_suggestion: l.severity_suggestion.unwrap_or_else(|| "medium".to_string()),
+            is_duplicate: l.is_duplicate.unwrap_or(false),
+            duplicate_of: None,
+            duplicate_hint: l.duplicate_hint.unwrap_or_default(),
+            needs_changes: true,
+            no_change_reason: String::new(),
+            analysis_summary: l.analysis_summary.unwrap_or_default(),
+            confidence: 0.5,
+        },
+        scope: Scope {
+            affected_modules: l.affected_modules.unwrap_or_default(),
+            ..Default::default()
+        },
+        ..Default::default()
     };
-    spec.scope.affected_modules = l.affected_modules.unwrap_or_default();
     Some(spec)
 }
 
