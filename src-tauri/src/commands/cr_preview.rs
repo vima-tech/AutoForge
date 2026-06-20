@@ -5,7 +5,7 @@
 //! reflects the CR's actual code. Supports two project kinds:
 //!   - `web`   → start the dev command, embed `url` in an iframe.
 //!   - `tauri` → start the web frontend dev server for the iframe, and optionally
-//!               launch the native desktop window via `app_command` (escape hatch D).
+//!     launch the native desktop window via `app_command` (escape hatch D).
 //!
 //! When the project has no preview config the status is `no_config` / kind `none`,
 //! and the frontend collapses the preview area (fallback C).

@@ -317,7 +317,7 @@ pub async fn search_conversation_archives(
             }
         })
         .collect();
-    hits.sort_by(|a, b| b.match_count.cmp(&a.match_count));
+    hits.sort_by_key(|x| std::cmp::Reverse(x.match_count));
     Ok(hits)
 }
 
