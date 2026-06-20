@@ -5,6 +5,7 @@
 //!   - `builtin`：直接用 `builtin_prompt`
 //!   - `append` ：`builtin_prompt` + Agent 的补充文本（system_prompt）
 //!   - `custom` ：完全用 Agent 自定义文本（system_prompt）
+//!
 //! 自定义对话角色（无注册表项）在 `compose_system_prompt` 中自动退回其 system_prompt。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
