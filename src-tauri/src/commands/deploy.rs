@@ -328,7 +328,7 @@ fn strip_code_fence(text: &str) -> String {
     let t = text.trim();
     if let Some(rest) = t.strip_prefix("```") {
         // drop optional language tag on the first line
-        let body = rest.splitn(2, '\n').nth(1).unwrap_or("");
+        let body = rest.split_once('\n').map(|(_, after)| after).unwrap_or("");
         return body.trim_end_matches("```").trim().to_string();
     }
     t.to_string()
