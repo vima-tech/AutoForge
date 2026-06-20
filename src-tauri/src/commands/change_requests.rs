@@ -391,13 +391,15 @@ pub async fn review_1(
         let admin_id = decision.admin_id.unwrap_or_else(|| "admin".to_string());
         record_admin_decision(
             &state.db,
-            &issue.project_id,
-            &issue_id,
-            None,
-            "review_1",
-            "rejected",
-            &admin_id,
-            decision.suggestions.as_deref(),
+            AdminDecisionRecord {
+                project_id: &issue.project_id,
+                issue_id: &issue_id,
+                change_request_id: None,
+                stage: "review_1",
+                decision: "rejected",
+                admin_id: &admin_id,
+                suggestions: decision.suggestions.as_deref(),
+            },
         )
         .await?;
 
@@ -465,13 +467,15 @@ async fn approve_issue_review_1(
 
     record_admin_decision(
         db,
-        &issue.project_id,
-        issue_id,
-        Some(&cr_id),
-        "review_1",
-        "approved",
-        admin_id,
-        suggestions,
+        AdminDecisionRecord {
+            project_id: &issue.project_id,
+            issue_id,
+            change_request_id: Some(&cr_id),
+            stage: "review_1",
+            decision: "approved",
+            admin_id,
+            suggestions,
+        },
     )
     .await?;
 
@@ -600,13 +604,15 @@ async fn approve_cr_review_2(
 
     record_admin_decision(
         db,
-        &cr.project_id,
-        &cr.issue_id,
-        Some(cr_id),
-        "review_2",
-        "approved",
-        admin_id,
-        suggestions,
+        AdminDecisionRecord {
+            project_id: &cr.project_id,
+            issue_id: &cr.issue_id,
+            change_request_id: Some(cr_id),
+            stage: "review_2",
+            decision: "approved",
+            admin_id,
+            suggestions,
+        },
     )
     .await?;
 
@@ -686,13 +692,15 @@ pub async fn review_2(
         record_review_2_outcome(&state.db, &cr_id, false).await;
         record_admin_decision(
             &state.db,
-            &cr.project_id,
-            &cr.issue_id,
-            Some(&cr_id),
-            "review_2",
-            "rejected",
-            &admin_id,
-            decision.suggestions.as_deref(),
+            AdminDecisionRecord {
+                project_id: &cr.project_id,
+                issue_id: &cr.issue_id,
+                change_request_id: Some(&cr_id),
+                stage: "review_2",
+                decision: "rejected",
+                admin_id: &admin_id,
+                suggestions: decision.suggestions.as_deref(),
+            },
         )
         .await?;
 
@@ -745,13 +753,15 @@ pub async fn review_2(
         record_review_2_outcome(&state.db, &cr_id, false).await;
         record_admin_decision(
             &state.db,
-            &cr.project_id,
-            &cr.issue_id,
-            Some(&cr_id),
-            "review_2",
-            "revision",
-            &admin_id,
-            decision.suggestions.as_deref(),
+            AdminDecisionRecord {
+                project_id: &cr.project_id,
+                issue_id: &cr.issue_id,
+                change_request_id: Some(&cr_id),
+                stage: "review_2",
+                decision: "revision",
+                admin_id: &admin_id,
+                suggestions: decision.suggestions.as_deref(),
+            },
         )
         .await?;
 
@@ -1044,16 +1054,31 @@ pub async fn delete_change_request(
     Ok(())
 }
 
+/// Fields describing a single human审核 decision, grouped to keep
+/// `record_admin_decision` under clippy's argument-count threshold.
+struct AdminDecisionRecord<'a> {
+    project_id: &'a str,
+    issue_id: &'a str,
+    change_request_id: Option<&'a str>,
+    stage: &'a str,
+    decision: &'a str,
+    admin_id: &'a str,
+    suggestions: Option<&'a str>,
+}
+
 async fn record_admin_decision(
     db: &crate::db::Db,
-    project_id: &str,
-    issue_id: &str,
-    change_request_id: Option<&str>,
-    stage: &str,
-    decision: &str,
-    admin_id: &str,
-    suggestions: Option<&str>,
+    record: AdminDecisionRecord<'_>,
 ) -> Result<(), String> {
+    let AdminDecisionRecord {
+        project_id,
+        issue_id,
+        change_request_id,
+        stage,
+        decision,
+        admin_id,
+        suggestions,
+    } = record;
     sqlx::query(
         "INSERT INTO admin_decisions
          (id, project_id, issue_id, change_request_id, stage, decision, admin_id, suggestions)
