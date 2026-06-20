@@ -1828,7 +1828,7 @@ fn route_by_relevance(instruction: &str, members: &[Agent]) -> Option<String> {
                 score += 1;
             }
         }
-        if score > 0 && best.map_or(true, |(b, _)| score > b) {
+        if score > 0 && best.is_none_or(|(b, _)| score > b) {
             best = Some((score, m.id.as_str()));
         }
     }
