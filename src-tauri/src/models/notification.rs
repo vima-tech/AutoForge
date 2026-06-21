@@ -122,6 +122,15 @@ impl NotificationDraft {
                 link_ref: Some(cr_id.clone()),
                 thread_key: Some(cr_id.clone()),
             }),
+            AppEvent::CrReverted { cr_id, .. } => Some(NotificationDraft {
+                category: "result",
+                kind: "cr_reverted",
+                title: "需求改动已撤销".into(),
+                body: cr_id.clone(),
+                link_page: Some("audit"),
+                link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
+            }),
             AppEvent::SecurityAuditCompleted {
                 cr_id,
                 severity,

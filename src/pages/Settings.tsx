@@ -18,7 +18,7 @@ import {
   listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
-  getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
+  getSystemHealth, checkClaudeAuth, updateConcurrencyConfig, getConcurrencyConfig,
   listPreviewEnvironments, listTestSessions, listAdminDecisions, listJobFailures,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   listNotifyChannels, createNotifyChannel, updateNotifyChannel, deleteNotifyChannel, testNotifyChannel,
@@ -1455,23 +1455,37 @@ function CodeAgentSettings() {
 }
 
 function ConcurrencySettings() {
-  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority' });
+  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, build_slots: 2, cpu_budget_pct: 0 });
   const [result, setResult] = useState('');
+
+  useEffect(() => {
+    getConcurrencyConfig().then(cfg => setForm(f => ({
+      ...f,
+      max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy,
+      timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor,
+      build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct,
+    }))).catch(() => { });
+  }, []);
 
   const save = async () => {
     const cfg = await updateConcurrencyConfig({
       max_slots: form.max_slots,
       pause_threshold: form.pause_threshold,
       queue_strategy: form.queue_strategy,
+      timeout_min: form.timeout_min,
+      idle_timeout_min: form.idle_timeout_min,
+      max_load_factor: form.max_load_factor,
+      build_slots: form.build_slots,
+      cpu_budget_pct: form.cpu_budget_pct,
     });
-    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy });
+    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy, timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor, build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct });
     setResult(`${cfg.stage} · ${cfg.active_slots}/${cfg.max_slots} · 待审核 ${cfg.pending_review}`);
   };
 
   return (
     <div className="set-inner rise">
       <div className="set-h">并发与流控</div>
-      <div className="set-desc">控制 Claude Code 执行槽位和审核积压背压阈值。</div>
+      <div className="set-desc">控制 Claude Code 执行槽位、审核积压背压阈值与代码 agent 超时回收。</div>
       <div className="cfg-card">
         <div className="cfg-fields">
           <div className="field"><label>最大并发槽位</label>
@@ -1483,6 +1497,26 @@ function ConcurrencySettings() {
           <div className="field"><label>队列策略</label>
             <Select value={form.queue_strategy} onChange={val => setForm(f => ({ ...f, queue_strategy: val }))}
               options={[{ value: 'priority', label: 'priority' }, { value: 'fifo', label: 'fifo' }, { value: 'oldest', label: 'oldest' }]} />
+          </div>
+          <div className="field"><label>墙钟超时（分钟）</label>
+            <input type="number" min="5" max="180" value={form.timeout_min} onChange={e => setForm(f => ({ ...f, timeout_min: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>单个代码 agent 运行硬上限，到点杀进程组兜底。</span>
+          </div>
+          <div className="field"><label>空闲超时（分钟）</label>
+            <input type="number" min="0" max="60" value={form.idle_timeout_min} onChange={e => setForm(f => ({ ...f, idle_timeout_min: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>连续无输出【且无 CPU 消耗】才判卡死并杀进程组；0=关闭。安静的长构建不会误杀。</span>
+          </div>
+          <div className="field"><label>负载背压（×核数）</label>
+            <input type="number" min="0" max="8" step="0.5" value={form.max_load_factor} onChange={e => setForm(f => ({ ...f, max_load_factor: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>系统负载超过 该值×CPU核数 时暂缓再起新 agent（在已有任务运行时）；0=关闭。压住批量过载。</span>
+          </div>
+          <div className="field"><label>构建池并发</label>
+            <input type="number" min="1" max="16" value={form.build_slots} onChange={e => setForm(f => ({ ...f, build_slots: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>合并门测试任意时刻最多并发编译数，限住批量合并的编译波。全平台。</span>
+          </div>
+          <div className="field"><label>CPU 预算（% × 核数）</label>
+            <input type="number" min="0" max="100" step="5" value={form.cpu_budget_pct} onChange={e => setForm(f => ({ ...f, cpu_budget_pct: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>cgroup 把 agent 自测+门的总 CPU 限到 该%×核数（不禁测试、只限速）；0=关闭。仅 Linux 生效，建议 70~80。</span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>

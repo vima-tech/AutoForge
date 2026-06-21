@@ -84,6 +84,16 @@ pub struct UpdateConcurrencyConfig {
     pub max_slots: Option<usize>,
     pub pause_threshold: Option<usize>,
     pub queue_strategy: Option<String>,
+    /// 代码 agent 墙钟超时（分钟）。
+    pub timeout_min: Option<u64>,
+    /// 代码 agent 空闲超时（分钟，0 = 关闭）。
+    pub idle_timeout_min: Option<u64>,
+    /// 负载感知入场：系统 1 分钟负载 > factor×nproc 时暂缓启动新 agent（0 = 关闭）。
+    pub max_load_factor: Option<f64>,
+    /// 合并门构建池：任意时刻最多并发的编译/测试数。
+    pub build_slots: Option<usize>,
+    /// cgroup CPU 预算（占总核数百分比，0 = 关闭；仅 Linux 生效）。
+    pub cpu_budget_pct: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,6 +104,102 @@ pub struct ConcurrencyConfig {
     pub pause_threshold: usize,
     pub stage: String,
     pub queue_strategy: String,
+    /// 代码 agent 墙钟超时（分钟）。
+    pub timeout_min: u64,
+    /// 代码 agent 空闲超时（分钟，0 = 关闭）。
+    pub idle_timeout_min: u64,
+    /// 负载感知入场阈值（factor×nproc，0 = 关闭）。
+    pub max_load_factor: f64,
+    /// 合并门构建池大小。
+    pub build_slots: usize,
+    /// cgroup CPU 预算（% × nproc，0 = 关闭）。
+    pub cpu_budget_pct: u64,
+}
+
+/// 代码 agent 超时默认值（分钟）。墙钟是硬上限兜底，空闲超时是抓卡死的主闸。
+pub const DEFAULT_TIMEOUT_MIN: u64 = 30;
+/// 空闲超时默认值按平台走：Linux 有 CPU 感知判定（仍烧 CPU 不算卡死、不误杀安静长构建），
+/// 故默认 8 分钟开启；非 Linux 无 /proc 读 CPU，空闲只能"看输出"，为避免误杀不流式的长构建，
+/// 默认 0（关闭），由墙钟兜底，用户可手动开。
+#[cfg(target_os = "linux")]
+pub const DEFAULT_IDLE_TIMEOUT_MIN: u64 = 8;
+#[cfg(not(target_os = "linux"))]
+pub const DEFAULT_IDLE_TIMEOUT_MIN: u64 = 0;
+/// 负载感知入场默认阈值：负载 > 1.5×nproc 才暂缓——只在真过载时踩刹车，正常不挡。
+pub const DEFAULT_MAX_LOAD_FACTOR: f64 = 1.5;
+/// 合并门构建池默认并发：2 个编译/测试同时跑（每个可吃多核，故不宜大）。
+pub const DEFAULT_BUILD_SLOTS: usize = 2;
+/// CPU 预算默认 0=关（cgroup 依环境，显式开启更安全；建议 Linux 上设 70~80）。
+pub const DEFAULT_CPU_BUDGET_PCT: u64 = 0;
+
+/// 读取合并门构建池大小（clamp [1, 32]）。
+pub async fn load_build_slots(db: &crate::db::Db) -> usize {
+    let v: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key='execution.build_slots'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    v.and_then(|(s,)| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_BUILD_SLOTS)
+        .clamp(1, 32)
+}
+
+/// 读取 CPU 预算百分比（clamp [0, 100]，0=关）。
+pub async fn load_cpu_budget_pct(db: &crate::db::Db) -> u64 {
+    let v: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key='execution.cpu_budget_pct'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    v.and_then(|(s,)| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CPU_BUDGET_PCT)
+        .min(100)
+}
+
+/// 读取负载感知入场阈值（factor×nproc）。0 或负 = 关闭。clamp 到 [0, 8]。
+pub async fn load_max_load_factor(db: &crate::db::Db) -> f64 {
+    let v: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key='execution.max_load_factor'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let f = v
+        .and_then(|(s,)| s.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_MAX_LOAD_FACTOR);
+    f.clamp(0.0, 8.0)
+}
+
+/// 读取并 clamp 代码 agent 超时设置，返回 (墙钟秒, 空闲秒)。供 `tasks::execution` 用。
+/// 墙钟 clamp 到 [5, 180] 分钟；空闲 clamp 到 [0, 60] 分钟（0=关闭）。空闲若 > 墙钟则取墙钟。
+pub async fn load_execution_limits(db: &crate::db::Db) -> (u64, u64) {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM app_settings
+         WHERE key IN ('execution.timeout_min', 'execution.idle_timeout_min')",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut wall_min = DEFAULT_TIMEOUT_MIN;
+    let mut idle_min = DEFAULT_IDLE_TIMEOUT_MIN;
+    for (key, value) in rows {
+        match key.as_str() {
+            "execution.timeout_min" => {
+                wall_min = value.parse::<u64>().unwrap_or(DEFAULT_TIMEOUT_MIN);
+            }
+            "execution.idle_timeout_min" => {
+                idle_min = value.parse::<u64>().unwrap_or(DEFAULT_IDLE_TIMEOUT_MIN);
+            }
+            _ => {}
+        }
+    }
+    let wall_min = wall_min.clamp(5, 180);
+    // 空闲超时不得超过墙钟，否则永不先于墙钟触发，等于无效。
+    let idle_min = idle_min.min(60).min(wall_min);
+    (wall_min * 60, idle_min * 60)
 }
 
 pub async fn load_concurrency_settings(
@@ -107,14 +213,15 @@ pub async fn load_concurrency_settings(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut max_slots = 5;
+    let default_slots = 5;
+    let mut max_slots = default_slots;
     let mut pause_threshold = 20;
     let mut queue_strategy = "priority".to_string();
 
     for (key, value) in rows {
         match key.as_str() {
             "concurrency.max_slots" => {
-                max_slots = value.parse::<usize>().unwrap_or(5).max(1);
+                max_slots = value.parse::<usize>().unwrap_or(default_slots).max(1);
             }
             "concurrency.pause_threshold" => {
                 pause_threshold = value.parse::<usize>().unwrap_or(20).max(1);
@@ -561,6 +668,71 @@ pub async fn update_concurrency_config(
     .await
     .map_err(|e| e.to_string())?;
 
+    // 代码 agent 超时（可选）。clamp 与 load_execution_limits 保持一致。
+    if let Some(t) = payload.timeout_min {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('execution.timeout_min', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(t.clamp(5, 180).to_string())
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(i) = payload.idle_timeout_min {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('execution.idle_timeout_min', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(i.min(60).to_string())
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(f) = payload.max_load_factor {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('execution.max_load_factor', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(format!("{:.2}", f.clamp(0.0, 8.0)))
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(b) = payload.build_slots {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('execution.build_slots', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(b.clamp(1, 32).to_string())
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        // 即时调整构建池容量（与 max_slots/cpu_budget 一致，无需重启）。
+        crate::state::set_build_slots(b.clamp(1, 32));
+    }
+    if let Some(p) = payload.cpu_budget_pct {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('execution.cpu_budget_pct', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(p.min(100).to_string())
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        // 热改 cgroup 预算（仅在已启用时生效；0 → 解除限制 max）。
+        crate::core::cpubudget::set_budget(p.min(100));
+    }
+
+    let (wall_secs, idle_secs) = load_execution_limits(&state.db).await;
+    let max_load_factor = load_max_load_factor(&state.db).await;
+    let build_slots = load_build_slots(&state.db).await;
+    let cpu_budget_pct = load_cpu_budget_pct(&state.db).await;
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,
         max_slots: status.max_slots,
@@ -568,6 +740,11 @@ pub async fn update_concurrency_config(
         pause_threshold: status.pause_threshold,
         stage: status.stage,
         queue_strategy,
+        timeout_min: wall_secs / 60,
+        idle_timeout_min: idle_secs / 60,
+        max_load_factor,
+        build_slots,
+        cpu_budget_pct,
     })
 }
 
@@ -576,6 +753,10 @@ pub async fn get_concurrency_config(
     state: State<'_, AppState>,
 ) -> Result<ConcurrencyConfig, String> {
     let status = state.concurrency.status();
+    let (wall_secs, idle_secs) = load_execution_limits(&state.db).await;
+    let max_load_factor = load_max_load_factor(&state.db).await;
+    let build_slots = load_build_slots(&state.db).await;
+    let cpu_budget_pct = load_cpu_budget_pct(&state.db).await;
 
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,
@@ -584,6 +765,11 @@ pub async fn get_concurrency_config(
         pause_threshold: status.pause_threshold,
         stage: status.stage,
         queue_strategy: state.concurrency.queue_strategy(),
+        timeout_min: wall_secs / 60,
+        idle_timeout_min: idle_secs / 60,
+        max_load_factor,
+        build_slots,
+        cpu_budget_pct,
     })
 }
 

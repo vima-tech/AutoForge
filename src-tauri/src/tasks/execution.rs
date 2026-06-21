@@ -336,12 +336,23 @@ pub async fn run(
     );
 
     // Run the configured code agent (claude / codex / opencode), resolved per
-    // project → global default → claude fallback.
-    let timeout_secs = 1800; // 30 minutes
+    // project → global default → claude fallback. 超时（墙钟 + 空闲）从设置读取，
+    // 到点真杀进程组——避免卡死/超时的 agent 变成孤儿持续烧 CPU。
+    let (wall_secs, idle_secs) = crate::commands::system::load_execution_limits(db).await;
+    let limits = crate::agents::code_agent::RunLimits {
+        wall_secs,
+        idle_secs,
+    };
     let code_agent = crate::agents::code_agent::resolve(db, &project).await;
-    info!("cr {} 使用代码 Agent: {}", cr_id, code_agent.kind());
+    info!(
+        "cr {} 使用代码 Agent: {}（墙钟 {}s / 空闲 {}s）",
+        cr_id,
+        code_agent.kind(),
+        wall_secs,
+        idle_secs
+    );
     let (exit_code, stdout, stderr) = code_agent
-        .run(&worktree_path, &prompt, timeout_secs)
+        .run(&worktree_path, &prompt, limits)
         .await
         .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
 

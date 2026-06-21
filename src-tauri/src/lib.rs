@@ -73,6 +73,18 @@ pub fn run() {
             let concurrency =
                 core::concurrency::ConcurrencyManager::new(max_slots, pause_threshold);
             concurrency.update_config(None, None, Some(queue_strategy));
+
+            // 合并门构建池 + cgroup CPU 预算：按配置初始化。构建池全平台；CPU 预算仅
+            // Linux 且 pct>0 时尝试，失败优雅降级（见 core::cpubudget）。
+            let (build_slots, cpu_budget_pct) = tauri::async_runtime::block_on(async {
+                (
+                    commands::system::load_build_slots(&db).await,
+                    commands::system::load_cpu_budget_pct(&db).await,
+                )
+            });
+            state::init_build_pool(build_slots);
+            core::cpubudget::init(cpu_budget_pct);
+
             let job_tx = tasks::runner::start(db.clone(), app_handle.clone(), concurrency.clone());
 
             let webhook_handle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
@@ -99,7 +111,13 @@ pub fn run() {
             let db_for_requeue = db.clone();
             let tx_for_requeue = job_tx.clone();
             tauri::async_runtime::spawn(async move {
+                // 先回收上次崩溃残留的孤儿 agent 进程组（在旧 worktree 里还在烧 CPU 的
+                // claude + 其子进程），再重排执行任务（重排会 fork 全新 worktree）。
+                core::reaper::reap_orphans_under(&state::worktrees_base());
                 tasks::runner::requeue_orphaned_executions(&db_for_requeue, &tx_for_requeue).await;
+                // 同样救回卡在 pending_analysis 的孤儿需求：要么进程中途退出，要么旧版
+                // 用稳定 analysis:<id> 重新分析时被已 completed 的 job 行去重而从未派发。
+                tasks::runner::requeue_orphaned_analyses(&db_for_requeue, &tx_for_requeue).await;
             });
 
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
@@ -304,6 +322,10 @@ pub fn run() {
             commands::change_requests::get_merge_conflict,
             commands::change_requests::retry_merge,
             commands::change_requests::ai_resolve_merge_conflict,
+            commands::change_requests::revert_change_request,
+            commands::conflicts::get_conflict_detail,
+            commands::conflicts::resolve_conflict_manually,
+            commands::conflicts::open_conflict_workspace,
             commands::change_requests::review_1,
             commands::change_requests::review_1_batch,
             commands::change_requests::review_2,
@@ -503,6 +525,13 @@ pub fn run() {
             commands::preview::mask_preview_data,
             commands::preview::provision_preview_container,
         ])
-        .run(tauri::generate_context!())
-        .expect("error running AutoForge");
+        .build(tauri::generate_context!())
+        .expect("error building AutoForge")
+        .run(|_app, event| {
+            // 退出时回收所有在途 code agent 进程组，杜绝退出/重启后 claude（及其
+            // ripgrep/构建子进程）变成孤儿继续烧 CPU。
+            if let tauri::RunEvent::Exit = event {
+                core::reaper::kill_all();
+            }
+        });
 }

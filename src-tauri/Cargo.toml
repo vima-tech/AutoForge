@@ -75,6 +75,11 @@ rust_xlsxwriter = "0.79"
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "=2.0.2", features = ["v2_4"] }
 
+# 进程组回收（core/reaper.rs）：对独立进程组的 code agent 整组发 SIGKILL，
+# 回收 claude + 其 ripgrep/构建子进程树。仅 unix 需要（windows 走 taskkill /T）。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.dev]
 incremental = true
 

@@ -278,5 +278,14 @@ export default function Block({ b, projectId, highlight, messageId, blockIndex }
   );
   if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} highlight={highlight} messageId={messageId} blockIndex={blockIndex} />;
   if (b.t === 'file_written') return <FileWrittenBlock b={b} highlight={highlight} />;
+  if (b.t === 'ws_ref') return (
+    <div className="att" style={{ borderColor: 'var(--ember)', background: 'var(--ember-tint)' }}>
+      <div className="att-ic" style={{ background: 'var(--ember)' }}><Icon name="folder" size={18} /></div>
+      <div style={{ minWidth: 0 }}>
+        <div className="att-name">{highlightText(b.name, highlight)}</div>
+        <div className="att-meta" style={{ fontFamily: 'var(--font-mono)' }}>引用 · .autoforge/{highlightText(b.path, highlight)}</div>
+      </div>
+    </div>
+  );
   return null;
 }

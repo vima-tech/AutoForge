@@ -48,6 +48,11 @@ pub enum AppEvent {
         cr_id: String,
         project_id: String,
     },
+    /// 已合并需求的改动被「撤销」（在 dev 上 `git revert` 了该 CR 的 squash 提交）。
+    CrReverted {
+        cr_id: String,
+        project_id: String,
+    },
     SecurityAuditCompleted {
         cr_id: String,
         audit_id: String,
@@ -103,6 +108,7 @@ impl AppEvent {
             | AppEvent::TestCompleted { cr_id, .. }
             | AppEvent::ReviewNeeded { cr_id, .. }
             | AppEvent::CrMerged { cr_id, .. }
+            | AppEvent::CrReverted { cr_id, .. }
             | AppEvent::SecurityAuditCompleted { cr_id, .. }
             | AppEvent::IterationWarning { cr_id, .. }
             | AppEvent::MergeConflict { cr_id, .. } => Some(cr_id),

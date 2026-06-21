@@ -151,6 +151,8 @@ export interface WorktreeSession {
   id: string; change_request_id: string; worktree_path: string;
   branch_name: string; status: string; prompt_snapshot: string | null;
   iteration_count: number; report_content: string | null;
+  /** 合并到 dev 时产生的 squash 提交 SHA；为 null 时无法一键撤销（合并早于撤销功能）。 */
+  merge_commit: string | null;
   started_at: string | null; completed_at: string | null;
 }
 export interface Conversation {
@@ -211,6 +213,8 @@ export interface SystemHealth {
 export interface ConcurrencyConfig {
   active_slots: number; max_slots: number; pending_review: number;
   pause_threshold: number; stage: string; queue_strategy: string;
+  timeout_min: number; idle_timeout_min: number; max_load_factor: number;
+  build_slots: number; cpu_budget_pct: number;
 }
 export interface PreviewEnvironment {
   id: string; project_id: string; env_type: string;
@@ -259,6 +263,8 @@ export const getBadgeCounts = () => ipc<BadgeCounts>('get_badge_counts');
 export const getConcurrencyConfig = () => ipc<ConcurrencyConfig>('get_concurrency_config');
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
+  timeout_min: number; idle_timeout_min: number; max_load_factor: number;
+  build_slots: number; cpu_budget_pct: number;
 }>) => ipc<ConcurrencyConfig>('update_concurrency_config', { payload });
 export const listPreviewEnvironments = (projectId?: string, status?: string) =>
   ipc<PreviewEnvironment[]>('list_preview_environments', {
@@ -476,6 +482,26 @@ export const retryMerge = (crId: string) =>
   ipc<void>('retry_merge', { crId });
 export const aiResolveMergeConflict = (crId: string) =>
   ipc<void>('ai_resolve_merge_conflict', { crId });
+/** 撤销一个已合并需求的改动（在 dev 上 git revert 其 squash 提交）。 */
+export const revertChangeRequest = (crId: string) =>
+  ipc<void>('revert_change_request', { crId });
+
+// ── 人工解冲突（方案 B 逐 hunk 决策 + C 外部 IDE 兜底）────────────────────────
+export type ConflictSegment = {
+  kind: 'context' | 'conflict';
+  text: string | null; ours: string | null; theirs: string | null; base: string | null;
+};
+export type ConflictFile = { path: string; binary: boolean; segments: ConflictSegment[] };
+export type ConflictDetail = { files: ConflictFile[]; resolvable: boolean };
+/** 读取 CR 的冲突现场（三方有序段），后端按需物化冲突态。 */
+export const getConflictDetail = (crId: string) =>
+  ipc<ConflictDetail>('get_conflict_detail', { crId });
+/** 人工解决冲突：files 为 path→整文件内容（应用内）；传 null 表示已在外部 IDE 改好盘。 */
+export const resolveConflictManually = (crId: string, files: Record<string, string> | null) =>
+  ipc<void>('resolve_conflict_manually', { crId, files });
+/** 外部 IDE 兜底：物化冲突态并在文件管理器中定位 worktree，返回其路径。 */
+export const openConflictWorkspace = (crId: string) =>
+  ipc<string>('open_conflict_workspace', { crId });
 export const review1 = (issueId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string;
 }) => ipc<ChangeRequest>('review_1', { issueId, decision });

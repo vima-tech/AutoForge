@@ -14,10 +14,12 @@ import {
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
-  getMergeConflict, retryMerge, aiResolveMergeConflict, getCustomMergeMessageEnabled,
+  getMergeConflict, retryMerge, aiResolveMergeConflict, revertChangeRequest, getCustomMergeMessageEnabled,
+  getConflictDetail, resolveConflictManually, openConflictWorkspace,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
   type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
   type BranchInfo, type BranchPreviewStatus, type MergeConflictView,
+  type ConflictDetail,
 } from '../services';
 
 type Sel = { kind: 'issue' | 'cr'; id: string };
@@ -57,6 +59,8 @@ const STATUS_LABEL: Record<string, string> = {
   merge_conflict: '合并冲突',
   no_change_needed: '无需改动',
   merged: '已合并',
+  reverting: '撤销中',
+  reverted: '已撤销',
   rejected: '已拒绝',
 };
 const STATUS_COLOR: Record<string, string> = {
@@ -71,6 +75,8 @@ const STATUS_COLOR: Record<string, string> = {
   merge_conflict: 'amber',
   no_change_needed: 'blue',
   merged: 'green',
+  reverting: 'amber',
+  reverted: 'violet',
   rejected: 'red',
 };
 // Failed states float to the top so abnormal requirements are easy to find and resolve.
@@ -669,18 +675,181 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   );
 }
 
+// ── ConflictResolver：逐 hunk 决策式三方解冲突器（方案 B）+ 外部 IDE 兜底（方案 C）──
+type HunkChoice = { mode: 'ours' | 'theirs' | 'both' | 'manual'; manual?: string };
+const HUNK_LABELS: Record<HunkChoice['mode'], string> = {
+  ours: '采用本分支', theirs: '采用 dev', both: '两者保留', manual: '手动编辑',
+};
+function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
+  crId: string; onAiResolve: () => void; onRefresh: () => void;
+  showError: (m: string) => void; busy: boolean;
+}) {
+  const [detail, setDetail] = useState<ConflictDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [activeFile, setActiveFile] = useState(0);
+  const [choices, setChoices] = useState<Record<string, HunkChoice>>({});
+  const [submitting, setSubmitting] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    getConflictDetail(crId)
+      .then(d => { setDetail(d); setActiveFile(0); setChoices({}); })
+      .catch(e => showError('读取冲突现场失败：' + String(e)))
+      .finally(() => setLoading(false));
+  }, [crId, showError]);
+  useEffect(() => { load(); }, [load]);
+
+  const segKey = (fi: number, si: number) => `${fi}:${si}`;
+  const setChoice = (fi: number, si: number, c: HunkChoice) =>
+    setChoices(prev => ({ ...prev, [segKey(fi, si)]: c }));
+
+  const preCode: React.CSSProperties = {
+    margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+    fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-2)', lineHeight: 1.5,
+  };
+
+  if (loading) return <div className="empty-compact" style={{ padding: '16px 0' }}>读取冲突现场…</div>;
+  if (!detail) return null;
+
+  let totalHunks = 0, decided = 0;
+  detail.files.forEach((ff, fi) => ff.segments.forEach((s, si) => {
+    if (s.kind === 'conflict') { totalHunks++; if (choices[segKey(fi, si)]) decided++; }
+  }));
+  const allDecided = totalHunks > 0 && decided === totalHunks;
+
+  const assemble = (): Record<string, string> | null => {
+    const out: Record<string, string> = {};
+    for (let fi = 0; fi < detail.files.length; fi++) {
+      const ff = detail.files[fi];
+      if (ff.binary) continue;
+      const parts: string[] = [];
+      for (let si = 0; si < ff.segments.length; si++) {
+        const s = ff.segments[si];
+        if (s.kind === 'context') { parts.push(s.text ?? ''); continue; }
+        const c = choices[segKey(fi, si)];
+        if (!c) return null;
+        if (c.mode === 'ours') parts.push(s.ours ?? '');
+        else if (c.mode === 'theirs') parts.push(s.theirs ?? '');
+        else if (c.mode === 'both') parts.push([s.ours ?? '', s.theirs ?? ''].filter(x => x).join('\n'));
+        else parts.push(c.manual ?? '');
+      }
+      out[ff.path] = parts.join('\n');
+    }
+    return out;
+  };
+
+  const doConfirm = async () => {
+    const files = assemble();
+    if (!files) { showError('仍有未决策的冲突块'); return; }
+    setSubmitting(true);
+    try { await resolveConflictManually(crId, files); onRefresh(); }
+    catch (e) { showError('提交解决失败：' + String(e)); }
+    finally { setSubmitting(false); }
+  };
+  const doExternalOpen = async () => {
+    try { await openConflictWorkspace(crId); }
+    catch (e) { showError('打开工作区失败：' + String(e)); }
+  };
+  const doExternalDone = async () => {
+    setSubmitting(true);
+    try { await resolveConflictManually(crId, null); onRefresh(); }
+    catch (e) { showError('提交失败：' + String(e)); }
+    finally { setSubmitting(false); }
+  };
+
+  if (!detail.resolvable) {
+    return (
+      <div>
+        <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 10 }}>
+          冲突已可自动消解（rerere / 无实际冲突）。可直接提交并回到代码审核复审。
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-primary btn-sm" disabled={submitting} onClick={doExternalDone}><Icon name="check" size={13} />提交并复审</button>
+          <button className="btn btn-sm" disabled={busy || submitting} onClick={onAiResolve}><Icon name="zap" size={13} />AI 解冲突</button>
+        </div>
+      </div>
+    );
+  }
+
+  const f = detail.files[activeFile];
+  return (
+    <div>
+      <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 10 }}>
+        逐处选择保留哪一侧（或两者保留 / 手动编辑）。已解决 <b style={{ color: 'var(--text-2)' }}>{decided}/{totalHunks}</b>。
+      </div>
+      {detail.files.length > 1 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+          {detail.files.map((ff, i) => {
+            const done = ff.binary || ff.segments.every((s, si) => s.kind !== 'conflict' || choices[segKey(i, si)]);
+            return (
+              <button key={i} className="btn btn-sm" onClick={() => setActiveFile(i)}
+                style={i === activeFile ? { borderColor: 'var(--ember)', color: 'var(--ember-soft)' } : undefined}>
+                {done && <Icon name="check" size={12} />}{ff.path.split('/').pop()}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ background: 'var(--code-bg)', borderRadius: 8, padding: '10px 12px', maxHeight: 420, overflow: 'auto' }}>
+        {f.binary ? (
+          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>二进制文件冲突，无法逐 hunk 解决，请用「外部编辑器打开」处理。</div>
+        ) : f.segments.map((s, si) => {
+          if (s.kind === 'context') {
+            if (!s.text) return null;
+            return <pre key={si} style={{ ...preCode, color: 'var(--text-faint)' }}>{s.text}</pre>;
+          }
+          const c = choices[segKey(activeFile, si)];
+          return (
+            <div key={si} style={{ border: '1px solid var(--border-strong)', borderRadius: 8, margin: '8px 0', overflow: 'hidden' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
+                <div style={{ background: 'var(--bg-2)', padding: '6px 8px' }}>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', marginBottom: 4 }}>dev（传入）</div>
+                  <pre style={preCode}>{s.theirs || '（空）'}</pre>
+                </div>
+                <div style={{ background: 'var(--bg-2)', padding: '6px 8px' }}>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', marginBottom: 4 }}>本分支（你的）</div>
+                  <pre style={preCode}>{s.ours || '（空）'}</pre>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 6, padding: '6px 8px', flexWrap: 'wrap', background: 'var(--bg-2)' }}>
+                {(['ours', 'theirs', 'both', 'manual'] as const).map(mode => (
+                  <button key={mode} className={'chip ' + (c?.mode === mode ? 'ember' : '')} style={{ cursor: 'pointer', fontSize: 'var(--text-micro)' }}
+                    onClick={() => setChoice(activeFile, si, { mode, manual: mode === 'manual' ? (c?.manual ?? [s.ours, s.theirs].filter(x => x).join('\n')) : undefined })}>
+                    {HUNK_LABELS[mode]}
+                  </button>
+                ))}
+              </div>
+              {c?.mode === 'manual' && (
+                <textarea value={c.manual ?? ''} onChange={e => setChoice(activeFile, si, { mode: 'manual', manual: e.target.value })}
+                  style={{ width: '100%', minHeight: 80, boxSizing: 'border-box', background: 'var(--bg-3)', border: 'none', borderTop: '1px solid var(--border)', color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', padding: '6px 8px', resize: 'vertical' }} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+        <button className="btn btn-primary btn-sm" disabled={!allDecided || submitting} onClick={doConfirm}><Icon name="check" size={13} />确认解决并复审</button>
+        <button className="btn btn-sm" disabled={busy || submitting} onClick={onAiResolve}><Icon name="zap" size={13} />AI 解冲突</button>
+        <button className="btn btn-sm" disabled={submitting} onClick={doExternalOpen}><Icon name="external" size={13} />外部编辑器打开</button>
+        <button className="btn btn-sm" disabled={submitting} onClick={doExternalDone}><Icon name="check" size={13} />我已在外部解决·复审</button>
+      </div>
+    </div>
+  );
+}
+
 // ── LedgerView：全量需求总账（玻璃墙）──────────────────────────────────────────
 // 只「看 / 下钻 / 整理」：所有状态可见 + 筛选搜索；状态只读、优先级不可拖；无拖拽/改状态/指派。
 const LEDGER_STATUS_LABEL: Record<string, string> = {
   triage: '待整理', pending_analysis: '分析中', analysis_failed: '分析失败',
   pending_issue_review: '需求审核', pending_execution: '待编码', executing: '编码中',
   pending_code_review: '代码审核', pending_merge: '待合并', merged: '已合并',
+  reverting: '撤销中', reverted: '已撤销',
   rejected: '已拒绝', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
 };
 const LEDGER_STATUS_CHIP: Record<string, string> = {
   triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_issue_review: 'amber',
   executing: 'blue', pending_code_review: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
-  merge_conflict: 'amber', no_change_needed: 'blue',
+  merge_conflict: 'amber', no_change_needed: 'blue', reverting: 'amber', reverted: 'violet',
 };
 // 不可拒绝的状态：运行中 / 待合并 / 已合并 / 已拒绝（与后端 reject_issues 跳过集一致）。
 const REJECT_SKIP = ['executing', 'building', 'running', 'pending_execution', 'pending_merge', 'merged', 'rejected'];
@@ -1482,6 +1651,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [diff, setDiff] = useState('');
   const [conflict, setConflict] = useState<MergeConflictView | null>(null);
   const [conflictBusy, setConflictBusy] = useState(false);
+  // 「撤销已合并需求」二次确认弹窗开关。
+  const [revertConfirm, setRevertConfirm] = useState(false);
+  const [revertBusy, setRevertBusy] = useState(false);
   const [grade, setGrade] = useState<CrGrade | null>(null);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [tab, setTab] = useState<'report' | 'diff'>('report');
@@ -1994,6 +2166,20 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setConflictBusy(false); }
   };
 
+  // 已合并需求闭环：撤销该需求的改动（在 dev 上 git revert 其 squash 提交）。
+  const doRevert = async () => {
+    if (!activeCr || revertBusy) return;
+    setRevertBusy(true);
+    try {
+      await revertChangeRequest(activeCr);
+      setRevertConfirm(false);
+      if (activeProject) await loadList(activeProject.id);
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      showError('撤销失败：' + String(e));
+    } finally { setRevertBusy(false); }
+  };
+
   // 失败需求闭环：彻底删除需求及其执行数据。
   const doDelete = async () => {
     if (!activeCr || submitting) return;
@@ -2311,31 +2497,30 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               ? '该需求分支与 dev 上的其他改动冲突。可一键重试合并（dev 已含解时即可干净落地），或交由 AI 自动解决冲突（解完回到代码审核复审，不直接落 dev）。'
               : '该需求分支并入最新 dev 后测试未通过（集成破坏）。可一键重试合并，或交由 AI 修复后回到代码审核复审；也可在右上角「重新执行」基于最新 dev 重新实现。'}
           </div>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
-            <button className="btn btn-primary btn-sm" disabled={conflictBusy} onClick={doAiResolve}>
-              <Icon name="zap" size={13} />AI 解冲突并合并
-            </button>
-            <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
-              <Icon name="refresh" size={13} />重试合并
-            </button>
-          </div>
-          {conflict && conflict.files.length > 0 && (
-            <div style={{ marginBottom: 10 }}>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.14em', marginBottom: 6 }}>冲突文件（{conflict.files.length}）</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {conflict.files.map((f, i) => (
-                  <span className="chip amber" key={i} style={{ fontSize: 'var(--text-micro)' }}><Icon name="file" size={12} />{f}</span>
-                ))}
+          {conflict && conflict.files.length > 0 ? (
+            <>
+              <ConflictResolver
+                crId={cr!.id}
+                busy={conflictBusy}
+                onAiResolve={doAiResolve}
+                onRefresh={() => { if (activeProject) loadList(activeProject.id); window.dispatchEvent(new Event('AutoForge:badges-refresh')); }}
+                showError={showError}
+              />
+              <div style={{ marginTop: 10 }}>
+                <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
+                  <Icon name="refresh" size={13} />重试合并（dev 已含解时直接落地）
+                </button>
               </div>
+            </>
+          ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-primary btn-sm" disabled={conflictBusy} onClick={doAiResolve}>
+                <Icon name="zap" size={13} />AI 解冲突并合并
+              </button>
+              <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
+                <Icon name="refresh" size={13} />重试合并
+              </button>
             </div>
-          )}
-          {conflict && conflict.diff && (
-            <details>
-              <summary style={{ cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.14em' }}>查看带冲突标记的三方差异</summary>
-              <pre style={{ margin: '8px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-2)', lineHeight: 1.5, maxHeight: 360, overflow: 'auto', background: 'var(--code-bg)', borderRadius: 8, padding: '10px 12px' }}>
-                {conflict.diff}
-              </pre>
-            </details>
           )}
         </div>
       ) : FAILED_STATUSES.includes(cr!.status) ? (
@@ -2517,12 +2702,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                           <Icon name={NO_CHANGE_STATUSES.includes(cr.status) ? 'check' : 'alert'} size={14} />{STATUS_LABEL[cr.status] ?? cr.status}
                         </span>
                         <button className="btn btn-danger" onClick={() => setConfirmDelete(true)} disabled={submitting}><Icon name="trash" size={15} />删除需求</button>
-                        <button className="btn btn-primary" onClick={doRetry} disabled={submitting}><Icon name="refresh" size={15} />重新执行</button>
+                        {/* 冲突态的主操作是解决器里的「确认解决并复审」，故此处「重新执行」降级为次级，
+                            保证每屏至多一个 .btn-primary（DESIGN）；其余失败态仍以重新执行为主操作。 */}
+                        <button className={'btn' + (cr.status === 'merge_conflict' ? '' : ' btn-primary')} onClick={doRetry} disabled={submitting}><Icon name="refresh" size={15} />重新执行</button>
                       </>
                     : cr.status !== 'pending_code_review'
-                    ? <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
-                        {STATUS_LABEL[cr.status] ?? cr.status}
-                      </span>
+                    ? <>
+                        <span className={'chip ' + (STATUS_COLOR[cr.status] ?? '')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
+                          {STATUS_LABEL[cr.status] ?? cr.status}
+                        </span>
+                        {cr.status === 'merged' && (
+                          session?.merge_commit
+                            ? <button className="btn btn-danger" onClick={() => setRevertConfirm(true)} disabled={revertBusy} title="在 dev 上 git revert 该需求的合并提交">
+                                <Icon name="refresh" size={15} />{revertBusy ? '撤销中…' : '撤销改动'}
+                              </button>
+                            : <span title="该需求合并早于撤销功能，无法一键撤销" style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)' }}>不可撤销</span>
+                        )}
+                      </>
                     : decided
                       ? <span className={'chip ' + (decided === 'approved' ? 'green' : decided === 'rejected' ? 'red' : 'amber')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
                           <Icon name={decided === 'approved' ? 'check' : decided === 'rejected' ? 'x' : 'refresh'} size={14} />
@@ -2725,6 +2921,16 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           okLabel="删除需求"
           onOk={doDelete}
           onCancel={() => setConfirmDelete(false)}
+        />
+      )}
+
+      {revertConfirm && (
+        <ConfirmModal
+          msg="确定撤销该需求的改动？"
+          sub="将在 dev 上 git revert 该需求的合并提交，生成一个撤销提交（不改写历史、可再次提交恢复）。若后续改动依赖了它，会撤销失败并提示人工处理。"
+          okLabel="撤销改动"
+          onOk={() => { setRevertConfirm(false); doRevert(); }}
+          onCancel={() => setRevertConfirm(false)}
         />
       )}
 

@@ -1,6 +1,7 @@
 pub mod asr_realtime;
 pub mod audio_decode;
 pub mod concurrency;
+pub mod cpubudget;
 pub mod ctx_window;
 pub mod event;
 pub mod gate;
@@ -8,6 +9,7 @@ pub mod git;
 pub mod mask;
 pub mod notify;
 pub mod platform;
+pub mod reaper;
 pub mod secrets;
 pub mod security;
 pub mod stack;

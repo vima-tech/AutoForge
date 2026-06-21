@@ -102,6 +102,12 @@ pub async fn run_and_gate(
     .await?;
 
     let checks = configured_checks(crate::commands::run_config::effective_config(&project).as_deref());
+
+    // 构建池：占一个全局许可再跑编译/测试，限制跨项目/CR 的并发编译数，避免批量合并时
+    // 多个 rustc/tsc 同时把 CPU/内存打满。持有至本 CR 全部 check 跑完后随作用域释放。
+    let build_pool = crate::state::build_pool();
+    let _build_permit = build_pool.acquire().await;
+
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
         results.push(run_check(&test_path, name, command, timeout).await);
@@ -310,10 +316,33 @@ pub(crate) async fn run_check(
     let mut cmd = crate::core::platform::shell(&command);
     cmd.current_dir(repo_path)
         // Killed if this future is dropped (e.g. on timeout) instead of leaking.
-        .kill_on_drop(true);
-    // Own process group so a timeout can be reaped (cross-platform helper).
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Own process group so a timeout can reap the whole tree (cross-platform helper).
     crate::core::platform::detach_process_group(&mut cmd);
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult {
+                name,
+                command,
+                ok: false,
+                code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            }
+        }
+    };
+    // pgid == child pid（detach 后）。纳入 CPU 预算（Linux 且启用时），让门的 rustc/tsc
+    // 也受总预算约束；超时再据此整组回收。
+    let pgid = child.id();
+    if let Some(p) = pgid {
+        crate::core::cpubudget::attach(p);
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
     match output {
         Ok(Ok(output)) => {
@@ -335,13 +364,50 @@ pub(crate) async fn run_check(
             stdout: String::new(),
             stderr: e.to_string(),
         },
-        Err(_) => CheckResult {
-            name,
-            command,
-            ok: false,
-            code: -1,
-            stdout: String::new(),
-            stderr: format!("timeout after {}s", timeout_secs),
-        },
+        Err(_) => {
+            // 超时：SIGKILL 整个进程组（sh + cargo/tsc 子进程），不留孤儿。
+            if let Some(p) = pgid {
+                crate::core::reaper::kill_group(p);
+            }
+            CheckResult {
+                name,
+                command,
+                ok: false,
+                code: -1,
+                stdout: String::new(),
+                stderr: format!("timeout after {}s", timeout_secs),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // run_check 已从 `.output()` 重构为 spawn + cgroup attach + 超时整组真杀；
+    // 这几条覆盖成功取输出 / 失败码 / 超时三条路径，守住重构正确性。
+    #[tokio::test]
+    async fn run_check_captures_success_output() {
+        let r = run_check(".", "echo".into(), "echo af-ok-123".into(), 10).await;
+        assert!(r.ok, "echo should succeed: {}", r.stderr);
+        assert_eq!(r.code, 0);
+        assert!(r.stdout.contains("af-ok-123"), "stdout={}", r.stdout);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_reports_failure_code() {
+        let r = run_check(".", "exit3".into(), "exit 3".into(), 10).await;
+        assert!(!r.ok);
+        assert_eq!(r.code, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_times_out_and_reaps() {
+        let r = run_check(".", "sleep".into(), "sleep 30".into(), 1).await;
+        assert!(!r.ok);
+        assert!(r.stderr.contains("timeout"), "stderr={}", r.stderr);
     }
 }

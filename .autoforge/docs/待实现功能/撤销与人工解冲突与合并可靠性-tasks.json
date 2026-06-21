@@ -3,7 +3,7 @@
     "title": "稳定撤销 issue 改动 + 人工解冲突器 + 合并可靠性加固 任务清单",
     "plan_ref": ".autoforge/docs/待实现功能/AutoForge-撤销与人工解冲突与合并可靠性-功能提案.md",
     "created": "2026-06-20",
-    "status": "📝 待实现（成文 2026-06-20；基于合并/冲突状态机深度审计 + 撤销/解冲突两轮交互方案定稿）",
+    "status": "✅ 主体已实现（2026-06-21；cargo test 114 passed、cargo build/​npm run build 通过、tsc 零错、新文件 conflicts.rs/revert.rs clippy 零告警）。已落地：P0-1 squash 合并由仓库先行完成、本轮补 merge_commit 列(迁移0058)+SHA 回填；P0-2 state::cr_lock per-CR 锁 + ai_resolve 状态复核；P0-3 enqueue 仅对新建/failed 才 dispatch（幂等键不再重复执行）；P1 撤销全链（CrReverted 事件 + JobPayload::Revert + tasks/revert.rs 双路径 git revert + revert_change_request 原子门 merged→reverting + Audit 撤销按钮/确认弹窗，含 2 个 revert 单测）；P2 解冲突器（merge.rs 抽 finalize_resolution/materialize_conflict/list_unmerged，commands/conflicts.rs 三命令 get_conflict_detail/resolve_conflict_manually/open_conflict_workspace + 段解析 3 单测，Audit ConflictResolver 逐 hunk 决策 UI + 外部 IDE 兜底，sync 防御性 merge --abort 清残留）；P3-4(L2) worktree 缺失 merge_failed 守卫。【取舍/未做】P3-1(M2)：squash + Phase1 dev-sync + merge_lock 下 land 阶段冲突实际不可达，写它=死代码，故不做；P3-2(M3)：『非冲突 merge 失败当 clean 放行』为推测性、改动有回归风险（worktree 未提交态合并语义），暂留并标注；P3-3(L1)：内存 pending_review 计数漂移仅影响 Dashboard 显示（准入用 DB COUNT），修复需把 ConcurrencyManager 侵入式穿参进 ai_resolve/finalize，性价比低暂缓。",
     "decisions": [
       "合并方式采纳 git merge --squash（spec testing.md:11/CLAUDE.md:205 已更新）：land_on_dev 改 squash + 显式 commit -m，每 CR 在 dev 压成一个普通提交；分支清理改 branch -D",
       "撤销 = git revert <sha>（squash 是普通提交，无需 -m 1）；撤销单元为 worktree_sessions.merge_commit（迁移 0058 新列）",

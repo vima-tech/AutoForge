@@ -4,13 +4,31 @@
 //! - 纯 Rust，零 Tauri 类型，可在非 Tauri 入口复用（CLAUDE.md 铁律 #1）。
 //! - 安全不变量由 `run()` 对**所有 kind** 统一施加：传输层禁 remote git
 //!   （`GIT_ALLOW_PROTOCOL=""`）、worktree 隔离、进程组隔离。各家 flag 为额外加固。
-use super::CodeAgent;
+use super::{CodeAgent, RunLimits};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+/// Unregister a tracked agent process group when the run future ends (normal
+/// completion, error, or cancellation). Explicit kills happen on timeout / app
+/// exit; this guard only drops the bookkeeping entry — it never kills, so a
+/// freshly-reused pid is never signalled.
+struct GroupGuard(u32);
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        crate::core::reaper::unregister(self.0);
+    }
+}
+
+/// Drained-stream message from the reader tasks to the supervising select loop.
+enum StreamMsg {
+    Out(Vec<u8>),
+    Err(Vec<u8>),
+    Eof,
+}
 
 /// 解析自 `code_agents` 表的一次性运行档案。
 #[derive(Debug, Clone)]
@@ -79,7 +97,7 @@ impl CodeAgent for CliCodeAgent {
         &self,
         worktree: &str,
         prompt: &str,
-        timeout_secs: u64,
+        limits: RunLimits,
     ) -> Result<(i32, String, String)> {
         let mut cmd = self.base_cmd(worktree);
         // 每个分支构建该 kind 的参数，并返回 prompt 是否走 stdin（true）/ 已作位置参数（false）。
@@ -136,6 +154,21 @@ impl CodeAgent for CliCodeAgent {
         };
 
         let mut child = cmd.spawn()?;
+
+        // The child was spawned with setpgid(0,0), so its pgid == its pid. Track
+        // it so timeout / app-exit can SIGKILL the whole group (agent + ripgrep /
+        // build / test descendants). `_guard` clears the registry entry when this
+        // run ends, however it ends.
+        let pgid = child.id().unwrap_or(0);
+        crate::core::reaper::register(pgid);
+        let _guard = GroupGuard(pgid);
+        // 降低整个进程组的调度优先级（nice +10），让批量 agent 的构建/搜索子进程给
+        // 前台/UI 让路——总 CPU 不变但机器不卡。子进程 fork 后继承该 nice 值。
+        crate::core::reaper::lower_priority(pgid);
+        // 纳入 cgroup CPU 预算（Linux，且已启用时）：agent 及其子孙（含自测的 rustc/tsc）
+        // 的总 CPU 被内核限到预算内——测试照跑，只是被限速。未启用/非 Linux 时空操作。
+        crate::core::cpubudget::attach(pgid);
+
         if feed_stdin {
             if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(prompt.as_bytes()).await?;
@@ -146,20 +179,119 @@ impl CodeAgent for CliCodeAgent {
             drop(child.stdin.take());
         }
 
-        let output =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "{} code agent timed out after {}s",
-                        self.profile.kind,
-                        timeout_secs
-                    )
-                })??;
+        // Drain stdout/stderr incrementally so we can enforce an IDLE timeout (no
+        // output for `idle_secs`) on top of the WALL ceiling. `.wait_with_output()`
+        // buffers to the end and would hide a hung-but-not-exited agent.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamMsg>(64);
+        let mut open_streams = 0u8;
+        if let Some(mut out) = child.stdout.take() {
+            open_streams += 1;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match out.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send(StreamMsg::Eof).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(StreamMsg::Out(buf[..n].to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(mut err) = child.stderr.take() {
+            open_streams += 1;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match err.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send(StreamMsg::Eof).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(StreamMsg::Err(buf[..n].to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx); // only the reader tasks hold senders now
 
-        let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let wall_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(limits.wall_secs.max(1));
+        let idle_dur = Duration::from_secs(limits.idle_secs);
+        let mut last_activity = tokio::time::Instant::now();
+        // CPU 基准：空闲告警时用它判断"安静但在干活"（CPU 仍在涨）还是"真卡死"。
+        // ~0.5s CPU 时间（_SC_CLK_TCK 通常 100/s）即算活动，足以区分 hung 与 busy。
+        let mut last_cpu = crate::core::reaper::group_cpu_ticks(pgid).unwrap_or(0);
+        const CPU_ACTIVE_TICKS: u64 = 50;
+        let mut timeout_kind: Option<&'static str> = None;
+
+        while open_streams > 0 {
+            let idle_deadline = last_activity + idle_dur;
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(StreamMsg::Out(b)) => {
+                        stdout_buf.extend_from_slice(&b);
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Some(StreamMsg::Err(b)) => {
+                        stderr_buf.extend_from_slice(&b);
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Some(StreamMsg::Eof) => open_streams -= 1,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(idle_deadline), if limits.idle_secs > 0 => {
+                    // 无输出达 idle_secs：再看进程组是否仍在烧 CPU。仍在涨 = 安静地跑长
+                    // 构建/测试（claude --print 不流式时尤甚），不杀，重置窗口继续等；
+                    // CPU 也不动 = 真卡死，才判 idle 超时。这样杜绝误杀合法长任务。
+                    match crate::core::reaper::group_cpu_ticks(pgid) {
+                        Some(cur) if cur > last_cpu + CPU_ACTIVE_TICKS => {
+                            last_cpu = cur;
+                            last_activity = tokio::time::Instant::now();
+                        }
+                        _ => {
+                            timeout_kind = Some("idle");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(wall_deadline) => {
+                    timeout_kind = Some("wall");
+                    break;
+                }
+            }
+        }
+
+        if let Some(kind) = timeout_kind {
+            // 真杀：SIGKILL 整个进程组（agent + ripgrep/构建子进程），再回收僵尸。
+            crate::core::reaper::kill_group(pgid);
+            let _ = child.wait().await;
+            return Err(anyhow::anyhow!(
+                "{} code agent {} timeout（墙钟 {}s / 空闲 {}s）— 已杀进程组回收",
+                self.profile.kind,
+                kind,
+                limits.wall_secs,
+                limits.idle_secs
+            ));
+        }
+
+        let status = child.wait().await?;
+        let code = status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
         Ok((code, stdout, stderr))
     }
 

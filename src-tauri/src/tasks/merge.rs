@@ -27,7 +27,7 @@ async fn land_on_dev(
     cr_id: &str,
     dev_is_live: bool,
     merge_msg: &str,
-) -> std::result::Result<(), (i32, String)> {
+) -> std::result::Result<String, (i32, String)> {
 
     if !dev_is_live {
         // Fast path (all non-self-managed projects): in-place checkout + merge.
@@ -62,7 +62,8 @@ async fn land_on_dev(
             .map(|(c, _, _)| c == 0)
             .unwrap_or(false);
         if nothing_staged {
-            return Ok(());
+            // No CR-specific commit produced ⇒ nothing to revert later. Empty SHA.
+            return Ok(String::new());
         }
         let (cc2, _, ce2) = git
             .run(&[
@@ -80,7 +81,12 @@ async fn land_on_dev(
             let _ = git.run(&["reset", "--hard", "HEAD"]).await;
             return Err((cc2, ce2));
         }
-        return Ok(());
+        // Capture the squash commit SHA — this is the unit `tasks/revert.rs` reverts.
+        return match git.run(&["rev-parse", "HEAD"]).await {
+            Ok((0, out, _)) => Ok(out.trim().to_string()),
+            Ok((c, _, e)) => Err((c, e)),
+            Err(e) => Err((-1, e.to_string())),
+        };
     }
 
     // Isolated path (AutoForge self-managed: dev is checked out live).
@@ -156,6 +162,17 @@ async fn land_on_dev(
         }
     }
 
+    // Capture the squash commit SHA before teardown (empty when nothing staged ⇒ no
+    // CR-specific commit). This is what `tasks/revert.rs` reverts on origin/<dev>.
+    let merge_sha = if nothing_staged {
+        String::new()
+    } else {
+        match tmp_git.run(&["rev-parse", "HEAD"]).await {
+            Ok((0, out, _)) => out.trim().to_string(),
+            _ => String::new(),
+        }
+    };
+
     // Push the merge to origin/<dev>. This is what makes it durable, since the
     // throwaway worktree and temp branch are removed immediately after.
     let push_target = format!("HEAD:{}", project.branch_dev);
@@ -179,7 +196,7 @@ async fn land_on_dev(
     // put; the user adopts the change via the in-app "同步更新" (ff-only pull).
     let _ = git.run(&["worktree", "remove", "--force", &tmp_path]).await;
     let _ = git.run(&["branch", "-D", &tmp_branch]).await;
-    Ok(())
+    Ok(merge_sha)
 }
 
 /// Result of bringing `dev` into the CR worktree branch before landing.
@@ -205,6 +222,10 @@ async fn sync_dev_into_worktree(
         return DevSync::Clean { dev_merged: false };
     }
     let wt = GitProxy::new(worktree_path);
+    // Clear any stale in-progress merge left by opening the conflict resolver
+    // (get_conflict_detail / open_conflict_workspace materialize a merge and may not be
+    // followed by a resolve). No-op when not mid-merge; safe because we re-merge dev next.
+    let _ = wt.run(&["merge", "--abort"]).await;
     let _ = wt.run(&["config", "rerere.enabled", "true"]).await;
     let _ = wt.run(&["fetch", "origin", branch_dev]).await;
     // Prefer origin/<dev> so we integrate the newest dev (matches land_on_dev's base).
@@ -268,6 +289,147 @@ async fn sync_dev_into_worktree(
     DevSync::Conflict { files, diff }
 }
 
+/// 解析用于 merge 的 dev 引用：优先 `origin/<dev>`（与 land_on_dev 一致），不可达回退本地。
+pub(crate) async fn resolve_dev_ref(wt: &GitProxy, branch_dev: &str) -> String {
+    let remote_ref = format!("origin/{}", branch_dev);
+    if wt
+        .run(&["rev-parse", "--verify", "--quiet", &remote_ref])
+        .await
+        .map(|(c, _, _)| c == 0)
+        .unwrap_or(false)
+    {
+        remote_ref
+    } else {
+        branch_dev.to_string()
+    }
+}
+
+/// worktree 内当前未合并（冲突）的文件列表。
+pub(crate) async fn list_unmerged(wt: &GitProxy) -> Vec<String> {
+    wt.run(&["diff", "--name-only", "--diff-filter=U"])
+        .await
+        .ok()
+        .map(|(_, o, _)| {
+            o.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把 CR worktree 置于「与 dev 冲突的 MERGE 进行态」——若上一步 abort 过则重新合并重建。
+/// 幂等：已处于 MERGE 中（存在 MERGE_HEAD）则原样保留，重复打开解决器不重跑。开启 rerere。
+/// 返回所用的 dev 引用。供 AI 自动解冲突与人工/外部解冲突共用同一现场。
+pub(crate) async fn materialize_conflict(wt: &GitProxy, branch_name: &str, branch_dev: &str) -> String {
+    let _ = wt.run(&["config", "rerere.enabled", "true"]).await;
+    let _ = wt.run(&["fetch", "origin", branch_dev]).await;
+    let dev_ref = resolve_dev_ref(wt, branch_dev).await;
+    let in_merge = wt
+        .run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .await
+        .map(|(c, _, _)| c == 0)
+        .unwrap_or(false);
+    if !in_merge {
+        let merge_msg = format!("AutoForge: sync {} into {}", dev_ref, branch_name);
+        let _ = wt.run(&["merge", "-m", &merge_msg, &dev_ref]).await;
+    }
+    dev_ref
+}
+
+/// 三路共享的「解冲突收尾」：暂存 worktree → 校验冲突标记已全清 → 提交 → 复跑测试门 →
+/// 通过【回到代码审核】复审、失败置 `merge_failed`。绝不直接落 dev。AI 自动解、应用内逐
+/// hunk 决策、外部 IDE 解决都收敛到这里。返回 `Ok(true)` 表示已回代码审核，`Ok(false)`
+/// 表示退回 `merge_conflict`/`merge_failed`。
+pub(crate) async fn finalize_resolution(
+    db: &Db,
+    tx: &JobSender,
+    app: &tauri::AppHandle,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+    issue: &crate::models::issue::Issue,
+    commit_msg: &str,
+) -> Result<bool> {
+    let wt = GitProxy::new(&session.worktree_path);
+    // Stage everything and verify there are no leftover conflict markers / unmerged paths.
+    let _ = wt.run(&["add", "-A"]).await;
+    let markers_clean = wt
+        .run(&["diff", "--cached", "--check"])
+        .await
+        .map(|(c, _, _)| c == 0)
+        .unwrap_or(false);
+    let still_unmerged = !list_unmerged(&wt).await.is_empty();
+    if !markers_clean || still_unmerged {
+        let _ = wt.run(&["merge", "--abort"]).await;
+        sqlx::query("UPDATE change_requests SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
+            .bind(&cr.id).execute(db).await?;
+        sqlx::query("UPDATE issues SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
+            .bind(&cr.issue_id).execute(db).await?;
+        event::emit(
+            app,
+            event::AppEvent::WorktreeUpdate {
+                cr_id: cr.id.clone(),
+                status: "merge_conflict".to_string(),
+                message: Some("仍有未解决的冲突标记，需继续处理".to_string()),
+            },
+        );
+        return Ok(false);
+    }
+
+    let _ = wt
+        .run(&[
+            "-c",
+            "user.name=AutoForge",
+            "-c",
+            "user.email=autoforge@local",
+            "commit",
+            "-m",
+            commit_msg,
+        ])
+        .await;
+    let _ = sqlx::query("UPDATE worktree_sessions SET conflict_files=NULL, conflict_diff=NULL WHERE id=?")
+        .bind(&session.id)
+        .execute(db)
+        .await;
+
+    // Re-run the test gate on the integrated result. Failure blocks (merge_failed).
+    let passed = crate::tasks::testing::run_and_gate(db, tx, app, &cr.id)
+        .await
+        .unwrap_or(false);
+    if !passed {
+        sqlx::query("UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
+            .bind(&cr.id).execute(db).await?;
+        sqlx::query("UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
+            .bind(&cr.issue_id).execute(db).await?;
+        event::emit(
+            app,
+            event::AppEvent::WorktreeUpdate {
+                cr_id: cr.id.clone(),
+                status: "merge_failed".to_string(),
+                message: Some("解冲突后测试未通过，已阻断合并".to_string()),
+            },
+        );
+        return Ok(false);
+    }
+
+    // Route back to human review 2 — never land a resolved conflict directly.
+    sqlx::query("UPDATE change_requests SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
+        .bind(&cr.id).execute(db).await?;
+    sqlx::query("UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
+        .bind(&cr.issue_id).execute(db).await?;
+    crate::core::notify::dispatch(db, "review_needed", &issue.title, "合并冲突已解决，待代码审核 复审").await;
+    event::emit(
+        app,
+        event::AppEvent::ReviewNeeded {
+            cr_id: cr.id.clone(),
+            issue_title: issue.title.clone(),
+            stage: 2,
+        },
+    );
+    info!("conflict resolved for cr {}, routed back to review 2", cr.id);
+    Ok(true)
+}
+
 /// 方案 B：把合并冲突交给 code agent 自动消解，复跑测试后【回到代码审核】复审，
 /// 绝不直接落 dev。手动「AI 解冲突并合并」按钮与 Phase 1 自动开关共用此函数。
 pub async fn ai_resolve_conflict(
@@ -276,6 +438,25 @@ pub async fn ai_resolve_conflict(
     app: &tauri::AppHandle,
     cr_id: &str,
 ) -> Result<()> {
+    // Serialize with merge::run and any other resolve for this CR (H2: no concurrent
+    // git on the same worktree). Held for the whole resolve.
+    let cr_lock = crate::state::cr_lock(cr_id);
+    let _cr_guard = cr_lock.lock().await;
+    // Re-check under the lock: a prior resolve (auto-spawn vs. manual button) may have
+    // already moved this CR off merge_conflict. If so, this invocation is a duplicate
+    // (the lock just serialized us behind the winner) — no-op instead of re-merging.
+    let cur_status = sqlx::query_as::<_, (String,)>("SELECT status FROM change_requests WHERE id=?")
+        .bind(cr_id)
+        .fetch_optional(db)
+        .await?
+        .map(|(s,)| s);
+    if cur_status.as_deref() != Some("merge_conflict") {
+        info!(
+            "ai_resolve_conflict: cr {} no longer in conflict ({:?}); skipping duplicate resolve",
+            cr_id, cur_status
+        );
+        return Ok(());
+    }
     let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
         "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
     )
@@ -313,38 +494,11 @@ pub async fn ai_resolve_conflict(
     );
 
     let wt = GitProxy::new(&session.worktree_path);
-    let _ = wt.run(&["config", "rerere.enabled", "true"]).await;
-    let _ = wt.run(&["fetch", "origin", &project.branch_dev]).await;
-    let remote_ref = format!("origin/{}", project.branch_dev);
-    let dev_ref = if wt
-        .run(&["rev-parse", "--verify", "--quiet", &remote_ref])
-        .await
-        .map(|(c, _, _)| c == 0)
-        .unwrap_or(false)
-    {
-        remote_ref
-    } else {
-        project.branch_dev.clone()
-    };
-    // Re-create the conflict in the tree (Phase 1 aborted it). rerere may auto-resolve.
-    let merge_msg = format!("AutoForge: sync {} into {}", dev_ref, session.branch_name);
-    let (mc, _, _) = wt
-        .run(&["merge", "-m", &merge_msg, &dev_ref])
-        .await
-        .unwrap_or((-1, String::new(), String::new()));
+    // Recreate the conflict现场 (Phase 1 aborted it); rerere may auto-resolve some hunks.
+    let dev_ref = materialize_conflict(&wt, &session.branch_name, &project.branch_dev).await;
+    let unmerged = list_unmerged(&wt).await;
 
-    if mc != 0 {
-        let unmerged: Vec<String> = wt
-            .run(&["diff", "--name-only", "--diff-filter=U"])
-            .await
-            .ok()
-            .map(|(_, o, _)| {
-                o.lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+    if !unmerged.is_empty() {
         let conflict_view = wt
             .run(&["diff"])
             .await
@@ -370,8 +524,13 @@ pub async fn ai_resolve_conflict(
             diff = conflict_view.chars().take(12000).collect::<String>(),
         );
         let code_agent = crate::agents::code_agent::resolve(db, &project).await;
+        // 解冲突上限 10 分钟，空闲 5 分钟无输出即判卡死并真杀进程组。
+        let limits = crate::agents::code_agent::RunLimits {
+            wall_secs: 600,
+            idle_secs: 300,
+        };
         let (_code, report, _err) = code_agent
-            .run(&session.worktree_path, &prompt, 600)
+            .run(&session.worktree_path, &prompt, limits)
             .await
             .unwrap_or((-1, String::new(), String::new()));
         // agent 输出视为外部输入：留档/回灌前过注入检测（命中只记录，文件改动才是结果）。
@@ -383,82 +542,11 @@ pub async fn ai_resolve_conflict(
         }
     }
 
-    // Stage and verify the conflict markers are fully gone.
-    let _ = wt.run(&["add", "-A"]).await;
-    let markers_clean = wt
-        .run(&["diff", "--cached", "--check"])
-        .await
-        .map(|(c, _, _)| c == 0)
-        .unwrap_or(false);
-    let still_unmerged = wt
-        .run(&["diff", "--name-only", "--diff-filter=U"])
-        .await
-        .ok()
-        .map(|(_, o, _)| !o.trim().is_empty())
-        .unwrap_or(false);
-
-    if !markers_clean || still_unmerged {
-        let _ = wt.run(&["merge", "--abort"]).await;
-        sqlx::query("UPDATE change_requests SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
-            .bind(cr_id).execute(db).await?;
-        sqlx::query("UPDATE issues SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.issue_id).execute(db).await?;
-        event::emit(
-            app,
-            event::AppEvent::WorktreeUpdate {
-                cr_id: cr_id.to_string(),
-                status: "merge_conflict".to_string(),
-                message: Some("AI 未能完全解决冲突，仍需人工处理".to_string()),
-            },
-        );
-        return Ok(());
-    }
-
+    // Shared tail: stage / verify markers gone / commit / re-test / route to review 2.
     let commit_msg = format!("AutoForge: AI 解决合并冲突（{} → {}）", dev_ref, session.branch_name);
-    let _ = wt.run(&["commit", "-m", &commit_msg]).await;
-    let _ = sqlx::query(
-        "UPDATE worktree_sessions SET conflict_files=NULL, conflict_diff=NULL WHERE id=?",
-    )
-    .bind(&session.id)
-    .execute(db)
-    .await;
-
-    // Re-run the test gate on the integrated result. Failure blocks (merge_failed).
-    let passed = crate::tasks::testing::run_and_gate(db, tx, app, cr_id)
+    finalize_resolution(db, tx, app, &session, &cr, &issue, &commit_msg)
         .await
-        .unwrap_or(false);
-    if !passed {
-        sqlx::query("UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
-            .bind(cr_id).execute(db).await?;
-        sqlx::query("UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.issue_id).execute(db).await?;
-        event::emit(
-            app,
-            event::AppEvent::WorktreeUpdate {
-                cr_id: cr_id.to_string(),
-                status: "merge_failed".to_string(),
-                message: Some("AI 解冲突后测试未通过，已阻断合并".to_string()),
-            },
-        );
-        return Ok(());
-    }
-
-    // Route back to human review 2 — never land an AI-resolved conflict directly.
-    sqlx::query("UPDATE change_requests SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
-        .bind(cr_id).execute(db).await?;
-    sqlx::query("UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
-        .bind(&cr.issue_id).execute(db).await?;
-    crate::core::notify::dispatch(db, "review_needed", &issue.title, "AI 已解决合并冲突，待代码审核 复审").await;
-    event::emit(
-        app,
-        event::AppEvent::ReviewNeeded {
-            cr_id: cr_id.to_string(),
-            issue_title: issue.title,
-            stage: 2,
-        },
-    );
-    info!("AI resolved merge conflict for cr {}, routed back to review 2", cr_id);
-    Ok(())
+        .map(|_| ())
 }
 
 pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
@@ -487,11 +575,39 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .await?
             .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
 
+    // L2：worktree 缺失时绝不继续——否则 run_and_gate 会回退到主仓库路径（testing.rs），
+    // 在【错误的树】上跑测试却仍尝试 land 该分支。置 merge_failed 引导重新执行重建 worktree。
+    if !std::path::Path::new(&session.worktree_path).exists() {
+        let msg = "CR worktree 不存在，无法在正确的分支上测试/合并；请「重新执行」基于最新代码重建后再合并。";
+        let _ = sqlx::query("UPDATE worktree_sessions SET report_content=? WHERE id=?")
+            .bind(msg)
+            .bind(&session.id)
+            .execute(db)
+            .await;
+        sqlx::query("UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
+            .bind(cr_id).execute(db).await?;
+        sqlx::query("UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
+            .bind(&cr.issue_id).execute(db).await?;
+        event::emit(
+            app,
+            event::AppEvent::WorktreeUpdate {
+                cr_id: cr_id.to_string(),
+                status: "merge_failed".to_string(),
+                message: Some(msg.to_string()),
+            },
+        );
+        return Ok(());
+    }
+
     // ── Phase 0：同项目合并串行 ─────────────────────────────────────────────
     // 全程持有该项目的合并锁，避免并发 `checkout dev && merge` 互相踩同一个 dev
     // 工作树（竞态）；跨项目仍并行。锁在函数返回时随 guard 释放。
     let merge_lock = crate::state::merge_lock(&cr.project_id);
     let _merge_guard = merge_lock.lock().await;
+    // Also hold this CR's worktree lock so a concurrent conflict-resolve (auto/manual)
+    // can't write the same worktree underneath us. Order: merge_lock → cr_lock (no deadlock).
+    let cr_lock = crate::state::cr_lock(cr_id);
+    let _cr_guard = cr_lock.lock().await;
 
     // 在把 dev 并入分支【之前】快照本 CR 相对分叉点的 diff——这样持久化的 diff 始终
     // 只含本 CR 的改动（merge dev 进来后再按 base_commit 做 diff 会把 dev 的无关改动
@@ -705,9 +821,9 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .map(str::to_string)
         .unwrap_or_else(|| format!("AutoForge merge: {}", cr_id));
 
-    if let Err((merge_code, merge_err)) =
-        land_on_dev(&git, &project, &session, cr_id, dev_is_live, &merge_msg).await
-    {
+    let merge_commit = match land_on_dev(&git, &project, &session, cr_id, dev_is_live, &merge_msg).await {
+        Ok(sha) => sha,
+        Err((merge_code, merge_err)) => {
         info!("merge failed ({}): {}", merge_code, merge_err);
         let fail_reason = format!(
             "## 合并失败\n\n无法将分支 `{}` 合并到 `{}`（退出码 {}）。常见原因为代码冲突，可在修复后重新执行。\n\n```\n{}\n```\n",
@@ -742,7 +858,8 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             },
         );
         return Err(anyhow!("merge failed for {}: {}", cr_id, merge_err));
-    }
+        }
+    };
 
     // Remove worktree
     if std::path::Path::new(&session.worktree_path).exists() {
@@ -765,9 +882,17 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .execute(db)
         .await?;
 
+    // Persist the squash commit SHA so "撤销该需求改动" can later `git revert` it.
+    // Empty (nothing-staged / capture failed) → store NULL so the UI degrades gracefully.
+    let merge_commit_opt: Option<&str> = if merge_commit.is_empty() {
+        None
+    } else {
+        Some(merge_commit.as_str())
+    };
     sqlx::query(
-        "UPDATE worktree_sessions SET status='merged', completed_at=datetime('now') WHERE id=?",
+        "UPDATE worktree_sessions SET status='merged', merge_commit=?, completed_at=datetime('now') WHERE id=?",
     )
+    .bind(merge_commit_opt)
     .bind(&session.id)
     .execute(db)
     .await?;
@@ -987,6 +1112,7 @@ mod tests {
             report_content: None,
             diff_content: None,
             base_commit: None,
+            merge_commit: None,
             conflict_files: None,
             conflict_diff: None,
             started_at: None,

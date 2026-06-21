@@ -32,6 +32,10 @@ pub enum JobPayload {
     Merge {
         change_request_id: String,
     },
+    /// 撤销一个已合并 CR 的改动：在 dev 上 `git revert` 其 squash 提交。
+    Revert {
+        change_request_id: String,
+    },
     SecurityAudit {
         change_request_id: String,
     },

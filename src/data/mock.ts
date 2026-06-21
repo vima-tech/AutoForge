@@ -21,7 +21,8 @@ export type BlockType =
   | { t: 'artifact'; kind: string; title: string; rows: [string, string][]; body: string;
       decided?: 'confirmed' | 'rejected';
       _meta?: { project_id?: string; title?: string; description?: string; category?: string; severity?: string } }
-  | { t: 'file_written'; path: string; name: string; preview: string; size_bytes: number; error?: boolean };
+  | { t: 'file_written'; path: string; name: string; preview: string; size_bytes: number; error?: boolean }
+  | { t: 'ws_ref'; path: string; name: string };
 
 export interface Message {
   from: string;

@@ -365,6 +365,7 @@ dependencies = [
  "innate",
  "keyring",
  "lettre",
+ "libc",
  "once_cell",
  "qrcode",
  "rand 0.8.6",

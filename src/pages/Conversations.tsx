@@ -14,7 +14,7 @@ import {
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
-  listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
+  listProjects, listWorkspaceFiles, writeWorkspaceFile, ensureWorkspaceDirs,
   runConversationCommand, INNATE_SENDER, submitIssue, getAsrSettings,
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
@@ -37,6 +37,13 @@ interface PendingAttachment {
   id: string;
   file: File;
   mode: 'file' | 'image';
+}
+
+// 工作区文件引用：点击上下文面板的工作区文件后，作为附件引用暂存到输入框上方。
+// path 是相对 .autoforge/ 的路径（如 docs/prd.md），发送时随消息携带，后端按需读取内容。
+interface WorkspaceRef {
+  path: string;
+  name: string;
 }
 
 // ── 输入框草稿：按会话窗口隔离、跨页面切换不丢失 ──
@@ -264,6 +271,11 @@ function contextAttachmentBlock(a: ConversationAttachment): BlockType {
   return { t: 'file', id: a.id, name: a.original_name, meta, color: '#e0a32e', mime: a.mime, size: a.size_bytes };
 }
 
+// 工作区文件引用块：消息携带 .autoforge/ 相对路径，后端在构建 Agent 提示时按需读取内容。
+function workspaceRefBlock(r: WorkspaceRef): BlockType {
+  return { t: 'ws_ref', path: r.path, name: r.name };
+}
+
 function convPreview(c: Conversation): string {
   if (!c.last_message) return '暂无消息';
   try {
@@ -435,13 +447,15 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   );
 }
 
-function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, busy }: {
+function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, wsRefs, onRemoveWsRef, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
   onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
   onCompress: (mode: 'summary' | 'conclusion') => Promise<boolean>;
   onError: (message: string) => void;
   quote: QuoteDraft | null;
   onClearQuote: () => void;
+  wsRefs: WorkspaceRef[];
+  onRemoveWsRef: (path: string) => void;
   busy?: boolean;
 }) {
   const [text, setText] = useState('');
@@ -930,7 +944,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const pendingItems = [...pending];
     const refs = contextRefs();
     const mentions = mentionedAgentIds();
-    if (!outgoing && pendingItems.length === 0 && refs.length === 0) return;
+    if (!outgoing && pendingItems.length === 0 && refs.length === 0 && wsRefs.length === 0) return;
     if (asrRef.current) void stopAsr();
     setText('');
     setPending([]);
@@ -1131,6 +1145,17 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             </button>
           </div>
         ))}
+        {wsRefs.map(ref => (
+          <div key={ref.path} className="composer-pending-item" title={`.autoforge/${ref.path}`}
+            style={{ borderColor: 'var(--ember)', background: 'var(--ember-tint)' }}>
+            <Icon name="folder" size={15} style={{ color: 'var(--ember)' }} />
+            <span className="pending-name">{ref.name}</span>
+            <span className="pending-size" style={{ fontFamily: 'var(--font-mono)' }}>引用</span>
+            <button className="icon-btn" title="移除引用" disabled={busy} onClick={() => onRemoveWsRef(ref.path)}>
+              <Icon name="x" size={13} />
+            </button>
+          </div>
+        ))}
         <div style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', paddingRight: 4 }}>
           {isG ? '群聊共享上下文' : 'Enter 发送'}
         </div>
@@ -1223,7 +1248,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             insertPlainText(e.clipboardData.getData('text/plain'));
           }}
         />
-        <button className="send-btn" disabled={(!text.trim() && pending.length === 0) || busy} onClick={send}>
+        <button className="send-btn" disabled={(!text.trim() && pending.length === 0 && wsRefs.length === 0) || busy} onClick={send}>
           <Icon name="send" size={18} />
         </button>
       </div>
@@ -1729,7 +1754,7 @@ export default function ConversationsPage() {
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
-  const [wsFileContent,  setWsFileContent]  = useState<{ path: string; content: string } | null>(null);
+  const [wsRefs,         setWsRefs]         = useState<WorkspaceRef[]>([]);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
@@ -1863,6 +1888,7 @@ export default function ConversationsPage() {
     setEditGroup(null);
     setActivity(null);
     setJustSentId('');
+    setWsRefs([]);
   }, [active]);
 
   // 4. Auto-focus search input when panel opens.
@@ -1946,7 +1972,7 @@ export default function ConversationsPage() {
 
   // Load project files + workspace files when context panel opens for a project-linked group chat
   useEffect(() => {
-    if (!showContext) { setProjectFiles([]); setWorkspaceFiles([]); setWsFileContent(null); return; }
+    if (!showContext) { setProjectFiles([]); setWorkspaceFiles([]); return; }
     const c = convs.find(c => c.id === active);
     if (!c?.project_id) { setProjectFiles([]); setWorkspaceFiles([]); return; }
     const pid = c.project_id;
@@ -2107,6 +2133,7 @@ export default function ConversationsPage() {
     mentionedAgentIds: string[],
   ) => {
     if (!conv || sending) return false;
+    const stagedWsRefs = wsRefs;
     setSending(true);
     setLoadError('');
     try {
@@ -2131,6 +2158,11 @@ export default function ConversationsPage() {
         blocks.push(contextAttachmentBlock(attachment));
       }
 
+      // 工作区文件引用：随消息携带 .autoforge/ 相对路径，后端构建提示时按需读取内容。
+      for (const ref of stagedWsRefs) {
+        blocks.push(workspaceRefBlock(ref));
+      }
+
       if (quoteDraft) {
         blocks.push({
           t: 'quote_ref',
@@ -2146,6 +2178,7 @@ export default function ConversationsPage() {
       setMsgs(ms => [...ms, m]);
       markSent(m.id);
       setQuoteDraft(null);
+      setWsRefs([]);
       loadConvs().catch(() => {});
       if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
       setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
@@ -2164,7 +2197,7 @@ export default function ConversationsPage() {
         return true;
       }
 
-      const shouldStartTask = text.trim().length > 0 || contextRefs.length > 0 || attachments.length > 0;
+      const shouldStartTask = text.trim().length > 0 || contextRefs.length > 0 || attachments.length > 0 || stagedWsRefs.length > 0;
       if (shouldStartTask) {
         const directAgentIds = conv.conv_type === 'direct'
           ? conv.members.filter(id => {
@@ -2229,7 +2262,7 @@ export default function ConversationsPage() {
       setConvs(cs => cs.map(c => c.id === updated.id ? updated : c));
       setEditGroup(null);
       setShowContext(false);
-      setWsFileContent(null);
+      setWsRefs([]);
       if (active === updated.id) {
         loadContextAttachments(updated.id).catch(() => {});
       }
@@ -2489,7 +2522,7 @@ export default function ConversationsPage() {
                         工作区文件
                         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
                           {(['docs', 'specs'] as const).map(tab => (
-                            <button key={tab} onClick={() => { setWorkspaceTab(tab); setWsFileContent(null); }}
+                            <button key={tab} onClick={() => setWorkspaceTab(tab)}
                               className="btn btn-sm"
                               style={{ padding: '1px 8px', fontSize: 'var(--text-micro)', background: workspaceTab === tab ? 'var(--ember)' : undefined, color: workspaceTab === tab ? '#fff' : undefined }}>
                               {tab}
@@ -2497,22 +2530,7 @@ export default function ConversationsPage() {
                           ))}
                         </div>
                       </div>
-                      {/* File viewer */}
-                      {wsFileContent && (
-                        <div style={{ margin: '4px 8px 4px', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-                          <div style={{ padding: '6px 10px', background: 'var(--bg-3)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 'var(--text-caption)' }}>
-                            <Icon name="file" size={11} style={{ color: 'var(--ember)' }} />
-                            <span style={{ fontFamily: 'var(--font-mono)', flex: 1, color: 'var(--text-2)' }}>.autoforge/{wsFileContent.path}</span>
-                            <button className="icon-btn" style={{ width: 20, height: 20 }} onClick={() => setWsFileContent(null)}>
-                              <Icon name="x" size={11} />
-                            </button>
-                          </div>
-                          <pre style={{ margin: 0, padding: '8px 10px', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                            {wsFileContent.content}
-                          </pre>
-                        </div>
-                      )}
-                      {/* File list */}
+                      {/* File list：点击即把文件作为附件引用暂存到输入框上方，发送时随消息携带 */}
                       {workspaceFiles.filter(f => f.subfolder === workspaceTab).length === 0 ? (
                         <div className="empty-compact" style={{ padding: '8px 8px' }}>
                           .autoforge/{workspaceTab}/ 暂无文件
@@ -2521,16 +2539,14 @@ export default function ConversationsPage() {
                           </span>
                         </div>
                       ) : (
-                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => (
+                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => {
+                          const referenced = wsRefs.some(r => r.path === f.rel_path);
+                          return (
                           <div key={f.rel_path} className="mention-row" style={{ cursor: 'pointer' }}
-                            onClick={() => {
-                              if (wsFileContent?.path === f.rel_path) { setWsFileContent(null); return; }
-                              if (conv.project_id) {
-                                readWorkspaceFile(conv.project_id, f.rel_path)
-                                  .then(content => setWsFileContent({ path: f.rel_path, content }))
-                                  .catch(err => setLoadError(String(err)));
-                              }
-                            }}>
+                            title={referenced ? '点击取消引用' : '点击引用到输入框'}
+                            onClick={() => setWsRefs(refs => referenced
+                              ? refs.filter(r => r.path !== f.rel_path)
+                              : [...refs, { path: f.rel_path, name: f.name }])}>
                             <div className="cfg-logo" style={{ width: 28, height: 28, background: 'var(--ember)', flexShrink: 0 }}>
                               <Icon name="file" size={13} />
                             </div>
@@ -2538,9 +2554,10 @@ export default function ConversationsPage() {
                               <div className="nm">{f.name}</div>
                               <div className="rl" style={{ fontSize: 'var(--text-caption)' }}>{f.modified_at} · {(f.size_bytes / 1024).toFixed(1)} KB</div>
                             </div>
-                            <Icon name={wsFileContent?.path === f.rel_path ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                            <Icon name={referenced ? 'check' : 'plus'} size={13}
+                              style={{ color: referenced ? 'var(--ember)' : 'var(--text-3)', flexShrink: 0 }} />
                           </div>
-                        ))
+                        ); })
                       )}
                       <div style={{ height: 1, background: 'var(--border)', margin: '4px 0 2px' }} />
 
@@ -2689,6 +2706,8 @@ export default function ConversationsPage() {
             onError={setLoadError}
             quote={quoteDraft}
             onClearQuote={() => setQuoteDraft(null)}
+            wsRefs={wsRefs}
+            onRemoveWsRef={(path) => setWsRefs(refs => refs.filter(r => r.path !== path))}
             busy={sending}
           />
         </div>

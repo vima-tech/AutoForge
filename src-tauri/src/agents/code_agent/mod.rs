@@ -4,13 +4,27 @@ use async_trait::async_trait;
 pub mod cli;
 pub use cli::{CliCodeAgent, CliProfile};
 
+/// 一次 agent 运行的时限。`wall_secs` 是硬上限（墙钟）；`idle_secs` 是空闲超时——
+/// 连续这么久没有任何输出即判定卡死（0 = 关闭空闲超时）。两者任一触发都会对整个
+/// 进程组发 SIGKILL，回收 agent 及其 ripgrep/构建子进程，避免孤儿持续烧 CPU。
+#[derive(Debug, Clone, Copy)]
+pub struct RunLimits {
+    pub wall_secs: u64,
+    pub idle_secs: u64,
+}
+
 /// 可插拔代码实现 agent 的统一抽象。纯 Rust，零 Tauri 类型——业务层只依赖此 trait，
 /// 不感知底层是哪个 CLI（claude / codex / opencode），未来可换非 CLI 实现。
 #[async_trait]
 pub trait CodeAgent: Send + Sync {
-    /// 在 worktree 内执行实现任务，返回 (exit_code, stdout, stderr)。
-    async fn run(&self, worktree: &str, prompt: &str, timeout_secs: u64)
-        -> Result<(i32, String, String)>;
+    /// 在 worktree 内执行实现任务，返回 (exit_code, stdout, stderr)。超时（墙钟或空闲）
+    /// 会真正杀掉子进程组并返回 Err，绝不留下孤儿进程。
+    async fn run(
+        &self,
+        worktree: &str,
+        prompt: &str,
+        limits: RunLimits,
+    ) -> Result<(i32, String, String)>;
     /// 该 agent 是否已安装并（在可探测时）登录。
     async fn check_auth(&self) -> bool;
     /// kind 标识（claude / codex / opencode）。

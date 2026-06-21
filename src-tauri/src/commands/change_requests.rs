@@ -346,6 +346,62 @@ pub async fn retry_merge(cr_id: String, state: State<'_, AppState>) -> Result<()
     Ok(())
 }
 
+/// 撤销一个已合并需求的改动：在 dev 上 `git revert` 其 squash 提交。
+///
+/// 原子状态门（merged→reverting）防双击重复入队（enqueue 的幂等键只防重复行、不防重复
+/// 执行）；无 `merge_commit` 的旧 CR（合并早于撤销功能 / 空改动）直接拒绝。实际撤销在
+/// `tasks/revert.rs` 后台 job 内执行，复用合并锁 + per-CR 锁串行。
+#[tauri::command]
+pub async fn revert_change_request(cr_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    // 必须有可撤销的 squash 提交 SHA。
+    let has_commit = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT merge_commit FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(&cr_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .and_then(|(c,)| c)
+    .map(|c| !c.trim().is_empty())
+    .unwrap_or(false);
+    if !has_commit {
+        return Err("该需求没有可撤销的合并提交（合并早于撤销功能或为空改动）".to_string());
+    }
+    // 原子门：仅 merged 可转 reverting；二次点击/竞态看到非 merged 即拒绝。
+    let res = sqlx::query(
+        "UPDATE change_requests SET status='reverting', updated_at=datetime('now') WHERE id=? AND status='merged'",
+    )
+    .bind(&cr_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if res.rows_affected() == 0 {
+        return Err("仅已合并的需求可撤销（可能已在撤销中或状态已变化）".to_string());
+    }
+    let cr: ChangeRequest = sqlx::query_as("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE issues SET status='reverting', updated_at=datetime('now') WHERE id=?")
+        .bind(&cr.issue_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 唯一 key：去重靠上面的状态门，而非 enqueue 幂等键。
+    let _ = enqueue(
+        &state.db,
+        &state.job_tx,
+        "revert",
+        &format!("revert:{}:{}", cr_id, Uuid::new_v4()),
+        JobPayload::Revert {
+            change_request_id: cr_id.clone(),
+        },
+    )
+    .await;
+    Ok(())
+}
+
 /// 方案 B 手动入口：把当前 CR 的合并冲突交给 AI 自动解决（解完回代码审核 复审）。
 /// 长任务，spawn 到后台执行，命令立即返回。
 #[tauri::command]

@@ -1524,6 +1524,21 @@ async fn message_to_prompt_text(db: &crate::db::Db, msg: &Message) -> Result<Str
                     .unwrap_or("图片");
                 parts.push(format!("[图片: {}]", label));
             }
+            Some("ws_ref") => {
+                let path = block.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if !path.is_empty() {
+                    match load_workspace_ref_content(db, &msg.conversation_id, path).await {
+                        Ok(content) => parts.push(format!(
+                            "[工作区文件引用 - .autoforge/{}]\n```\n{}\n```",
+                            path, content
+                        )),
+                        Err(e) => parts.push(format!(
+                            "[工作区文件引用: .autoforge/{} 读取失败: {}]",
+                            path, e
+                        )),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1562,6 +1577,37 @@ async fn load_text_attachment_content(
         Ok(Some(text.chars().take(MAX_CHARS).collect::<String>()))
     } else {
         Ok(Some(text.to_string()))
+    }
+}
+
+/// 解析消息携带的工作区文件引用（ws_ref 块）：经会话定位项目 repo_path，
+/// 再用 workspace 守卫读取 .autoforge/ 下的文件内容（限 docs/specs，禁越界），
+/// 构建 Agent 提示时按需调用，避免把全文塞进存储的消息。
+async fn load_workspace_ref_content(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    rel_under_autoforge: &str,
+) -> Result<String, String> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT p.repo_path FROM conversations c \
+         JOIN projects p ON p.id = c.project_id WHERE c.id = ?",
+    )
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (repo_path,) = row.ok_or_else(|| "会话未绑定项目".to_string())?;
+    if repo_path.is_empty() {
+        return Err("项目未配置仓库路径".to_string());
+    }
+    let content =
+        crate::commands::workspace::read_workspace_path(&repo_path, rel_under_autoforge).await?;
+    // 防止单个引用文件撑爆上下文，与文本附件一致截断到 50k 字符。
+    const MAX_CHARS: usize = 50_000;
+    if content.chars().count() > MAX_CHARS {
+        Ok(content.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        Ok(content)
     }
 }
 

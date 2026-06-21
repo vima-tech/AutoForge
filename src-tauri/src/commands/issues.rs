@@ -251,9 +251,12 @@ pub async fn submit_issue(
 
 /// Re-run requirement analysis for an issue whose analysis failed (or is stuck at
 /// review 1). Resets the issue to `pending_analysis` and re-enqueues the analysis
-/// job. Re-enqueuing reuses the existing idempotency row (incrementing its attempt
-/// counter) and still re-dispatches the work, so a transient LLM failure recovers
-/// in one click instead of leaving the issue on a dead-end.
+/// job under a UNIQUE idempotency key (`analysis:<id>:retry:<uuid>`). The stable
+/// `analysis:<id>` key would silently de-duplicate against an already-`completed`
+/// job row — `enqueue` only re-dispatches a `failed` row — leaving the issue parked
+/// at `pending_analysis` forever. A unique key always dispatches, so a transient LLM
+/// failure (or a re-analysis of an already-analyzed issue) recovers in one click.
+/// The status-guarded UPDATE above already idempotently blocks a double-click.
 #[tauri::command]
 pub async fn retry_analysis(
     issue_id: String,
@@ -275,7 +278,7 @@ pub async fn retry_analysis(
         &state.db,
         &state.job_tx,
         "analysis",
-        &format!("analysis:{}", issue_id),
+        &format!("analysis:{}:retry:{}", issue_id, uuid::Uuid::new_v4()),
         JobPayload::Analysis {
             issue_id: issue_id.clone(),
         },
@@ -318,7 +321,9 @@ pub async fn reanalyze_with_feedback(
         &state.db,
         &state.job_tx,
         "analysis",
-        &format!("analysis:{}", issue_id),
+        // 唯一 key：稳定的 analysis:<id> 会被 enqueue 按已 completed 的旧 job 行去重而
+        // 不再派发，需求会永远停在 pending_analysis。带意见重评必须真正重跑。
+        &format!("analysis:{}:retry:{}", issue_id, uuid::Uuid::new_v4()),
         JobPayload::Analysis {
             issue_id: issue_id.clone(),
         },

@@ -542,7 +542,10 @@ pub async fn refine_triage(
         .await
         .map_err(|e| e.to_string())?;
 
-        let idem = format!("analysis:{}", id);
+        // 唯一 key：若该碎片此前已被分析过（重新整理/再分流），稳定的 analysis:<id> 会
+        // 被 enqueue 按已 completed 的旧 job 行去重而不派发，需求卡死在 pending_analysis。
+        // 批量精炼后必须真正重跑分析，故每次都用唯一 key 强制派发。
+        let idem = format!("analysis:{}:refine:{}", id, uuid::Uuid::new_v4());
         let _ = crate::tasks::runner::enqueue(
             &state.db,
             &state.job_tx,

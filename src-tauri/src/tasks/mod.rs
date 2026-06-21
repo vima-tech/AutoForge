@@ -3,6 +3,7 @@ pub mod autosupply;
 pub mod execution;
 pub mod merge;
 pub mod preview;
+pub mod revert;
 pub mod runner;
 pub mod scan;
 pub mod security_audit;
