@@ -57,8 +57,8 @@ pub async fn list_change_requests(
 /// 已合并 CR 会随项目生命周期无限累积，全量加载会拖垮列表，故走分页：
 /// - 活动集（非合并）天然有界，调用方一次取够（大 limit）；
 /// - 已合并历史按页滚动加载，total 同时供左栏「已合并」徽标计数。
-/// status 为空或 "all" 表示不过滤状态；exclude_merged 为 true 时排除已合并
-///（仅在未显式按 merged 筛选时生效，显式选 merged 说明主动要看）。
+///   status 为空或 "all" 表示不过滤状态；exclude_merged 为 true 时排除已合并
+///   （仅在未显式按 merged 筛选时生效，显式选 merged 说明主动要看）。
 #[derive(serde::Serialize)]
 pub struct ChangeRequestPage {
     pub items: Vec<ChangeRequest>,
