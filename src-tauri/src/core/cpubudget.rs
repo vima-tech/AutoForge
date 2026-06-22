@@ -106,9 +106,7 @@ fn try_init_linux(budget_pct: u64) -> Option<String> {
     if budget_pct == 0 {
         return None;
     }
-    let Some(cpu_max) = cpu_max_line(budget_pct, nproc()) else {
-        return None;
-    };
+    let cpu_max = cpu_max_line(budget_pct, nproc())?;
 
     // 解析本进程的 cgroup v2 路径：/proc/self/cgroup 里以 "0::" 开头那行。
     let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
