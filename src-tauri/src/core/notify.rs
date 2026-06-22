@@ -87,7 +87,7 @@ async fn send_to_channel(
     let text = format!("【AutoForge · {event_kind}】{title}\n{body}");
     match kind {
         "email" => {
-            send_email(target, &format!("AutoForge · {event_kind}"), &format!("{title}\n{body}")).await
+            return send_email(target, &format!("AutoForge · {event_kind}"), &format!("{title}\n{body}")).await;
         }
         "feishu" => {
             let mut payload = json!({ "msg_type": "text", "content": { "text": text } });
@@ -97,7 +97,7 @@ async fn send_to_channel(
                 payload["timestamp"] = json!(ts);
                 payload["sign"] = json!(sign);
             }
-            post_json(client, target, &payload).await
+            return post_json(client, target, &payload).await;
         }
         "dingtalk" => {
             let mut url = target.to_string();
@@ -108,7 +108,7 @@ async fn send_to_channel(
                 url.push_str(&format!("{sep}timestamp={ts}&sign={sign}"));
             }
             let payload = json!({ "msgtype": "text", "text": { "content": text } });
-            post_json(client, &url, &payload).await
+            return post_json(client, &url, &payload).await;
         }
         "ntfy" => {
             let mut req = client
@@ -119,7 +119,7 @@ async fn send_to_channel(
             if !secret.is_empty() {
                 req = req.header("Authorization", format!("Bearer {secret}"));
             }
-            finish(req).await
+            return finish(req).await;
         }
         "clawbot" => {
             // target = 绑定时拿到的 baseurl，query 携带 to_user_id / 可选 context_token；secret = bot_token。
@@ -147,11 +147,11 @@ async fn send_to_channel(
             let payload = json!({ "msg": msg, "base_info": clawbot_base_info() });
             let url = join_url(base, "ilink/bot/sendmessage");
             let req = clawbot_headers(client.post(&url), Some(secret)).json(&payload);
-            finish(req).await
+            return finish(req).await;
         }
         _ => {
             let payload = build_payload(kind, event_kind, title, body);
-            post_json(client, target, &payload).await
+            return post_json(client, target, &payload).await;
         }
     }
 }
