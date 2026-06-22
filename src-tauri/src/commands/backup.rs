@@ -320,16 +320,17 @@ async fn apply_backup(db: &Db, backup: &ConfigBackup) -> Result<BackupSummary, S
         let headers_json = secrets::encrypt_field(&m.headers_json)?;
         sqlx::query(
             "INSERT INTO mcp_servers
-                (id,name,transport,command,args_json,env_json,url,headers_json,agent_ids_json,enabled,created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                (id,name,transport,command,args_json,env_json,url,headers_json,agent_ids_json,for_code_agent,capability_map_json,enabled,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, transport=excluded.transport, command=excluded.command,
                 args_json=excluded.args_json, env_json=excluded.env_json, url=excluded.url,
-                headers_json=excluded.headers_json, agent_ids_json=excluded.agent_ids_json, enabled=excluded.enabled",
+                headers_json=excluded.headers_json, agent_ids_json=excluded.agent_ids_json,
+                for_code_agent=excluded.for_code_agent, capability_map_json=excluded.capability_map_json, enabled=excluded.enabled",
         )
         .bind(&m.id).bind(&m.name).bind(&m.transport).bind(&m.command).bind(&m.args_json)
         .bind(&env_json).bind(&m.url).bind(&headers_json).bind(&m.agent_ids_json)
-        .bind(m.enabled).bind(&m.created_at)
+        .bind(m.for_code_agent).bind(&m.capability_map_json).bind(m.enabled).bind(&m.created_at)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;

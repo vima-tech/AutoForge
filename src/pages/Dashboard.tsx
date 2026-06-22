@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
 import IntakePanel from '../components/IntakePanel';
-import { getPipelineStats, listActiveProjects, listIssues, listTriageIssues, getAutosupplySettings, type PipelineStats, type Project, type Issue, type AutosupplySettings } from '../services';
+import { getPipelineStats, listActiveProjects, listIssues, listTriageIssues, getAutosupplySettings, issueSourceMeta, type PipelineStats, type Project, type Issue, type AutosupplySettings } from '../services';
 import { useOperator, DEFAULT_OPERATOR } from '../operator';
 
 // 按本地时段给出问候语前缀。
@@ -36,6 +36,8 @@ const STATUS_LABEL: Record<string, string> = {
   merge_conflict: '合并冲突',
   no_change_needed: '无需改动',
   merged: '已合并',
+  reverting: '撤销中',
+  reverted: '已撤销',
   rejected: '已拒绝',
 };
 const STATUS_COLOR: Record<string, string> = {
@@ -52,6 +54,8 @@ const STATUS_COLOR: Record<string, string> = {
   merge_conflict: 'amber',
   no_change_needed: 'blue',
   merged: 'green',
+  reverting: 'amber',
+  reverted: 'violet',
   rejected: 'red',
 };
 
@@ -93,7 +97,7 @@ const buildPipeline = (p: StageCounts) => [
   { ic: 'inbox', name: '需求入口',   cnt: p.triage,           stage: 'triage',           state: p.triage > 0 ? 'active' : 'done' },
   { ic: 'search', name: '需求分析',  cnt: p.pending_analysis, stage: 'pending_analysis', state: p.pending_analysis > 0 ? 'active' : 'done' },
   { ic: 'check', name: '需求审核',   cnt: p.pending_review_1, stage: 'pending_issue_review', state: p.pending_review_1 > 0 ? 'active' : 'done' },
-  { ic: 'code', name: 'Claude Code', cnt: p.executing,        stage: 'executing',        state: p.executing > 0 ? 'active' : '' },
+  { ic: 'code', name: '代码 Agent', cnt: p.executing,        stage: 'executing',        state: p.executing > 0 ? 'active' : '' },
   { ic: 'eye', name: '代码审核',     cnt: p.pending_review_2, stage: 'pending_code_review', state: p.pending_review_2 > 3 ? 'warn' : p.pending_review_2 > 0 ? 'active' : '' },
   { ic: 'merge', name: '合并 dev',   cnt: p.merged,           stage: 'merged',           state: p.merged > 0 ? 'done' : '' },
 ];
@@ -147,8 +151,8 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
   }, [loadAll]);
 
   // ── derived ────────────────────────────────────────────────────────────────
-  // 队列只看「在途」需求，过滤掉已合并/已拒绝等终态
-  const queueIssues = issues.filter(i => i.status !== 'merged' && i.status !== 'rejected');
+  // 队列只看「在途」需求，过滤掉已合并/已拒绝/已撤销等终态（已撤销可在审计页「恢复需求」后重回队列）
+  const queueIssues = issues.filter(i => i.status !== 'merged' && i.status !== 'rejected' && i.status !== 'reverted');
   const activeProjectCount = projects.filter(p => p.status === 'active').length;
   const pendingReview = stats?.pending_review_slots ?? stats?.pending_review_2 ?? 0;
   const pauseThreshold = stats?.pause_threshold ?? 20;
@@ -266,11 +270,19 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
                 style={{ cursor: 'pointer' }} title="在功能审计中查看">
                 <div className="q-pr">{i + 1}</div>
                 <div className="q-main">
-                  <div className="q-title">{q.title}</div>
+                  <div className="q-title">
+                    {!!q.restored_from_revert && (
+                      <span className="dot" style={{ display: 'inline-block', background: 'var(--violet)', marginRight: 6, verticalAlign: 'middle' }} title="撤销恢复的需求" />
+                    )}
+                    {q.title}
+                  </div>
                   <div className="q-meta">
                     <span className="req-id" style={{ color: 'var(--text-3)' }}>{q.id.slice(0, 10)}</span>
                     <span className={'chip ' + (SEV_COLOR[q.category] || 'blue')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{q.category}</span>
                     <span className={'chip ' + (SEV_COLOR[q.severity] || '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{q.severity}</span>
+                    {(() => { const s = issueSourceMeta(q.source_type); return (
+                      <span className={'chip ' + s.chip} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} title={`需求来源：${s.label}`}>{s.label}</span>
+                    ); })()}
                     <span>· {projects.find(p => p.id === q.project_id)?.name ?? '—'}</span>
                   </div>
                 </div>

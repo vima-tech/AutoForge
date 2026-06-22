@@ -122,6 +122,48 @@ pub async fn start_conversation_task(
     Ok(task)
 }
 
+/// Recover conversation (会议室) AI tasks orphaned by a previous process exit.
+///
+/// A task is created `running` and driven by an in-memory `tauri::async_runtime::spawn`
+/// task that dies with the process. Unlike pipeline jobs, these are **not** auto-resumed:
+/// re-running would re-post AI messages, re-spend LLM tokens, and re-write workspace files
+/// — all user-visible side effects. So we close them out as `failed`（注明重启中断）and let
+/// the operator re-send the trigger. In-flight steps/runs are closed the same way so the
+/// task detail view doesn't show phantom spinners.
+///
+/// Run ONCE at startup, before any new task can be spawned. DB-only (no Tauri types) so it
+/// stays callable from non-Tauri entry points.
+pub async fn fail_orphaned_conversation_tasks(db: &crate::db::Db) -> usize {
+    const REASON: &str = "任务因程序重启中断，请重新发送指令触发。";
+    // Close in-flight steps/runs first so no child row outlives its parent task.
+    let _ = sqlx::query(
+        "UPDATE conversation_task_runs SET status='failed', completed_at=datetime('now') WHERE status='running'",
+    )
+    .execute(db)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE conversation_task_steps SET status='failed', error=?, completed_at=datetime('now') WHERE status='running'",
+    )
+    .bind(REASON)
+    .execute(db)
+    .await;
+    let affected = sqlx::query(
+        "UPDATE conversation_tasks SET status='failed', error=?, completed_at=datetime('now') WHERE status='running'",
+    )
+    .bind(REASON)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected() as usize)
+    .unwrap_or(0);
+    if affected > 0 {
+        info!(
+            "startup recovery: failed {} interrupted conversation task(s)",
+            affected
+        );
+    }
+    affected
+}
+
 #[tauri::command]
 pub async fn list_conversation_tasks(
     conversation_id: String,

@@ -96,10 +96,14 @@ impl Evidence {
 /// 同时把整批结构化产出落 `agent_outputs`（best-effort）。
 pub async fn propose(db: &Db, project_id: &str, max: usize) -> Result<Vec<IntakePayload>> {
     let max = max.clamp(1, 20);
+    // 种子上下文：给审计师一张「地图」——近期变更热点（bug 高发区）、被人工否决过的
+    // 方向（负面样例，别再提）。让它带着重点深挖，而非盲目 list 几个文件挑皮毛。
+    let seed = build_seed_context(db, project_id).await;
     let instruction = format!(
-        "请基于本项目的代码现状与上下文，提出最多 {} 条最值得做的改进/需求。\
-         工程类每条必须带 file:line 证据，宁缺毋滥。",
-        max
+        "请以资深代码审计师身份，深挖本项目 linter 发现不了的高价值问题，提出最多 {} 条。\
+         务必先用 search_project_code/read_project_file 核实证据，每条 engineering 必须带真实 file:line 证据；\
+         宁缺毋滥，没有深层问题就返回空数组 []。\n\n{}",
+        max, seed
     );
     let (raw, trace_id) = crate::agents::llm::run_system_role_text_traced(
         db,
@@ -164,6 +168,109 @@ pub async fn propose(db: &Db, project_id: &str, max: usize) -> Result<Vec<Intake
             }
         })
         .collect())
+}
+
+/// 组装 proposer 的种子上下文：近期变更热点（git）+ 被人工否决的负面样例（DB）。
+/// best-effort——任何子项取不到就跳过，绝不阻断提议主流程。返回可直接拼进 instruction 的文本。
+async fn build_seed_context(db: &Db, project_id: &str) -> String {
+    let repo_path: Option<String> =
+        sqlx::query_scalar::<_, String>("SELECT repo_path FROM projects WHERE id=?")
+            .bind(project_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+            .filter(|p| !p.trim().is_empty());
+
+    let mut blocks: Vec<String> = Vec::new();
+
+    if let Some(repo) = repo_path.as_deref() {
+        let recent = git_lines(repo, &["log", "--oneline", "-n", "12"]).await;
+        if !recent.is_empty() {
+            blocks.push(format!(
+                "### 近期提交（优先审查最近改动的区域，bug 高发）\n{}",
+                recent.join("\n")
+            ));
+        }
+        let hotspots = git_hotspots(repo, 12).await;
+        if !hotspots.is_empty() {
+            blocks.push(format!(
+                "### 变更热点文件（改动最频繁=风险最集中，重点审这些）\n{}",
+                hotspots.join("\n")
+            ));
+        }
+    }
+
+    // 负面样例（P5 反馈闭环）：近期被人工否决/判噪的方向，别再重复提。
+    let rejected: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT title FROM issues WHERE project_id=? AND status='rejected' \
+         ORDER BY updated_at DESC LIMIT 15",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if !rejected.is_empty() {
+        blocks.push(format!(
+            "### 已被人工否决的方向（视为低价值，**不要再提**类似的）\n{}",
+            rejected
+                .iter()
+                .map(|t| format!("- {}", t))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if blocks.is_empty() {
+        String::new()
+    } else {
+        format!("## 项目种子上下文（用于聚焦审查）\n\n{}", blocks.join("\n\n"))
+    }
+}
+
+/// 运行只读 git 命令，返回非空 stdout 行（带 5s 超时）。失败/超时返回空。
+async fn git_lines(repo: &str, args: &[&str]) -> Vec<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    cmd.stdin(std::process::Stdio::null());
+    let fut = cmd.output();
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+        Ok(Ok(o)) => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// 用近 200 条提交的改动文件频次，算出 top-N 变更热点文件（纯 Rust 计数，不走 shell 管道）。
+async fn git_hotspots(repo: &str, top: usize) -> Vec<String> {
+    let files = git_lines(
+        repo,
+        &["log", "--name-only", "--pretty=format:", "-n", "200"],
+    )
+    .await;
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for f in files {
+        // 跳过明显的非源码/生成物，聚焦真正的代码热点。
+        if f.contains("node_modules/")
+            || f.contains("/target/")
+            || f.ends_with(".lock")
+            || f.ends_with(".md")
+        {
+            continue;
+        }
+        *counts.entry(f).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(String, u32)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(top)
+        .map(|(f, c)| format!("- {} （近 200 提交改动 {} 次）", f, c))
+        .collect()
 }
 
 #[cfg(test)]

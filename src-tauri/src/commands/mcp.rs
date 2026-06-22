@@ -80,8 +80,8 @@ pub async fn create_mcp_server(
     )?;
     sqlx::query(
         "INSERT INTO mcp_servers
-         (id, name, transport, command, args_json, env_json, url, headers_json, agent_ids_json, enabled)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, transport, command, args_json, env_json, url, headers_json, agent_ids_json, for_code_agent, capability_map_json, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&payload.name)
@@ -92,6 +92,8 @@ pub async fn create_mcp_server(
     .bind(payload.url.unwrap_or_default())
     .bind(&headers_json)
     .bind(payload.agent_ids_json.unwrap_or_else(|| "[]".to_string()))
+    .bind(payload.for_code_agent.unwrap_or(false))
+    .bind(payload.capability_map_json.unwrap_or_else(|| "{}".to_string()))
     .bind(payload.enabled.unwrap_or(true))
     .execute(&state.db)
     .await
@@ -148,6 +150,14 @@ pub async fn update_mcp_server(
         sets.push("agent_ids_json=?");
         values.push(v);
     }
+    if let Some(v) = payload.for_code_agent {
+        sets.push("for_code_agent=?");
+        values.push(if v { "1".into() } else { "0".into() });
+    }
+    if let Some(v) = payload.capability_map_json {
+        sets.push("capability_map_json=?");
+        values.push(v);
+    }
     if let Some(v) = payload.enabled {
         sets.push("enabled=?");
         values.push(if v { "1".into() } else { "0".into() });
@@ -193,6 +203,22 @@ pub async fn test_mcp_connection(
     crate::agents::tools::mcp::test_connection(&server)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 按约定发现指定 code_intel server 的能力映射，返回 capability_map_json 文本（供 UI 回填）。
+/// 用库中原始（未掩码、env/headers 仍为密文）配置连接——connect 内部自行解密。
+#[tauri::command]
+pub async fn discover_code_intel_map(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let server = sqlx::query_as::<_, McpServer>("SELECT * FROM mcp_servers WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("MCP server 不存在: {}", id))?;
+    Ok(crate::agents::tools::code_intel::discover_capability_map(&server).await)
 }
 
 async fn fetch_masked(state: &AppState, id: &str) -> Result<McpServer, String> {

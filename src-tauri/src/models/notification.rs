@@ -170,7 +170,8 @@ impl NotificationDraft {
             | AppEvent::MessageReceived { .. }
             | AppEvent::ConversationTaskUpdated { .. }
             | AppEvent::AsrResult { .. }
-            | AppEvent::AutosupplyStatus { .. } => None,
+            | AppEvent::AutosupplyStatus { .. }
+            | AppEvent::CodeAgentLog { .. } => None,
         }
     }
 }

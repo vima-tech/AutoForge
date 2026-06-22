@@ -29,6 +29,9 @@ pub struct Issue {
     /// 需求审核 管理员补充意见（一次性）：提交后需求带此意见重新分析，被分析任务消费后清空。
     #[sqlx(default)]
     pub review_feedback: Option<String>,
+    /// 该需求是否由「恢复需求」从已撤销态重回队列（1=是）。用于队列里的小 dot 标识。
+    #[sqlx(default)]
+    pub restored_from_revert: i64,
     pub created_at: String,
     pub updated_at: String,
 }

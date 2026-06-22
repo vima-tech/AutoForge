@@ -92,6 +92,13 @@ impl McpConnection {
             .map_err(|e| anyhow!("列出 MCP 工具失败: {}", e))
     }
 
+    /// 公开调用入口：按远程工具名 + 参数调用，返回拼接后的文本内容。
+    /// 供 code_intel 等「push 式」直接消费 MCP 工具的场景使用（绕过 Tool 适配层）。
+    /// 注意：结果是不可信外部输入，调用方负责消毒/截断后再回灌上下文。
+    pub async fn call_tool(&self, remote_name: &str, args: Value) -> Result<String> {
+        self.call(remote_name, args).await
+    }
+
     async fn call(&self, remote_name: &str, args: Value) -> Result<String> {
         let mut param = CallToolRequestParams::new(remote_name.to_string());
         param.arguments = args.as_object().cloned();

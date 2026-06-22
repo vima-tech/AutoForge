@@ -143,7 +143,13 @@ src-tauri/                    # Rust 后端
       llm.rs                  # LLM API 文本生成（run_agent_text）
       local_claude.rs         # claude CLI 调用（worktree 执行）
       analysis.rs             # 需求分析 Agent
-      code_agent.rs           # 代码实现 Agent
+      code_agent/             # 可插拔编码 Agent（claude/codex/opencode）
+        mod.rs                #   trait CodeAgent + resolve/resolve_for_risk + 分级选模型 + build_prompt
+        cli.rs                #   CliCodeAgent：一个 struct 覆盖三家 kind（含 MCP pull 注入、超时回收）
+        mcp_inject.rs         #   pull：把 for_code_agent 的 MCP 注入各 CLI（claude/codex/opencode 机制各异）
+      tools/
+        code_intel.rs         #   push：执行前用 MCP code-intel 预查符号定位/调用者/影响面，注入 prompt
+        mcp.rs                #   MCP client（rmcp）：把外部 MCP 工具适配为本地 Tool
     commands/                 # Tauri IPC commands（每个文件对应一个功能域）
       projects.rs             # 项目 CRUD
       issues.rs               # 需求管理
@@ -225,6 +231,38 @@ listen('autoforge://event', (e) => { /* message_received | conversation_task_upd
 所有 git 操作经 `core/git.rs::GitProxy`，正则拦截危险命令：
 push main/master、push --force、symbolic-ref、config --global 等。
 Claude Code 在 worktree 内执行时额外禁止 git 工具：`--disallowedTools "Bash(git *)"`.
+
+### 可插拔编码 Agent + MCP 接入（接新 agent 必读）
+
+代码实现任务由**可插拔的 CLI 编码 Agent** 执行，抽象在 `agents/code_agent/`（纯 Rust，零 Tauri）。
+当前内置三种 `kind`：**claude / codex / opencode**，由 `code_agents` 表配置，按「项目覆盖 → 全局默认 → 硬兜底 claude」解析（`resolve` / `resolve_for_risk`）。
+
+**统一抽象**
+- `trait CodeAgent`（`mod.rs`）：`run(worktree, prompt, limits, mcp: &[McpInject])` + `check_auth()` + `kind()`。
+- `CliCodeAgent`（`cli.rs`）：一个 struct 用 `match kind` 覆盖三家。所有 kind 统一施加安全护栏：传输层禁 remote git（`GIT_ALLOW_PROTOCOL=""`）、worktree 隔离、进程组隔离、墙钟/空闲双超时真杀进程组。
+- `RunLimits`：墙钟 + 空闲超时（从设置读，见 `system::load_execution_limits`）。
+
+**分级选模型**（执行前按风险挑快/强模型）
+- `code_agents` 表的 `fast_model` / `strong_model`（迁移 0059）；`risk_from_spec(spec)` 用分析阶段的 `scope.blast_radius` + 影响文件数 + `estimate.complexity` 判 Low/High，`resolve_for_risk` 选 fast/strong（空则回落 `model`）。**风险取自分析阶段而非 grader**——grader 在执行后才跑。三家共用，模型名各填各的。
+
+**MCP 接入（编码 Agent 用 MCP 的两条机制）**
+适用面由 `mcp_servers` 表的 `for_code_agent`（迁移 0063）决定，与角色 Agent 的 `agent_ids_json` 正交，可同时成立：
+- **push（代码情报预查）**：`agents/tools/code_intel.rs::locate_context`。执行前把分析点名的符号喂给 `for_code_agent` 的 MCP（`capability_map_json` 显式映射，或留空按工具名/schema **约定自动发现**），取回 file:line/调用者/影响面注入 prompt。能力槽位由 push 流程**硬编码**（目前 `locate_symbol` / `find_callers` / `impact_analysis`），加新槽要改 Rust。结果过 `has_obvious_injection`。
+- **pull（实时调用）**：`agents/code_agent/mcp_inject.rs`。把 `for_code_agent` 的 MCP 注入 spawn 出去的 CLI，让 agent 在 worktree 内自主调任意 MCP 工具。**各 CLI 注入机制不同**：
+  - **claude**（一等公民）：`--mcp-config <临时json>` + `--strict-mcp-config`（只用注入的、忽略机器级 `~/.claude.json`）+ `--allowedTools mcp__<name>`（`--print` 下 MCP 工具必须显式放行）。
+  - **codex**：`-c mcp_servers.<name>.command/args/env`（value 按 TOML 解析，走 argv 免转义，仅 stdio）。
+  - **opencode**：`run` 无逐次注入入口（只有全局 `opencode mcp` 持久配置）→ 暂不支持。
+  - 无 `for_code_agent` server 时所有注入为空，CLI 命令与改造前完全一致（零回归）。env/headers 出库为密文，`McpInject::from_server` 经 `secrets::decrypt` 解密后写入子进程。
+
+**接入新编码 Agent（如 kimi）的步骤**
+1. `cli.rs` 的 `run()` 里加一个 `match self.profile.kind.as_str()` 分支，构建该 CLI 的非交互参数（参考 codex/opencode 分支），并决定 prompt 走 stdin 还是位置参数（`feed_stdin`）。
+2. `mcp_inject.rs` 加 `for_kimi(servers)`（在 `build()` 里分发）——按该 CLI 的 MCP 配置机制生成参数/临时文件/env。若该 CLI 不支持逐次 MCP 注入，返回空（像 opencode）。
+3. `check_auth()`（`cli.rs`）加该 kind 的探测分支。
+4. `code_agent_display_name`（`execution.rs`）加可读名。
+5. 0057 种子或 UI「新增自定义 Agent」里登记该 kind；`code_agents.rs` 的 CRUD 无需改（kind 是自由字符串）。
+6. **铁律**：新分支同样不得引用 Tauri 类型；安全护栏（remote git 禁用、超时真杀）由 `base_cmd` + run 循环统一施加，新 CLI 自动继承，不要在分支里绕过。
+
+> push（代码情报）三家一致、与 CLI 无关，故接新 agent 时 push 自动可用；要适配的只有 **pull 注入**（第 2 步）与 **auth 探测**（第 3 步）。
 
 ---
 

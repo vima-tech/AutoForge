@@ -154,6 +154,24 @@ pub async fn get_change_request(
         .map_err(|e| e.to_string())
 }
 
+/// 代码审核页「批准合并」前预填的默认合并提交信息。
+///
+/// 与后端合并任务回退时使用的模板（`tasks::merge::default_merge_message`）共享同一实现，
+/// 保证审核页预填内容与人审留空时实际落地的提交信息字字一致（单一真源）。
+#[tauri::command]
+pub async fn get_default_merge_message(
+    cr_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cr = sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("cr {} not found", cr_id))?;
+    Ok(crate::tasks::merge::default_merge_message(&state.db, &cr).await)
+}
+
 #[tauri::command]
 pub async fn get_worktree_session(
     cr_id: String,
@@ -694,8 +712,13 @@ async fn approve_cr_review_2(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Enqueue merge job
-    let idem_key = format!("merge:{}", cr_id);
+    // Enqueue merge job.
+    // 唯一键（带 uuid）而非固定 `merge:{cr}`：一个 CR 可能经历「合并 → 撤销(revert) →
+    // 从 revert 恢复重新执行 → 再次通过代码审核」。固定键会撞上上一次合并遗留的、status=
+    // completed 的 job_executions 行 → enqueue 的 INSERT OR IGNORE 命中既有行、判为非
+    // inserted 且非 failed → 不派发，CR 永远卡在 pending_merge（无驱动任务）。merge job
+    // 幂等（见 requeue_orphaned_merges 注释），唯一键安全，与 retry_merge 的做法一致。
+    let idem_key = format!("merge:{}:approve:{}", cr_id, Uuid::new_v4());
     let _ = enqueue(
         db,
         job_tx,
@@ -1039,6 +1062,81 @@ pub async fn retry_change_request(
             cr_id: cr_id.clone(),
             status: "re-executing".to_string(),
             message: Some("需求已重新进入执行队列".to_string()),
+        },
+    );
+
+    sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Restore a reverted requirement back into the pipeline queue: re-implement it
+/// from a clean worktree against the current dev (which already carries the revert
+/// commit), so it flows through code review (review_2) and re-merges. Mirrors
+/// `retry_change_request`'s reset+enqueue, but gated on the `reverted` terminal
+/// state — the closure path for "I undid this, now I want it back".
+#[tauri::command]
+pub async fn restore_change_request(
+    cr_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ChangeRequest, String> {
+    let cr = sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Atomic gate: only a reverted CR can re-enter; a double click / race that sees
+    // any other state is rejected (the row already moved on).
+    let res = sqlx::query(
+        "UPDATE change_requests SET status='pending_execution', updated_at=datetime('now') WHERE id=? AND status='reverted'",
+    )
+    .bind(&cr_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if res.rows_affected() == 0 {
+        return Err(format!(
+            "只有已撤销的需求可以恢复（当前状态：{}）",
+            cr.status
+        ));
+    }
+
+    // Clear leftover worktrees/previews from the prior attempt before re-running.
+    cleanup_cr_worktrees(&state.db, &cr).await;
+
+    // Flag the issue as restored-from-revert so the queue can mark it with a small dot.
+    sqlx::query(
+        "UPDATE issues SET status='pending_execution', restored_from_revert=1, updated_at=datetime('now') WHERE id=?",
+    )
+    .bind(&cr.issue_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Unique idempotency key so the restore is never swallowed by INSERT OR IGNORE.
+    let idem_key = format!("execution:{}:restore:{}", cr_id, Uuid::new_v4());
+    let _ = enqueue(
+        &state.db,
+        &state.job_tx,
+        "execution",
+        &idem_key,
+        JobPayload::Execution {
+            change_request_id: cr_id.clone(),
+            project_id: cr.project_id.clone(),
+        },
+    )
+    .await;
+
+    crate::core::event::emit(
+        &app,
+        crate::core::event::AppEvent::WorktreeUpdate {
+            cr_id: cr_id.clone(),
+            status: "re-executing".to_string(),
+            message: Some("已撤销的需求已重新进入执行队列".to_string()),
         },
     );
 

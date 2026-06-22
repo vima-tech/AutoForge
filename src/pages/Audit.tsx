@@ -14,8 +14,10 @@ import {
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
-  getMergeConflict, retryMerge, aiResolveMergeConflict, revertChangeRequest, getCustomMergeMessageEnabled,
+  getMergeConflict, retryMerge, aiResolveMergeConflict, revertChangeRequest, restoreChangeRequest, getCustomMergeMessageEnabled, getDefaultMergeMessage,
   getConflictDetail, resolveConflictManually, openConflictWorkspace,
+  issueSourceMeta, listCodeAgentRuns, getCodeAgentRun,
+  type CodeAgentRunMeta, type CodeAgentRunLog,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
   type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
   type BranchInfo, type BranchPreviewStatus, type MergeConflictView,
@@ -356,7 +358,7 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
           <Icon name="chevDown" size={13} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: open ? 'rotate(180deg)' : 'none' }} />
         </button>
         {open && (
-          <div className="mention-pop" style={{ right: 0, left: 'auto', top: 'calc(100% + 6px)', bottom: 'auto', minWidth: 220, marginBottom: 0 }}>
+          <div className="mention-pop" style={{ right: 0, left: 'auto', top: 'calc(100% + 6px)', bottom: 'auto', minWidth: 220, marginBottom: 0, maxHeight: 360, overflowY: 'auto' }}>
             {branches.length === 0 && (
               <div className="empty-compact" style={{ padding: '8px 10px' }}>无本地分支或未配置启动命令</div>
             )}
@@ -414,11 +416,32 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 
   // 列表模糊过滤：按标题或需求编号（短/全 id）筛选当前闸口列表。
   const [search, setSearch] = useState('');
+  // 来源过滤（融进搜索框，不额外占高度）：空集=不过滤；否则只显示命中所选来源的需求。
+  const [sourceFilter, setSourceFilter] = useState<Set<string>>(new Set());
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
+  const sourceMenuRef = useRef<HTMLDivElement>(null);
+  // 点击浮层外部关闭来源过滤菜单（与项目选择菜单一致；非模态，外点即关）。
+  useEffect(() => {
+    if (!sourceMenuOpen) return;
+    const close = (e: PointerEvent) => {
+      if (e.target instanceof Node && sourceMenuRef.current?.contains(e.target)) return;
+      setSourceMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [sourceMenuOpen]);
+  // 来源选项动态取自当前待审需求实际出现过的 source_type（不堆砌不存在的来源）。
+  const availableSources = useMemo(() => {
+    const set = new Set<string>();
+    for (const i of pendingIssues) if (i.source_type) set.add(i.source_type);
+    return Array.from(set).sort();
+  }, [pendingIssues]);
   const filteredIssues = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return pendingIssues;
-    return pendingIssues.filter(i => i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q));
-  }, [pendingIssues, search]);
+    return pendingIssues.filter(i =>
+      (sourceFilter.size === 0 || sourceFilter.has(i.source_type)) &&
+      (!q || i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q)));
+  }, [pendingIssues, search, sourceFilter]);
   const filteredCrs = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return crs;
@@ -427,8 +450,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       r.id.toLowerCase().includes(q) ||
       r.issue_id.toLowerCase().includes(q));
   }, [crs, issueTitles, search]);
-  // 切换闸口时清空搜索，避免跨闸口残留筛选词。
-  useEffect(() => { setSearch(''); }, [gate]);
+  // 切换闸口时清空搜索与来源过滤，避免跨闸口残留筛选条件。
+  useEffect(() => { setSearch(''); setSourceFilter(new Set()); setSourceMenuOpen(false); }, [gate]);
 
   // 仅 pending_issue_review 可批量通过（analysis_failed 需先重分析，不可直接过审）；批量仅作用于当前筛选可见集。
   const selectablePending = useMemo(() => filteredIssues.filter(i => i.status === 'pending_issue_review'), [filteredIssues]);
@@ -532,11 +555,46 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         </div>
       </div>
 
-      {/* 顶部固定搜索框：置于滚动容器外，不随列表滚动 */}
+      {/* 顶部固定搜索框：置于滚动容器外，不随列表滚动。来源过滤融进框内右侧图标，不额外占高度 */}
       {(gate === 'issue' ? pendingIssues.length > 0 : crs.length > 0) && (
         <div style={{ padding: '8px 12px 4px', flexShrink: 0 }}>
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 需求编号…"
-            style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+          <div style={{ position: 'relative' }} ref={sourceMenuRef}>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 需求编号…"
+              style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', paddingRight: gate === 'issue' ? 34 : 10, color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+            {gate === 'issue' && availableSources.length > 0 && (
+              <>
+                <button type="button" onClick={() => setSourceMenuOpen(o => !o)}
+                  title={sourceFilter.size ? `来源过滤：已选 ${sourceFilter.size} 项` : '按来源过滤'}
+                  style={{ position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)', width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', background: sourceFilter.size ? 'var(--ember-tint)' : 'transparent', border: 'none', borderRadius: 6, cursor: 'pointer', color: sourceFilter.size ? 'var(--ember-soft)' : 'var(--text-3)' }}>
+                  <Icon name="funnel" size={14} />
+                  {sourceFilter.size > 0 && <span style={{ position: 'absolute', top: 2, right: 2, width: 6, height: 6, borderRadius: 99, background: 'var(--ember)' }} />}
+                </button>
+                {sourceMenuOpen && (
+                  <div className="mention-pop" style={{ right: 0, left: 'auto', top: 'calc(100% + 6px)', bottom: 'auto', minWidth: 180, marginBottom: 0, zIndex: 40 }}>
+                    <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <span>按来源过滤</span>
+                      {sourceFilter.size > 0 && (
+                        <span onClick={() => setSourceFilter(new Set())} style={{ cursor: 'pointer', color: 'var(--ember-soft)', textTransform: 'none', letterSpacing: 0 }}>清除</span>
+                      )}
+                    </div>
+                    {availableSources.map(src => {
+                      const s = issueSourceMeta(src);
+                      const on = sourceFilter.has(src);
+                      const count = pendingIssues.filter(i => i.source_type === src).length;
+                      return (
+                        <div key={src} className={'mention-row' + (on ? ' mention-active' : '')}
+                          onClick={() => setSourceFilter(prev => { const n = new Set(prev); n.has(src) ? n.delete(src) : n.add(src); return n; })}>
+                          <span style={{ width: 14, flexShrink: 0, color: 'var(--ember)' }}>{on && <Icon name="check" size={13} />}</span>
+                          <span className="nm" style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.label}</span>
+                          <span className="rl" style={{ flexShrink: 0 }}>{count}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </div>
       )}
 
@@ -550,10 +608,10 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           </button>
         )}
 
-        {/* 搜索无匹配提示：原始列表有内容但筛选后为空 */}
-        {search.trim() && (gate === 'issue' ? (pendingIssues.length > 0 && filteredIssues.length === 0) : (crs.length > 0 && filteredCrs.length === 0)) && (
+        {/* 搜索/来源过滤无匹配提示：原始列表有内容但筛选后为空 */}
+        {(search.trim() || (gate === 'issue' && sourceFilter.size > 0)) && (gate === 'issue' ? (pendingIssues.length > 0 && filteredIssues.length === 0) : (crs.length > 0 && filteredCrs.length === 0)) && (
           <div className="empty-compact" style={{ padding: '14px 12px', textAlign: 'center', color: 'var(--text-faint)', fontSize: 'var(--text-caption)' }}>
-            无匹配「{search.trim()}」的{gate === 'issue' ? '需求' : '变更'}
+            {search.trim() ? <>无匹配「{search.trim()}」的{gate === 'issue' ? '需求' : '变更'}</> : '当前来源筛选下无待审需求'}
           </div>
         )}
 
@@ -992,29 +1050,30 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   return (
     <>
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
-      <div className="list-body scroll" ref={scrollRef} style={{ paddingTop: 0, flex: 1 }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 12px' }}>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
-              style={{ flex: 1, minWidth: 0, boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
-            {/* 「显示已合并需求」开关：与功能审计页共享同一状态，默认隐藏。 */}
-            <button className={'icon-btn' + (showMerged ? ' on' : '')} style={{ flexShrink: 0 }}
-              onClick={onToggleMerged}
-              title={showMerged ? `隐藏已合并需求（${mergedCount}）` : `显示已合并需求（${mergedCount}）`}>
-              <Icon name={showMerged ? 'eye' : 'eye-off'} size={16} />
-            </button>
-          </div>
-          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-            {['all', ...statuses.filter(s => showMerged || s !== 'merged')].map(s => (
-              <button key={s} onClick={() => setStatusFilter(s)}
-                className={'filter-chip' + (statusFilter === s ? ' on' : '')}
-                style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>
-                {s === 'all' ? '全部' : (LEDGER_STATUS_LABEL[s] ?? s)}
-              </button>
-            ))}
-          </div>
+      {/* 搜索栏 + 筛选 tag：固定在顶部，不随列表滚动。 */}
+      <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 12px' }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
+            style={{ flex: 1, minWidth: 0, boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+          {/* 「显示已合并需求」开关：与功能审计页共享同一状态，默认隐藏。 */}
+          <button className={'icon-btn' + (showMerged ? ' on' : '')} style={{ flexShrink: 0 }}
+            onClick={onToggleMerged}
+            title={showMerged ? `隐藏已合并需求（${mergedCount}）` : `显示已合并需求（${mergedCount}）`}>
+            <Icon name={showMerged ? 'eye' : 'eye-off'} size={16} />
+          </button>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '0 14px 6px' }}>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {['all', ...statuses.filter(s => showMerged || s !== 'merged')].map(s => (
+            <button key={s} onClick={() => setStatusFilter(s)}
+              className={'filter-chip' + (statusFilter === s ? ' on' : '')}
+              style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>
+              {s === 'all' ? '全部' : (LEDGER_STATUS_LABEL[s] ?? s)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="list-body scroll" ref={scrollRef} style={{ paddingTop: 0, flex: 1 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 14px 6px' }}>
           <button onClick={toggleAll} disabled={!items.length} title="全选已加载的需求"
             style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'none', border: 'none', cursor: items.length ? 'pointer' : 'default', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)' }}>
             <LedgerCheck on={allLoadedSelected} /> 全选
@@ -1278,7 +1337,7 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
 
               {hasBrief && (
                 <>
-                  <SpecH2 icon="code" color="var(--text-3)">Claude Code 执行工单</SpecH2>
+                  <SpecH2 icon="code" color="var(--text-3)">代码 Agent 执行工单</SpecH2>
                   <div className="panel" style={{ padding: '12px 14px' }}>
                     {b.objective && <p style={{ margin: '0 0 8px' }}><b>目标：</b>{b.objective}</p>}
                     {b.instructions.length > 0 && (
@@ -1497,9 +1556,14 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
             <span className="audit-top-title" style={{ fontWeight: 700, fontSize: 'var(--text-title)' }} title={issue.title}>{issue.title}</span>
             <span className={'chip ' + (analysisFailed ? 'red' : 'amber')}>{analysisFailed ? '分析失败' : '需求审核'}</span>
           </div>
-          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8 }}>
+          <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
             <span className={'chip ' + (SEV_COLOR[issue.category] || 'blue')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.category}</span>
             <span className={'chip ' + (SEV_COLOR[issue.severity] || '')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.severity}</span>
+            {(() => { const s = issueSourceMeta(issue.source_type); return (
+              <span className={'chip ' + s.chip} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }} title={`需求来源：${s.label}`}>
+                <Icon name="inbox" size={11} style={{ marginRight: 3, opacity: .7 }} />来源 · {s.label}
+              </span>
+            ); })()}
             <span>{fmtFull(issue.updated_at)}</span>
           </div>
         </div>
@@ -1654,9 +1718,19 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   // 「撤销已合并需求」二次确认弹窗开关。
   const [revertConfirm, setRevertConfirm] = useState(false);
   const [revertBusy, setRevertBusy] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
   const [grade, setGrade] = useState<CrGrade | null>(null);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
-  const [tab, setTab] = useState<'report' | 'diff'>('report');
+  const [tab, setTab] = useState<'report' | 'diff' | 'logs'>('report');
+  // 代码 Agent 执行日志：列表 meta + 当前展开的完整日志。
+  const [runs, setRuns] = useState<CodeAgentRunMeta[]>([]);
+  const [activeRun, setActiveRun] = useState<CodeAgentRunLog | null>(null);
+  const [runStream, setRunStream] = useState<'stdout' | 'stderr'>('stdout');
+  // 运行期实时日志增量（仅当前选中 CR）；切 CR 清空，运行结束后刷进 runs 落库列表。
+  const [liveLog, setLiveLog] = useState<{ stream: string; text: string }[]>([]);
+  const liveEndRef = useRef<HTMLDivElement | null>(null);
+  // 一键复制日志的瞬时反馈：记当前刚复制的按钮 key（live/stdout/stderr），1.5s 后清。
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [fsReader, setFsReader] = useState(false);   // 全屏阅读模式（与会议室阅读模式风格一致）
   const [diffScale, setDiffScale] = useState(() => {
     const v = Number(localStorage.getItem('audit.diffScale'));
@@ -2003,9 +2077,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     setDecided(null);
     setGrade(null);
     setAdvice('');
-    // 预填默认合并信息（与后端回退模板一致），人审可改后随「批准合并」提交
+    // 预填默认合并信息（与后端回退模板一致），人审可改后随「批准合并」提交。
+    // 先放短码占位避免空白，再异步拉取后端生成的 feat(模块): 标题 [autoforge #编号] 模板。
     setCommitMsg(`AutoForge merge: ${crId}`);
+    getDefaultMergeMessage(crId)
+      .then(msg => { if (loadReqRef.current === reqId && msg) setCommitMsg(msg); })
+      .catch(() => {});
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
+    setRuns([]); setActiveRun(null); setLiveLog([]);  // 清掉上一条 CR 的执行日志 + 实时缓冲
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
     setConflict(null);  // 清掉上一条 CR 的冲突现场
     autoOpenRef.current = false;  // 切换 CR 时取消上一条未完成的自动打开
@@ -2015,18 +2094,20 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     // 报告页「需求原文」所需的原始需求：不再全量缓存，选中 CR 时按需补拉进 issuesById。
     const origIssueId = crs.find(c => c.id === crId)?.issue_id;
     (async () => {
-      const [s, d, g, pv, origIssue] = await Promise.all([
+      const [s, d, g, pv, origIssue, rl] = await Promise.all([
         getWorktreeSession(crId),
         getCodeDiff(crId),
         getCrGrade(crId).catch(() => null),
         getCrPreview(crId).catch(() => null),
         origIssueId ? getIssue(origIssueId).catch(() => null) : Promise.resolve(null),
+        listCodeAgentRuns(crId).catch(() => [] as CodeAgentRunMeta[]),
       ]);
       if (loadReqRef.current !== reqId) return;
       setSession(s);
       setCrPreview(pv);
       setDiff(d);
       setGrade(g);
+      setRuns(rl);
       if (origIssue) setIssuesById(prev => ({ ...prev, [origIssue.id]: origIssue }));
       setCrLoading(false);
       // 合并冲突态：按需拉取冲突现场（文件列表 + 带标记 diff）供三方视图渲染。
@@ -2105,10 +2186,38 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         setCrProgress(prev => ({ ...prev, [ev.cr_id as string]: { phase: ev.phase || '', note: ev.note } }));
         return;
       }
+      // 实时日志是高频事件，由专门的监听器处理，这里直接跳过——否则每段增量都会触发列表重载。
+      if (ev?.type === 'code_agent_log') return;
       debounced();
     }).then(fn => { unlisten = fn; });
     return () => { if (timer) clearTimeout(timer); unlisten?.(); };
   }, [activeProject, loadList, loadProjectReviewCounts]);
+
+  // 实时日志监听：只累积当前选中 CR 的代码 Agent 输出增量；运行结束（worktree_update）
+  // 时刷新已落库的执行日志列表，让完整日志接替实时缓冲。随 activeCr 重订阅。
+  useEffect(() => {
+    if (!activeCr) return;
+    const cr = activeCr;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ type?: string; cr_id?: string; stream?: string; chunk?: string }>('AutoForge://event', e => {
+      const ev = e.payload;
+      if (ev?.cr_id !== cr) return;
+      if (ev.type === 'code_agent_log' && ev.chunk) {
+        const item = { stream: ev.stream || 'stdout', text: ev.chunk };
+        // 上限保护：超过 4000 段时丢弃最旧的，保留尾部 3000 段。
+        setLiveLog(prev => prev.length > 4000 ? [...prev.slice(-3000), item] : [...prev, item]);
+      } else if (ev.type === 'worktree_update') {
+        listCodeAgentRuns(cr).then(setRuns).catch(() => {});
+      }
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [activeCr]);
+
+  // 实时日志自动滚到底（仅在执行日志 tab 打开时）。
+  useEffect(() => {
+    if (tab === 'logs' && liveLog.length > 0) liveEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [liveLog, tab]);
 
   const doReview = async (decision: 'approved' | 'revision' | 'rejected') => {
     if (!activeCr || submitting) return;
@@ -2178,6 +2287,20 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } catch (e) {
       showError('撤销失败：' + String(e));
     } finally { setRevertBusy(false); }
+  };
+
+  // 已撤销需求闭环：恢复需求，重新进入执行队列（再次实现并经代码审核后合并）。
+  const doRestore = async () => {
+    if (!activeCr || restoreBusy) return;
+    setRestoreBusy(true);
+    try {
+      await restoreChangeRequest(activeCr);
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      showError('恢复需求失败：' + String(e));
+    } finally { setRestoreBusy(false); }
   };
 
   // 失败需求闭环：彻底删除需求及其执行数据。
@@ -2469,7 +2592,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               <span style={{ fontWeight: 700, fontSize: 'var(--text-body)' }}>{oi.title}</span>
               <span className={'chip ' + (SEV_COLOR[oi.category] || 'blue')} style={{ fontSize: 'var(--text-micro)' }}>{oi.category}</span>
               <span className={'chip ' + (SEV_COLOR[oi.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{oi.severity}</span>
-              <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{oi.source_type} · {fmtFull(oi.created_at)}</span>
+              <span className={'chip ' + issueSourceMeta(oi.source_type).chip} style={{ fontSize: 'var(--text-micro)' }} title="需求来源">{issueSourceMeta(oi.source_type).label}</span>
+              <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{fmtFull(oi.created_at)}</span>
             </div>
             <p style={{ margin: 0, whiteSpace: 'pre-line', fontSize: 'var(--text-control)', color: 'var(--text-2)', lineHeight: 'var(--leading-normal)' }}>{oi.description || '（无描述）'}</p>
           </div>
@@ -2600,6 +2724,125 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     </div>
   );
 
+  // 点开一条执行日志：拉完整 stdout/stderr，默认展示有内容的那一路。再次点击已展开的同一条则收起。
+  const openRun = async (id: string) => {
+    if (activeRun?.id === id) { setActiveRun(null); return; }
+    setActiveRun(null);
+    try {
+      const r = await getCodeAgentRun(id);
+      setActiveRun(r);
+      setRunStream(r && !r.stdout?.trim() && r.stderr?.trim() ? 'stderr' : 'stdout');
+    } catch { /* 拉取失败静默：日志查看不阻断主流程 */ }
+  };
+  // 一键复制：写剪贴板并给 1.5s 的「已复制」反馈。剪贴板不可用时提示。
+  const copyLog = async (text: string, key: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey(k => (k === key ? null : k)), 1500);
+    } catch { showError('复制失败：剪贴板不可用'); }
+  };
+  const runExitMeta = (code: number) =>
+    code === 0 ? { chip: 'green', label: '成功' }
+      : code === 124 ? { chip: 'amber', label: '超时被杀' }
+        : { chip: 'red', label: `退出码 ${code}` };
+  const fmtBytes = (n: number) =>
+    n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`;
+  const RUN_PHASE_LABEL: Record<string, string> = { execution: '代码实现', conflict_resolve: 'AI 解冲突' };
+
+  // 执行日志正文：实时输出（运行中）在最上，其下是历史运行列表（落库），点开看完整 stdout/stderr。
+  const renderLogsBody = () => (
+    <div className="report">
+      {liveLog.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+            <span className="dot amber" />
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.12em' }}>实时输出 · 运行中</span>
+            <button className="btn btn-sm btn-ghost" style={{ marginLeft: 'auto' }}
+              onClick={() => copyLog(liveLog.map(l => l.text).join('\n'), 'live')} title="复制实时日志全文">
+              <Icon name={copiedKey === 'live' ? 'check' : 'copy'} size={13} />{copiedKey === 'live' ? '已复制' : '复制'}
+            </button>
+          </div>
+          <div className="log-body scroll" style={{ border: '1px solid var(--ember)', borderRadius: 'var(--radius-sm)', maxHeight: '52vh' }}>
+            {parseLogLines(liveLog.map(l => l.text).join('\n')).map((l, i) => (
+              <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
+                <span className="log-gut">{i + 1}</span>
+                <span className="log-code">{l.text || ' '}</span>
+              </div>
+            ))}
+            <div ref={liveEndRef} />
+          </div>
+        </div>
+      )}
+      {runs.length === 0 ? (
+        liveLog.length === 0 && (
+          <div className="empty-compact" style={{ padding: '20px 0' }}>
+            {crLoading ? '加载中…' : '暂无执行日志（该需求尚未运行过代码 Agent，或日志已超出保留期）'}
+          </div>
+        )
+      ) : (<>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
+          {runs.map(r => {
+            const ex = runExitMeta(r.exit_code);
+            const on = activeRun?.id === r.id;
+            return (
+              <button key={r.id} onClick={() => openRun(r.id)}
+                className="panel"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+                  padding: '10px 12px', cursor: 'pointer', textAlign: 'left',
+                  borderColor: on ? 'var(--ember)' : 'var(--border)',
+                  background: on ? 'var(--ember-tint)' : 'var(--bg-2)',
+                }}>
+                <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{RUN_PHASE_LABEL[r.phase] || r.phase}</span>
+                <span className="chip" style={{ fontSize: 'var(--text-micro)' }}>{r.kind}{r.model ? ` · ${r.model}` : ''}</span>
+                <span className={'chip ' + ex.chip} style={{ fontSize: 'var(--text-micro)' }}>{ex.label}</span>
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                  {(r.duration_ms / 1000).toFixed(1)}s · out {fmtBytes(r.stdout_bytes)} · err {fmtBytes(r.stderr_bytes)}{r.truncated ? ' · 已截断' : ''}
+                </span>
+                <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{fmtFull(r.created_at)}</span>
+              </button>
+            );
+          })}
+        </div>
+        {activeRun && (<>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <div className="seg">
+              <button className={runStream === 'stdout' ? 'on' : ''} onClick={() => setRunStream('stdout')}>stdout · {fmtBytes(activeRun.stdout_bytes)}</button>
+              <button className={runStream === 'stderr' ? 'on' : ''} onClick={() => setRunStream('stderr')}>stderr · {fmtBytes(activeRun.stderr_bytes)}</button>
+            </div>
+            <button className="btn btn-sm btn-ghost" style={{ marginLeft: 'auto' }}
+              onClick={() => copyLog(runStream === 'stdout' ? activeRun.stdout : activeRun.stderr, runStream)}
+              title={`复制当前 ${runStream} 全文`}>
+              <Icon name={copiedKey === runStream ? 'check' : 'copy'} size={13} />{copiedKey === runStream ? '已复制' : `复制 ${runStream}`}
+            </button>
+          </div>
+          {activeRun.truncated > 0 && (
+            <div style={{ fontSize: 'var(--text-label)', color: 'var(--amber)', marginBottom: 8 }}>
+              <Icon name="alert" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />日志过长，仅保留尾部约 512K 字符（开头已省略）。
+            </div>
+          )}
+          {(() => {
+            const raw = runStream === 'stdout' ? activeRun.stdout : activeRun.stderr;
+            const lines = parseLogLines(raw);
+            return (
+              <div className="log-body scroll" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                {!raw.trim()
+                  ? <div className="log-empty">（该流无输出）</div>
+                  : lines.map((l, i) => (
+                    <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
+                      <span className="log-gut">{i + 1}</span>
+                      <span className="log-code">{l.text || ' '}</span>
+                    </div>
+                  ))}
+              </div>
+            );
+          })()}
+        </>)}
+      </>)}
+    </div>
+  );
+
   // 全屏阅读模式头部工具：字号缩放 + 退出（与会议室阅读模式一致）
   const renderFsTools = () => (
     <>
@@ -2718,6 +2961,11 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                               </button>
                             : <span title="该需求合并早于撤销功能，无法一键撤销" style={{ fontSize: 'var(--text-label)', color: 'var(--text-faint)' }}>不可撤销</span>
                         )}
+                        {cr.status === 'reverted' && (
+                          <button className="btn btn-primary" onClick={doRestore} disabled={restoreBusy} title="重新进入执行队列，再次实现并经代码审核后合并">
+                            <Icon name="refresh" size={15} />{restoreBusy ? '恢复中…' : '恢复需求'}
+                          </button>
+                        )}
                       </>
                     : decided
                       ? <span className={'chip ' + (decided === 'approved' ? 'green' : decided === 'rejected' ? 'red' : 'amber')} style={{ padding: '7px 14px', fontSize: 'var(--text-control)' }}>
@@ -2739,6 +2987,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                     <div className="seg">
                       <button className={tab === 'report' ? 'on' : ''} onClick={() => setTab('report')}>实现报告</button>
                       <button className={tab === 'diff' ? 'on' : ''} onClick={() => setTab('diff')}>代码 Diff</button>
+                      <button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')} style={{ position: 'relative' }}>
+                        执行日志{runs.length > 0 ? ` · ${runs.length}` : ''}
+                        {liveLog.length > 0 && <span className="dot amber" style={{ position: 'absolute', top: 3, right: 3 }} />}
+                      </button>
                     </div>
                     <div className="diff-tab-tools">
                       {tab === 'report' && issuesById[cr.issue_id] && (
@@ -2756,13 +3008,15 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                           </button>
                         </div>
                       )}
-                      <button className="icon-btn" title="全屏阅读（报告 + Diff 分栏）" onClick={() => setFsReader(true)}>
-                        <Icon name="maximize" size={15} />
-                      </button>
+                      {tab !== 'logs' && (
+                        <button className="icon-btn" title="全屏阅读（报告 + Diff 分栏）" onClick={() => setFsReader(true)}>
+                          <Icon name="maximize" size={15} />
+                        </button>
+                      )}
                     </div>
                   </div>
                   <div className="diff-viewport scroll">
-                    {tab === 'report' ? renderReportBody() : renderDiffBody()}
+                    {tab === 'report' ? renderReportBody() : tab === 'diff' ? renderDiffBody() : renderLogsBody()}
                   </div>
 
                   {/* 底部悬浮 dock：左 = 本次改动预览启动；右 = 管理员建议 + 修改 */}
@@ -2787,7 +3041,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                       </div>
                     )}
                     <div className="dock-advice">
-                      <span className="dock-label">管理员建议 → Claude Code</span>
+                      <span className="dock-label">管理员建议 → 代码 Agent</span>
                       <div className="dock-advice-row">
                         <textarea
                           ref={adviceRef}
@@ -2876,7 +3130,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         <div onMouseDown={() => setShowLedger(false)}
           style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
           <div onMouseDown={e => e.stopPropagation()}
-            style={{ width: 'min(820px, calc(100vw - 64px))', maxHeight: 'min(680px, calc(100vh - 64px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            style={{ width: 'min(820px, calc(100vw - 64px))', height: 'min(680px, calc(100vh - 64px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             <div style={{ padding: '16px 20px 12px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}>
                 <span className="cn">全量需求总账</span>

@@ -2,7 +2,99 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub mod cli;
+pub mod mcp_inject;
 pub use cli::{CliCodeAgent, CliProfile};
+pub use mcp_inject::McpInject;
+
+/// 加载「适用于编码 Agent」的 MCP server（for_code_agent=1 且 enabled=1），解密后供 CLI 注入（pull）。
+/// 查询失败 / 无配置 → 空 Vec（编码 agent 不接任何实时 MCP，行为与改造前一致）。
+pub async fn load_code_agent_mcp(db: &crate::db::Db) -> Vec<McpInject> {
+    sqlx::query_as::<_, crate::models::mcp_server::McpServer>(
+        "SELECT * FROM mcp_servers WHERE for_code_agent=1 AND enabled=1 ORDER BY created_at",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(McpInject::from_server)
+    .collect()
+}
+
+/// 单条日志正文（stdout / stderr）落库上限——超出只保留**尾部**这么多字符并打标记。
+/// 失败/超时的关键线索（最后报错、卡死前最后输出）都在尾部，故截头保尾。
+const LOG_KEEP_CHARS: usize = 512 * 1024;
+/// 运行日志保留窗口（天）：滚动清理，保证持久可查又不无限膨胀。
+const LOG_RETENTION_DAYS: i64 = 14;
+
+/// 截头保尾到 `LOG_KEEP_CHARS`，返回 (落库文本, 原始字符数, 是否截断)。
+fn clip_tail(s: &str) -> (String, i64, bool) {
+    let total = s.chars().count();
+    if total <= LOG_KEEP_CHARS {
+        return (s.to_string(), total as i64, false);
+    }
+    let tail: String = s
+        .chars()
+        .skip(total - LOG_KEEP_CHARS)
+        .collect();
+    let dropped = total - LOG_KEEP_CHARS;
+    (
+        format!("…（已省略开头 {dropped} 个字符）\n{tail}"),
+        total as i64,
+        true,
+    )
+}
+
+/// 一次代码 Agent 运行的留档输入。纯数据，无 Tauri 类型。
+pub struct RunLogInput<'a> {
+    pub change_request_id: &'a str,
+    pub worktree_session_id: Option<&'a str>,
+    /// execution（代码实现）/ conflict_resolve（AI 解合并冲突）。
+    pub phase: &'a str,
+    pub kind: &'a str,
+    pub model: Option<&'a str>,
+    pub exit_code: i32,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub duration_ms: i64,
+}
+
+/// 把一次代码 Agent 执行的完整 stdout/stderr 落库（迁移 0064 表），并滚动清理过期日志。
+/// 失败只记录不阻断——留档不应影响主流程。纯 Rust（仅依赖 Db），可在任何入口复用。
+pub async fn log_run(db: &crate::db::Db, input: RunLogInput<'_>) {
+    let (stdout, stdout_bytes, t1) = clip_tail(input.stdout);
+    let (stderr, stderr_bytes, t2) = clip_tail(input.stderr);
+    let id = uuid::Uuid::new_v4().to_string();
+    let res = sqlx::query(
+        "INSERT INTO code_agent_run_logs
+         (id, change_request_id, worktree_session_id, phase, kind, model, exit_code,
+          duration_ms, stdout, stderr, stdout_bytes, stderr_bytes, truncated)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(input.change_request_id)
+    .bind(input.worktree_session_id)
+    .bind(input.phase)
+    .bind(input.kind)
+    .bind(input.model)
+    .bind(input.exit_code as i64)
+    .bind(input.duration_ms)
+    .bind(&stdout)
+    .bind(&stderr)
+    .bind(stdout_bytes)
+    .bind(stderr_bytes)
+    .bind(i64::from(t1 || t2))
+    .execute(db)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!("code agent run log insert failed: {e}");
+        return;
+    }
+    // 滚动清理：超过保留窗口的日志删除（带索引，开销极低）。
+    let _ = sqlx::query("DELETE FROM code_agent_run_logs WHERE created_at < datetime('now', ?)")
+        .bind(format!("-{LOG_RETENTION_DAYS} days"))
+        .execute(db)
+        .await;
+}
 
 /// 一次 agent 运行的时限。`wall_secs` 是硬上限（墙钟）；`idle_secs` 是空闲超时——
 /// 连续这么久没有任何输出即判定卡死（0 = 关闭空闲超时）。两者任一触发都会对整个
@@ -13,17 +105,34 @@ pub struct RunLimits {
     pub idle_secs: u64,
 }
 
+/// 一段运行期实时日志增量：`stream` 为 "stdout"/"stderr"，`text` 为该段可读文本。
+#[derive(Debug, Clone)]
+pub struct LogChunk {
+    pub stream: &'static str,
+    pub text: String,
+}
+
+/// 运行期实时日志的 sink。cli.rs 边跑边往里 `send`（纯 Rust，零 Tauri 依赖）；
+/// 持有 AppHandle 的任务层（execution/merge）从中收取并经
+/// `event::emit(AppEvent::CodeAgentLog)` 推前端，实现"实时滚动日志"。
+pub type LogSink = tokio::sync::mpsc::UnboundedSender<LogChunk>;
+
 /// 可插拔代码实现 agent 的统一抽象。纯 Rust，零 Tauri 类型——业务层只依赖此 trait，
 /// 不感知底层是哪个 CLI（claude / codex / opencode），未来可换非 CLI 实现。
 #[async_trait]
 pub trait CodeAgent: Send + Sync {
     /// 在 worktree 内执行实现任务，返回 (exit_code, stdout, stderr)。超时（墙钟或空闲）
-    /// 会真正杀掉子进程组并返回 Err，绝不留下孤儿进程。
+    /// 会真正杀掉子进程组并以退出码 124 返回（保留已捕获输出），绝不留下孤儿进程。
+    /// `mcp` 是「适用于编码 Agent」的 MCP server（pull）：注入 CLI 让 agent 实时调用；
+    /// 空切片 = 不接任何实时 MCP。`log` 为可选实时日志 sink：每收到一段 stdout/stderr
+    /// 即往里 send，供上层推前端做"实时滚动"；None = 不需要实时（行为不变）。
     async fn run(
         &self,
         worktree: &str,
         prompt: &str,
         limits: RunLimits,
+        mcp: &[McpInject],
+        log: Option<&LogSink>,
     ) -> Result<(i32, String, String)>;
     /// 该 agent 是否已安装并（在可探测时）登录。
     async fn check_auth(&self) -> bool;
@@ -31,16 +140,54 @@ pub trait CodeAgent: Send + Sync {
     fn kind(&self) -> &str;
 }
 
-/// 按「项目覆盖 → 全局默认 → 硬兜底 claude」解析出本次该用的 code agent。
-/// 表不存在 / 查询失败 / 无启用项时一律安全回落到 claude，绝不让解析失败阻断流水线。
-pub async fn resolve(
+/// 一次代码实现的风险档位，决定选哪个模型（快 / 强）。由分析阶段的结构化信号
+/// （blast_radius + 影响文件数 + 复杂度）在执行**前**推断——grader 在执行后才跑，
+/// 来不及用来选模型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeRisk {
+    /// 隔离的小改动：用快模型省时省钱。
+    Low,
+    /// 跨模块 / 系统级 / 复杂改动：用强模型保质量。
+    High,
+}
+
+/// 从分析 spec 推断风险档位。无 spec 时保守按 High（用强模型），绝不为省钱牺牲质量。
+pub fn risk_from_spec(
+    spec: Option<&crate::agents::analysis::IssueAnalysisSpec>,
+) -> CodeRisk {
+    let Some(spec) = spec else { return CodeRisk::High };
+
+    // 影响半径：cross_module / systemic 一律 High。
+    match spec.scope.blast_radius.as_str() {
+        "cross_module" | "systemic" => return CodeRisk::High,
+        _ => {}
+    }
+    // 复杂度：high / complex 视为 High。
+    if let Some(est) = spec.estimate.as_ref() {
+        let c = est.complexity.to_ascii_lowercase();
+        if c.contains("high") || c.contains("complex") || c.contains("高") {
+            return CodeRisk::High;
+        }
+    }
+    // 影响面：触及超过 3 个文件视为 High。
+    let touched = spec.scope.affected_files.len();
+    if touched > 3 {
+        return CodeRisk::High;
+    }
+    // 其余（isolated / module、少量文件、低复杂度）→ Low，用快模型。
+    CodeRisk::Low
+}
+
+/// 按「项目覆盖 → 全局默认 → 硬兜底 claude」选出本次该用的 code agent 行。
+/// 表不存在 / 查询失败 / 无启用项时返回 None（调用方回落硬兜底 claude）。
+async fn resolve_row(
     db: &crate::db::Db,
     project: &crate::models::project::Project,
-) -> Box<dyn CodeAgent> {
+) -> Option<crate::models::code_agent::CodeAgentRow> {
     use crate::models::code_agent::CodeAgentRow;
 
     // 1) 项目级覆盖（且该 agent 启用）。
-    let mut row: Option<CodeAgentRow> = if let Some(id) =
+    let row: Option<CodeAgentRow> = if let Some(id) =
         project.code_agent_id.as_deref().filter(|s| !s.is_empty())
     {
         sqlx::query_as::<_, CodeAgentRow>("SELECT * FROM code_agents WHERE id=? AND enabled=1")
@@ -52,27 +199,64 @@ pub async fn resolve(
     } else {
         None
     };
-
-    // 2) 全局默认（启用）。
-    if row.is_none() {
-        row = sqlx::query_as::<_, CodeAgentRow>(
-            "SELECT * FROM code_agents WHERE is_default=1 AND enabled=1 LIMIT 1",
-        )
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+    if row.is_some() {
+        return row;
     }
 
-    match row {
+    // 2) 全局默认（启用）。
+    sqlx::query_as::<_, CodeAgentRow>(
+        "SELECT * FROM code_agents WHERE is_default=1 AND enabled=1 LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 解析 code agent，模型用该行配置的 `model`（不分级）。AI 解冲突等场景用这个。
+pub async fn resolve(
+    db: &crate::db::Db,
+    project: &crate::models::project::Project,
+) -> Box<dyn CodeAgent> {
+    match resolve_row(db, project).await {
         Some(r) => Box::new(CliCodeAgent::new(CliProfile {
             kind: r.kind,
             program: r.program,
             model: r.model,
             extra_args: parse_extra_args(&r.extra_args_json),
         })),
-        // 3) 硬兜底。
         None => Box::new(CliCodeAgent::claude()),
+    }
+}
+
+/// 解析 code agent，并按风险档位挑模型：Low → fast_model、High → strong_model；
+/// 选中的那档为空时回落到 `model`（再空则交给底层 CLI 默认）。三家共用此机制。
+/// 返回 (agent, 实际选用的模型字符串/None)，供进度提示展示。
+pub async fn resolve_for_risk(
+    db: &crate::db::Db,
+    project: &crate::models::project::Project,
+    risk: CodeRisk,
+) -> (Box<dyn CodeAgent>, Option<String>) {
+    match resolve_row(db, project).await {
+        Some(r) => {
+            let tiered = match risk {
+                CodeRisk::Low => r.fast_model.clone(),
+                CodeRisk::High => r.strong_model.clone(),
+            };
+            // 选中档为空 → 回落 model。统一在此 trim 掉空串，避免传空 --model。
+            let model = tiered
+                .or_else(|| r.model.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let agent = Box::new(CliCodeAgent::new(CliProfile {
+                kind: r.kind,
+                program: r.program,
+                model: model.clone(),
+                extra_args: parse_extra_args(&r.extra_args_json),
+            }));
+            (agent, model)
+        }
+        None => (Box::new(CliCodeAgent::claude()), None),
     }
 }
 
@@ -91,6 +275,7 @@ pub fn build_prompt(
     iteration: u32,
     repo_path: &str,
     project_config: Option<&str>,
+    codegraph_ctx: Option<&str>,
 ) -> String {
     let mut prompt = format!(
         r#"# 需求实现任务
@@ -110,6 +295,14 @@ pub fn build_prompt(
     // 结构化分析规格（issue_analysis.schema.json v1.0）—— 给 Claude Code 的精准工单
     if let Some(spec) = spec {
         prompt.push_str(&render_spec_brief(spec));
+    }
+
+    // codegraph 预查的精确定位（file:line + 签名 + 调用者），紧跟 spec 的影响范围之后，
+    // 让 agent 拿到可直接打开的位置，省去全仓探索。空串时不输出任何标题。
+    if let Some(cg) = codegraph_ctx {
+        if !cg.trim().is_empty() {
+            prompt.push_str(cg);
+        }
     }
 
     if let Some(s) = admin_suggestions {
@@ -404,6 +597,34 @@ mod tests {
         assert!(parse_extra_args("[]").is_empty());
         assert_eq!(parse_extra_args(r#"["-a","b c"]"#), vec!["-a".to_string(), "b c".to_string()]);
         assert!(parse_extra_args("not json").is_empty());
+    }
+
+    #[test]
+    fn risk_from_spec_classifies_low_vs_high() {
+        use crate::agents::analysis::{AffectedFile, Estimate, IssueAnalysisSpec};
+        // 无 spec → 保守 High。
+        assert_eq!(risk_from_spec(None), CodeRisk::High);
+
+        // 隔离 + 少量文件 + 低复杂度 → Low。
+        let mut spec = IssueAnalysisSpec::default();
+        spec.scope.blast_radius = "isolated".into();
+        spec.scope.affected_files = vec![AffectedFile::default()];
+        assert_eq!(risk_from_spec(Some(&spec)), CodeRisk::Low);
+
+        // 影响半径 systemic → High。
+        let mut s2 = spec.clone();
+        s2.scope.blast_radius = "systemic".into();
+        assert_eq!(risk_from_spec(Some(&s2)), CodeRisk::High);
+
+        // 文件数 > 3 → High。
+        let mut s3 = spec.clone();
+        s3.scope.affected_files = vec![AffectedFile::default(); 4];
+        assert_eq!(risk_from_spec(Some(&s3)), CodeRisk::High);
+
+        // 复杂度 high → High。
+        let mut s4 = spec.clone();
+        s4.estimate = Some(Estimate { complexity: "high".into(), ..Default::default() });
+        assert_eq!(risk_from_spec(Some(&s4)), CodeRisk::High);
     }
 
     #[test]

@@ -1269,6 +1269,8 @@ pub struct AutosupplySettings {
     pub scan_enabled: bool,
     pub proposer_enabled: bool,
     pub max_per_run: i64,
+    pub proposer_max_per_run: i64,
+    pub min_severity: String,
     pub analyze_enabled: bool,
     pub triage_enabled: bool,
 }
@@ -1284,6 +1286,8 @@ pub async fn get_autosupply_settings(
         scan_enabled: cfg.scan_enabled,
         proposer_enabled: cfg.proposer_enabled,
         max_per_run: cfg.max_per_run as i64,
+        proposer_max_per_run: cfg.proposer_max_per_run as i64,
+        min_severity: cfg.min_severity,
         analyze_enabled: cfg.analyze_enabled,
         triage_enabled: cfg.triage_enabled,
     })
@@ -1297,15 +1301,26 @@ pub async fn set_autosupply_settings(
     scan_enabled: bool,
     proposer_enabled: bool,
     max_per_run: i64,
+    proposer_max_per_run: i64,
+    min_severity: String,
     analyze_enabled: bool,
     triage_enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<AutosupplySettings, String> {
+    // 严重度门槛白名单校验，非法值退回 low（不过滤）。
+    let min_sev = match min_severity.trim().to_ascii_lowercase().as_str() {
+        "critical" => "critical",
+        "high" => "high",
+        "medium" => "medium",
+        _ => "low",
+    };
     write_setting(&state, "autosupply.enabled", if enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.interval_min", &interval_min.max(5).to_string()).await?;
     write_setting(&state, "autosupply.scan_enabled", if scan_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.proposer_enabled", if proposer_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.max_per_run", &max_per_run.clamp(1, 200).to_string()).await?;
+    write_setting(&state, "autosupply.proposer_max_per_run", &proposer_max_per_run.clamp(1, 50).to_string()).await?;
+    write_setting(&state, "autosupply.min_severity", min_sev).await?;
     write_setting(&state, "autosupply.analyze_enabled", if analyze_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.triage_enabled", if triage_enabled { "1" } else { "0" }).await?;
     get_autosupply_settings(state).await

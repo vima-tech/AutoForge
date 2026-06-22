@@ -5,6 +5,17 @@ use anyhow::{anyhow, Result};
 use tracing::info;
 use uuid::Uuid;
 
+/// 将 code agent 的 kind（claude / codex / opencode）映射成进度提示里展示的可读名，
+/// 未知 kind 原样回显，避免切换 agent 后文案仍写死「Claude Code」。
+fn code_agent_display_name(kind: &str) -> String {
+    match kind {
+        "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Compose a human-readable failure reason (exit code + trailing output) so the
 /// audit page can surface *why* a run failed without anyone opening the logs.
 fn build_failure_reason(exit_code: i32, stdout: &str, stderr: &str) -> String {
@@ -236,6 +247,17 @@ pub async fn run(
         .map(|(_, out, _)| out.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    // 代码情报预查：通过可配置的 MCP code-intel 提供者（mcp_servers role='code_intel'）
+    // 在主仓上把分析点名的符号定位到 file:line，注入 prompt。由 AutoForge 跑查询
+    // （主仓有索引，worktree 没有），三家 code agent 都受益。best-effort：未配置 / 提供者
+    // 不可用 / 无符号 → 空串，不影响后续。换工具只改配置，无需改这里。
+    let codegraph_ctx = match analysis_spec.as_ref() {
+        Some(spec) => {
+            crate::agents::tools::code_intel::locate_context(db, &project.repo_path, spec).await
+        }
+        None => String::new(),
+    };
+
     // Create WorktreeSession record
     let session_id = Uuid::new_v4().to_string();
     let prompt = crate::agents::code_agent::build_prompt(
@@ -249,6 +271,7 @@ pub async fn run(
         iteration as u32,
         &project.repo_path,
         crate::commands::run_config::effective_config(&project).as_deref(),
+        Some(codegraph_ctx.as_str()),
     );
 
     sqlx::query(
@@ -326,15 +349,6 @@ pub async fn run(
         },
     );
 
-    event::emit(
-        app,
-        event::AppEvent::TaskProgress {
-            cr_id: cr_id.to_string(),
-            phase: "coding".to_string(),
-            note: Some("调用 Claude Code 实现中（最长 30 分钟）…".to_string()),
-        },
-    );
-
     // Run the configured code agent (claude / codex / opencode), resolved per
     // project → global default → claude fallback. 超时（墙钟 + 空闲）从设置读取，
     // 到点真杀进程组——避免卡死/超时的 agent 变成孤儿持续烧 CPU。
@@ -343,18 +357,90 @@ pub async fn run(
         wall_secs,
         idle_secs,
     };
-    let code_agent = crate::agents::code_agent::resolve(db, &project).await;
+    // 分级选模型：用分析阶段的风险信号挑快/强模型（执行前可得；grader 在执行后才跑）。
+    let risk = crate::agents::code_agent::risk_from_spec(analysis_spec.as_ref());
+    let (code_agent, picked_model) =
+        crate::agents::code_agent::resolve_for_risk(db, &project, risk).await;
+    let risk_label = match risk {
+        crate::agents::code_agent::CodeRisk::Low => "低风险·快模型",
+        crate::agents::code_agent::CodeRisk::High => "高风险·强模型",
+    };
+    let model_note = picked_model
+        .as_deref()
+        .map(|m| format!("，模型 {}", m))
+        .unwrap_or_default();
+
+    // 进度提示用实际解析出的 agent 名，避免切到 codex/opencode 后仍写死「Claude Code」。
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "coding".to_string(),
+            note: Some(format!(
+                "调用 {} 实现中（{}{}，最长 {} 分钟）…",
+                code_agent_display_name(code_agent.kind()),
+                risk_label,
+                model_note,
+                wall_secs / 60
+            )),
+        },
+    );
+
     info!(
-        "cr {} 使用代码 Agent: {}（墙钟 {}s / 空闲 {}s）",
+        "cr {} 使用代码 Agent: {}（{}{}，墙钟 {}s / 空闲 {}s）",
         cr_id,
         code_agent.kind(),
+        risk_label,
+        model_note,
         wall_secs,
         idle_secs
     );
+    // pull：把「适用于编码 Agent」的 MCP server 注入 CLI，让 agent 在 worktree 内实时调用。
+    let code_mcp = crate::agents::code_agent::load_code_agent_mcp(db).await;
+    let run_started = std::time::Instant::now();
+    // 实时日志：cli 边跑边往 sink 发增量，这里转成 CodeAgentLog 事件推前端（执行日志 tab 实时滚动）。
+    let (log_tx, mut log_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agents::code_agent::LogChunk>();
+    let forward = {
+        let app = app.clone();
+        let cr = cr_id.to_string();
+        tokio::spawn(async move {
+            while let Some(c) = log_rx.recv().await {
+                event::emit(
+                    &app,
+                    event::AppEvent::CodeAgentLog {
+                        cr_id: cr.clone(),
+                        phase: "execution".to_string(),
+                        stream: c.stream.to_string(),
+                        chunk: c.text,
+                    },
+                );
+            }
+        })
+    };
     let (exit_code, stdout, stderr) = code_agent
-        .run(&worktree_path, &prompt, limits)
+        .run(&worktree_path, &prompt, limits, &code_mcp, Some(&log_tx))
         .await
         .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
+    drop(log_tx); // 关闭 sink，让转发任务收尾
+    let _ = forward.await;
+
+    // 完整执行日志落库（含超时被杀前的输出），便于事后发现/调试问题。失败不阻断主流程。
+    crate::agents::code_agent::log_run(
+        db,
+        crate::agents::code_agent::RunLogInput {
+            change_request_id: cr_id,
+            worktree_session_id: Some(&session_id),
+            phase: "execution",
+            kind: code_agent.kind(),
+            model: picked_model.as_deref(),
+            exit_code,
+            stdout: &stdout,
+            stderr: &stderr,
+            duration_ms: run_started.elapsed().as_millis() as i64,
+        },
+    )
+    .await;
 
     let report = crate::agents::code_agent::extract_report(&stdout).to_string();
 
@@ -410,11 +496,23 @@ pub async fn run(
     // empty (the audit page would hang on "加载中…") and turning the eventual
     // `git merge --no-ff` into a no-op.
     let wt_git = GitProxy::new(&worktree_path);
-    let has_changes = wt_git
+    // 未提交/未跟踪改动：claude 走这条——它被禁 `Bash(git *)`，只改文件从不 commit。
+    let has_uncommitted = wt_git
         .run(&["status", "--porcelain"])
         .await
         .map(|(_, out, _)| !out.trim().is_empty())
         .unwrap_or(false);
+    // 自提交型 agent（codex 在 workspace-write 下可本地 commit；GIT_ALLOW_PROTOCOL 只禁
+    // 远程 git，不禁本地 commit）会把改动直接落到分支，工作树反而是干净的。只看 porcelain
+    // 会把这种真实工作误判成 no_change_needed，故再比对分支 HEAD 是否已领先 fork 点。
+    let head_now = wt_git
+        .run(&["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|(c, _, _)| *c == 0)
+        .map(|(_, o, _)| o.trim().to_string());
+    let has_commits = matches!((&base_commit, &head_now), (Some(b), Some(h)) if b != h);
+    let has_changes = has_uncommitted || has_commits;
     if !has_changes {
         // The agent ran cleanly (exit 0) but produced no diff. This is a
         // legitimate terminal outcome — typically the agent concluded the
@@ -458,20 +556,29 @@ pub async fn run(
         );
         return Ok(());
     }
-    let _ = wt_git.run(&["add", "-A"]).await;
-    let commit_msg = format!("AutoForge: {} (i{})", issue.title, iteration);
-    let (commit_code, _, commit_err) = wt_git
-        .run(&[
-            "-c",
-            "user.name=AutoForge",
-            "-c",
-            "user.email=autoforge@local",
-            "commit",
-            "-m",
-            &commit_msg,
-        ])
-        .await
-        .unwrap_or((-1, String::new(), "git not available".to_string()));
+    // 仅当存在未提交改动时才由 AutoForge 代为提交（claude 模式）。若 agent 已自行提交
+    // （codex/opencode，has_commits 且工作树干净），跳过——否则 `git commit` 会因
+    // "nothing to commit" 非零退出，被下面误判成提交失败。CR diff 始终以 fork 点为基
+    // （compute_worktree_diff 的 `git diff <base>`），committed/uncommitted 均能正确捕获。
+    let (commit_code, commit_err) = if has_uncommitted {
+        let _ = wt_git.run(&["add", "-A"]).await;
+        let commit_msg = format!("AutoForge: {} (i{})", issue.title, iteration);
+        wt_git
+            .run(&[
+                "-c",
+                "user.name=AutoForge",
+                "-c",
+                "user.email=autoforge@local",
+                "commit",
+                "-m",
+                &commit_msg,
+            ])
+            .await
+            .map(|(c, _, e)| (c, e))
+            .unwrap_or((-1, "git not available".to_string()))
+    } else {
+        (0, String::new())
+    };
     if commit_code != 0 {
         let reason = build_failure_reason(
             commit_code,

@@ -10,6 +10,10 @@ pub struct CodeAgentRow {
     pub label: String,
     pub program: String,
     pub model: Option<String>,
+    /// 低风险改动用的快模型（可空 → 回落 `model`）。
+    pub fast_model: Option<String>,
+    /// 高风险改动用的强模型（可空 → 回落 `model`）。
+    pub strong_model: Option<String>,
     pub extra_args_json: String,
     pub enabled: bool,
     pub is_default: bool,
@@ -24,6 +28,10 @@ pub struct UpsertCodeAgent {
     pub label: String,
     pub program: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub fast_model: Option<String>,
+    #[serde(default)]
+    pub strong_model: Option<String>,
     #[serde(default)]
     pub extra_args: Vec<String>,
     #[serde(default = "default_true")]

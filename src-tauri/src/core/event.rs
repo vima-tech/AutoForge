@@ -95,6 +95,15 @@ pub enum AppEvent {
         cr_id: String,
         files: Vec<String>,
     },
+    /// 代码 Agent 运行期的实时日志增量（一段可读 stdout/stderr）。高频事件，
+    /// 仅供 UI"实时滚动"——刻意不进通知收件箱（`from_event` 不匹配它），
+    /// 也不归并到 CR 通知线程（不在 `cr_id()` 内），避免刷屏与持久化负担。
+    CodeAgentLog {
+        cr_id: String,
+        phase: String,
+        stream: String,
+        chunk: String,
+    },
 }
 
 impl AppEvent {

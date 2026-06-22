@@ -118,6 +118,15 @@ pub fn run() {
                 // 同样救回卡在 pending_analysis 的孤儿需求：要么进程中途退出，要么旧版
                 // 用稳定 analysis:<id> 重新分析时被已 completed 的 job 行去重而从未派发。
                 tasks::runner::requeue_orphaned_analyses(&db_for_requeue, &tx_for_requeue).await;
+                // 救回卡在 pending_merge 的孤儿合并：review_2/自动合并门/解冲突回落已置态并入队，
+                // 但 Merge 驱动任务随进程消失。Merge 幂等（git merge --squash 重跑空操作），可安全重排。
+                tasks::runner::requeue_orphaned_merges(&db_for_requeue, &tx_for_requeue).await;
+                // 救回卡在 reverting 的孤儿撤销：git revert 不幂等，绝不自动重跑——回滚到稳定态
+                // merged，由人确认 dev 后手动重试。
+                tasks::runner::recover_orphaned_reverts(&db_for_requeue).await;
+                // 关闭卡在 running 的孤儿会议室任务：交互式、有副作用（发消息/扣费/写文件），
+                // 不自动重跑，标 failed 让用户重新发指令。
+                commands::orchestration::fail_orphaned_conversation_tasks(&db_for_requeue).await;
             });
 
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
@@ -154,13 +163,32 @@ pub fn run() {
             let app_for_supply = app_handle.clone();
             let running_for_supply = autosupply_running.clone();
             tauri::async_runtime::spawn(async move {
+                use tasks::autosupply;
                 loop {
-                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
-                    let sleep_min = cfg.interval_min.max(5) as u64;
-                    tokio::time::sleep(std::time::Duration::from_secs(sleep_min * 60)).await;
-                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    let cfg = autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    if !cfg.enabled {
+                        // 关闭时每分钟复查一次是否被重新开启（不睡满整个间隔）。
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    // 按「距上次实际运行已过多久」计算到下次触发的剩余时间，而非每次重启
+                    // 都重新睡满一个完整间隔——这样 dev 热重载/频繁重启不再清零计时器。
+                    let interval_secs = cfg.interval_min.max(5) * 60;
+                    let wait_secs = match autosupply::last_run_unix(&db_for_supply).await {
+                        Some(last) => {
+                            let elapsed = (autosupply::now_unix() - last).max(0);
+                            (interval_secs - elapsed).max(0)
+                        }
+                        None => 0, // 从未运行过 → 尽快补跑
+                    };
+                    // 即便已到期，也给启动留 20s 缓冲，避免开机瞬间与初始化抢资源。
+                    let secs = if wait_secs == 0 { 20 } else { wait_secs as u64 };
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    // 醒来后重载配置（睡眠期间可能被关闭或改了间隔）。
+                    let cfg = autosupply::AutosupplyConfig::load(&db_for_supply).await;
                     if cfg.enabled {
-                        let _ = tasks::autosupply::run_cycle(
+                        // run_cycle 内部会在成功运行后写入 last_run_at。
+                        let _ = autosupply::run_cycle(
                             &db_for_supply,
                             &tx_for_supply,
                             &app_for_supply,
@@ -317,6 +345,7 @@ pub fn run() {
             commands::change_requests::list_change_requests_page,
             commands::change_requests::get_change_request_by_issue,
             commands::change_requests::get_change_request,
+            commands::change_requests::get_default_merge_message,
             commands::change_requests::get_worktree_session,
             commands::change_requests::get_code_diff,
             commands::change_requests::get_merge_conflict,
@@ -331,6 +360,7 @@ pub fn run() {
             commands::change_requests::review_2,
             commands::change_requests::review_2_batch,
             commands::change_requests::retry_change_request,
+            commands::change_requests::restore_change_request,
             commands::change_requests::delete_change_request,
             commands::conversations::list_conversations,
             commands::conversations::list_messages,
@@ -411,6 +441,7 @@ pub fn run() {
             commands::mcp::update_mcp_server,
             commands::mcp::delete_mcp_server,
             commands::mcp::test_mcp_connection,
+            commands::mcp::discover_code_intel_map,
             commands::settings::list_agents,
             commands::settings::create_agent,
             commands::settings::update_agent,
@@ -427,6 +458,8 @@ pub fn run() {
             commands::code_agents::set_default_code_agent,
             commands::code_agents::set_project_code_agent,
             commands::code_agents::check_code_agent_auth,
+            commands::code_agents::list_code_agent_runs,
+            commands::code_agents::get_code_agent_run,
             commands::system::pipeline_stats,
             commands::system::get_badge_counts,
             commands::system::update_concurrency_config,

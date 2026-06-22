@@ -80,7 +80,29 @@ export interface Issue {
   repro_steps?: string | null; environment?: string | null;
   expected?: string | null; actual?: string | null;
   acceptance_json?: string | null;
+  /** 1 = 该需求由「恢复需求」从已撤销态重回队列（用于队列里的小 dot 标识）。 */
+  restored_from_revert?: number;
 }
+// 需求来源（issues.source_type）→ 人类可读标签 + 语义 chip 色。
+// 来源真源是后端落库的 source_type 字面量；新增来源时在此登记即可全局生效。
+export const ISSUE_SOURCE_META: Record<string, { label: string; chip: string }> = {
+  manual:         { label: '手动提交',      chip: '' },
+  bulk:           { label: '批量导入',      chip: '' },
+  github:         { label: 'GitHub 接入',   chip: 'blue' },
+  webhook:        { label: 'Webhook',       chip: 'blue' },
+  conversation:   { label: '会议室',        chip: '' },
+  quickcapture:   { label: '速录',          chip: '' },
+  meeting:        { label: '会议录音',      chip: '' },
+  todo_scan:      { label: '自动供料 · 扫描', chip: 'violet' },
+  code_analysis:  { label: '自动供料 · 分析', chip: 'violet' },
+  proposer:       { label: '自动供料 · 提议', chip: 'violet' },
+  security_audit: { label: '安全审计',      chip: 'amber' },
+};
+/** 取需求来源的展示元信息；未登记的来源原样回显，避免丢失信息。 */
+export function issueSourceMeta(src?: string | null): { label: string; chip: string } {
+  return ISSUE_SOURCE_META[src ?? ''] ?? { label: src || '未知来源', chip: '' };
+}
+
 export interface IssueAnalysis {
   id: string; issue_id: string; authenticity_score: number;
   feasibility_score: number | null; priority_suggestion: number | null;
@@ -154,6 +176,18 @@ export interface WorktreeSession {
   /** 合并到 dev 时产生的 squash 提交 SHA；为 null 时无法一键撤销（合并早于撤销功能）。 */
   merge_commit: string | null;
   started_at: string | null; completed_at: string | null;
+}
+/** 代码 Agent 单次执行日志的元信息（列表用，不含正文）。 */
+export interface CodeAgentRunMeta {
+  id: string; change_request_id: string; worktree_session_id: string | null;
+  phase: string; kind: string; model: string | null;
+  exit_code: number; duration_ms: number;
+  stdout_bytes: number; stderr_bytes: number; truncated: number;
+  created_at: string;
+}
+/** 完整一条执行日志（含 stdout/stderr 正文）。 */
+export interface CodeAgentRunLog extends CodeAgentRunMeta {
+  stdout: string; stderr: string;
 }
 export interface Conversation {
   id: string; conv_type: string; name: string | null;
@@ -280,12 +314,14 @@ export const listAdminDecisions = (projectId?: string) =>
 // ── Code Agents（可插拔代码实现 agent：claude / codex / opencode） ──────────────
 export interface CodeAgent {
   id: string; kind: string; label: string; program: string;
-  model: string | null; extra_args_json: string;
+  model: string | null; fast_model: string | null; strong_model: string | null;
+  extra_args_json: string;
   enabled: boolean; is_default: boolean; created_at: string;
 }
 export interface UpsertCodeAgentPayload {
   id?: string | null; kind: string; label: string; program: string;
-  model?: string | null; extra_args?: string[]; enabled?: boolean;
+  model?: string | null; fast_model?: string | null; strong_model?: string | null;
+  extra_args?: string[]; enabled?: boolean;
 }
 export const listCodeAgents = () => ipc<CodeAgent[]>('list_code_agents');
 export const upsertCodeAgent = (payload: UpsertCodeAgentPayload) =>
@@ -473,6 +509,11 @@ export const getChangeRequestByIssue = (issueId: string) =>
   ipc<ChangeRequest | null>('get_change_request_by_issue', { issueId });
 export const getWorktreeSession = (crId: string) =>
   ipc<WorktreeSession | null>('get_worktree_session', { crId });
+// 代码 Agent 执行日志：列表只拿元信息，详情按 id 拉完整 stdout/stderr。
+export const listCodeAgentRuns = (crId: string) =>
+  ipc<CodeAgentRunMeta[]>('list_code_agent_runs', { crId });
+export const getCodeAgentRun = (id: string) =>
+  ipc<CodeAgentRunLog | null>('get_code_agent_run', { id });
 export const getCodeDiff = (crId: string) =>
   ipc<string>('get_code_diff', { crId });
 export type MergeConflictView = { files: string[]; diff: string };
@@ -485,6 +526,9 @@ export const aiResolveMergeConflict = (crId: string) =>
 /** 撤销一个已合并需求的改动（在 dev 上 git revert 其 squash 提交）。 */
 export const revertChangeRequest = (crId: string) =>
   ipc<void>('revert_change_request', { crId });
+/** 恢复一个已撤销的需求：重新进入执行队列，再次实现并经过代码审核后合并。 */
+export const restoreChangeRequest = (crId: string) =>
+  ipc<ChangeRequest>('restore_change_request', { crId });
 
 // ── 人工解冲突（方案 B 逐 hunk 决策 + C 外部 IDE 兜底）────────────────────────
 export type ConflictSegment = {
@@ -768,12 +812,14 @@ export interface McpServer {
   id: string; name: string; transport: McpTransport;
   command: string; args_json: string; env_json: string;
   url: string; headers_json: string; agent_ids_json: string;
+  for_code_agent: boolean; capability_map_json: string;
   enabled: boolean; created_at: string;
 }
 export type McpServerInput = Partial<{
   name: string; transport: McpTransport;
   command: string; args_json: string; env_json: string;
-  url: string; headers_json: string; agent_ids_json: string; enabled: boolean;
+  url: string; headers_json: string; agent_ids_json: string;
+  for_code_agent: boolean; capability_map_json: string; enabled: boolean;
 }>;
 export const listMcpServers = () => ipc<McpServer[]>('list_mcp_servers');
 export const createMcpServer = (payload: McpServerInput & { name: string }) =>
@@ -782,6 +828,7 @@ export const updateMcpServer = (id: string, payload: McpServerInput) =>
   ipc<McpServer>('update_mcp_server', { id, payload });
 export const deleteMcpServer = (id: string) => ipc<void>('delete_mcp_server', { id });
 export const testMcpConnection = (id: string) => ipc<string[]>('test_mcp_connection', { id });
+export const discoverCodeIntelMap = (id: string) => ipc<string>('discover_code_intel_map', { id });
 export const deleteLlmConfig = (id: string) => ipc<void>('delete_llm_config', { id });
 /** 测试连接结果：状态文案 + 顺带刷新（上下文窗口 / 多模态）后的配置。 */
 export interface TestLlmResult { message: string; config: LlmConfig; }
@@ -1001,6 +1048,7 @@ export const rejectIssues = (issueIds: string[]) =>
 export interface AutosupplySettings {
   enabled: boolean; interval_min: number; scan_enabled: boolean;
   proposer_enabled: boolean; max_per_run: number;
+  proposer_max_per_run: number; min_severity: string;
   analyze_enabled: boolean; triage_enabled: boolean;
 }
 export const getAutosupplySettings = () => ipc<AutosupplySettings>('get_autosupply_settings');
@@ -1008,6 +1056,7 @@ export const setAutosupplySettings = (s: AutosupplySettings) =>
   ipc<AutosupplySettings>('set_autosupply_settings', {
     enabled: s.enabled, intervalMin: s.interval_min, scanEnabled: s.scan_enabled,
     proposerEnabled: s.proposer_enabled, maxPerRun: s.max_per_run,
+    proposerMaxPerRun: s.proposer_max_per_run, minSeverity: s.min_severity,
     analyzeEnabled: s.analyze_enabled, triageEnabled: s.triage_enabled,
   });
 export const runProposer = (projectId: string, max?: number) =>
@@ -1195,6 +1244,9 @@ export const getCustomMergeMessageEnabled = () =>
   ipc<boolean>('get_custom_merge_message_enabled');
 export const setCustomMergeMessageEnabled = (enabled: boolean) =>
   ipc<void>('set_custom_merge_message_enabled', { enabled });
+// 默认合并提交信息（与后端回退模板一致），审核页据此预填
+export const getDefaultMergeMessage = (crId: string) =>
+  ipc<string>('get_default_merge_message', { crId });
 
 // M5 — preview data masking + container preview
 export const maskPreviewData = (crId: string) =>

@@ -9,12 +9,20 @@ use tracing::warn;
 fn grep_todos(repo_path: &str) -> Vec<String> {
     const EXTS: &[&str] = &["rs", "ts", "tsx", "js", "py", "go"];
     const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__", "dist", "build"];
-    const TAGS: &[&str] = &["TODO", "FIXME", "HACK", "XXX"];
+    // 高信号标签：明确标记「待修/隐患/危险」，价值远高于泛泛的 TODO。
+    const HIGH_SIGNAL_TAGS: &[&str] = &["FIXME", "HACK", "XXX", "BUG", "SAFETY"];
+    // 普通 TODO 仅当行内含下列风险/安全关键词时才收（其余 TODO 视为低价值噪音丢弃）。
+    const TODO_KEYWORDS: &[&str] = &[
+        "security", "vuln", "inject", "race", "deadlock", "leak", "overflow", "panic",
+        "unsafe", "unwrap", "auth", "crash", "data loss", "corrupt", "dos",
+        "安全", "漏洞", "注入", "竞态", "死锁", "泄漏", "泄露", "溢出", "崩溃", "鉴权", "越权",
+    ];
 
+    // 返回该行是否命中、且应被收录（高信号标签直接收；TODO 需含风险关键词）。
     fn looks_like_tag(line: &str) -> bool {
-        TAGS.iter().any(|tag| {
+        // 标签后须紧跟 `:` 或 `(...):` 且其后有非空内容，近似原正则。
+        fn tagged(line: &str, tag: &str) -> bool {
             if let Some(idx) = line.find(tag) {
-                // 紧跟 `:` 或 `(...):`，且其后有非空内容，近似原正则。
                 let rest = line[idx + tag.len()..].trim_start();
                 let rest = rest.strip_prefix('(').map_or(rest, |r| {
                     r.split_once(')').map_or(rest, |(_, after)| after)
@@ -25,7 +33,15 @@ fn grep_todos(repo_path: &str) -> Vec<String> {
             } else {
                 false
             }
-        })
+        }
+        if HIGH_SIGNAL_TAGS.iter().any(|tag| tagged(line, tag)) {
+            return true;
+        }
+        if tagged(line, "TODO") {
+            let lower = line.to_lowercase();
+            return TODO_KEYWORDS.iter().any(|kw| lower.contains(kw));
+        }
+        false
     }
 
     let mut hits: Vec<String> = Vec::new();
@@ -113,7 +129,8 @@ pub async fn scan_todos(project_id: &str, repo_path: &str) -> Vec<IntakePayload>
                     todo_text, file_path, line_num
                 )),
                 category: Some("Debt".to_string()),
-                severity: Some("low".to_string()),
+                // 已过高信号筛选（FIXME/HACK/XXX/BUG/SAFETY 或含风险关键词的 TODO），按 medium 计。
+                severity: Some("medium".to_string()),
                 source_type: "todo_scan".to_string(),
                 source_ref: Some(format!("todo:{}:{}", file_path, line_num)),
             })
@@ -473,6 +490,48 @@ pub async fn scan_clippy(project_id: &str, repo_path: &str) -> Vec<IntakePayload
     parse_clippy_json(project_id, &stdout)
 }
 
+/// 高价值 clippy 警告白名单（perf / suspicious / 并发 / 正确性相关）。
+/// clippy 的 correctness 组本就 deny-by-default（level=error）会无条件收录；这里补收
+/// 一批**虽为 warning 但确有价值**的 lint，其余 style/complexity/pedantic/nursery 噪音一律丢弃。
+fn is_high_value_clippy(code: &str) -> bool {
+    const ALLOW: &[&str] = &[
+        // 并发隐患（持锁 await → 易死锁）
+        "await_holding_lock",
+        "await_holding_refcell_ref",
+        "await_holding_invalid_type",
+        // 可疑/疑似 bug
+        "float_cmp",
+        "eq_op",
+        "logic_bug",
+        "nonsensical_open_options",
+        "suspicious_operation_groupings",
+        "mem_replace_with_uninit",
+        "invalid_regex",
+        "drop_non_drop",
+        "forget_non_drop",
+        // 性能
+        "redundant_clone",
+        "needless_collect",
+        "or_fun_call",
+        "large_enum_variant",
+        "box_collection",
+        "vec_box",
+        "unnecessary_to_owned",
+        "inefficient_to_string",
+        "manual_memcpy",
+        "large_stack_arrays",
+        "boxed_local",
+        // 健壮性
+        "unwrap_used",
+        "expect_used",
+        "indexing_slicing",
+        "panic_in_result_fn",
+        "lossy_float_literal",
+    ];
+    let bare = code.rsplit("::").next().unwrap_or(code);
+    ALLOW.contains(&bare)
+}
+
 /// 解析 clippy `--message-format=json` 的串联 JSON 行流（每行一个对象）。
 fn parse_clippy_json(project_id: &str, stdout: &str) -> Vec<IntakePayload> {
     let mut out = Vec::new();
@@ -514,6 +573,11 @@ fn parse_clippy_json(project_id: &str, stdout: &str) -> Vec<IntakePayload> {
             .and_then(|c| c.get("code"))
             .and_then(|c| c.as_str())
             .unwrap_or("clippy");
+        // 降噪：error（correctness，deny-by-default）无条件收；warning 仅收高价值白名单，
+        // 其余 style/complexity/pedantic/nursery 一律丢弃，避免「皮毛」条目淹没待整理池。
+        if level != "error" && !is_high_value_clippy(code) {
+            continue;
+        }
         let text = msg.get("message").and_then(|m| m.as_str()).unwrap_or("");
         let short: String = text.chars().take(80).collect();
         out.push(IntakePayload {
@@ -524,7 +588,8 @@ fn parse_clippy_json(project_id: &str, stdout: &str) -> Vec<IntakePayload> {
                 code, file, line_no, level, text
             )),
             category: Some(if level == "error" { "Bug" } else { "Debt" }.to_string()),
-            severity: Some(if level == "error" { "high" } else { "low" }.to_string()),
+            // error→high；幸存的高价值 warning→medium（不再是 low，过得了严重度门槛）。
+            severity: Some(if level == "error" { "high" } else { "medium" }.to_string()),
             source_type: "code_analysis".to_string(),
             source_ref: Some(format!("clippy:{}:{}", file, line_no)),
         });
@@ -724,7 +789,8 @@ mod tests {
         let sub = dir.join("src");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
-        std::fs::write(sub.join("a.rs"), format!("// {todo}: fix me\nlet x = 1;\n")).unwrap();
+        // 普通 TODO 无风险关键词 → 降噪丢弃；含关键词（unsafe）的 TODO → 保留。
+        std::fs::write(sub.join("a.rs"), format!("// {todo}: tidy up\n// {todo}: unsafe pointer cast\n")).unwrap();
         std::fs::write(sub.join("b.ts"), format!("// {fixme}(bob): broken\n// note: plain\n"))
             .unwrap();
         std::fs::write(dir.join("node_modules").join("c.js"), format!("// {todo}: ignored\n"))
@@ -734,24 +800,31 @@ mod tests {
         let hits = grep_todos(dir.to_str().unwrap());
         std::fs::remove_dir_all(&dir).ok();
 
-        assert!(hits.iter().any(|h| h.contains(&format!("{todo}: fix me"))));
+        // 高信号 FIXME 保留；含风险关键词的 TODO 保留。
         assert!(hits.iter().any(|h| h.contains(&format!("{fixme}(bob): broken"))));
-        // skipped: node_modules, non-source ext, and "note:" (not a tag)
+        assert!(hits.iter().any(|h| h.contains("unsafe pointer cast")));
+        // 丢弃：普通无关键词 TODO、node_modules、非源码、"note:"（非标签）。
+        assert!(!hits.iter().any(|h| h.contains("tidy up")));
         assert!(!hits.iter().any(|h| h.contains("ignored")));
         assert!(!hits.iter().any(|h| h.contains("not source")));
         assert!(!hits.iter().any(|h| h.contains("plain")));
     }
 
     #[test]
-    fn parses_clippy_findings_and_skips_summary() {
-        let stdout = r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused variable: `x`","code":{"code":"unused_variables"},"spans":[{"file_name":"src/a.rs","line_start":12,"is_primary":true}]}}
+    fn parses_clippy_findings_filters_noise_and_skips_summary() {
+        // 行1：低价值 style warning（needless_return）→ 被降噪丢弃。
+        // 行2：高价值 perf warning（redundant_clone）→ 保留为 medium。
+        // 行4：error（无 code）→ 保留为 high；行5：无 span 汇总行 → 跳过。
+        let stdout = r#"{"reason":"compiler-message","message":{"level":"warning","message":"unneeded return statement","code":{"code":"clippy::needless_return"},"spans":[{"file_name":"src/a.rs","line_start":12,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"level":"warning","message":"redundant clone","code":{"code":"clippy::redundant_clone"},"spans":[{"file_name":"src/c.rs","line_start":7,"is_primary":true}]}}
 {"reason":"compiler-artifact","package_id":"foo"}
 {"reason":"compiler-message","message":{"level":"error","message":"mismatched types","code":null,"spans":[{"file_name":"src/b.rs","line_start":3,"is_primary":true}]}}
 {"reason":"compiler-message","message":{"level":"error","message":"aborting due to previous error","spans":[]}}"#;
         let out = parse_clippy_json("p1", stdout);
-        assert_eq!(out.len(), 2, "artifact + summary(no span) skipped");
-        assert!(out[0].title.contains("clippy unused_variables"));
-        assert_eq!(out[0].severity.as_deref(), Some("low"));
+        assert_eq!(out.len(), 2, "low-value warning + artifact + summary(no span) skipped");
+        // 高价值 warning 保留，severity=medium。
+        assert!(out[0].title.contains("clippy clippy::redundant_clone"));
+        assert_eq!(out[0].severity.as_deref(), Some("medium"));
         assert_eq!(out[0].category.as_deref(), Some("Debt"));
         // 无 code 时回退到 "clippy"；error → Bug/high。
         assert!(out[1].title.contains("clippy clippy"));

@@ -422,6 +422,110 @@ pub async fn requeue_orphaned_analyses(db: &Db, tx: &JobSender) -> usize {
     requeued
 }
 
+/// Recover merges orphaned by a previous process exit (crash or quit).
+///
+/// `review_2`(approved) / the auto-merge gate / 自动解冲突回落 all flip the CR to
+/// `pending_merge` and enqueue a Merge job whose live driver task lives only in this
+/// process. If AutoForge restarts after the flip but before the merge lands, the CR
+/// stays at `pending_merge` with nothing left to drive it — stuck forever (no command
+/// re-triggers a `pending_merge` CR by hand).
+///
+/// Safe to auto-re-enqueue because the Merge job is **idempotent**: it re-derives
+/// everything from the worktree session, and `git merge --squash` of an already-landed
+/// branch produces no new diff (lands as a no-op rather than double-applying). Worst
+/// case for a crash in the exact post-squash/pre-`merged` window is a lost
+/// `merge_commit` SHA, which the merge path already tolerates (stores NULL).
+///
+/// Run ONCE at startup, before any driver task exists. Keyed on CR state, not job rows.
+/// `merge_conflict` / `merge_failed` are parked terminal states awaiting human/AI action
+/// — deliberately NOT swept here.
+pub async fn requeue_orphaned_merges(db: &Db, tx: &JobSender) -> usize {
+    // Retire dead merge job rows so the fresh enqueue below isn't deduped against them.
+    let _ = sqlx::query(
+        "UPDATE job_executions SET status='failed', last_error='superseded by restart recovery', updated_at=datetime('now')
+         WHERE job_type='merge' AND status IN ('pending','waiting','running')",
+    )
+    .execute(db)
+    .await;
+
+    let pending: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM change_requests WHERE status='pending_merge'")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+    let mut requeued = 0usize;
+    for (cr_id,) in pending {
+        let idem_key = format!("merge:{}:restart:{}", cr_id, Uuid::new_v4());
+        if enqueue(
+            db,
+            tx,
+            "merge",
+            &idem_key,
+            JobPayload::Merge {
+                change_request_id: cr_id.clone(),
+            },
+        )
+        .await
+        .is_ok()
+        {
+            requeued += 1;
+        }
+    }
+    if requeued > 0 {
+        info!("startup recovery: re-enqueued {} orphaned merge(s)", requeued);
+    }
+    requeued
+}
+
+/// Recover reverts orphaned by a previous process exit (crash or quit).
+///
+/// `revert_change_request` atomically flips a `merged` CR to `reverting` and enqueues a
+/// Revert job. Unlike merge, `git revert` is **NOT idempotent** — re-running after the
+/// revert commit already landed would revert the revert (re-applying the change). So we
+/// do NOT auto-re-enqueue; we roll the CR back to its prior stable `merged` state and let
+/// the operator re-trigger the (manual, user-initiated) revert after confirming dev.
+///
+/// Returns how many reverts were rolled back.
+pub async fn recover_orphaned_reverts(db: &Db) -> usize {
+    // Retire any dead revert job rows so they don't linger as phantom in-flight work.
+    let _ = sqlx::query(
+        "UPDATE job_executions SET status='failed', last_error='superseded by restart recovery', updated_at=datetime('now')
+         WHERE job_type='revert' AND status IN ('pending','waiting','running')",
+    )
+    .execute(db)
+    .await;
+
+    let reverting: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, issue_id FROM change_requests WHERE status='reverting'",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut rolled = 0usize;
+    for (cr_id, issue_id) in &reverting {
+        let _ = sqlx::query(
+            "UPDATE change_requests SET status='merged', updated_at=datetime('now') WHERE id=? AND status='reverting'",
+        )
+        .bind(cr_id)
+        .execute(db)
+        .await;
+        let _ = sqlx::query(
+            "UPDATE issues SET status='merged', updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(issue_id)
+        .execute(db)
+        .await;
+        rolled += 1;
+    }
+    if rolled > 0 {
+        info!(
+            "startup recovery: rolled back {} interrupted revert(s) to merged",
+            rolled
+        );
+    }
+    rolled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +545,41 @@ mod tests {
         .await
         .unwrap();
         p
+    }
+
+    /// Startup recovery: a CR interrupted mid-revert (status `reverting`) must roll back to
+    /// its prior stable `merged` state — never be re-run (git revert is not idempotent).
+    /// CRs in other states are untouched.
+    #[tokio::test]
+    async fn recover_reverts_rolls_reverting_back_to_merged() {
+        let db = pool().await;
+        sqlx::query(
+            "CREATE TABLE change_requests (id TEXT PRIMARY KEY, issue_id TEXT, status TEXT, updated_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE issues (id TEXT PRIMARY KEY, status TEXT, updated_at TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO change_requests (id, issue_id, status) VALUES ('cr1','i1','reverting'), ('cr2','i2','merged')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO issues (id, status) VALUES ('i1','reverting'), ('i2','merged')")
+            .execute(&db).await.unwrap();
+
+        let rolled = recover_orphaned_reverts(&db).await;
+        assert_eq!(rolled, 1, "exactly one reverting CR rolled back");
+
+        let cr1: (String,) = sqlx::query_as("SELECT status FROM change_requests WHERE id='cr1'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(cr1.0, "merged", "interrupted revert returns to merged");
+        let i1: (String,) = sqlx::query_as("SELECT status FROM issues WHERE id='i1'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(i1.0, "merged");
+        let cr2: (String,) = sqlx::query_as("SELECT status FROM change_requests WHERE id='cr2'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(cr2.0, "merged", "unrelated CR untouched");
     }
 
     /// M1: the idempotency key dedups the ROW *and* the EXECUTION — re-enqueuing the same

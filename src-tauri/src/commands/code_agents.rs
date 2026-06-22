@@ -2,6 +2,7 @@
 //! 业务侧的可插拔抽象在 `agents::code_agent`；这里只做 CRUD + 默认/项目绑定 + 健康探测。
 use crate::agents::code_agent::{CliCodeAgent, CliProfile, CodeAgent};
 use crate::models::code_agent::{CodeAgentRow, UpsertCodeAgent};
+use crate::models::code_agent_run::{CodeAgentRunLog, CodeAgentRunMeta};
 use crate::state::AppState;
 use tauri::State;
 use uuid::Uuid;
@@ -21,6 +22,8 @@ pub async fn upsert_code_agent(
 ) -> Result<CodeAgentRow, String> {
     let extra_json = serde_json::to_string(&payload.extra_args).unwrap_or_else(|_| "[]".into());
     let model = payload.model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let fast_model = payload.fast_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let strong_model = payload.strong_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
     let id = match payload.id.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => {
@@ -41,12 +44,14 @@ pub async fn upsert_code_agent(
             }
             // 更新现有：保留 is_default（由 set_default_code_agent 单独管理）。
             sqlx::query(
-                "UPDATE code_agents SET kind=?, label=?, program=?, model=?, extra_args_json=?, enabled=? WHERE id=?",
+                "UPDATE code_agents SET kind=?, label=?, program=?, model=?, fast_model=?, strong_model=?, extra_args_json=?, enabled=? WHERE id=?",
             )
             .bind(&payload.kind)
             .bind(&payload.label)
             .bind(&payload.program)
             .bind(model)
+            .bind(fast_model)
+            .bind(strong_model)
             .bind(&extra_json)
             .bind(payload.enabled)
             .bind(id)
@@ -58,14 +63,16 @@ pub async fn upsert_code_agent(
         None => {
             let id = Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO code_agents (id, kind, label, program, model, extra_args_json, enabled, is_default)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                "INSERT INTO code_agents (id, kind, label, program, model, fast_model, strong_model, extra_args_json, enabled, is_default)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             )
             .bind(&id)
             .bind(&payload.kind)
             .bind(&payload.label)
             .bind(&payload.program)
             .bind(model)
+            .bind(fast_model)
+            .bind(strong_model)
             .bind(&extra_json)
             .bind(payload.enabled)
             .execute(&state.db)
@@ -164,4 +171,36 @@ pub async fn check_code_agent_auth(id: String, state: State<'_, AppState>) -> Re
         extra_args: crate::agents::code_agent::parse_extra_args(&row.extra_args_json),
     });
     Ok(agent.check_auth().await)
+}
+
+/// 列出某个 CR 的代码 Agent 执行日志（轻量元信息，不含 stdout/stderr 正文）。
+/// 最新在前；上限 50 条足够覆盖一个 CR 的多次执行/重试。
+#[tauri::command]
+pub async fn list_code_agent_runs(
+    cr_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<CodeAgentRunMeta>, String> {
+    sqlx::query_as::<_, CodeAgentRunMeta>(
+        "SELECT id, change_request_id, worktree_session_id, phase, kind, model, exit_code,
+                duration_ms, stdout_bytes, stderr_bytes, truncated, created_at
+         FROM code_agent_run_logs WHERE change_request_id=?
+         ORDER BY created_at DESC, rowid DESC LIMIT 50",
+    )
+    .bind(&cr_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 取单条执行日志的完整正文（stdout/stderr），用于详情查看。
+#[tauri::command]
+pub async fn get_code_agent_run(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<CodeAgentRunLog>, String> {
+    sqlx::query_as::<_, CodeAgentRunLog>("SELECT * FROM code_agent_run_logs WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }

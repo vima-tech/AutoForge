@@ -37,7 +37,7 @@ import {
   listBuiltinTools, type BuiltinToolInfo,
   getSecretBackendStatus, type SecretBackend,
   exportConfig, importConfig, revealBackup, type BackupSummary, type ExportResult,
-  listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
+  listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection, discoverCodeIntelMap,
   type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
@@ -414,7 +414,7 @@ function AsrSettings() {
 
 // ── 工厂自喂料（autosupply）设置 ──────────────────────────────────────────────
 function AutosupplySettings() {
-  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20, analyze_enabled: true, triage_enabled: true });
+  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20, proposer_max_per_run: 8, min_severity: 'low', analyze_enabled: true, triage_enabled: true });
   const [level, setLevel] = useState<AutonomyLevel>('strict');
   const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
@@ -481,10 +481,20 @@ function AutosupplySettings() {
               onChange={e => setCfg(c => ({ ...c, interval_min: Math.max(5, Number(e.target.value) || 1440) }))}
               onBlur={() => save(cfg)} />
           </div>
-          <div className="field"><label>每轮入池上限</label>
+          <div className="field"><label>扫描每轮入池上限</label>
             <input type="number" min="1" max="200" value={cfg.max_per_run}
               onChange={e => setCfg(c => ({ ...c, max_per_run: Math.max(1, Math.min(200, Number(e.target.value) || 20)) }))}
               onBlur={() => save(cfg)} />
+          </div>
+          <div className="field"><label>严重度门槛</label>
+            <Select value={cfg.min_severity} onChange={v => save({ ...cfg, min_severity: v })}
+              options={[
+                { value: 'low', label: '全部（low+，不过滤）' },
+                { value: 'medium', label: 'medium 及以上（滤掉皮毛）' },
+                { value: 'high', label: 'high 及以上（只要要紧的）' },
+                { value: 'critical', label: '仅 critical（最严苛）' },
+              ]} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 6 }}>低于此级别的产物入池前丢弃，进一步压制 linter 噪音。</span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
             <Switch on={cfg.scan_enabled} onToggle={() => save({ ...cfg, scan_enabled: !cfg.scan_enabled })} />
@@ -500,8 +510,16 @@ function AutosupplySettings() {
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
             <Switch on={cfg.proposer_enabled} onToggle={() => save({ ...cfg, proposer_enabled: !cfg.proposer_enabled })} />
-            <span>proposer 工程提议<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（默认关，需绑定 proposer 角色 LLM）</span></span>
+            <span>proposer 深度审计提议<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（资深代码审计师，找 linter 发现不了的深层问题；独立预算，不被扫描挤占；建议绑定强模型）</span></span>
           </div>
+          {cfg.proposer_enabled && (
+            <div className="field"><label>proposer 每轮上限（独立预算）</label>
+              <input type="number" min="1" max="50" value={cfg.proposer_max_per_run}
+                onChange={e => setCfg(c => ({ ...c, proposer_max_per_run: Math.max(1, Math.min(50, Number(e.target.value) || 8)) }))}
+                onBlur={() => save(cfg)} />
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 6 }}>与扫描预算分开计；确定性扫描不再饿死深度提议。</span>
+            </div>
+          )}
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 4 }}>
             <button className="btn" disabled={running} onClick={runNow}>
               <Icon name="refresh" size={14} style={{ animation: running ? 'spin 1s linear infinite' : undefined }} />{running ? '运行中…' : '立即跑一轮'}
@@ -519,6 +537,7 @@ function ToolsSettings() {
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
+  const [open, setOpen] = useState(false); // 默认折叠，节省高度
 
   useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
 
@@ -544,7 +563,7 @@ function ToolsSettings() {
       <div className="set-desc">为 Agent 启用外部工具。工具结果视为不可信外部输入，回灌上下文前自动过安全过滤。仅 OpenAI 兼容 / Anthropic 接口规范的 LLM 支持工具调用。</div>
 
       <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
-        <div className="cfg-top" style={{ gap: 10 }}>
+        <div className="cfg-top" style={{ gap: 10, cursor: 'pointer', userSelect: 'none' }} onClick={() => setOpen(o => !o)}>
           <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="search" size={15} /></div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
@@ -553,8 +572,10 @@ function ToolsSettings() {
             <div className="cfg-sub">原生免 Key 联网搜索（DuckDuckGo），可选搜索后自动读取正文</div>
           </div>
           <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
+          <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
         </div>
 
+        {open && (
         <div className="cfg-fields rise" style={{ marginTop: 14 }}>
           <div className="field"><label>搜索 Provider</label>
             <Select value={ws.provider || 'duckduckgo'} onChange={val => setWs(w => ({ ...w, provider: val }))}
@@ -599,6 +620,7 @@ function ToolsSettings() {
             </span>
           </div>
         </div>
+        )}
       </div>
 
       <OpenDesignSettingsCard />
@@ -614,6 +636,7 @@ function OpenDesignSettingsCard() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [log, setLog] = useState('');
+  const [open, setOpen] = useState(false); // 默认折叠，节省高度
 
   useEffect(() => { getOpenDesignSettings().then(setOd).catch(e => setStatus(String(e))); }, []);
 
@@ -633,7 +656,7 @@ function OpenDesignSettingsCard() {
 
   return (
     <div className="cfg-card" style={{ marginTop: 14 }}>
-      <div className="cfg-top" style={{ gap: 10 }}>
+      <div className="cfg-top" style={{ gap: 10, cursor: 'pointer', userSelect: 'none' }} onClick={() => setOpen(o => !o)}>
         <div className="cfg-logo" style={{ background: 'var(--violet)', width: 28, height: 28 }}><Icon name="palette" size={15} /></div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="cfg-name cfg-name-line"><span className="cfg-name-text">OpenDesign · 本地服务</span>
@@ -641,8 +664,10 @@ function OpenDesignSettingsCard() {
           </div>
           <div className="cfg-sub">默认自动拉起：检测本地 open-design 检出（无则克隆）→ pnpm install → tools-dev 启动，就绪后打开浏览器</div>
         </div>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
 
+      {open && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field full"><label>本地检出路径（可选）</label>
           <input type="text" className="mono" value={od.repo_path} placeholder="留空则自动探测 ~/projects/open-design 等，找不到再克隆到自管目录"
@@ -672,9 +697,17 @@ function OpenDesignSettingsCard() {
           </span>
         </div>
       </div>
+      )}
     </div>
   );
 }
+
+// 代码情报默认能力映射（codegraph）。「填入默认」按钮用，也是占位提示。
+const CODEGRAPH_CAP_PRESET = JSON.stringify({
+  locate_symbol: { tool: 'codegraph_search', args: { query: '$SYMBOL', projectPath: '$REPO', limit: 1 } },
+  find_callers: { tool: 'codegraph_callers', args: { symbol: '$SYMBOL', projectPath: '$REPO', limit: 5 } },
+  impact_analysis: { tool: 'codegraph_impact', args: { symbol: '$SYMBOL', projectPath: '$REPO', depth: 2 } },
+}, null, 2);
 
 function McpServers() {
   const [servers, setServers] = useState<McpServer[]>([]);
@@ -684,6 +717,11 @@ function McpServers() {
   const [test, setTest] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  // 代码情报「高级设置（能力映射）」的展开态——默认折叠，留空即走约定，无需展开。
+  const [advExp, setAdvExp] = useState<Set<string>>(new Set());
+  const toggleAdv = (id: string) => setAdvExp(prev => {
+    const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n;
+  });
 
   const reload = () => Promise.all([listMcpServers(), listAgents()])
     .then(([s, a]) => { setServers(s); setAgents(a); })
@@ -705,12 +743,24 @@ function McpServers() {
     setDraft(s.id, 'agent_ids_json', JSON.stringify([...cur]));
   };
 
+  // 能力映射是否「未填写」（空 / {} / 纯空白）。
+  const mapIsEmpty = (m?: string | null) => !m || ['', '{}'].includes(m.trim());
+
   const save = async (id: string) => {
     const d = drafts[id] ?? {};
     if (Object.keys(d).length === 0) { setExp(null); return; }
     setBusy(id);
     try {
-      const updated = await updateMcpServer(id, d);
+      let updated = await updateMcpServer(id, d);
+      // 适用于编码 Agent 且能力映射未填写：保存后按约定发现并回填持久化（用刚存的最新配置连接）。
+      if (updated.for_code_agent && mapIsEmpty(updated.capability_map_json)) {
+        const m = await discoverCodeIntelMap(id).catch(() => '{}');
+        if (!mapIsEmpty(m)) {
+          updated = await updateMcpServer(id, { capability_map_json: m });
+          setAdvExp(prev => new Set(prev).add(id));
+          setTest(t => ({ ...t, [id]: '✓ 已按约定发现并填入能力映射' }));
+        }
+      }
       setServers(ss => ss.map(s => s.id === id ? updated : s));
       setDrafts(x => { const n = { ...x }; delete n[id]; return n; });
     } catch (e) { setTest(t => ({ ...t, [id]: '保存失败: ' + String(e) })); }
@@ -730,6 +780,18 @@ function McpServers() {
     try {
       const tools = await testMcpConnection(id);
       setTest(t => ({ ...t, [id]: tools.length ? `✓ 发现 ${tools.length} 个工具：${tools.join(', ')}` : '✓ 已连接，但无工具' }));
+      // 适用于编码 Agent 且能力映射未填写：按约定发现并填入草稿（供检查后保存）。
+      const sv = servers.find(x => x.id === id); const dr = drafts[id] ?? {};
+      const forCodeNow = Boolean(dr.for_code_agent ?? sv?.for_code_agent ?? false);
+      const curMap = String(dr.capability_map_json ?? sv?.capability_map_json ?? '');
+      if (forCodeNow && mapIsEmpty(curMap)) {
+        const m = await discoverCodeIntelMap(id).catch(() => '{}');
+        if (!mapIsEmpty(m)) {
+          setDraft(id, 'capability_map_json', m);
+          setAdvExp(prev => new Set(prev).add(id));
+          setTest(t => ({ ...t, [id]: (t[id] ?? '') + '　·　已按约定填入能力映射，检查后保存生效' }));
+        }
+      }
     } catch (e) { setTest(t => ({ ...t, [id]: '✗ ' + String(e) })); }
     finally { setBusy(null); }
   };
@@ -738,11 +800,12 @@ function McpServers() {
     <div style={{ marginTop: 22 }}>
       {confirmDel && <ConfirmModal msg="确认删除此 MCP Server？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
       <div className="set-h" style={{ fontSize: 'var(--text-section)' }}>MCP Servers</div>
-      <div className="set-desc">接入外部 MCP 工具生态。每个 server 勾选适用的 Agent —— 仅被勾选的 Agent 会加载其工具。MCP 工具结果同样过安全过滤。</div>
+      <div className="set-desc">接入外部 MCP 工具生态。每个 server 的适用面有两个正交维度，可同时开启：勾选「角色 Agent」让会议室 Agent 调用其工具；开「适用于编码 Agent」让编码 Agent 在 worktree 内实时调用本 server 工具（pull），并对含代码情报能力的 server 额外做执行前预查（push）。MCP 工具结果同样过安全过滤。</div>
 
       {servers.map(s => {
         const d = drafts[s.id] ?? {};
         const transport = String(val(s, d, 'transport') ?? 'stdio') as McpTransport;
+        const forCode = Boolean(val(s, d, 'for_code_agent') ?? false);
         const scoped = scopedAgents(s, d);
         const en = Boolean(d.enabled ?? s.enabled);
         return (
@@ -753,7 +816,7 @@ function McpServers() {
                 <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{String(val(s, d, 'name') ?? '')}</span>
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{transport.toUpperCase()}</span>
                 </div>
-                <div className="cfg-sub">{scoped.length ? `适用 ${scoped.length} 个 Agent` : '未勾选任何 Agent'}</div>
+                <div className="cfg-sub">{[scoped.length ? `${scoped.length} 个角色 Agent` : '', forCode ? '编码 Agent' : ''].filter(Boolean).join(' · ') || '未启用任何适用面'}</div>
               </div>
               <span className={'chip ' + (en ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{en ? '已启用' : '未启用'}</span>
               <Icon name={exp === s.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
@@ -766,6 +829,15 @@ function McpServers() {
                 <div className="field"><label>传输方式</label>
                   <Select value={transport} onChange={v => setDraft(s.id, 'transport', v)}
                     options={[{ value: 'stdio', label: 'stdio（本地子进程）' }, { value: 'http', label: 'HTTP（远程 streamable）' }]} />
+                </div>
+                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  <Switch on={forCode} onToggle={() => setDraft(s.id, 'for_code_agent', !forCode)} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)' }}>适用于编码 Agent</div>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                      开启后本 server 对编码 Agent 生效，两条机制：①<b>实时调用（pull）</b>——工具注入 CLI，agent 在 worktree 内自主调用任意 MCP 工具（claude 完整支持 / codex 实验性 / opencode 暂不支持）；②<b>代码情报预查（push）</b>——若含 locate_symbol 等能力，执行前预查并注入 prompt。与下方「角色 Agent」正交，可同时开。
+                    </div>
+                  </div>
                 </div>
                 {transport === 'stdio' ? (<>
                   <div className="field full"><label>启动命令 command</label>
@@ -790,7 +862,31 @@ function McpServers() {
                       onChange={e => setDraft(s.id, 'headers_json', e.target.value)} />
                   </div>
                 </>)}
-                <div className="field full"><label>适用 Agent（勾选后该 Agent 加载本 server 的工具）</label>
+                {forCode && (
+                  <div className="field full">
+                    <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                      编码 Agent 的代码情报由 AutoForge 在执行前 push 式调用并注入实现 prompt，三家 code agent 一致受益。
+                      默认按工具命名自动发现（codegraph 等常见工具无需任何配置）；仅非常规工具才需在下方手动指定映射。
+                    </span>
+                    <button type="button" className="btn btn-sm btn-ghost" style={{ alignSelf: 'flex-start', marginTop: 6 }}
+                      onClick={() => toggleAdv(s.id)}>
+                      <Icon name={advExp.has(s.id) ? 'chevDown' : 'chevRight'} size={13} />高级：自定义能力映射
+                    </button>
+                    {advExp.has(s.id) && (
+                      <div style={{ marginTop: 8 }}>
+                        <label style={{ marginBottom: 8 }}>能力映射 capability_map（可选，留空自动按工具命名约定发现；占位符 $SYMBOL / $REPO）</label>
+                        <textarea className="mono" rows={6} style={{ resize: 'vertical', width: '100%' }}
+                          value={String(val(s, d, 'capability_map_json') ?? '{}')}
+                          placeholder={`格式示例（仅 codegraph）：\n${CODEGRAPH_CAP_PRESET}`}
+                          onChange={e => setDraft(s.id, 'capability_map_json', e.target.value)} />
+                        <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>
+                          locate_symbol / find_callers → 各自的工具名 + 参数。$SYMBOL 替换为符号名、$REPO 替换为主仓路径。
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="field full"><label>适用的角色 Agent（勾选后该会议室 Agent 加载本 server 的工具，pull 式直接调用）</label>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '6px 0' }}>
                     {agents.length === 0 && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>暂无 Agent</span>}
                     {agents.map(a => {
@@ -1288,7 +1384,7 @@ function RolesPage() {
   );
 }
 
-interface CodeAgentDraft { kind: string; label: string; program: string; model: string; extra: string; enabled: boolean; }
+interface CodeAgentDraft { kind: string; label: string; program: string; model: string; fast_model: string; strong_model: string; extra: string; enabled: boolean; }
 const CODE_AGENT_KINDS = [
   { value: 'claude', label: 'claude（Claude Code）' },
   { value: 'codex', label: 'codex（Codex CLI）' },
@@ -1312,7 +1408,7 @@ function CodeAgentSettings() {
   const toDraft = (a: CodeAgentT): CodeAgentDraft => {
     let extra: string[] = [];
     try { extra = JSON.parse(a.extra_args_json || '[]'); } catch { extra = []; }
-    return { kind: a.kind, label: a.label, program: a.program, model: a.model ?? '', extra: extra.join(' '), enabled: a.enabled };
+    return { kind: a.kind, label: a.label, program: a.program, model: a.model ?? '', fast_model: a.fast_model ?? '', strong_model: a.strong_model ?? '', extra: extra.join(' '), enabled: a.enabled };
   };
 
   const load = (autoCheck = false) => {
@@ -1344,6 +1440,7 @@ function CodeAgentSettings() {
       await upsertCodeAgent({
         id: a.id, kind: d.kind, label: d.label.trim() || d.kind,
         program: d.program.trim() || d.kind, model: d.model.trim() || null,
+        fast_model: d.fast_model.trim() || null, strong_model: d.strong_model.trim() || null,
         extra_args: d.extra.split(/\s+/).filter(Boolean), enabled: d.enabled,
       });
       setMsg(`已保存 ${d.label || a.kind}`);
@@ -1379,6 +1476,8 @@ function CodeAgentSettings() {
       <div className="set-desc">
         选择驱动「代码实现」与「AI 解冲突」的 CLI 编码 agent。所有 agent 都在隔离 worktree 内执行，
         并被统一禁止 remote git 操作。项目可在「项目管理」单独覆盖；未覆盖时跟随这里的全局默认。
+        配了「快模型 / 强模型」后，系统会按分析阶段的风险（影响半径 / 文件数 / 复杂度）自动挑选：
+        低风险小改动走快模型省时省钱，跨模块或复杂改动走强模型保质量；留空则一律用上方默认模型。
       </div>
 
       <div className="cfg-card" style={{ marginBottom: 16 }}>
@@ -1427,6 +1526,12 @@ function CodeAgentSettings() {
               </div>
               <div className="field"><label>模型（可空，{d.kind === 'opencode' ? 'provider/model' : '裸名'}）</label>
                 <input value={d.model} onChange={e => setDraft(a.id, { model: e.target.value })} placeholder="默认" />
+              </div>
+              <div className="field"><label>快模型（低风险改动，可空 → 回落上方模型）</label>
+                <input value={d.fast_model} onChange={e => setDraft(a.id, { fast_model: e.target.value })} placeholder={d.kind === 'opencode' ? 'anthropic/claude-haiku-4-5' : '如 sonnet / haiku'} />
+              </div>
+              <div className="field"><label>强模型（高风险改动，可空 → 回落上方模型）</label>
+                <input value={d.strong_model} onChange={e => setDraft(a.id, { strong_model: e.target.value })} placeholder={d.kind === 'opencode' ? 'anthropic/claude-opus-4-8' : '如 opus'} />
               </div>
               <div className="field"><label>额外参数（空格分隔，可空）</label>
                 <input value={d.extra} onChange={e => setDraft(a.id, { extra: e.target.value })} placeholder="--flag value" />
@@ -1485,7 +1590,7 @@ function ConcurrencySettings() {
   return (
     <div className="set-inner rise">
       <div className="set-h">并发与流控</div>
-      <div className="set-desc">控制 Claude Code 执行槽位、审核积压背压阈值与代码 agent 超时回收。</div>
+      <div className="set-desc">控制代码 Agent 执行槽位、审核积压背压阈值与代码 agent 超时回收。</div>
       <div className="cfg-card">
         <div className="cfg-fields">
           <div className="field"><label>最大并发槽位</label>
@@ -2277,7 +2382,7 @@ function GatingSettings() {
           </div>
         </div>
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>AutoForge merge: &lt;编号&gt;</code>，审核页不显示输入框。批量审核始终走默认模板。
+          启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>&lt;前缀&gt;(&lt;修改模块&gt;): &lt;需求标题&gt; [autoforge #&lt;编号&gt;]</code>（前缀按需求类别取 feat/fix/refactor/chore…），审核页不显示输入框。批量审核始终走默认模板。
         </div>
       </div>
     </div>

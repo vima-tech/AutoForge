@@ -573,7 +573,14 @@ pub async fn list_local_branches(
     let branches = out
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.contains("HEAD detached") && !l.contains("(no branch)"))
+        // 排除 AutoForge 内部 worktree 分支（execution 创建的 `autoforge/<cr>-i<n>`），
+        // 它们只是 CR 实现的临时检出，不是用户可启动的项目分支。
+        .filter(|l| {
+            !l.is_empty()
+                && !l.contains("HEAD detached")
+                && !l.contains("(no branch)")
+                && !l.starts_with("autoforge/")
+        })
         .map(|name| BranchInfo {
             name: name.to_string(),
             is_current: name == current,

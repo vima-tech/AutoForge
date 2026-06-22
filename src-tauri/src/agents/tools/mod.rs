@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::core::security::{has_obvious_injection, safe_truncate};
 
+pub mod code_intel;
 pub mod code_scan;
 pub mod mcp;
 pub mod memory;

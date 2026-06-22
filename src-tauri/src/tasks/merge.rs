@@ -38,6 +38,14 @@ async fn land_on_dev(
         if cc != 0 {
             return Err((cc, format!("checkout {} 失败：{}", project.branch_dev, ce)));
         }
+        // Clear any half-applied squash left staged on dev by a previous attempt that
+        // crashed between `merge --squash`(stages) and `commit`. `--squash` sets no
+        // MERGE_HEAD, so `merge --abort` can't undo it; the next `merge --squash` below
+        // refuses to run against a dirty index ("local changes would be overwritten") and
+        // would spuriously fail the recovered merge. `reset --hard HEAD` discards only that
+        // uncommitted residue — committed dev history is untouched — making this re-entrant.
+        // Safe because a successful `checkout dev` already implies a clean-enough tree.
+        let _ = git.run(&["reset", "--hard", "HEAD"]).await;
         // Squash-merge: collapse the CR branch (impl commits + Phase-1 dev-sync
         // merge) into a SINGLE commit on dev, so a batch of N CRs leaves N commits
         // instead of ~3N. Phase 1 already merged dev into the branch, so this
@@ -90,9 +98,11 @@ async fn land_on_dev(
     }
 
     // Isolated path (AutoForge self-managed: dev is checked out live).
-    // Refresh the remote tracking ref so we base the merge on the newest dev and
-    // the push is a fast-forward (best-effort: offline falls back to local dev).
-    let _ = git.run(&["fetch", "origin", &project.branch_dev]).await;
+    // No fetch here: Phase 1 (sync_dev_into_worktree) already `git fetch`ed
+    // origin/<dev> into the SHARED object store/refs (a worktree shares the main
+    // repo's remote-tracking refs), so origin/<dev> is already fresh — a second
+    // fetch is a redundant network round-trip held under the merge lock. Offline
+    // still falls back to local dev below, exactly as before.
     let remote_ref = format!("origin/{}", project.branch_dev);
     let base = if git
         .run(&["rev-parse", "--verify", "--quiet", &remote_ref])
@@ -529,10 +539,51 @@ pub async fn ai_resolve_conflict(
             wall_secs: 600,
             idle_secs: 300,
         };
+        // 解冲突同属编码任务：同样注入「适用于编码 Agent」的 MCP（pull）。
+        let code_mcp = crate::agents::code_agent::load_code_agent_mcp(db).await;
+        let run_started = std::time::Instant::now();
+        // 实时日志：解冲突也推 CodeAgentLog（phase=conflict_resolve），前端同样可实时滚动。
+        let (log_tx, mut log_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::agents::code_agent::LogChunk>();
+        let forward = {
+            let app = app.clone();
+            let cr = cr_id.to_string();
+            tokio::spawn(async move {
+                while let Some(c) = log_rx.recv().await {
+                    crate::core::event::emit(
+                        &app,
+                        crate::core::event::AppEvent::CodeAgentLog {
+                            cr_id: cr.clone(),
+                            phase: "conflict_resolve".to_string(),
+                            stream: c.stream.to_string(),
+                            chunk: c.text,
+                        },
+                    );
+                }
+            })
+        };
         let (_code, report, _err) = code_agent
-            .run(&session.worktree_path, &prompt, limits)
+            .run(&session.worktree_path, &prompt, limits, &code_mcp, Some(&log_tx))
             .await
             .unwrap_or((-1, String::new(), String::new()));
+        drop(log_tx);
+        let _ = forward.await;
+        // 解冲突也是一次代码 Agent 执行，完整日志同样落库（phase=conflict_resolve）。
+        crate::agents::code_agent::log_run(
+            db,
+            crate::agents::code_agent::RunLogInput {
+                change_request_id: cr_id,
+                worktree_session_id: Some(&session.id),
+                phase: "conflict_resolve",
+                kind: code_agent.kind(),
+                model: None,
+                exit_code: _code,
+                stdout: &report,
+                stderr: &_err,
+                duration_ms: run_started.elapsed().as_millis() as i64,
+            },
+        )
+        .await;
         // agent 输出视为外部输入：留档/回灌前过注入检测（命中只记录，文件改动才是结果）。
         if crate::core::security::has_obvious_injection(&report) {
             info!(
@@ -547,6 +598,75 @@ pub async fn ai_resolve_conflict(
     finalize_resolution(db, tx, app, &session, &cr, &issue, &commit_msg)
         .await
         .map(|_| ())
+}
+
+/// 把需求 category 映射到 Conventional Commits 前缀（feat/fix/docs…）。
+fn commit_prefix_for_category(category: &str) -> &'static str {
+    match category.trim().to_ascii_lowercase().as_str() {
+        "feature" | "feat" => "feat",
+        "bug" | "fix" => "fix",
+        "improvement" | "refactor" | "perf" => "refactor",
+        "debt" | "chore" => "chore",
+        "docs" | "documentation" => "docs",
+        _ => "chore",
+    }
+}
+
+/// 构造合并提交信息的默认模板：`<前缀>(<修改模块>): <需求标题> [autoforge #<需求编号>]`。
+///
+/// 前缀取自需求 category（Feature→feat / Bug→fix / Improvement→refactor / Debt→chore…），
+/// 修改模块取自最近一次需求分析的 affected_modules（空则省略括号段），需求编号沿用 UI 口径
+/// （issue id 前 8 位短码）。任何字段缺失时优雅降级，最差回退到旧模板，保证永远产出非空信息。
+pub async fn default_merge_message(db: &Db, cr: &crate::models::change_request::ChangeRequest) -> String {
+    let issue = sqlx::query_as::<_, crate::models::issue::Issue>("SELECT * FROM issues WHERE id=?")
+        .bind(&cr.issue_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+    let Some(issue) = issue else {
+        // 需求不存在（理论上不会发生）——回退旧模板，绝不产出空提交信息。
+        return format!("AutoForge merge: {}", cr.id);
+    };
+
+    let prefix = commit_prefix_for_category(&issue.category);
+
+    // 修改模块：取最近一次分析的 affected_modules（JSON 数组），最多取 2 个用「/」连接。
+    let modules = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT affected_modules FROM issue_analyses WHERE issue_id=? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&issue.id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+    .map(|mods| {
+        mods.into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("/")
+    })
+    .filter(|m| !m.is_empty());
+
+    // 需求标题：折叠空白、去首尾，超长截断（避免单行提交信息过长）。
+    let mut title = issue.title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.chars().count() > 60 {
+        title = title.chars().take(60).collect::<String>() + "…";
+    }
+    if title.is_empty() {
+        title = "需求变更".to_string();
+    }
+
+    // 需求编号：与审核页一致，取 issue id 前 8 位短码。
+    let short_id: String = issue.id.chars().take(8).collect();
+
+    let scope = modules.map(|m| format!("({})", m)).unwrap_or_default();
+    format!("{}{}: {} [autoforge #{}]", prefix, scope, title, short_id)
 }
 
 pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
@@ -813,13 +933,15 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     );
 
     // 人审填写的合并信息（持久化在 CR 上，retry/AI 解冲突回落均复用）；空则回退默认模板。
-    let merge_msg = cr
+    let merge_msg = match cr
         .merge_commit_message
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("AutoForge merge: {}", cr_id));
+    {
+        Some(s) => s.to_string(),
+        None => default_merge_message(db, &cr).await,
+    };
 
     let merge_commit = match land_on_dev(&git, &project, &session, cr_id, dev_is_live, &merge_msg).await {
         Ok(sha) => sha,
@@ -927,33 +1049,52 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     )
     .await;
 
-    crate::core::notify::dispatch(db, "cr_merged", "已合并到 dev", cr_id).await;
+    // ── 合并后副作用：脱锁后台执行 ─────────────────────────────────────────────
+    // 到此合并主流程已完成（CR/issue 已置 merged、CrMerged 事件已发出、worktree 已删）。
+    // 余下的「通知分发 + Innate 知识沉淀/召回反馈/蒸馏」全是合并后副作用，其中 kb_evolve
+    // 是 LLM 蒸馏、notify::dispatch 可能走外部 HTTP，inline `.await` 会在仍持有
+    // merge_lock + cr_lock 的情况下把锁占满整段时长，饿死同项目下一个 CR 的合并（合并慢
+    // 的主因之一）。整体 spawn 到后台，让 run() 立即返回释放锁。只依赖可克隆的 db 与
+    // 字符串，不引用任何 Tauri 类型（符合后端独立化铁律）。
+    {
+        let db2 = db.clone();
+        let cr_id2 = cr_id.to_string();
+        let project_id2 = cr.project_id.clone();
+        let issue_id2 = cr.issue_id.clone();
+        let report = session.report_content.clone();
+        tokio::spawn(async move {
+            crate::core::notify::dispatch(&db2, "cr_merged", "已合并到 dev", &cr_id2).await;
 
-    // Innate: capture the merged implementation as a SUCCESS exemplar (positive signal) —
-    // 它已通过代码审核 + 测试并合并，是"这类需求该怎么改"的高质量样本，供需求分析/代码实现角色召回。
-    let issue_title: String = sqlx::query_as::<_, (String,)>("SELECT title FROM issues WHERE id=?")
-        .bind(&cr.issue_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| t.0)
-        .unwrap_or_default();
-    if let Some(report) = session.report_content.as_deref().filter(|r| !r.trim().is_empty()) {
-        let content = format!(
-            "已合并需求「{}」的成功实现方案（通过代码审核 与测试）：\n\n{}",
-            issue_title, report
-        );
-        let trigger = format!("实现该项目同类需求时可参考的成功改动方案；相关需求：{}", issue_title);
-        crate::knowledge::kb_add(&cr.project_id, &content, &trigger).await;
+            // Innate: capture the merged implementation as a SUCCESS exemplar (positive signal) —
+            // 它已通过代码审核 + 测试并合并，是"这类需求该怎么改"的高质量样本，供需求分析/代码实现角色召回。
+            let issue_title: String =
+                sqlx::query_as::<_, (String,)>("SELECT title FROM issues WHERE id=?")
+                    .bind(&issue_id2)
+                    .fetch_optional(&db2)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.0)
+                    .unwrap_or_default();
+            if let Some(report) = report.as_deref().filter(|r| !r.trim().is_empty()) {
+                let content = format!(
+                    "已合并需求「{}」的成功实现方案（通过代码审核 与测试）：\n\n{}",
+                    issue_title, report
+                );
+                let trigger =
+                    format!("实现该项目同类需求时可参考的成功改动方案；相关需求：{}", issue_title);
+                crate::knowledge::kb_add(&project_id2, &content, &trigger).await;
+            }
+
+            // Innate: close the recall feedback loop — the recalled knowledge fed code
+            // that passed review 2 + tests and merged, so reinforce it (positive signal).
+            crate::knowledge::consume_recall_trace(&db2, "change_request", &cr_id2, "ok", Some("up"))
+                .await;
+
+            // Innate: distil this project's accumulated logs into knowledge after a successful merge.
+            crate::knowledge::kb_evolve(&project_id2).await;
+        });
     }
-
-    // Innate: close the recall feedback loop — the recalled knowledge fed code
-    // that passed review 2 + tests and merged, so reinforce it (positive signal).
-    crate::knowledge::consume_recall_trace(db, "change_request", cr_id, "ok", Some("up")).await;
-
-    // Innate: distil this project's accumulated logs into knowledge after a successful merge.
-    crate::knowledge::kb_evolve(&cr.project_id).await;
 
     info!("merge completed for cr {}", cr_id);
     Ok(())
@@ -1191,6 +1332,40 @@ mod tests {
         let res = land_on_dev(&g, &project, &session, "cr1", false, "merge msg").await;
         assert!(res.is_ok(), "no-op land should succeed, got {res:?}");
         assert_eq!(commit_count(&repo, "dev"), before, "must NOT create an empty commit");
+
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// Re-entrancy (startup recovery): a previous land that crashed AFTER `merge --squash`
+    /// (stages changes on dev) but BEFORE `commit` leaves dev's index dirty with no
+    /// MERGE_HEAD. The recovered land must `reset --hard` that residue and re-apply cleanly
+    /// rather than fail on a dirty index ("local changes would be overwritten"). Asserts the
+    /// recovered land succeeds with exactly one squash commit carrying the CR change.
+    #[tokio::test]
+    async fn land_on_dev_recovers_from_staged_squash_residue() {
+        let (repo, wt) = setup("reentrant");
+        std::fs::write(wt.join("g.txt"), "g1\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qam", "cr commit"]);
+
+        // Simulate crash residue: stage the squash on dev but never commit (no MERGE_HEAD).
+        git(&repo, &["checkout", "-q", "dev"]);
+        git(&repo, &["merge", "--squash", "cr"]);
+
+        let before = commit_count(&repo, "dev");
+        let g = GitProxy::new(repo.to_str().unwrap());
+        let project = dummy_project(repo.to_str().unwrap());
+        let session = dummy_session(wt.to_str().unwrap(), "cr");
+
+        let res = land_on_dev(&g, &project, &session, "cr1", false, "recovered merge").await;
+        assert!(res.is_ok(), "recovered land should succeed despite staged residue: {res:?}");
+        assert_eq!(
+            commit_count(&repo, "dev"),
+            before + 1,
+            "exactly one squash commit after recovery (no doubling, no failure)"
+        );
+        git(&repo, &["checkout", "-q", "dev"]);
+        assert_eq!(std::fs::read_to_string(repo.join("g.txt")).unwrap(), "g1\n");
 
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
