@@ -54,6 +54,7 @@ pub async fn list_issues_page(
     exclude_merged: Option<bool>,
     limit: i64,
     offset: i64,
+    sort_asc: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<IssuePage, String> {
     use sqlx::{QueryBuilder, Sqlite};
@@ -112,10 +113,16 @@ pub async fn list_issues_page(
                 .push_bind(l)
                 .push(")");
         }
-        qb.push(" ORDER BY updated_at DESC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
+        // 统一按创建时间排序（updated_at 会随执行/重分析变动，跨页不稳定）。
+        // 默认正序：旧需求置前，避免问题积压长期无人处理。
+        qb.push(if sort_asc.unwrap_or(true) {
+            " ORDER BY created_at ASC LIMIT "
+        } else {
+            " ORDER BY created_at DESC LIMIT "
+        })
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(offset);
         qb.build_query_as::<Issue>()
             .fetch_all(&state.db)
             .await

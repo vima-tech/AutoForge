@@ -7,6 +7,7 @@ pub mod agent;
 pub mod change_request;
 pub mod code_agent;
 pub mod code_agent_run;
+pub mod code_agent_skill;
 pub mod conversation;
 pub mod conversation_archive;
 pub mod cr_grade;

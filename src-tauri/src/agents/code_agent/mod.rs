@@ -3,8 +3,10 @@ use async_trait::async_trait;
 
 pub mod cli;
 pub mod mcp_inject;
+pub mod skill_inject;
 pub use cli::{CliCodeAgent, CliProfile};
 pub use mcp_inject::McpInject;
+pub use skill_inject::SkillInject;
 
 /// 加载「适用于编码 Agent」的 MCP server（for_code_agent=1 且 enabled=1），解密后供 CLI 注入（pull）。
 /// 查询失败 / 无配置 → 空 Vec（编码 agent 不接任何实时 MCP，行为与改造前一致）。
@@ -18,6 +20,97 @@ pub async fn load_code_agent_mcp(db: &crate::db::Db) -> Vec<McpInject> {
     .iter()
     .map(McpInject::from_server)
     .collect()
+}
+
+/// 加载「适用于编码 Agent」的技能（skill），供 CLI 注入（claude 写 SKILL.md / 其余折叠进 prompt）。
+/// 两路来源取并集，按 name 去重，**项目级文件覆盖同名全局库条目**：
+///   ① 全局库 `code_agent_skills`（enabled，且 project_id 为 NULL 或 = 本项目）；
+///   ② 项目级 `<repo>/.autoforge/skills/<name>/SKILL.md`（与 .autoforge/specs 同构，仓内手写）。
+/// 查询失败 / 无配置 → 空 Vec（编码 agent 不接任何技能，行为与改造前一致）。
+pub async fn load_code_agent_skills(
+    db: &crate::db::Db,
+    project: &crate::models::project::Project,
+) -> Vec<SkillInject> {
+    use crate::models::code_agent_skill::CodeAgentSkillRow;
+    use std::collections::BTreeMap;
+
+    let mut by_name: BTreeMap<String, SkillInject> = BTreeMap::new();
+    // ① 全局库（含本项目专属）。
+    let rows = sqlx::query_as::<_, CodeAgentSkillRow>(
+        "SELECT * FROM code_agent_skills
+         WHERE enabled=1 AND (project_id IS NULL OR project_id=?)
+         ORDER BY created_at",
+    )
+    .bind(&project.id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for r in &rows {
+        let s = SkillInject::from_row(r);
+        by_name.insert(s.name.clone(), s);
+    }
+    // ② 项目级文件覆盖（仓内手写优先）。
+    for s in read_project_skills(&project.repo_path) {
+        by_name.insert(s.name.clone(), s);
+    }
+    by_name.into_values().collect()
+}
+
+/// 读 `<repo>/.autoforge/skills/<name>/SKILL.md`：解析 frontmatter（name/description）+ 正文。
+/// 与 build_prompt 里 read_project_specs 同构（同步、best-effort、每文件限长）。无目录 → 空。
+fn read_project_skills(repo_path: &str) -> Vec<SkillInject> {
+    let dir = std::path::Path::new(repo_path)
+        .join(".autoforge")
+        .join("skills");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for entry in rd.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let md = entry.path().join("SKILL.md");
+        let Ok(content) = std::fs::read_to_string(&md) else {
+            continue;
+        };
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        out.push(parse_skill_md(&dir_name, &content));
+    }
+    out
+}
+
+/// 解析 SKILL.md：`---\nname: ..\ndescription: ..\n---\n<body>`。缺 frontmatter 时
+/// name 回退目录名、description 回退首行、body 取全文（容错，绝不 panic）。
+fn parse_skill_md(dir_name: &str, content: &str) -> SkillInject {
+    let mut name = skill_inject::sanitize(dir_name);
+    let mut description = String::new();
+    let trimmed = content.trim_start();
+    let body = if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let front = &rest[..end];
+            for line in front.lines() {
+                if let Some(v) = line.strip_prefix("name:") {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        name = skill_inject::sanitize(v);
+                    }
+                } else if let Some(v) = line.strip_prefix("description:") {
+                    description = v.trim().to_string();
+                }
+            }
+            // 跳过 frontmatter 结束的 `\n---` 及其后换行。
+            rest[end + 4..].trim_start_matches('\n').to_string()
+        } else {
+            content.to_string()
+        }
+    } else {
+        content.to_string()
+    };
+    if description.is_empty() {
+        description = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+    }
+    SkillInject { name, description, body }
 }
 
 /// 单条日志正文（stdout / stderr）落库上限——超出只保留**尾部**这么多字符并打标记。
@@ -124,14 +217,17 @@ pub trait CodeAgent: Send + Sync {
     /// 在 worktree 内执行实现任务，返回 (exit_code, stdout, stderr)。超时（墙钟或空闲）
     /// 会真正杀掉子进程组并以退出码 124 返回（保留已捕获输出），绝不留下孤儿进程。
     /// `mcp` 是「适用于编码 Agent」的 MCP server（pull）：注入 CLI 让 agent 实时调用；
-    /// 空切片 = 不接任何实时 MCP。`log` 为可选实时日志 sink：每收到一段 stdout/stderr
-    /// 即往里 send，供上层推前端做"实时滚动"；None = 不需要实时（行为不变）。
+    /// 空切片 = 不接任何实时 MCP。`skills` 是「编码 Agent 技能」：claude 写 worktree
+    /// `.claude/skills` 走原生渐进披露、其余折叠进 prompt；空切片 = 不注入任何技能（行为不变）。
+    /// `log` 为可选实时日志 sink：每收到一段 stdout/stderr 即往里 send，供上层推前端做"实时
+    /// 滚动"；None = 不需要实时（行为不变）。
     async fn run(
         &self,
         worktree: &str,
         prompt: &str,
         limits: RunLimits,
         mcp: &[McpInject],
+        skills: &[SkillInject],
         log: Option<&LogSink>,
     ) -> Result<(i32, String, String)>;
     /// 该 agent 是否已安装并（在可探测时）登录。
@@ -553,6 +649,24 @@ pub fn extract_report(output: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_skill_md_reads_frontmatter() {
+        let md = "---\nname: race-audit\ndescription: 审查并发竞态\n---\n\n# 正文\n逐项检查锁。";
+        let s = parse_skill_md("dir-name", md);
+        assert_eq!(s.name, "race-audit");
+        assert_eq!(s.description, "审查并发竞态");
+        assert!(s.body.contains("逐项检查锁"));
+        assert!(!s.body.starts_with("---")); // frontmatter 已剥离
+    }
+
+    #[test]
+    fn parse_skill_md_without_frontmatter_falls_back() {
+        let s = parse_skill_md("my dir", "第一行说明\n更多内容");
+        assert_eq!(s.name, "my-dir"); // 回退目录名（已清洗）
+        assert_eq!(s.description, "第一行说明"); // 回退首行
+        assert!(s.body.contains("更多内容"));
+    }
 
     fn proj(code_agent_id: Option<&str>) -> crate::models::project::Project {
         crate::models::project::Project {

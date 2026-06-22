@@ -397,6 +397,8 @@ pub async fn run(
     );
     // pull：把「适用于编码 Agent」的 MCP server 注入 CLI，让 agent 在 worktree 内实时调用。
     let code_mcp = crate::agents::code_agent::load_code_agent_mcp(db).await;
+    // 技能注入：claude 写 worktree `.claude/skills`、codex/opencode 折叠进 prompt（全局库 + 项目文件）。
+    let code_skills = crate::agents::code_agent::load_code_agent_skills(db, &project).await;
     let run_started = std::time::Instant::now();
     // 实时日志：cli 边跑边往 sink 发增量，这里转成 CodeAgentLog 事件推前端（执行日志 tab 实时滚动）。
     let (log_tx, mut log_rx) =
@@ -419,7 +421,7 @@ pub async fn run(
         })
     };
     let (exit_code, stdout, stderr) = code_agent
-        .run(&worktree_path, &prompt, limits, &code_mcp, Some(&log_tx))
+        .run(&worktree_path, &prompt, limits, &code_mcp, &code_skills, Some(&log_tx))
         .await
         .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
     drop(log_tx); // 关闭 sink，让转发任务收尾
@@ -643,6 +645,8 @@ pub async fn run(
     .bind(&grade.change_class)
     .execute(db)
     .await;
+    // 同时落统一产出表（role=grader），与 analysis/test/triage/proposer 同库串流水线。
+    crate::agents::grader::record_to_outputs(db, cr_id, &project.id, &grade).await;
 
     event::emit(
         app,
@@ -680,14 +684,9 @@ pub async fn run(
         .bind(format!("门控降级自动放行 [{} · {}]", grade.tier, grade.change_class))
         .execute(db)
         .await;
-        let _ = crate::tasks::runner::enqueue(
-            db,
-            tx,
-            "merge",
-            &format!("merge:{}", cr_id),
-            crate::models::job::JobPayload::Merge { change_request_id: cr_id.to_string() },
-        )
-        .await;
+        // 入队合并流水线（开关 ON → 并行 premerge；OFF → legacy merge）。统一唯一键，修掉
+        // 旧固定键 `merge:{cr}` 在「撤销→恢复→自动放行」时撞历史 completed 行卡死的隐患。
+        crate::tasks::merge::enqueue_merge_pipeline(db, tx, cr_id, "autogate").await;
         crate::core::notify::dispatch(db, "auto_merged", &issue.title, "低风险改动已自动放行合并").await;
         event::emit(
             app,

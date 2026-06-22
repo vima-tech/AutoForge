@@ -89,6 +89,11 @@ pub enum AppEvent {
     AutosupplyStatus {
         running: bool,
     },
+    /// 自喂料的深度提议器（proposer）连续多轮失败（如模型工具调用格式不兼容、未绑定 LLM）。
+    /// 进通知收件箱提醒操作者介入——否则 proposer 静默空转、工厂「发现不了问题」却无人知晓。
+    AutosupplyDegraded {
+        reason: String,
+    },
     /// 合并前自动把 dev 并入 CR 分支时发生代码冲突：CR 已置 `merge_conflict` 态，
     /// 等待人工三方解决 / 一键重试 / AI 自动解冲突。
     MergeConflict {
@@ -102,6 +107,14 @@ pub enum AppEvent {
         cr_id: String,
         phase: String,
         stream: String,
+        chunk: String,
+    },
+    /// 预览/dev-server 启动日志的实时增量。`key` 与前端日志弹窗的 `sig` 对应
+    /// （`cr:<id>` 或 `branch:<pid>:<branch>`），供前端只累积当前打开的那个日志。
+    /// 由 `commands::cr_preview` 的文件 tail 任务发射（子进程输出直写文件、不流经 Rust，
+    /// 故后端 tail 该文件增量再转成事件）。高频 UI-only：不进通知收件箱、不归并 CR 线程。
+    PreviewLog {
+        key: String,
         chunk: String,
     },
 }

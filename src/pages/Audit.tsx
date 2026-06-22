@@ -12,8 +12,9 @@ import {
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
-  getCrPreview, startCrPreview, stopCrPreview, launchCrApp, getCrPreviewLog,
-  listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview, getBranchPreviewLog,
+  getCrPreview, startCrPreview, stopCrPreview, launchCrApp,
+  listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview,
+  startPreviewLogTail, stopPreviewLogTail,
   getMergeConflict, retryMerge, aiResolveMergeConflict, revertChangeRequest, restoreChangeRequest, getCustomMergeMessageEnabled, getDefaultMergeMessage,
   getConflictDetail, resolveConflictManually, openConflictWorkspace,
   issueSourceMeta, listCodeAgentRuns, getCodeAgentRun,
@@ -56,6 +57,8 @@ const STATUS_LABEL: Record<string, string> = {
   executing: 'AI 执行中',
   pending_code_review: '待代码审核',
   pending_merge: '待合并',
+  merge_testing: '合并测试中',
+  merge_ready: '待落地',
   execution_failed: '执行失败',
   merge_failed: '合并失败',
   merge_conflict: '合并冲突',
@@ -72,6 +75,8 @@ const STATUS_COLOR: Record<string, string> = {
   executing: 'blue',
   pending_code_review: 'ember',
   pending_merge: 'blue',
+  merge_testing: 'blue',
+  merge_ready: 'amber',
   execution_failed: 'red',
   merge_failed: 'red',
   merge_conflict: 'amber',
@@ -82,7 +87,9 @@ const STATUS_COLOR: Record<string, string> = {
   rejected: 'red',
 };
 // Failed states float to the top so abnormal requirements are easy to find and resolve.
-const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_code_review', 'executing', 'pending_execution', 'pending_merge', 'pending_issue_review', 'no_change_needed', 'merged', 'rejected'];
+const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_code_review', 'executing', 'pending_execution', 'pending_merge', 'merge_testing', 'merge_ready', 'pending_issue_review', 'no_change_needed', 'merged', 'rejected'];
+// 需求审核闸口的状态排序：失败需求置顶（需重新分析），待审需求随后。
+const ISSUE_STATUS_ORDER = ['analysis_failed', 'pending_issue_review'];
 
 // Stuck/abnormal CR states that the user can recover (retry) or remove (delete).
 const FAILED_STATUSES = ['execution_failed', 'merge_failed', 'merge_conflict'];
@@ -97,12 +104,13 @@ const SEV_COLOR: Record<string, string> = {
   Bug: 'red', Feature: 'ember', Improvement: 'blue', Debt: 'violet',
 };
 
-function sortedCrs(crs: ChangeRequest[]) {
+function sortedCrs(crs: ChangeRequest[], sortAsc = false) {
   return [...crs].sort((a, b) => {
     const ai = STATUS_ORDER.indexOf(a.status);
     const bi = STATUS_ORDER.indexOf(b.status);
     if (ai !== bi) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-    return b.updated_at.localeCompare(a.updated_at);
+    // 统一用创建时间（与行内显示一致），方向由 sortAsc 控制；状态分组仍优先。
+    return sortAsc ? a.created_at.localeCompare(b.created_at) : b.created_at.localeCompare(a.created_at);
   });
 }
 
@@ -220,38 +228,44 @@ const LOG_PHASE_META: Record<'starting' | 'running' | 'stopped', { dot: string; 
   stopped: { dot: 'red', label: '进程已退出 · 见日志末尾确认是否报错' },
 };
 
-// 实时日志窗口：定时拉取、按行高亮、跟随底部自动滚动（用户上滚则暂停跟随）。
-// `phase` 由父组件的状态轮询喂入，使头部状态灯能区分「启动中 / 运行中 / 已退出」——
-// 否则进程崩溃后日志只是停更，用户无从判断是仍在编译还是已经报错退出。
-function LiveLogModal({ title, load, phase, onClose }: {
-  title: string; load: () => Promise<string>; phase?: () => LogPhase; onClose: () => void;
+// 实时日志窗口：事件驱动累积、按行高亮、跟随底部自动滚动（用户上滚则暂停跟随）。
+// 打开时向后端 `start_preview_log_tail(sig)` 订阅，后端 tail 日志文件并通过 `preview_log`
+// 事件（payload.key === sig）增量推送新增内容，前端只 append——不再每秒全文重取/重解析。
+// `phase` 是父组件按 sig 实时计算的值（骑乘父组件已有的预览状态更新，无需弹窗自行轮询），
+// 使头部状态灯能区分「启动中 / 运行中 / 已退出」——否则进程崩溃后日志只是停更，
+// 用户无从判断是仍在编译还是已经报错退出。
+function LiveLogModal({ title, sig, phase, onClose }: {
+  title: string; sig: string; phase?: LogPhase; onClose: () => void;
 }) {
   const [raw, setRaw] = useState('');
-  const [livePhase, setLivePhase] = useState<LogPhase>('starting');
   const bodyRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
-  const loadRef = useRef(load);
-  loadRef.current = load;
-  const phaseRef = useRef(phase);
-  phaseRef.current = phase;
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
 
-  // 仅挂载时启动轮询（组件按 sig key 重挂载切换目标），避免父组件 re-render 重置定时器
+  // 仅挂载时订阅（组件按 sig key 重挂载切换目标）：订阅 tail 事件 + 启动后端 tail。
   useEffect(() => {
-    let alive = true;
-    const tick = () => {
-      loadRef.current().then(t => { if (alive) setRaw(t); }).catch(() => {});
-      if (alive && phaseRef.current) setLivePhase(phaseRef.current());
-    };
-    tick();
-    const id = window.setInterval(tick, 1000);
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ type?: string; key?: string; chunk?: string }>('AutoForge://event', e => {
+      const ev = e.payload;
+      if (ev?.type !== 'preview_log' || ev.key !== sig || !ev.chunk) return;
+      // 上限保护：累积超 400K 字符则保留尾部 300K，避免超长 build 日志撑爆内存。
+      setRaw(prev => { const n = prev + ev.chunk; return n.length > 400000 ? n.slice(-300000) : n; });
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn; });
+    startPreviewLogTail(sig).catch(() => {});
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeRef.current(); };
     window.addEventListener('keydown', onKey);
-    return () => { alive = false; window.clearInterval(id); window.removeEventListener('keydown', onKey); };
-  }, []);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      stopPreviewLogTail(sig).catch(() => {});
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [sig]);
 
   const lines = useMemo(() => parseLogLines(raw), [raw]);
+  const livePhase = phase ?? 'starting';
   const meta = livePhase ? LOG_PHASE_META[livePhase] : null;
 
   // 跟随底部：内容更新后若仍处于跟随态则滚到底
@@ -416,6 +430,9 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 
   // 列表模糊过滤：按标题或需求编号（短/全 id）筛选当前闸口列表。
   const [search, setSearch] = useState('');
+  // 时间排序方向：true=正序（最早在前，默认——旧需求置前避免积压），false=倒序（最新在前）。
+  // 状态分组仍优先，方向只翻组内时间次序。
+  const [sortAsc, setSortAsc] = useState(true);
   // 来源过滤（融进搜索框，不额外占高度）：空集=不过滤；否则只显示命中所选来源的需求。
   const [sourceFilter, setSourceFilter] = useState<Set<string>>(new Set());
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
@@ -438,10 +455,19 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   }, [pendingIssues]);
   const filteredIssues = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return pendingIssues.filter(i =>
+    const filtered = pendingIssues.filter(i =>
       (sourceFilter.size === 0 || sourceFilter.has(i.source_type)) &&
       (!q || i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q)));
-  }, [pendingIssues, search, sourceFilter]);
+    // 与 CR 侧 sortedCrs 一致：先按状态分组（失败需关注，置顶），同状态内按更新时间倒序，
+    // 避免 pending_issue_review / analysis_failed 仅按 created_at 交错排列显得混乱。
+    return filtered.sort((a, b) => {
+      const ai = ISSUE_STATUS_ORDER.indexOf(a.status);
+      const bi = ISSUE_STATUS_ORDER.indexOf(b.status);
+      if (ai !== bi) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+      // 统一用创建时间（updated_at 会随执行/重分析变动，不稳定）：与行内显示一致。方向由 sortAsc 控制。
+      return sortAsc ? a.created_at.localeCompare(b.created_at) : b.created_at.localeCompare(a.created_at);
+    });
+  }, [pendingIssues, search, sourceFilter, sortAsc]);
   const filteredCrs = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return crs;
@@ -557,8 +583,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 
       {/* 顶部固定搜索框：置于滚动容器外，不随列表滚动。来源过滤融进框内右侧图标，不额外占高度 */}
       {(gate === 'issue' ? pendingIssues.length > 0 : crs.length > 0) && (
-        <div style={{ padding: '8px 12px 4px', flexShrink: 0 }}>
-          <div style={{ position: 'relative' }} ref={sourceMenuRef}>
+        <div style={{ padding: '8px 12px 4px', flexShrink: 0, display: 'flex', gap: 6, alignItems: 'center' }}>
+          <div style={{ position: 'relative', flex: 1, minWidth: 0 }} ref={sourceMenuRef}>
             <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 需求编号…"
               style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', paddingRight: gate === 'issue' ? 34 : 10, color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
             {gate === 'issue' && availableSources.length > 0 && (
@@ -595,6 +621,11 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
               </>
             )}
           </div>
+          <button type="button" className="icon-btn" onClick={() => setSortAsc(v => !v)}
+            title={sortAsc ? '创建时间正序（最早在前）· 点击切换为倒序' : '创建时间倒序（最新在前）· 点击切换为正序'}
+            style={{ flexShrink: 0 }}>
+            <SortGlyph asc={sortAsc} />
+          </button>
         </div>
       )}
 
@@ -617,7 +648,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 
         {/* 需求审核：待需求审核（Issue，尚未生成 CR） */}
         {gate === 'issue' && filteredIssues.length > 0 && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
+          <div className="req-group-head">
             <span>{STATUS_LABEL.pending_issue_review}</span>
             <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{filteredIssues.length}</span>
             {/* 批量审核：全选 / 取消全选可批量通过的待审核需求 */}
@@ -641,7 +672,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                 )}
                 <span className="req-id">{issue.id.slice(0, 8)}</span>
                 <span className="chip amber" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>需求审核</span>
-                <span className="req-time">{fmtShort(issue.updated_at)}</span>
+                <span className="req-time">{fmtShort(issue.created_at)}</span>
               </div>
               <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
             </div>
@@ -650,7 +681,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 
         {/* 代码审核 及其它 CR 状态 */}
         {gate === 'code' && (() => {
-          const sorted = sortedCrs(filteredCrs);
+          const sorted = sortedCrs(filteredCrs, sortAsc);
           const statusCounts = sorted.reduce<Record<string, number>>((acc, r) => {
             acc[r.status] = (acc[r.status] ?? 0) + 1;
             return acc;
@@ -662,7 +693,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             return (
               <React.Fragment key={r.id}>
                 {showLabel && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px 4px', fontSize: 'var(--text-caption)', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', fontWeight: 600 }}>
+                  <div className="req-group-head">
                     <span>{STATUS_LABEL[r.status] ?? r.status}</span>
                     <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{statusCounts[r.status]}</span>
                     {/* 批量代码审核：仅 pending_code_review 分组显示全选，可批量通过进入合并 */}
@@ -683,7 +714,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                     )}
                     <span className="req-id">{r.id.slice(0, 8)}</span>
                     <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
-                    <span className="req-time">{fmtShort(r.updated_at)}</span>
+                    <span className="req-time">{fmtShort(r.created_at)}</span>
                   </div>
                   <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}>{issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}</div>
                 </div>
@@ -900,7 +931,7 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
 const LEDGER_STATUS_LABEL: Record<string, string> = {
   triage: '待整理', pending_analysis: '分析中', analysis_failed: '分析失败',
   pending_issue_review: '需求审核', pending_execution: '待编码', executing: '编码中',
-  pending_code_review: '代码审核', pending_merge: '待合并', merged: '已合并',
+  pending_code_review: '代码审核', pending_merge: '待合并', merge_testing: '合并测试中', merge_ready: '待落地', merged: '已合并',
   reverting: '撤销中', reverted: '已撤销',
   rejected: '已拒绝', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
 };
@@ -908,9 +939,10 @@ const LEDGER_STATUS_CHIP: Record<string, string> = {
   triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_issue_review: 'amber',
   executing: 'blue', pending_code_review: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
   merge_conflict: 'amber', no_change_needed: 'blue', reverting: 'amber', reverted: 'violet',
+  pending_merge: 'blue', merge_testing: 'blue', merge_ready: 'amber',
 };
-// 不可拒绝的状态：运行中 / 待合并 / 已合并 / 已拒绝（与后端 reject_issues 跳过集一致）。
-const REJECT_SKIP = ['executing', 'building', 'running', 'pending_execution', 'pending_merge', 'merged', 'rejected'];
+// 不可拒绝的状态：运行中 / 待合并 / 测试中 / 待落地 / 已合并 / 已拒绝（与后端 reject_issues 跳过集一致）。
+const REJECT_SKIP = ['executing', 'building', 'running', 'pending_execution', 'pending_merge', 'merge_testing', 'merge_ready', 'merged', 'rejected'];
 const canReject = (s: string) => !REJECT_SKIP.includes(s);
 
 function LedgerCheck({ on }: { on: boolean }) {
@@ -918,6 +950,19 @@ function LedgerCheck({ on }: { on: boolean }) {
     <span style={{ width: 16, height: 16, borderRadius: 5, border: '1px solid var(--border-strong)', background: on ? 'var(--ember)' : 'var(--bg-3)', display: 'grid', placeItems: 'center' }}>
       {on && <Icon name="check" size={11} style={{ color: 'var(--bg)' }} />}
     </span>
+  );
+}
+
+// 排序方向图示：上下双向箭头，激活方向（asc=上 / desc=下）以 ember 高亮，另一侧 faint。
+// Icon 组件仅单色（currentColor），无法分侧上色，故用专用内联 SVG。
+function SortGlyph({ asc }: { asc: boolean }) {
+  const hot = 'var(--ember)';
+  const cold = 'var(--text-faint)';
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 2.5 L11.5 6.5 L4.5 6.5 Z" fill={asc ? hot : cold} />
+      <path d="M8 13.5 L11.5 9.5 L4.5 9.5 Z" fill={asc ? cold : hot} />
+    </svg>
   );
 }
 
@@ -937,6 +982,8 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
 }) {
   const [search, setSearch] = useState('');
   const [dq, setDq] = useState('');            // 防抖后的查询串（喂给后端）
+  // 创建时间排序方向：true=正序（最早在前，默认——旧需求置前避免积压），false=倒序。
+  const [sortAsc, setSortAsc] = useState(true);
   const [statusFilter, setStatusFilter] = useState(initialStatus ?? 'all');
   // 预置筛选变化时（如已打开的总账被再次定向到另一环节）同步应用。
   useEffect(() => { if (initialStatus) setStatusFilter(initialStatus); }, [initialStatus]);
@@ -978,22 +1025,22 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   useEffect(() => {
     const token = ++reqRef.current;
     setLoading(true);
-    listIssuesPage(projectId, statusFilter, dq, LEDGER_PAGE, 0, !showMerged)
+    listIssuesPage(projectId, statusFilter, dq, LEDGER_PAGE, 0, !showMerged, sortAsc)
       .then(p => { if (reqRef.current === token) { setItems(p.items); setTotal(p.total); } })
       .catch(() => { if (reqRef.current === token) { setItems([]); setTotal(0); } })
       .finally(() => { if (reqRef.current === token) setLoading(false); });
-  }, [projectId, statusFilter, dq, refreshKey, showMerged]);
+  }, [projectId, statusFilter, dq, refreshKey, showMerged, sortAsc]);
 
   const hasMore = items.length < total;
   const loadMore = useCallback(() => {
     if (loading || items.length >= total) return;
     const token = reqRef.current;  // 与当前重置同批；期间若发生重置则丢弃本次追加
     setLoading(true);
-    listIssuesPage(projectId, statusFilter, dq, LEDGER_PAGE, items.length, !showMerged)
+    listIssuesPage(projectId, statusFilter, dq, LEDGER_PAGE, items.length, !showMerged, sortAsc)
       .then(p => { if (reqRef.current === token) { setItems(prev => [...prev, ...p.items]); setTotal(p.total); } })
       .catch(() => {})
       .finally(() => { if (reqRef.current === token) setLoading(false); });
-  }, [loading, items.length, total, projectId, statusFilter, dq, showMerged]);
+  }, [loading, items.length, total, projectId, statusFilter, dq, showMerged, sortAsc]);
 
   // 触底哨兵进入视口即加载下一页（提前 240px 预取）。
   useEffect(() => {
@@ -1055,6 +1102,12 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
             style={{ flex: 1, minWidth: 0, boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
+          {/* 创建时间正/倒序切换：默认正序（旧需求在前），避免问题积压。 */}
+          <button type="button" className="icon-btn" style={{ flexShrink: 0 }}
+            onClick={() => setSortAsc(v => !v)}
+            title={sortAsc ? '创建时间正序（最早在前）· 点击切换为倒序' : '创建时间倒序（最新在前）· 点击切换为正序'}>
+            <SortGlyph asc={sortAsc} />
+          </button>
           {/* 「显示已合并需求」开关：与功能审计页共享同一状态，默认隐藏。 */}
           <button className={'icon-btn' + (showMerged ? ' on' : '')} style={{ flexShrink: 0 }}
             onClick={onToggleMerged}
@@ -1107,7 +1160,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
               </button>
             )}
             <span className={'chip ' + (LEDGER_STATUS_CHIP[i.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{LEDGER_STATUS_LABEL[i.status] ?? i.status}</span>
-            <span className="req-time">{fmtShort(i.updated_at)}</span>
+            <span className="req-time">{fmtShort(i.created_at)}</span>
           </div>
         ))}
         {/* 触底哨兵：进入视口即拉下一页 */}
@@ -1564,7 +1617,7 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
                 <Icon name="inbox" size={11} style={{ marginRight: 3, opacity: .7 }} />来源 · {s.label}
               </span>
             ); })()}
-            <span>{fmtFull(issue.updated_at)}</span>
+            <span>{fmtFull(issue.created_at)}</span>
           </div>
         </div>
         <div className="audit-decide">
@@ -1726,9 +1779,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [runs, setRuns] = useState<CodeAgentRunMeta[]>([]);
   const [activeRun, setActiveRun] = useState<CodeAgentRunLog | null>(null);
   const [runStream, setRunStream] = useState<'stdout' | 'stderr'>('stdout');
-  // 运行期实时日志增量（仅当前选中 CR）；切 CR 清空，运行结束后刷进 runs 落库列表。
-  const [liveLog, setLiveLog] = useState<{ stream: string; text: string }[]>([]);
+  // 运行期实时日志（仅当前选中 CR）：直接累积成字符串（含换行/打字增量），切 CR 清空，
+  // 运行结束后刷进 runs 落库列表。
+  const [liveLog, setLiveLog] = useState<string>('');
   const liveEndRef = useRef<HTMLDivElement | null>(null);
+  const [liveAutoScroll, setLiveAutoScroll] = useState(true); // 用户上滚查看历史时暂停自动滚底
+  // 日志过滤：隐藏结果行（↳）/ 仅看发言（💬）。对实时与落库视图同时生效。
+  const [hideResults, setHideResults] = useState(false);
+  const [speechOnly, setSpeechOnly] = useState(false);
   // 一键复制日志的瞬时反馈：记当前刚复制的按钮 key（live/stdout/stderr），1.5s 后清。
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [fsReader, setFsReader] = useState(false);   // 全屏阅读模式（与会议室阅读模式风格一致）
@@ -1744,6 +1802,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [advice, setAdvice] = useState('');
   const [commitMsg, setCommitMsg] = useState('');  // 合并提交信息（人审可改，空则后端回退默认模板）
   const [customMsgOn, setCustomMsgOn] = useState(false);  // Settings「自定义合并提交信息」开关，默认关
+  const [dockTab, setDockTab] = useState<'advice' | 'commit'>('advice');  // 底部 dock 右侧分段：管理员建议 / 合并信息（共用输入区，省空间）
   const [decided, setDecided] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -1754,7 +1813,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [crProgress, setCrProgress] = useState<Record<string, { phase: string; note?: string }>>({});
   const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
   const [intakeOpen, setIntakeOpen] = useState(false);
-  const [logModal, setLogModal] = useState<{ title: string; sig: string; load: () => Promise<string>; phase?: () => LogPhase } | null>(null);
+  // 日志内容经事件驱动累积（见 LiveLogModal）；phase 在渲染处按 sig 实时计算，故此处只存 sig。
+  const [logModal, setLogModal] = useState<{ title: string; sig: string } | null>(null);
   const [toast, setToast] = useState<ToastData | null>(null);
   // 统一系统内提示框：替代浏览器原生 alert()
   const showError = useCallback((msg: string) => setToast({ msg, tone: 'error' }), []);
@@ -2063,7 +2123,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   // 总账关闭后清掉预置筛选，下次从常规入口打开时回到「全部」。
   useEffect(() => { if (!showLedger) setLedgerStatus(undefined); }, [showLedger]);
 
-  // 读取「自定义合并提交信息」开关（Settings 门控降级面板）；关闭时审核页不显示输入框。
+  // 读取「自定义合并提交信息」开关（Settings 合并与放行面板）；关闭时审核页不显示输入框。
   useEffect(() => { getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {}); }, []);
 
   useEffect(() => {
@@ -2084,7 +2144,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       .then(msg => { if (loadReqRef.current === reqId && msg) setCommitMsg(msg); })
       .catch(() => {});
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
-    setRuns([]); setActiveRun(null); setLiveLog([]);  // 清掉上一条 CR 的执行日志 + 实时缓冲
+    setRuns([]); setActiveRun(null); setLiveLog(''); setLiveAutoScroll(true);  // 清掉上一条 CR 的执行日志 + 实时缓冲
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
     setConflict(null);  // 清掉上一条 CR 的冲突现场
     autoOpenRef.current = false;  // 切换 CR 时取消上一条未完成的自动打开
@@ -2204,9 +2264,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       const ev = e.payload;
       if (ev?.cr_id !== cr) return;
       if (ev.type === 'code_agent_log' && ev.chunk) {
-        const item = { stream: ev.stream || 'stdout', text: ev.chunk };
-        // 上限保护：超过 4000 段时丢弃最旧的，保留尾部 3000 段。
-        setLiveLog(prev => prev.length > 4000 ? [...prev.slice(-3000), item] : [...prev, item]);
+        const chunk = ev.chunk;
+        // 直接拼字符串（chunk 自带换行/打字增量）；上限保护：超 400K 字符保留尾部 300K。
+        setLiveLog(prev => { const n = prev + chunk; return n.length > 400000 ? n.slice(-300000) : n; });
       } else if (ev.type === 'worktree_update') {
         listCodeAgentRuns(cr).then(setRuns).catch(() => {});
       }
@@ -2214,10 +2274,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     return () => { cancelled = true; unlisten?.(); };
   }, [activeCr]);
 
-  // 实时日志自动滚到底（仅在执行日志 tab 打开时）。
+  // 实时日志自动滚到底（仅在执行日志 tab 打开、且用户未上滚查看历史时）。
   useEffect(() => {
-    if (tab === 'logs' && liveLog.length > 0) liveEndRef.current?.scrollIntoView({ block: 'end' });
-  }, [liveLog, tab]);
+    if (tab === 'logs' && liveLog.length > 0 && liveAutoScroll) liveEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [liveLog, tab, liveAutoScroll]);
 
   const doReview = async (decision: 'approved' | 'revision' | 'rejected') => {
     if (!activeCr || submitting) return;
@@ -2416,7 +2476,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     // 立即开日志窗口 + 标记「启动中」：worktree 首次检出在 start 返回前可能耗时数秒，
     // 这段空窗期先给用户「启动中…」的即时反馈，而非点完毫无动静。
     startingBranchesRef.current.add(branch);
-    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch), phase: () => branchPhase(branch) });
+    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}` });
     try {
       const st = await startBranchPreview(pid, branch);
       setBranchPreviews(prev => [...prev.filter(p => p.branch !== branch), st].sort((a, b) => a.branch.localeCompare(b.branch)));
@@ -2448,7 +2508,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const showBranchLog = useCallback((branch: string) => {
     if (!activeProject) return;
     const pid = activeProject.id;
-    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}`, load: () => getBranchPreviewLog(pid, branch), phase: () => branchPhase(branch) });
+    setLogModal({ title: `启动日志 · ${branch}`, sig: `branch:${pid}:${branch}` });
   }, [activeProject, branchPhase]);
 
   // web 项目：在 worktree 启动 dev server，就绪后自动打开浏览器（starting 时交给轮询补打开）
@@ -2460,7 +2520,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       setCrPreview(st);
       // 与分支启动/桌面应用一致：起 dev server 即打开实时日志，
       // 让用户看到编译/启动进度，并在进程报错退出时由阶段灯翻红提示。
-      setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}`, load: () => getCrPreviewLog(id), phase: crPhase });
+      setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}` });
       if (st.status === 'running' && st.url) openUrl(st.url).catch(() => {});
       else if (st.status === 'starting') autoOpenRef.current = true;
     } catch (e) { showError('启动预览失败：' + String(e)); }
@@ -2482,7 +2542,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     // 立刻置「启动中」防重复点击、弹出实时日志看编译进度、给一条提示说明等待。
     setCrAppLaunching(true);
     showInfo('正在启动桌面应用，首次编译可能需要数十秒，下方日志可跟踪进度…');
-    setLogModal({ title: '启动日志 · 桌面应用', sig: `cr:${id}`, load: () => getCrPreviewLog(id), phase: crPhase });
+    setLogModal({ title: '启动日志 · 桌面应用', sig: `cr:${id}` });
     try {
       await launchCrApp(id);
     } catch (e) {
@@ -2497,7 +2557,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const showCrPreviewLog = useCallback(() => {
     if (!activeCr) return;
     const id = activeCr;
-    setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}`, load: () => getCrPreviewLog(id), phase: crPhase });
+    setLogModal({ title: '预览日志 · 本次改动', sig: `cr:${id}` });
   }, [activeCr, crPhase]);
 
   // 切换需求时退出全屏阅读，避免残留覆盖到新选中项
@@ -2750,6 +2810,47 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`;
   const RUN_PHASE_LABEL: Record<string, string> = { execution: '代码实现', conflict_resolve: 'AI 解冲突' };
 
+  // 按过滤开关裁剪日志行：去掉行首 [mm:ss] 时间戳后按标记判定块类型；无标记的续行沿用
+  // 上一块类型（多行发言/思考不会被拆散）。隐藏结果（↳）/ 仅看发言（💬）。
+  const filterLogLines = (lines: { text: string; tone: string }[]) => {
+    if (!hideResults && !speechOnly) return lines;
+    let kind = '';
+    return lines.filter(l => {
+      const t = l.text.replace(/^\[\d{2}:\d{2}\]\s*/, '').trimStart();
+      const m = t.startsWith('💬') ? 'speech'
+        : t.startsWith('🔧') ? 'tool'
+          : t.startsWith('↳') ? 'result'
+            : t.startsWith('💭') ? 'think'
+              : t.startsWith('●') ? 'sys'
+                : (t.startsWith('✓') || t.startsWith('✗')) ? 'done' : '';
+      if (m) kind = m;  // 有标记则更新当前块类型，续行不变
+      if (speechOnly) return kind === 'speech';
+      if (hideResults) return kind !== 'result';
+      return true;
+    });
+  };
+  // 统一渲染日志正文（解析 + 过滤 + 行号）。空时给占位。
+  const renderLogBody = (raw: string, emptyHint: string) => {
+    const lines = filterLogLines(parseLogLines(raw));
+    if (!raw.trim()) return <div className="log-empty">{emptyHint}</div>;
+    if (lines.length === 0) return <div className="log-empty">（当前过滤下无内容）</div>;
+    return lines.map((l, i) => (
+      <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
+        <span className="log-gut">{i + 1}</span>
+        <span className="log-code">{l.text || ' '}</span>
+      </div>
+    ));
+  };
+  // 过滤开关条（实时与历史详情共用）。
+  const renderLogFilters = () => (
+    <div className="seg" style={{ flexShrink: 0 }}>
+      <button className={hideResults ? 'on' : ''} onClick={() => { setHideResults(v => !v); setSpeechOnly(false); }}
+        title="隐藏工具结果行（↳）">隐藏结果</button>
+      <button className={speechOnly ? 'on' : ''} onClick={() => { setSpeechOnly(v => !v); setHideResults(false); }}
+        title="只看 Agent 发言（💬）">仅发言</button>
+    </div>
+  );
+
   // 执行日志正文：实时输出（运行中）在最上，其下是历史运行列表（落库），点开看完整 stdout/stderr。
   const renderLogsBody = () => (
     <div className="report">
@@ -2758,18 +2859,25 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
             <span className="dot amber" />
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.12em' }}>实时输出 · 运行中</span>
-            <button className="btn btn-sm btn-ghost" style={{ marginLeft: 'auto' }}
-              onClick={() => copyLog(liveLog.map(l => l.text).join('\n'), 'live')} title="复制实时日志全文">
-              <Icon name={copiedKey === 'live' ? 'check' : 'copy'} size={13} />{copiedKey === 'live' ? '已复制' : '复制'}
-            </button>
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+              {renderLogFilters()}
+              {!liveAutoScroll && (
+                <button className="btn btn-sm btn-ghost" onClick={() => setLiveAutoScroll(true)} title="恢复自动滚到底">
+                  <Icon name="chevron" size={13} />跟随
+                </button>
+              )}
+              <button className="btn btn-sm btn-ghost"
+                onClick={() => copyLog(liveLog, 'live')} title="复制实时日志全文">
+                <Icon name={copiedKey === 'live' ? 'check' : 'copy'} size={13} />{copiedKey === 'live' ? '已复制' : '复制'}
+              </button>
+            </div>
           </div>
-          <div className="log-body scroll" style={{ border: '1px solid var(--ember)', borderRadius: 'var(--radius-sm)', maxHeight: '52vh' }}>
-            {parseLogLines(liveLog.map(l => l.text).join('\n')).map((l, i) => (
-              <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
-                <span className="log-gut">{i + 1}</span>
-                <span className="log-code">{l.text || ' '}</span>
-              </div>
-            ))}
+          <div className="log-body scroll" style={{ border: '1px solid var(--ember)', borderRadius: 'var(--radius-sm)', maxHeight: '52vh' }}
+            onScroll={e => {
+              const el = e.currentTarget;
+              setLiveAutoScroll(el.scrollHeight - el.scrollTop - el.clientHeight < 40);
+            }}>
+            {renderLogBody(liveLog, '（等待输出…）')}
             <div ref={liveEndRef} />
           </div>
         </div>
@@ -2811,33 +2919,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               <button className={runStream === 'stdout' ? 'on' : ''} onClick={() => setRunStream('stdout')}>stdout · {fmtBytes(activeRun.stdout_bytes)}</button>
               <button className={runStream === 'stderr' ? 'on' : ''} onClick={() => setRunStream('stderr')}>stderr · {fmtBytes(activeRun.stderr_bytes)}</button>
             </div>
-            <button className="btn btn-sm btn-ghost" style={{ marginLeft: 'auto' }}
-              onClick={() => copyLog(runStream === 'stdout' ? activeRun.stdout : activeRun.stderr, runStream)}
-              title={`复制当前 ${runStream} 全文`}>
-              <Icon name={copiedKey === runStream ? 'check' : 'copy'} size={13} />{copiedKey === runStream ? '已复制' : `复制 ${runStream}`}
-            </button>
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+              {runStream === 'stdout' && renderLogFilters()}
+              <button className="btn btn-sm btn-ghost"
+                onClick={() => copyLog(runStream === 'stdout' ? activeRun.stdout : activeRun.stderr, runStream)}
+                title={`复制当前 ${runStream} 全文`}>
+                <Icon name={copiedKey === runStream ? 'check' : 'copy'} size={13} />{copiedKey === runStream ? '已复制' : `复制 ${runStream}`}
+              </button>
+            </div>
           </div>
           {activeRun.truncated > 0 && (
             <div style={{ fontSize: 'var(--text-label)', color: 'var(--amber)', marginBottom: 8 }}>
               <Icon name="alert" size={13} style={{ verticalAlign: -2, marginRight: 4 }} />日志过长，仅保留尾部约 512K 字符（开头已省略）。
             </div>
           )}
-          {(() => {
-            const raw = runStream === 'stdout' ? activeRun.stdout : activeRun.stderr;
-            const lines = parseLogLines(raw);
-            return (
-              <div className="log-body scroll" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                {!raw.trim()
-                  ? <div className="log-empty">（该流无输出）</div>
-                  : lines.map((l, i) => (
-                    <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
-                      <span className="log-gut">{i + 1}</span>
-                      <span className="log-code">{l.text || ' '}</span>
-                    </div>
-                  ))}
-              </div>
-            );
-          })()}
+          <div className="log-body scroll" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+            {renderLogBody(runStream === 'stdout' ? activeRun.stdout : activeRun.stderr, '（该流无输出）')}
+          </div>
         </>)}
       </>)}
     </div>
@@ -2931,7 +3029,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                   </div>
                   <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                     <span>{STATUS_LABEL[cr.status] ?? cr.status} · {fmtFull(cr.updated_at)}</span>
-                    {(cr.status === 'executing' || cr.status === 'pending_merge') && crProgress[cr.id]?.note && (
+                    {(cr.status === 'executing' || cr.status === 'pending_merge' || cr.status === 'merge_testing' || cr.status === 'merge_ready') && crProgress[cr.id]?.note && (
                       <span style={{ color: 'var(--ember)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <span className="dot amber" /> {crProgress[cr.id].note}
                       </span>
@@ -3027,36 +3125,49 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                         <div className="dock-preview-actions">{renderCrLaunch()}</div>
                       </div>
                     )}
-                    {customMsgOn && cr.status === 'pending_code_review' && !decided && (
-                      <div className="dock-advice">
-                        <span className="dock-label">合并提交信息</span>
-                        <div className="dock-advice-row">
-                          <input
-                            value={commitMsg}
-                            onChange={e => setCommitMsg(e.target.value)}
-                            placeholder="留空则使用默认 AutoForge merge: <编号>"
-                            title="批准合并时作为 merge --no-ff 的提交信息"
-                          />
+                    {(() => {
+                      // 合并提交信息为可选项，仅在 Settings 开启自定义且 CR 待代码审核未决时可填。
+                      // 它与管理员建议共用一块输入区，用 seg 分段切换，避免三列横向争抢把两者都压窄。
+                      const showCommitTab = customMsgOn && cr.status === 'pending_code_review' && !decided;
+                      const t = showCommitTab ? dockTab : 'advice';
+                      return (
+                        <div className="dock-advice">
+                          {showCommitTab ? (
+                            <div className="seg dock-seg">
+                              <button className={t === 'advice' ? 'on' : ''} onClick={() => setDockTab('advice')}>管理员建议</button>
+                              <button className={t === 'commit' ? 'on' : ''} onClick={() => setDockTab('commit')}>合并信息</button>
+                            </div>
+                          ) : (
+                            <span className="dock-label">管理员建议 → 代码 Agent</span>
+                          )}
+                          <div className="dock-advice-row">
+                            {t === 'commit' ? (
+                              <input
+                                value={commitMsg}
+                                onChange={e => setCommitMsg(e.target.value)}
+                                placeholder="留空则使用默认 AutoForge merge: <编号>"
+                                title="批准合并时作为 merge --no-ff 的提交信息"
+                              />
+                            ) : (
+                              <>
+                                <textarea
+                                  ref={adviceRef}
+                                  value={advice}
+                                  onChange={e => setAdvice(e.target.value)}
+                                  onKeyDown={onAdviceKeyDown}
+                                  placeholder={canRevise ? '输入修改意见，Enter 发送，Shift+Enter 换行…' : '输入备注（只读状态不会提交）…'}
+                                />
+                                <button className="btn btn-sm" onClick={() => doReview('revision')}
+                                  disabled={!canRevise || submitting}
+                                  title={canRevise ? '提交修改意见，退回重新执行' : '仅「待代码审核」状态可提交修改'}>
+                                  <Icon name="refresh" size={14} />修改
+                                </button>
+                              </>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    )}
-                    <div className="dock-advice">
-                      <span className="dock-label">管理员建议 → 代码 Agent</span>
-                      <div className="dock-advice-row">
-                        <textarea
-                          ref={adviceRef}
-                          value={advice}
-                          onChange={e => setAdvice(e.target.value)}
-                          onKeyDown={onAdviceKeyDown}
-                          placeholder={canRevise ? '输入修改意见，Enter 发送，Shift+Enter 换行…' : '输入备注（只读状态不会提交）…'}
-                        />
-                        <button className="btn btn-sm" onClick={() => doReview('revision')}
-                          disabled={!canRevise || submitting}
-                          title={canRevise ? '提交修改意见，退回重新执行' : '仅「待代码审核」状态可提交修改'}>
-                          <Icon name="refresh" size={14} />修改
-                        </button>
-                      </div>
-                    </div>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>
@@ -3165,7 +3276,17 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       )}
 
       {logModal && (
-        <LiveLogModal key={logModal.sig} title={logModal.title} load={logModal.load} phase={logModal.phase} onClose={() => setLogModal(null)} />
+        <LiveLogModal
+          key={logModal.sig}
+          title={logModal.title}
+          sig={logModal.sig}
+          // phase 在此实时计算：骑乘父组件已有的预览状态更新（crPreview / branchPreviews
+          // 轮询），弹窗无需自行轮询即可让状态灯随进程「启动中→运行中→已退出」流转。
+          phase={logModal.sig.startsWith('cr:')
+            ? crPhase()
+            : branchPhase(logModal.sig.replace(/^branch:[^:]*:/, ''))}
+          onClose={() => setLogModal(null)}
+        />
       )}
 
       {confirmDelete && (

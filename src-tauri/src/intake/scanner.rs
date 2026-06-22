@@ -138,6 +138,131 @@ pub async fn scan_todos(project_id: &str, repo_path: &str) -> Vec<IntakePayload>
         .collect()
 }
 
+/// 一条「半成品/未实现」命中。
+struct Unfinished {
+    file: String,
+    line: usize,
+    text: String,
+    severity: &'static str,
+    category: &'static str,
+    note: &'static str,
+}
+
+/// 半成品/未实现桩扫描：揪出运行时会崩或明显未完成的功能点——`todo!()`/`unimplemented!()`、
+/// `NotImplementedError`、`panic("not implemented")`、以及注释里的「待/未实现」。这是 linter 与
+/// 依赖审计都覆盖不到、却最能反映「功能只做了一半」的强信号（直击「很多功能半进度」的痛点）。
+/// 纯 Rust 行扫描，跨平台一致；只收极低误报的强信号模式。
+fn grep_unfinished(repo_path: &str) -> Vec<Unfinished> {
+    use regex::Regex;
+    const EXTS: &[&str] = &["rs", "ts", "tsx", "js", "py", "go"];
+    const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "__pycache__", "dist", "build"];
+
+    // 运行时会 panic 的 Rust 未实现桩：近零误报。
+    let rust_stub = Regex::new(r"\b(todo!|unimplemented!)\s*\(").ok();
+    // 显式「未实现」错误（跨语言）：NotImplementedError / not implemented / not yet implemented。
+    let not_impl = Regex::new(r"(?i)not[\s_]*(yet[\s_]*)?implement").ok();
+    // 注释里的中文「待/未/尚未/暂未 实现」——仅当该行确为注释时计，避免误伤关键词数组等字符串。
+    let zh_marker = Regex::new(r"(待|未|尚未|暂未|暂不)\s*实现").ok();
+
+    fn is_comment_line(line: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*')
+    }
+
+    let mut hits: Vec<Unfinished> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![Path::new(repo_path).to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if hits.len() >= 80 {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !EXTS.contains(&ext) {
+                continue;
+            }
+            // 跳过本扫描器自身——它的模式定义行会自我命中，纯噪音。
+            let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if base == "scanner.rs" {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let rel = path.to_string_lossy().to_string();
+            for (i, line) in content.lines().enumerate() {
+                if hits.len() >= 80 {
+                    break;
+                }
+                if line.len() > 400 {
+                    continue; // 超长行多为生成物/压缩代码，跳过。
+                }
+                let (severity, category, note) = if rust_stub.as_ref().is_some_and(|r| r.is_match(line)) {
+                    ("high", "Bug", "运行时会 panic 的未实现桩（todo!/unimplemented!）")
+                } else if not_impl.as_ref().is_some_and(|r| r.is_match(line)) {
+                    ("high", "Bug", "显式标记为未实现（not implemented）")
+                } else if is_comment_line(line) && zh_marker.as_ref().is_some_and(|r| r.is_match(line)) {
+                    ("medium", "Debt", "注释标记功能待实现")
+                } else {
+                    continue;
+                };
+                hits.push(Unfinished {
+                    file: rel.clone(),
+                    line: i + 1,
+                    text: line.trim().chars().take(160).collect(),
+                    severity,
+                    category,
+                    note,
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// 扫描半成品/未实现功能点，产出 `source_type=unfinished_scan` 的待整理项。
+pub async fn scan_unfinished(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
+    let repo = repo_path.to_string();
+    let hits = match tokio::task::spawn_blocking(move || grep_unfinished(&repo)).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[scanner] unfinished scan failed: {}", e);
+            return vec![];
+        }
+    };
+    let pid = project_id.to_string();
+    hits.into_iter()
+        .map(|h| {
+            let title: String = format!("[半成品] {}", h.note);
+            IntakePayload {
+                project_id: pid.clone(),
+                title,
+                description: Some(format!(
+                    "{}\n\n位置：{}:{}\n代码：{}",
+                    h.note, h.file, h.line, h.text
+                )),
+                category: Some(h.category.to_string()),
+                severity: Some(h.severity.to_string()),
+                source_type: "unfinished_scan".to_string(),
+                source_ref: Some(format!("unfinished:{}:{}", h.file, h.line)),
+            }
+        })
+        .collect()
+}
+
 /// 运行 cargo audit，解析安全漏洞
 pub async fn scan_cargo_audit(project_id: &str, repo_path: &str) -> Vec<IntakePayload> {
     if !Path::new(repo_path).join("Cargo.lock").exists() {
@@ -808,6 +933,36 @@ mod tests {
         assert!(!hits.iter().any(|h| h.contains("ignored")));
         assert!(!hits.iter().any(|h| h.contains("not source")));
         assert!(!hits.iter().any(|h| h.contains("plain")));
+    }
+
+    #[test]
+    fn scans_unfinished_stubs_high_signal_only() {
+        let dir = std::env::temp_dir().join(format!("af-unfin-{}", std::process::id()));
+        let sub = dir.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // 运行时桩（high/Bug）+ 显式 not implemented（high）+ 注释中文待实现（medium）。
+        std::fs::write(
+            sub.join("a.rs"),
+            "fn f() { todo!(\"wire this\") }\nfn g() -> i32 { 1 + 1 }\n// 这里待实现：导出功能\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join("b.py"),
+            "def h():\n    raise NotImplementedError\n",
+        )
+        .unwrap();
+        // 字符串里出现“未实现”但不是注释行 → 不应命中（避免误伤关键词数组）。
+        std::fs::write(sub.join("c.ts"), "const label = \"未实现的占位\";\n").unwrap();
+
+        let hits = grep_unfinished(dir.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(hits.iter().any(|h| h.text.contains("todo!") && h.severity == "high"));
+        assert!(hits.iter().any(|h| h.text.contains("NotImplementedError") && h.severity == "high"));
+        assert!(hits.iter().any(|h| h.note.contains("注释标记") && h.severity == "medium"));
+        // 正常函数体与字符串字面量不应命中。
+        assert!(!hits.iter().any(|h| h.text.contains("1 + 1")));
+        assert!(!hits.iter().any(|h| h.text.contains("const label")));
     }
 
     #[test]

@@ -1,13 +1,72 @@
+use crate::agents::schema::{self, StructuredSchema};
 use crate::core::git::GitProxy;
 use crate::db::Db;
 use crate::models::project::Project;
+use serde::{Deserialize, Serialize};
 
 /// §7 risk grade for a change request's diff.
+/// 兼作 [`StructuredSchema`]（role=grader）落统一表 `agent_outputs`，与 analysis/test/triage/
+/// proposer 同库可串成流水线、支撑字段级体检与版本对比。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grade {
+    /// T0 | T1 | T2 | T3（就高不就低）。
+    #[serde(default = "default_tier")]
     pub tier: String,
+    #[serde(default)]
     pub score: i64,
+    #[serde(default)]
     pub rationale: String,
+    /// 改动类别（按受影响目录/文件归类），门控降级按 class 累积信任。
+    #[serde(default)]
     pub change_class: String,
+}
+
+fn default_tier() -> String {
+    "T3".to_string()
+}
+
+impl Default for Grade {
+    fn default() -> Self {
+        Self {
+            tier: default_tier(),
+            score: 0,
+            rationale: String::new(),
+            change_class: String::new(),
+        }
+    }
+}
+
+const GRADER_SCHEMA_TEMPLATE: &str = r#"{
+  "tier": "<T0|T1|T2|T3，就高不就低>",
+  "score": <0-100 风险分>,
+  "rationale": "<判级理由：影响面/可逆性/对数据与安全的触及>",
+  "change_class": "<改动类别，如 src/migrations/frontend>"
+}"#;
+
+impl StructuredSchema for Grade {
+    const ROLE: &'static str = "grader";
+    const VERSION: &'static str = "1.0";
+    fn schema_template() -> &'static str {
+        GRADER_SCHEMA_TEMPLATE
+    }
+}
+
+/// 把一次风险评级的结构化产出落 `agent_outputs`（role=grader, target=cr）。best-effort。
+pub async fn record_to_outputs(db: &Db, cr_id: &str, project_id: &str, grade: &Grade) {
+    let output_json = serde_json::to_string(grade).unwrap_or_else(|_| "{}".to_string());
+    schema::record(
+        db,
+        Grade::ROLE,
+        Grade::VERSION,
+        "cr",
+        cr_id,
+        Some(project_id),
+        None,
+        "ok",
+        &output_json,
+        &grade.rationale,
+    )
+    .await;
 }
 
 pub async fn grade(
@@ -222,4 +281,30 @@ async fn llm_tier(db: &Db, project_id: &str, diff: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // §3.5 防漂移：规范样例必须能解析进 Grade 且关键字段非默认——
+    // 改 struct/字段名而忘改 schema 模板（或反之）时此测试会失败。
+    #[test]
+    fn grade_parses_canonical_example() {
+        let ex = r#"{"tier":"T2","score":55,"rationale":"跨多文件功能改动","change_class":"src"}"#;
+        let (g, st) = schema::parse_or_default::<Grade>(ex);
+        assert_eq!(st, "ok");
+        assert_eq!(g.tier, "T2");
+        assert_eq!(g.score, 55);
+        assert_eq!(g.change_class, "src");
+        assert_eq!(<Grade as StructuredSchema>::ROLE, "grader");
+    }
+
+    #[test]
+    fn grade_default_is_conservative_t3() {
+        // 解析失败回退默认：保守按 T3（最高风险，绝不误降级）。
+        let (g, st) = schema::parse_or_default::<Grade>("garbage");
+        assert_eq!(st, "error");
+        assert_eq!(g.tier, "T3");
+    }
 }

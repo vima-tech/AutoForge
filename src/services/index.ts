@@ -332,6 +332,22 @@ export const setProjectCodeAgent = (projectId: string, codeAgentId: string | nul
   ipc<void>('set_project_code_agent', { projectId, codeAgentId });
 export const checkCodeAgentAuth = (id: string) => ipc<boolean>('check_code_agent_auth', { id });
 
+// 编码 Agent 技能（Skill）：注入到 worktree 供编码 agent 消费的可复用指令包。
+// claude 写 .claude/skills 走原生渐进披露；codex/opencode 折叠进 prompt。
+export interface CodeAgentSkill {
+  id: string; name: string; description: string; body: string;
+  project_id: string | null; enabled: boolean; created_at: string; updated_at: string;
+}
+export interface UpsertCodeAgentSkillPayload {
+  id?: string | null; name: string; description: string; body: string;
+  project_id?: string | null; enabled?: boolean;
+}
+export const listCodeAgentSkills = () => ipc<CodeAgentSkill[]>('list_code_agent_skills');
+export const upsertCodeAgentSkill = (payload: UpsertCodeAgentSkillPayload) =>
+  ipc<CodeAgentSkill>('upsert_code_agent_skill', { payload });
+export const deleteCodeAgentSkill = (id: string) =>
+  ipc<void>('delete_code_agent_skill', { id });
+
 // 错误历史：后端后台任务失败记录（runner 持久化的 last_error），供设置页排错。
 export interface JobFailure {
   id: string;
@@ -438,12 +454,14 @@ export const listIssuesPage = (
   limit: number,
   offset: number,
   excludeMerged?: boolean,   // 与功能审计页「显示已合并需求」开关共享：true 时隐藏已合并需求
+  sortAsc?: boolean,         // 按创建时间排序方向：true=正序（最早在前，默认），false=倒序
 ) => ipc<IssuePage>('list_issues_page', {
   projectId: projectId || null,
   status: status && status !== 'all' ? status : null,
   search: search?.trim() || null,
   excludeMerged: excludeMerged ?? false,
   limit, offset,
+  sortAsc: sortAsc ?? true,
 });
 // 某项目出现过的全部需求状态（去重），用于总账筛选 chip。
 export const listIssueStatuses = (projectId: string) =>
@@ -1130,6 +1148,14 @@ export const stopBranchPreview = (projectId: string, branch: string) =>
 export const getBranchPreviewLog = (projectId: string, branch: string) =>
   ipc<string>('get_branch_preview_log', { projectId, branch });
 
+// 预览日志实时 tail（事件驱动）：打开日志弹窗时 start、关闭时 stop。
+// `sig` 即弹窗标识（`cr:<id>` 或 `branch:<pid>:<branch>`），后端据此解析日志文件并
+// 通过 `preview_log` 事件（payload.key === sig）增量推送新增内容。
+export const startPreviewLogTail = (sig: string) =>
+  ipc<void>('start_preview_log_tail', { sig });
+export const stopPreviewLogTail = (sig: string) =>
+  ipc<void>('stop_preview_log_tail', { sig });
+
 // ── Specs ─────────────────────────────────────────────────────────────────────
 
 export type SpecCategory = 'tech_stack' | 'architecture' | 'coding' | 'api' | 'testing' | 'reference';
@@ -1244,6 +1270,11 @@ export const getCustomMergeMessageEnabled = () =>
   ipc<boolean>('get_custom_merge_message_enabled');
 export const setCustomMergeMessageEnabled = (enabled: boolean) =>
   ipc<void>('set_custom_merge_message_enabled', { enabled });
+// 合并并行化开关：开启后合并拆为并行 premerge（测试出锁）+ 串行 land
+export const getParallelPremergeEnabled = () =>
+  ipc<boolean>('get_parallel_premerge_enabled');
+export const setParallelPremergeEnabled = (enabled: boolean) =>
+  ipc<void>('set_parallel_premerge_enabled', { enabled });
 // 默认合并提交信息（与后端回退模板一致），审核页据此预填
 export const getDefaultMergeMessage = (crId: string) =>
   ipc<string>('get_default_merge_message', { crId });

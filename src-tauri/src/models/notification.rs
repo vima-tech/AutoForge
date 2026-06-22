@@ -163,6 +163,15 @@ impl NotificationDraft {
                 thread_key: Some(cr_id.clone()),
             }),
             // 心跳 / 高频 / 已有独立角标覆盖 —— 不入收件箱。
+            AppEvent::AutosupplyDegraded { reason } => Some(NotificationDraft {
+                category: "intervene",
+                kind: "autosupply_degraded",
+                title: "自喂料深度提议器异常".into(),
+                body: format!("proposer 连续多轮无产出，需介入：{reason}"),
+                link_page: Some("settings"),
+                link_ref: None,
+                thread_key: Some("autosupply_degraded".into()),
+            }),
             AppEvent::WorktreeUpdate { .. }
             | AppEvent::TaskProgress { .. }
             | AppEvent::PreviewUpdate { .. }
@@ -171,7 +180,8 @@ impl NotificationDraft {
             | AppEvent::ConversationTaskUpdated { .. }
             | AppEvent::AsrResult { .. }
             | AppEvent::AutosupplyStatus { .. }
-            | AppEvent::CodeAgentLog { .. } => None,
+            | AppEvent::CodeAgentLog { .. }
+            | AppEvent::PreviewLog { .. } => None,
         }
     }
 }

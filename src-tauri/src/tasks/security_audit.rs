@@ -120,6 +120,31 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     .execute(db)
     .await?;
 
+    // 结构化产出落统一表（role=security），best-effort：失败只记日志不阻断。
+    {
+        use crate::agents::schema::{self, StructuredSchema};
+        let report = SecurityReport {
+            verdict: status.to_string(),
+            severity: if findings.is_empty() { "none".to_string() } else { severity.clone() },
+            summary: summary.clone(),
+            findings: findings.clone(),
+        };
+        let output_json = serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string());
+        schema::record(
+            db,
+            SecurityReport::ROLE,
+            SecurityReport::VERSION,
+            "cr",
+            cr_id,
+            Some(&project.id),
+            None,
+            "ok",
+            &output_json,
+            "",
+        )
+        .await;
+    }
+
     if matches!(severity.as_str(), "high" | "critical") {
         crate::core::notify::dispatch(db, "security_high", "安全审查发现高危问题", &summary).await;
     }
@@ -137,10 +162,46 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     Ok(())
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Finding {
+    #[serde(default)]
     severity: String,
+    #[serde(default)]
     title: String,
+    #[serde(default)]
     detail: String,
+}
+
+/// 一次合并后安全审查的结构化报告（schema security v1.0）。落统一表 `agent_outputs`
+/// （role=security, target=cr），与 analysis/test/triage/proposer/grader 同库串流水线。
+/// 事实字段（verdict/severity）由启发式 + LLM 合并的 findings 推出（机器权威）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SecurityReport {
+    /// passed | flagged | failed（按最高严重度映射）。
+    #[serde(default)]
+    verdict: String,
+    /// none | low | medium | high | critical。
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    findings: Vec<Finding>,
+}
+
+const SECURITY_SCHEMA_TEMPLATE: &str = r#"{
+  "verdict": "<passed|flagged|failed>",
+  "severity": "<none|low|medium|high|critical>",
+  "summary": "<一句话结论>",
+  "findings": [{"severity": "<low|medium|high|critical>", "title": "<问题简述>", "detail": "<成因/位置/修复>"}]
+}"#;
+
+impl crate::agents::schema::StructuredSchema for SecurityReport {
+    const ROLE: &'static str = "security";
+    const VERSION: &'static str = "1.0";
+    fn schema_template() -> &'static str {
+        SECURITY_SCHEMA_TEMPLATE
+    }
 }
 
 /// Pre-merge deterministic security gate (design §4.3 — shift-left).

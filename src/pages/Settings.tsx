@@ -26,6 +26,7 @@ import {
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   getAutoConflictResolveEnabled, setAutoConflictResolveEnabled,
   getCustomMergeMessageEnabled, setCustomMergeMessageEnabled,
+  getParallelPremergeEnabled, setParallelPremergeEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
@@ -47,6 +48,8 @@ import {
   type JobFailure,
   listCodeAgents, upsertCodeAgent, deleteCodeAgent, setDefaultCodeAgent,
   setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT,
+  listCodeAgentSkills, upsertCodeAgentSkill, deleteCodeAgentSkill,
+  type CodeAgentSkill as CodeAgentSkillT,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1559,6 +1562,153 @@ function CodeAgentSettings() {
   );
 }
 
+interface SkillDraft { name: string; description: string; body: string; project_id: string | null; enabled: boolean; }
+
+function CodeAgentSkillSettings() {
+  const [skills, setSkills] = useState<CodeAgentSkillT[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, SkillDraft>>({});
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState('');
+  const [confirmDel, setConfirmDel] = useState<CodeAgentSkillT | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpand = (id: string) => setExpanded(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const toDraft = (s: CodeAgentSkillT): SkillDraft =>
+    ({ name: s.name, description: s.description, body: s.body, project_id: s.project_id, enabled: s.enabled });
+
+  const load = () => {
+    setLoading(true);
+    Promise.all([listCodeAgentSkills(), listProjects().catch(() => [] as Project[])])
+      .then(([list, ps]) => {
+        setSkills(list);
+        setProjects(ps);
+        setDrafts(Object.fromEntries(list.map(s => [s.id, toDraft(s)])));
+      })
+      .catch(() => setSkills([]))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { load(); }, []);
+
+  const setDraft = (id: string, patch: Partial<SkillDraft>) =>
+    setDrafts(d => ({ ...d, [id]: { ...d[id], ...patch } }));
+
+  const scopeOptions = [
+    { value: '', label: '全局（所有项目）' },
+    ...projects.map(p => ({ value: p.id, label: p.name })),
+  ];
+
+  const save = async (s: CodeAgentSkillT) => {
+    const d = drafts[s.id];
+    if (!d) return;
+    if (!d.name.trim()) { setMsg('技能名不能为空'); return; }
+    setMsg('');
+    try {
+      await upsertCodeAgentSkill({
+        id: s.id, name: d.name.trim(), description: d.description.trim(),
+        body: d.body, project_id: d.project_id || null, enabled: d.enabled,
+      });
+      setMsg(`已保存「${d.name.trim()}」`);
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  const doDelete = async (s: CodeAgentSkillT) => {
+    setConfirmDel(null);
+    try { await deleteCodeAgentSkill(s.id); load(); } catch (e) { setMsg(String(e)); }
+  };
+
+  const addSkill = async () => {
+    setMsg('');
+    try {
+      const created = await upsertCodeAgentSkill({
+        name: 'new-skill', description: '一句话描述：编码 agent 何时该用它', body: '# 技能说明\n在此写明步骤与约束。', enabled: true,
+      });
+      setExpanded(prev => new Set(prev).add(created.id));
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">编码技能（Skill）</div>
+      <div className="set-desc">
+        把可复用的「做法/手册」注入到编码 agent 的 worktree，让它在实现需求与解冲突时遵循。
+        <b>claude</b> 一等公民——写入 <code>.claude/skills/&lt;name&gt;/SKILL.md</code> 走原生渐进披露
+        （名称+描述常驻、正文按需加载）；<b>codex / opencode</b> 无原生 skill 机制，降级为把技能折叠进 prompt。
+        注入文件在执行结束即清理、并经 git exclude 兜底，<b>绝不会被提交</b>到代码分支。项目还可在仓内
+        手写 <code>.autoforge/skills/&lt;name&gt;/SKILL.md</code>，与这里的全局库取并集（同名时仓内文件优先）。
+      </div>
+
+      {loading ? (
+        <div className="empty"><Icon name="layers" /><div>加载中…</div></div>
+      ) : skills.length === 0 ? (
+        <div className="empty"><Icon name="layers" /><div>还没有技能。新增一个，注入编码 agent 的工作区。</div></div>
+      ) : skills.map(s => {
+        const d = drafts[s.id]; if (!d) return null;
+        const isOpen = expanded.has(s.id);
+        const scopeName = s.project_id ? (projects.find(p => p.id === s.project_id)?.name ?? '指定项目') : '全局';
+        return (
+          <div className="panel" key={s.id} style={{ marginBottom: 12 }}>
+            <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', userSelect: 'none' }}
+              onClick={() => toggleExpand(s.id)}>
+              <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }} />
+              <span className="chip" style={{ fontFamily: 'var(--font-mono)' }}>{s.name}</span>
+              <span style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>{d.description || '（无描述）'}</span>
+              <span className="chip blue" style={{ marginLeft: 'auto' }}>{scopeName}</span>
+              {!d.enabled && <span className="chip" style={{ color: 'var(--text-faint)' }}>已停用</span>}
+            </div>
+            {isOpen && (
+              <div className="cfg-fields" style={{ padding: '12px 14px' }}>
+                <div className="field"><label>技能名</label>
+                  <input value={d.name} onChange={e => setDraft(s.id, { name: e.target.value })} placeholder="race-audit" />
+                  <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>清洗为 [A-Za-z0-9_-]，作目录名 / SKILL.md 的 name。</span>
+                </div>
+                <div className="field"><label>适用范围</label>
+                  <Select value={d.project_id ?? ''} onChange={val => setDraft(s.id, { project_id: val || null })} options={scopeOptions} />
+                </div>
+                <div className="field full"><label>描述（决定 claude 何时按需加载正文，务必精炼准确）</label>
+                  <input value={d.description} onChange={e => setDraft(s.id, { description: e.target.value })} placeholder="审查并发竞态：共享状态、await 持锁、TOCTOU、幂等键" />
+                </div>
+                <div className="field full"><label>正文（SKILL.md，Markdown：写明步骤、清单与约束）</label>
+                  <textarea value={d.body} onChange={e => setDraft(s.id, { body: e.target.value })} rows={10}
+                    style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', resize: 'vertical' }}
+                    placeholder={'# 竞态审查手册\n逐项检查：\n- 共享状态是否有锁\n- 是否在 await 期间持锁\n- 幂等键是否缺失'} />
+                </div>
+                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Switch on={d.enabled} onToggle={() => setDraft(s.id, { enabled: !d.enabled })} />
+                    <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)' }}>启用</span>
+                  </div>
+                  <button className="btn btn-primary btn-sm" onClick={() => save(s)}><Icon name="check" size={13} />保存</button>
+                  <button className="btn btn-sm btn-danger" style={{ marginLeft: 'auto' }} onClick={() => setConfirmDel(s)}><Icon name="trash" size={13} />删除</button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+        <button className="btn" onClick={addSkill}><Icon name="plus" size={14} />新增技能</button>
+        {msg && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{msg}</span>}
+      </div>
+
+      {confirmDel && (
+        <ConfirmModal
+          msg={`确认删除技能「${confirmDel.name}」？`}
+          onOk={() => doDelete(confirmDel)}
+          onCancel={() => setConfirmDel(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 function ConcurrencySettings() {
   const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, build_slots: 2, cpu_budget_pct: 0 });
   const [result, setResult] = useState('');
@@ -2295,6 +2445,10 @@ function GatingSettings() {
   const [autoPassOn, setAutoPassOn] = useState(false);
   const [autoConflictOn, setAutoConflictOn] = useState(false);
   const [customMsgOn, setCustomMsgOn] = useState(false);
+  const [parallelOn, setParallelOn] = useState(false);
+  // 各面板说明默认收起，点标题区展开，省高度。键：autopass/conflict/custommsg/parallel。
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const toggleExpand = (k: string) => setExpanded(e => ({ ...e, [k]: !e[k] }));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -2303,6 +2457,7 @@ function GatingSettings() {
     getAutoPassEnabled().then(setAutoPassOn).catch(() => {});
     getAutoConflictResolveEnabled().then(setAutoConflictOn).catch(() => {});
     getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {});
+    getParallelPremergeEnabled().then(setParallelOn).catch(() => {});
   };
   useEffect(() => { reload(); }, []);
 
@@ -2327,14 +2482,24 @@ function GatingSettings() {
     finally { setBusy(false); }
   };
 
+  const toggleParallel = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !parallelOn; await setParallelPremergeEnabled(next); setParallelOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="set-inner rise">
-      <div className="set-h">门控降级</div>
-      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过代码审核自动合并。</div>
+      <div className="set-h">合并与放行</div>
+      <div className="set-desc">合并环节的策略与自动化：自动放行（门控降级）、冲突自动解决、自定义合并提交信息、合并并行化。</div>
       {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
       <div className="panel">
         <div className="panel-head">
-          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />门控降级（自动放行）</div>
+          <div className="panel-title" onClick={() => toggleExpand('autopass')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.autopass ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />门控降级（自动放行）
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className={'chip ' + (autoPassOn ? 'green' : '')}>{autoPassOn ? '已启用' : '已关闭'}</span>
             <button className="btn btn-sm" disabled={busy} onClick={toggle}>
@@ -2342,24 +2507,29 @@ function GatingSettings() {
             </button>
           </div>
         </div>
-        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过代码审核直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
-        </div>
-        {policies.length === 0
-          ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
-          : policies.map(p => (
-            <div key={p.change_class} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 16px', borderTop: '1px solid var(--border)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span className={'chip ' + (p.trust_state === 'auto' ? 'green' : p.trust_state === 'eligible' ? 'amber' : '')}>{p.trust_state}</span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)' }}>{p.change_class}</span>
+        {expanded.autopass && (<>
+          <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+            启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过代码审核直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
+          </div>
+          {policies.length === 0
+            ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
+            : policies.map(p => (
+              <div key={p.change_class} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 16px', borderTop: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className={'chip ' + (p.trust_state === 'auto' ? 'green' : p.trust_state === 'eligible' ? 'amber' : '')}>{p.trust_state}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)' }}>{p.change_class}</span>
+                </div>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>批准连胜 {p.approve_count} · 退改 {p.reject_count}</span>
               </div>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>批准连胜 {p.approve_count} · 退改 {p.reject_count}</span>
-            </div>
-          ))}
+            ))}
+        </>)}
       </div>
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="panel-head">
-          <div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />冲突自动解决（AI）</div>
+          <div className="panel-title" onClick={() => toggleExpand('conflict')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.conflict ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />冲突自动解决（AI）
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className={'chip ' + (autoConflictOn ? 'green' : '')}>{autoConflictOn ? '已启用' : '已关闭'}</span>
             <button className="btn btn-sm" disabled={busy} onClick={toggleConflict}>
@@ -2367,13 +2537,18 @@ function GatingSettings() {
             </button>
           </div>
         </div>
+        {expanded.conflict && (
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
           启用后，合并前自动把 dev 并入分支若发生代码冲突，将直接交由 AI 自动解冲突；解完仍会回到代码审核复审，不直接落 dev。关闭时冲突停在「合并冲突」态，可在审核页手动重试或点 AI 解冲突。
         </div>
+        )}
       </div>
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="panel-head">
-          <div className="panel-title"><Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />自定义合并提交信息</div>
+          <div className="panel-title" onClick={() => toggleExpand('custommsg')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.custommsg ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />自定义合并提交信息
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className={'chip ' + (customMsgOn ? 'green' : '')}>{customMsgOn ? '已启用' : '已关闭'}</span>
             <button className="btn btn-sm" disabled={busy} onClick={toggleCustomMsg}>
@@ -2381,9 +2556,30 @@ function GatingSettings() {
             </button>
           </div>
         </div>
+        {expanded.custommsg && (
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
           启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>&lt;前缀&gt;(&lt;修改模块&gt;): &lt;需求标题&gt; [autoforge #&lt;编号&gt;]</code>（前缀按需求类别取 feat/fix/refactor/chore…），审核页不显示输入框。批量审核始终走默认模板。
         </div>
+        )}
+      </div>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head">
+          <div className="panel-title" onClick={() => toggleExpand('parallel')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.parallel ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />合并并行化（实验）
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (parallelOn ? 'green' : '')}>{parallelOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggleParallel}>
+              <Icon name={parallelOn ? 'pause' : 'play'} size={13} />{parallelOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        {expanded.parallel && (
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，合并拆为「合并前测试（premerge）」与「落地（land）」两段：测试不再占用项目合并锁，同项目多个待合并需求可并行测试（受构建池约束），仅廉价的落地串行执行——批量合并显著提速。落地前会再校验 dev 是否被其它需求推进：未动或改动互不相交则直接落地，相交则自动回退重测。关闭时走原单锁流程，行为不变。
+        </div>
+        )}
       </div>
     </div>
   );
@@ -2775,8 +2971,9 @@ const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string
     items: [
       { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
       { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
+      { id: 'codeskills',  name: '编码技能',     ic: 'layers' },
       { id: 'autosupply',  name: '自动供料',     ic: 'refresh' },
-      { id: 'gating',      name: '门控降级',     ic: 'sliders' },
+      { id: 'gating',      name: '合并与放行',   ic: 'sliders' },
       { id: 'security',    name: '安全与权限',   ic: 'shield' },
     ],
   },
@@ -2872,6 +3069,7 @@ export default function SettingsPage({
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
           {sec === 'codeagent'   && <CodeAgentSettings />}
+          {sec === 'codeskills'  && <CodeAgentSkillSettings />}
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
           {sec === 'backup'      && <BackupSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}

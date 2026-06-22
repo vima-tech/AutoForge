@@ -351,16 +351,8 @@ pub async fn retry_merge(cr_id: String, state: State<'_, AppState>) -> Result<()
         .execute(&state.db)
         .await
         .map_err(|e| e.to_string())?;
-    let _ = enqueue(
-        &state.db,
-        &state.job_tx,
-        "merge",
-        &format!("merge:{}:retry:{}", cr_id, Uuid::new_v4()),
-        JobPayload::Merge {
-            change_request_id: cr_id.clone(),
-        },
-    )
-    .await;
+    // 入队合并流水线（开关 ON 时重试也走并行 premerge：在最新 dev 上重测后再落地）。
+    crate::tasks::merge::enqueue_merge_pipeline(&state.db, &state.job_tx, &cr_id, "retry").await;
     Ok(())
 }
 
@@ -712,23 +704,9 @@ async fn approve_cr_review_2(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Enqueue merge job.
-    // 唯一键（带 uuid）而非固定 `merge:{cr}`：一个 CR 可能经历「合并 → 撤销(revert) →
-    // 从 revert 恢复重新执行 → 再次通过代码审核」。固定键会撞上上一次合并遗留的、status=
-    // completed 的 job_executions 行 → enqueue 的 INSERT OR IGNORE 命中既有行、判为非
-    // inserted 且非 failed → 不派发，CR 永远卡在 pending_merge（无驱动任务）。merge job
-    // 幂等（见 requeue_orphaned_merges 注释），唯一键安全，与 retry_merge 的做法一致。
-    let idem_key = format!("merge:{}:approve:{}", cr_id, Uuid::new_v4());
-    let _ = enqueue(
-        db,
-        job_tx,
-        "merge",
-        &idem_key,
-        JobPayload::Merge {
-            change_request_id: cr_id.to_string(),
-        },
-    )
-    .await;
+    // 入队合并流水线（开关 ON → 并行 premerge；OFF → legacy merge）。统一唯一键，杜绝撞
+    // 历史 completed 行被去重不派发（CR 卡死 pending_merge 的根因）。
+    crate::tasks::merge::enqueue_merge_pipeline(db, job_tx, cr_id, "approve").await;
 
     // Release pending review slot
     concurrency.release_pending_review();

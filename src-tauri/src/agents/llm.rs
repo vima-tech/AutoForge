@@ -28,6 +28,82 @@ fn compose_tool_system(system_prompt: Option<&str>) -> String {
     }
 }
 
+/// 把工具入参的字符串原文按可能的类型归一：数字/布尔/null/数组/对象按 JSON 解析，
+/// 其余（含本就是字符串、含特殊字符的正则等）原样保留为字符串。
+/// 让 `<parameter=limit>50</parameter>` 这类文本入参也能正确填入期望 number 的工具 schema。
+fn coerce_arg_value(raw: &str) -> Value {
+    let t = raw.trim();
+    match serde_json::from_str::<Value>(t) {
+        // 已是合法 JSON 标量/复合：采纳其类型；但带引号的字符串去引号后仍按字符串处理。
+        Ok(Value::String(_)) => Value::String(t.to_string()),
+        Ok(v) => v,
+        Err(_) => Value::String(t.to_string()),
+    }
+}
+
+/// 解析「文本式工具调用」——部分 OpenAI 兼容模型（Qwen/MIMO/Hermes 系）在非原生
+/// function-calling 模式下，把工具调用写进 `message.content` 正文而非结构化的 `tool_calls`
+/// 字段，导致框架收不到调用、工具从不执行（proposer 长期空转的根因）。本函数兜底解析两类
+/// 常见写法，让这些模型的工具调用也能真正落地：
+/// (1) XML 风格 `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`（常外套 `<tool_call>`）；
+/// (2) Hermes JSON `<tool_call>{"name":"NAME","arguments":{...}}</tool_call>`。
+/// 返回 `(工具名, 入参 JSON)` 列表；解析不出任何调用则返回空（调用方据此走正常「最终回答」路径）。
+fn parse_textual_tool_calls(content: &str) -> Vec<(String, Value)> {
+    use regex::Regex;
+    let mut calls: Vec<(String, Value)> = Vec::new();
+
+    // —— 形式 2（优先）：<tool_call>{json}</tool_call>（Hermes 风格，含 name/arguments）——
+    if let Ok(re) = Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>") {
+        for cap in re.captures_iter(content) {
+            let Some(obj) = cap
+                .get(1)
+                .and_then(|m| serde_json::from_str::<Value>(m.as_str()).ok())
+            else {
+                continue;
+            };
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let args = obj
+                .get("arguments")
+                .or_else(|| obj.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // arguments 可能是 JSON 字符串（被双重序列化）→ 再解一层。
+            let args = match args {
+                Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(json!({})),
+                other => other,
+            };
+            calls.push((name.trim().to_string(), args));
+        }
+    }
+
+    // —— 形式 1：<function=NAME> ... </function>（可被 <tool_call> 包裹；逐个解析其内 <parameter=K>V）——
+    if let (Ok(func_re), Ok(param_re)) = (
+        Regex::new(r"(?s)<function=([^>\s]+)\s*>(.*?)</function>"),
+        Regex::new(r"(?s)<parameter=([^>\s]+)\s*>(.*?)</parameter>"),
+    ) {
+        for fcap in func_re.captures_iter(content) {
+            let name = fcap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let body = fcap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let mut args = serde_json::Map::new();
+            for pcap in param_re.captures_iter(body) {
+                let key = pcap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                let val = pcap.get(2).map(|m| m.as_str()).unwrap_or("");
+                if !key.is_empty() {
+                    args.insert(key.to_string(), coerce_arg_value(val));
+                }
+            }
+            calls.push((name.to_string(), Value::Object(args)));
+        }
+    }
+
+    calls
+}
+
 pub async fn run_agent_text(
     db: &crate::db::Db,
     agent: &Agent,
@@ -140,6 +216,17 @@ fn openai_user_content(prompt: &str, images: &[(String, String)]) -> Value {
 }
 
 /// 把用户文本与可选图片组装成 Anthropic 多模态 content：无图片时退化为纯字符串。
+/// 把 system 提示构造成带 `cache_control: ephemeral` 的结构化块，让 Anthropic 缓存这段
+/// （系统提示 + 项目上下文 + 规格）可复用前缀，命中后大幅降低输入延迟与成本。
+/// 不支持 prompt caching 的 Anthropic 兼容端点会优雅忽略 `cache_control` 字段，故零回归。
+fn anthropic_system_cached(system: &str) -> Value {
+    json!([{
+        "type": "text",
+        "text": system,
+        "cache_control": { "type": "ephemeral" }
+    }])
+}
+
 fn anthropic_user_content(prompt: &str, images: &[(String, String)]) -> Value {
     if images.is_empty() {
         return json!(prompt);
@@ -448,7 +535,7 @@ async fn run_anthropic(
         "temperature": cfg.temperature
     });
     if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
-        body["system"] = Value::String(system.to_string());
+        body["system"] = anthropic_system_cached(system);
     }
 
     // 图片 base64 体积巨大，trace 入参里只记文本 + 图片张数，避免 llm_traces 被撑爆。
@@ -514,6 +601,8 @@ async fn run_openai_tool_loop(
     // 工具循环的 system 始终带上不可信数据护栏（即使角色自身无 system）。
     messages.push(json!({ "role": "system", "content": compose_tool_system(system_prompt) }));
     messages.push(json!({ "role": "user", "content": prompt }));
+    // 记录最近一次模型正文，供轮数耗尽时优雅兜底（返回已有内容而非直接报错）。
+    let mut last_content = String::new();
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut req = client
@@ -562,11 +651,41 @@ async fn run_openai_tool_loop(
             .cloned()
             .unwrap_or_default();
 
+        let content_str = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !content_str.is_empty() {
+            last_content = content_str.clone();
+        }
+
         if tool_calls.is_empty() {
-            return msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
+            // 原生 tool_calls 为空：兜底解析正文里的「文本式工具调用」（Qwen/MIMO/Hermes 系）。
+            // 命中则执行并以 user 文本回灌结果（避免 OpenAI 的 tool_call_id 配对约束），续轮。
+            let textual = parse_textual_tool_calls(&content_str);
+            if !textual.is_empty() && iter + 1 < MAX_TOOL_ITERS {
+                messages.push(json!({ "role": "assistant", "content": content_str }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（严格 JSON，不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    let outcome = registry.invoke(name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[tools] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name,
+                        serde_json::to_string(args).unwrap_or_default(),
+                        outcome.content
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
+            // 无工具调用（或已到末轮）：返回正文作为最终回答。
+            return Some(content_str)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow!("OpenAI-compatible 响应缺少最终 content"));
         }
@@ -595,7 +714,11 @@ async fn run_openai_tool_loop(
             }));
         }
     }
-    Err(anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+    // 轮数耗尽：优雅兜底——返回最近一次模型正文（多数情况下已含可解析结果），
+    // 而非直接报错丢弃整轮工作；确无任何正文时才报错。
+    Some(last_content)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
 }
 
 /// Anthropic 工具调用循环：声明 tools → 解析 content[].type=tool_use → 执行 →
@@ -618,7 +741,7 @@ async fn run_anthropic_tool_loop(
             "temperature": cfg.temperature,
             "tools": tools
         });
-        body["system"] = Value::String(compose_tool_system(system_prompt));
+        body["system"] = anthropic_system_cached(&compose_tool_system(system_prompt));
 
         let req_input = serde_json::to_string(&messages).unwrap_or_default();
         let t0 = std::time::Instant::now();
@@ -795,4 +918,62 @@ fn status_code(status: StatusCode) -> String {
         .canonical_reason()
         .map(|reason| format!("{} {}", status.as_u16(), reason))
         .unwrap_or_else(|| status.as_u16().to_string())
+}
+
+#[cfg(test)]
+mod textual_tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn parses_xml_function_format() {
+        // MIMO/Qwen 实际产出的格式（含外套 <tool_call> 与多个 <parameter>）。
+        let raw = r#"<tool_call>
+<function=search_project_code>
+<parameter=query>unwrap\(\)|expect\(</parameter>
+<parameter=path>core/src</parameter>
+<parameter=limit>50</parameter>
+</function>
+</tool_call>"#;
+        let calls = parse_textual_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "search_project_code");
+        assert_eq!(calls[0].1["query"], "unwrap\\(\\)|expect\\(");
+        assert_eq!(calls[0].1["path"], "core/src");
+        // limit 应被归一为数字而非字符串。
+        assert_eq!(calls[0].1["limit"], 50);
+    }
+
+    #[test]
+    fn parses_multiple_function_calls() {
+        let raw = "<function=read_project_file><parameter=path>a.rs</parameter></function>\
+                   <function=read_project_file><parameter=path>b.rs</parameter></function>";
+        let calls = parse_textual_tool_calls(raw);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1["path"], "b.rs");
+    }
+
+    #[test]
+    fn parses_hermes_json_format() {
+        let raw = r#"思考中…<tool_call>{"name":"read_project_file","arguments":{"path":"src/x.rs","limit":40}}</tool_call>"#;
+        let calls = parse_textual_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_project_file");
+        assert_eq!(calls[0].1["path"], "src/x.rs");
+        assert_eq!(calls[0].1["limit"], 40);
+    }
+
+    #[test]
+    fn plain_text_yields_no_calls() {
+        // 正常的 JSON 数组最终回答不应被误判为工具调用。
+        let raw = r#"[{"title":"x","kind":"engineering"}]"#;
+        assert!(parse_textual_tool_calls(raw).is_empty());
+    }
+
+    #[test]
+    fn coerce_keeps_regex_string_but_parses_scalars() {
+        assert_eq!(coerce_arg_value("50"), serde_json::json!(50));
+        assert_eq!(coerce_arg_value("true"), serde_json::json!(true));
+        assert_eq!(coerce_arg_value("core/src"), serde_json::json!("core/src"));
+        assert_eq!(coerce_arg_value("a|b\\("), serde_json::json!("a|b\\("));
+    }
 }

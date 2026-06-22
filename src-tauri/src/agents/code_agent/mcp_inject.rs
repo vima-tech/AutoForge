@@ -76,11 +76,14 @@ impl Drop for TempFile {
 }
 
 /// 一次注入产出：追加到命令行的参数、要设置的环境变量、需保活到进程退出的临时文件。
+/// `allowed_tools` 是需放行的工具名（claude `--allowedTools` 的值）——单列出来由 cli.rs
+/// 与技能注入的放行项**合并成一次** `--allowedTools`，避免变参被「保留最后一个」覆盖。
 #[derive(Default)]
 pub struct McpCliConfig {
     pub args: Vec<OsString>,
     pub envs: Vec<(String, String)>,
     pub temp_files: Vec<TempFile>,
+    pub allowed_tools: Vec<String>,
 }
 
 fn unique_temp_path(tag: &str) -> PathBuf {
@@ -126,9 +129,9 @@ pub fn for_claude(servers: &[McpInject]) -> McpCliConfig {
     cfg.args.push(path.clone().into_os_string());
     cfg.args.push(OsString::from("--strict-mcp-config"));
     // 放行每个 server 的全部工具（mcp__<name> 允许该 server 下所有工具）。
-    cfg.args.push(OsString::from("--allowedTools"));
+    // 不在此直接发 `--allowedTools`——令牌交给 cli.rs 与技能放行项合并成一次发出。
     for s in servers {
-        cfg.args.push(OsString::from(format!("mcp__{}", s.name)));
+        cfg.allowed_tools.push(format!("mcp__{}", s.name));
     }
     cfg.temp_files.push(TempFile(path));
     cfg
@@ -222,8 +225,9 @@ mod tests {
         let joined: Vec<String> = cfg.args.iter().map(|a| a.to_string_lossy().to_string()).collect();
         assert!(joined.iter().any(|a| a == "--mcp-config"));
         assert!(joined.iter().any(|a| a == "--strict-mcp-config"));
-        assert!(joined.iter().any(|a| a == "--allowedTools"));
-        assert!(joined.iter().any(|a| a == "mcp__mytool"));
+        // 工具放行令牌单列在 allowed_tools，由 cli.rs 合并发出（不再混在 args 里）。
+        assert!(cfg.allowed_tools.iter().any(|a| a == "mcp__mytool"));
+        assert!(!joined.iter().any(|a| a == "--allowedTools"));
         assert_eq!(cfg.temp_files.len(), 1);
         // 临时文件确实写了内容。
         let path = &cfg.temp_files[0].0;

@@ -133,8 +133,17 @@ async fn dispatch_job(db: &Db, tx: &JobSender, app: &tauri::AppHandle, msg: &Job
         JobPayload::Testing { change_request_id } => {
             crate::tasks::testing::run(db, tx, app, change_request_id).await
         }
+        JobPayload::Premerge { change_request_id } => {
+            crate::tasks::merge::premerge_run(db, tx, app, change_request_id).await
+        }
         JobPayload::Merge { change_request_id } => {
-            crate::tasks::merge::run(db, tx, app, change_request_id).await
+            // 已走完 premerge（落了 tested_dev_sha）→ 仅落地（land_run，再校验 dev 漂移）；
+            // 否则（开关关 / 旧数据 / 直接 Merge）→ legacy 单锁全流程 run()。
+            if crate::tasks::merge::should_land_only(db, change_request_id).await {
+                crate::tasks::merge::land_run(db, tx, app, change_request_id).await
+            } else {
+                crate::tasks::merge::run(db, tx, app, change_request_id).await
+            }
         }
         JobPayload::Revert { change_request_id } => {
             crate::tasks::revert::run(db, app, change_request_id).await
@@ -440,22 +449,50 @@ pub async fn requeue_orphaned_analyses(db: &Db, tx: &JobSender) -> usize {
 /// `merge_conflict` / `merge_failed` are parked terminal states awaiting human/AI action
 /// — deliberately NOT swept here.
 pub async fn requeue_orphaned_merges(db: &Db, tx: &JobSender) -> usize {
-    // Retire dead merge job rows so the fresh enqueue below isn't deduped against them.
+    // Retire dead premerge/merge job rows so the fresh enqueue below isn't deduped against them.
     let _ = sqlx::query(
         "UPDATE job_executions SET status='failed', last_error='superseded by restart recovery', updated_at=datetime('now')
-         WHERE job_type='merge' AND status IN ('pending','waiting','running')",
+         WHERE job_type IN ('premerge','merge') AND status IN ('pending','waiting','running')",
     )
     .execute(db)
     .await;
 
-    let pending: Vec<(String,)> =
-        sqlx::query_as("SELECT id FROM change_requests WHERE status='pending_merge'")
+    let mut requeued = 0usize;
+
+    // pending_merge / merge_testing：尚未通过测试门或崩在 premerge 中 → 重排 Premerge
+    // （从头重测，幂等安全）。pending_merge 在开关关闭时由 should_land_only 路由回 legacy run。
+    let to_premerge: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM change_requests WHERE status IN ('pending_merge','merge_testing')",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for (cr_id,) in to_premerge {
+        let idem_key = format!("premerge:{}:restart:{}", cr_id, Uuid::new_v4());
+        if enqueue(
+            db,
+            tx,
+            "premerge",
+            &idem_key,
+            JobPayload::Premerge {
+                change_request_id: cr_id.clone(),
+            },
+        )
+        .await
+        .is_ok()
+        {
+            requeued += 1;
+        }
+    }
+
+    // merge_ready：已测过、只差落地 → 重排 Merge(land)（land_run 再校验 dev 漂移，幂等安全）。
+    let to_land: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM change_requests WHERE status='merge_ready'")
             .fetch_all(db)
             .await
             .unwrap_or_default();
-    let mut requeued = 0usize;
-    for (cr_id,) in pending {
-        let idem_key = format!("merge:{}:restart:{}", cr_id, Uuid::new_v4());
+    for (cr_id,) in to_land {
+        let idem_key = format!("merge:{}:landrestart:{}", cr_id, Uuid::new_v4());
         if enqueue(
             db,
             tx,
@@ -471,8 +508,9 @@ pub async fn requeue_orphaned_merges(db: &Db, tx: &JobSender) -> usize {
             requeued += 1;
         }
     }
+
     if requeued > 0 {
-        info!("startup recovery: re-enqueued {} orphaned merge(s)", requeued);
+        info!("startup recovery: re-enqueued {} orphaned premerge/merge(s)", requeued);
     }
     requeued
 }

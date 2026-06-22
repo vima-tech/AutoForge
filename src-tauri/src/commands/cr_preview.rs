@@ -834,6 +834,121 @@ pub async fn get_branch_preview_log(project_id: String, branch: String) -> Resul
     }
 }
 
+// ── 预览日志实时 tail（事件驱动）─────────────────────────────────────────────
+//
+// 预览/dev-server 子进程的 stdout+stderr 直写日志文件、不流经 Rust（见 `log_stdio` /
+// `dev_server`），故无法像 code-agent 那样在管道上挂 LogSink。改为：前端打开日志弹窗时
+// 启动一个后台 tail 任务，周期读取该日志文件的「新增字节」转成 `AppEvent::PreviewLog`
+// 增量推给前端——前端只 append，不再每秒全文重取/重解析/重渲染。子进程仍只写文件，与
+// Rust 保持解耦（不被父进程抽水速度牵制）。
+
+const TAIL_INTERVAL_MS: u64 = 600;
+/// 首次推送只回带尾部这么多字节，避免超长 build 日志一次性灌爆前端。
+const TAIL_INITIAL_CAP: u64 = 64 * 1024;
+
+#[allow(clippy::type_complexity)]
+static PREVIEW_TAILERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+> = std::sync::OnceLock::new();
+
+fn preview_tailers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>> {
+    PREVIEW_TAILERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 把前端弹窗 sig 解析成日志文件 key：`cr:<id>` → `<id>`；`branch:<pid>:<branch>` →
+/// `branch_log_key`。git refname 不含 `:`，故 `branch:` 后按首个 `:` 切分无歧义。
+fn log_key_from_sig(sig: &str) -> Option<String> {
+    if let Some(id) = sig.strip_prefix("cr:") {
+        return Some(id.to_string());
+    }
+    if let Some(rest) = sig.strip_prefix("branch:") {
+        let (pid, branch) = rest.split_once(':')?;
+        return Some(branch_log_key(pid, branch));
+    }
+    None
+}
+
+/// 启动某日志弹窗的实时 tail。重复启动同一 sig 会先停旧任务（处理重订阅/重挂载）。
+#[tauri::command]
+pub async fn start_preview_log_tail(app: tauri::AppHandle, sig: String) -> Result<(), String> {
+    let Some(file_key) = log_key_from_sig(&sig) else {
+        return Err(format!("无法解析日志标识: {sig}"));
+    };
+    let path = preview_log_path(&file_key);
+
+    // 先停掉同 sig 的旧任务，避免重复推送。
+    if let Some(old) = preview_tailers().lock().unwrap().remove(&sig) {
+        old.abort();
+    }
+
+    let task_sig = sig.clone();
+    let handle = tokio::spawn(async move {
+        let mut offset: u64 = 0;
+        let mut first = true;
+        // 跨轮保留「未构成完整 UTF-8 字符」的尾部字节，下一轮拼回，避免多字节字符被切碎。
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if len < offset {
+                // 文件被重建（新一轮预览覆盖写）→ 从头重读。
+                offset = 0;
+                first = true;
+                pending.clear();
+            }
+            if len > offset {
+                // 首次只取尾部 TAIL_INITIAL_CAP，避免一次性灌爆。
+                let trim_lead = first && len - offset > TAIL_INITIAL_CAP;
+                let start = if trim_lead { len - TAIL_INITIAL_CAP } else { offset };
+                if let Ok(mut f) = std::fs::File::open(&path) {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut buf = Vec::new();
+                    if f.seek(SeekFrom::Start(start)).is_ok() && f.read_to_end(&mut buf).is_ok() {
+                        offset = len;
+                        let mut slice = &buf[..];
+                        if trim_lead {
+                            // 截断点可能落在多字节字符中间：跳过前导续字节对齐到字符边界。
+                            let skip = slice.iter().take_while(|&&b| b & 0xC0 == 0x80).count();
+                            slice = &slice[skip..];
+                        }
+                        pending.extend_from_slice(slice);
+                        // 只发送可构成完整 UTF-8 的前缀，残余留到下轮。
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(_) => pending.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid > 0 {
+                            let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                            pending.drain(..valid);
+                            crate::core::event::emit(
+                                &app,
+                                crate::core::event::AppEvent::PreviewLog {
+                                    key: task_sig.clone(),
+                                    chunk,
+                                },
+                            );
+                        }
+                    }
+                }
+                first = false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(TAIL_INTERVAL_MS)).await;
+        }
+    });
+
+    preview_tailers().lock().unwrap().insert(sig, handle);
+    Ok(())
+}
+
+/// 停止某日志弹窗的 tail（前端关闭弹窗时调用）。
+#[tauri::command]
+pub async fn stop_preview_log_tail(sig: String) -> Result<(), String> {
+    if let Some(h) = preview_tailers().lock().unwrap().remove(&sig) {
+        h.abort();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

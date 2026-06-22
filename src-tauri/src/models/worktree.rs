@@ -23,6 +23,12 @@ pub struct WorktreeSession {
     pub conflict_files: Option<String>,
     /// 冲突时带冲突标记的快照（供审核页三方视图与 AI 解冲突 agent 输入）。
     pub conflict_diff: Option<String>,
+    /// 合并并行化：premerge 阶段测试所基于的 dev 提交 SHA。land 阶段据此判断 dev 是否在
+    /// 「测试后、落地前」被兄弟 CR 推进，决定直落 / 独立直落 / 重叠补测（见 merge::revalidate）。
+    /// 旧 session 或走 legacy 单锁路径时为 NULL。
+    pub tested_dev_sha: Option<String>,
+    /// premerge 阶段（测试门 + 安全门）通过的时间戳。
+    pub premerge_at: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
 }

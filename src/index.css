@@ -1951,6 +1951,9 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .preview-url { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: var(--text-label); color: var(--text-2); padding: 8px 11px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 9px; }
 .preview-url .live { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(79,157,107,.25); flex: none; }
 
+/* 分组标题：粘性吸顶——组内滚动时标题钉在列表顶部，滚入下一组时由后一标题顶替。
+   背景用 list-col 底色 var(--bg-1)，行从其下方完整穿过；z-index 高于 .req-item(relative)。 */
+.req-group-head { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; padding: 8px 12px 6px; background: var(--bg-1); font-size: var(--text-caption); letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); font-weight: 600; border-bottom: 1px solid var(--border); }
 .req-item { padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s; border: 1px solid transparent; }
 .req-item:hover { background: var(--surface-hover); }
 .req-item.active { background: var(--bg-3); border-color: var(--ember-tint-strong); }
@@ -2172,6 +2175,9 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 }
 .dock-advice-row input:focus { border-color: var(--ember); }
 .dock-advice-row .btn { flex: none; }
+/* dock 内分段切换（管理员建议 / 合并信息）：紧凑、左对齐，不拉满整行 */
+.dock-seg { align-self: flex-start; padding: 2px; }
+.dock-seg button { padding: 3px 10px; font-size: var(--text-caption); }
 
 .iter-warn {
   margin: 0 0 12px; padding: 10px 13px; border-radius: 12px;

@@ -612,7 +612,7 @@ pub async fn reject_issues(
             }
             // 运行中 / 已落地：不允许拒绝，避免脱节。
             "executing" | "building" | "running" | "pending_execution" | "pending_merge"
-            | "merged" => {
+            | "merge_testing" | "merge_ready" | "merged" => {
                 r.skipped += 1;
             }
             // 已拒绝：幂等跳过。

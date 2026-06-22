@@ -539,8 +539,9 @@ pub async fn ai_resolve_conflict(
             wall_secs: 600,
             idle_secs: 300,
         };
-        // 解冲突同属编码任务：同样注入「适用于编码 Agent」的 MCP（pull）。
+        // 解冲突同属编码任务：同样注入「适用于编码 Agent」的 MCP（pull）+ 技能（skill）。
         let code_mcp = crate::agents::code_agent::load_code_agent_mcp(db).await;
+        let code_skills = crate::agents::code_agent::load_code_agent_skills(db, &project).await;
         let run_started = std::time::Instant::now();
         // 实时日志：解冲突也推 CodeAgentLog（phase=conflict_resolve），前端同样可实时滚动。
         let (log_tx, mut log_rx) =
@@ -563,7 +564,7 @@ pub async fn ai_resolve_conflict(
             })
         };
         let (_code, report, _err) = code_agent
-            .run(&session.worktree_path, &prompt, limits, &code_mcp, Some(&log_tx))
+            .run(&session.worktree_path, &prompt, limits, &code_mcp, &code_skills, Some(&log_tx))
             .await
             .unwrap_or((-1, String::new(), String::new()));
         drop(log_tx);
@@ -669,6 +670,30 @@ pub async fn default_merge_message(db: &Db, cr: &crate::models::change_request::
     format!("{}{}: {} [autoforge #{}]", prefix, scope, title, short_id)
 }
 
+/// 合并流水线统一入口（review_2 批准 / 自动合并门 / 重试合并共用）。
+/// 开关 ON → 入队并行 `premerge`（测试出锁）；OFF → 入队 legacy `merge`（单锁全流程）。
+/// 一律用带 uuid 的唯一键：premerge/merge job 均幂等，唯一键杜绝撞历史 completed 行被
+/// `enqueue` 去重而不派发（CR 卡死 pending_merge 的根因）。`reason` 仅供幂等键可读。
+pub async fn enqueue_merge_pipeline(db: &Db, tx: &JobSender, cr_id: &str, reason: &str) {
+    let (job, payload) = if crate::core::gate::parallel_premerge_enabled(db).await {
+        (
+            "premerge",
+            JobPayload::Premerge {
+                change_request_id: cr_id.to_string(),
+            },
+        )
+    } else {
+        (
+            "merge",
+            JobPayload::Merge {
+                change_request_id: cr_id.to_string(),
+            },
+        )
+    };
+    let key = format!("{}:{}:{}:{}", job, cr_id, reason, uuid::Uuid::new_v4());
+    let _ = enqueue(db, tx, job, &key, payload).await;
+}
+
 pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
     // Load worktree session
     let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
@@ -729,9 +754,359 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     let cr_lock = crate::state::cr_lock(cr_id);
     let _cr_guard = cr_lock.lock().await;
 
-    // 在把 dev 并入分支【之前】快照本 CR 相对分叉点的 diff——这样持久化的 diff 始终
-    // 只含本 CR 的改动（merge dev 进来后再按 base_commit 做 diff 会把 dev 的无关改动
-    // 也算进来，重新污染）。worktree 删除后审核页据此回看已合并需求的改动。
+    // Snapshot the CR's own diff before Phase 1 merges dev in (keeps it scoped).
+    snapshot_cr_diff(db, &session, &cr).await;
+
+    // Phase 1 dev-sync + 测试门 + 安全门（仅碰 CR worktree）。任一失败已置态 → 直接返回。
+    match run_premerge_gates(db, tx, app, &session, &cr, &project, cr_id).await? {
+        GateResult::Stopped => return Ok(()),
+        GateResult::Pass { .. } => {}
+    }
+
+    // Land on dev（持锁内，串行）。legacy 单锁路径：gate 与 land 同处一把 merge_lock 下。
+    land_core(db, tx, app, &session, &cr, &project, cr_id).await
+}
+
+/// 合并前阶段（并行）：仅持 `cr_lock`（防解冲突并发写同一 worktree），**不持 merge_lock**，
+/// 故同项目多个 CR 的 premerge 可并行（受 `build_pool` 节流）。跑 Phase1 dev-sync + 测试门 +
+/// 安全门；通过则落 `tested_dev_sha` + 置 `merge_ready` 并入队 Merge(land)。开关关闭时兜底走
+/// legacy `run()`（自带 merge_lock，行为不变）。
+pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+    if !crate::core::gate::parallel_premerge_enabled(db).await {
+        return run(db, tx, app, cr_id).await;
+    }
+
+    let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
+        "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("no worktree session found for cr {}", cr_id))?;
+    let cr = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
+        "SELECT * FROM change_requests WHERE id=?",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("cr {} not found", cr_id))?;
+    let project =
+        sqlx::query_as::<_, crate::models::project::Project>("SELECT * FROM projects WHERE id=?")
+            .bind(&cr.project_id)
+            .fetch_optional(db)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
+
+    if !std::path::Path::new(&session.worktree_path).exists() {
+        return fail_missing_worktree(db, app, &session, &cr, cr_id).await;
+    }
+
+    // cr_lock ONLY — no merge_lock, so sibling CRs premerge in parallel.
+    let cr_lock = crate::state::cr_lock(cr_id);
+    let _cr_guard = cr_lock.lock().await;
+
+    set_status(db, cr_id, &cr.issue_id, "merge_testing").await?;
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "premerge".to_string(),
+            note: Some("合并前测试中（并行）…".to_string()),
+        },
+    );
+
+    snapshot_cr_diff(db, &session, &cr).await;
+
+    let tested_dev_sha = match run_premerge_gates(db, tx, app, &session, &cr, &project, cr_id).await? {
+        GateResult::Stopped => return Ok(()),
+        GateResult::Pass { tested_dev_sha } => tested_dev_sha,
+    };
+
+    // 通过：落 tested_dev_sha + premerge_at，置 merge_ready，入队 land。
+    let _ = sqlx::query(
+        "UPDATE worktree_sessions SET tested_dev_sha=?, premerge_at=datetime('now') WHERE id=?",
+    )
+    .bind(&tested_dev_sha)
+    .bind(&session.id)
+    .execute(db)
+    .await;
+    set_status(db, cr_id, &cr.issue_id, "merge_ready").await?;
+    event::emit(
+        app,
+        event::AppEvent::TaskProgress {
+            cr_id: cr_id.to_string(),
+            phase: "merge_ready".to_string(),
+            note: Some("已通过测试，待落地 dev".to_string()),
+        },
+    );
+    // Unique key：land job 幂等，唯一键杜绝撞历史 completed 行被去重不派发。
+    let _ = enqueue(
+        db,
+        tx,
+        "merge",
+        &format!("land:{}:{}", cr_id, uuid::Uuid::new_v4()),
+        JobPayload::Merge {
+            change_request_id: cr_id.to_string(),
+        },
+    )
+    .await;
+    info!("premerge passed for cr {}, queued land", cr_id);
+    Ok(())
+}
+
+/// 落地阶段（串行）：持 `merge_lock` + `cr_lock`。再校验 dev 是否在「测后落地前」前进（§5），
+/// 据此直落 / 独立直落 / 重叠补测 / 冲突回退；通过则 `land_core` 落地。只在 CR 已 premerge
+/// （`tested_dev_sha` 存在、状态 `merge_ready`）时由派发表路由到此。
+pub async fn land_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+    let cr = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
+        "SELECT * FROM change_requests WHERE id=?",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("cr {} not found", cr_id))?;
+    let project =
+        sqlx::query_as::<_, crate::models::project::Project>("SELECT * FROM projects WHERE id=?")
+            .bind(&cr.project_id)
+            .fetch_optional(db)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
+
+    // merge_lock → cr_lock（固定顺序，无死锁）。land 廉价，锁只覆盖再校验 + 落地。
+    let merge_lock = crate::state::merge_lock(&cr.project_id);
+    let _merge_guard = merge_lock.lock().await;
+    let cr_lock = crate::state::cr_lock(cr_id);
+    let _cr_guard = cr_lock.lock().await;
+
+    // 锁内复读最新状态：兄弟 land / 重启恢复可能已推进它。只从 merge_ready 落地。
+    let status: Option<String> =
+        sqlx::query_as::<_, (String,)>("SELECT status FROM change_requests WHERE id=?")
+            .bind(cr_id)
+            .fetch_optional(db)
+            .await?
+            .map(|(s,)| s);
+    if status.as_deref() != Some("merge_ready") {
+        info!("land_run: cr {} not in merge_ready ({:?}); skip", cr_id, status);
+        return Ok(());
+    }
+
+    // 复读 session（premerge 刚写了 tested_dev_sha）。
+    let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
+        "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("no worktree session for cr {}", cr_id))?;
+
+    if !std::path::Path::new(&session.worktree_path).exists() {
+        return fail_missing_worktree(db, app, &session, &cr, cr_id).await;
+    }
+
+    match revalidate(db, tx, app, &session, &cr, &project, cr_id).await? {
+        Revalidate::Land { verify } => {
+            land_core(db, tx, app, &session, &cr, &project, cr_id).await?;
+            // Phase 3 lite：独立改动免重测直落 → 落地后补一发合并后集成测试（在 dev 上跑，
+            // worktree 已删故 run_and_gate 回退到仓库路径=dev）。失败由现有机制登记 bug 需求
+            // 告警，不自动 revert。无 merge_lock，不阻塞后续 land。
+            if verify {
+                let _ = enqueue(
+                    db,
+                    tx,
+                    "testing",
+                    &format!("postmerge_verify:{}:{}", cr_id, uuid::Uuid::new_v4()),
+                    JobPayload::Testing {
+                        change_request_id: cr_id.to_string(),
+                    },
+                )
+                .await;
+                info!("land_run: enqueued post-merge integration verify for cr {}", cr_id);
+            }
+            Ok(())
+        }
+        Revalidate::Requeued | Revalidate::Conflict => Ok(()),
+    }
+}
+
+/// 派发路由用：CR 是否已走完 premerge（落了 `tested_dev_sha`）→ 走 land_run；否则 legacy run。
+pub async fn should_land_only(db: &Db, cr_id: &str) -> bool {
+    sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT tested_dev_sha FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(s,)| s.is_some())
+    .unwrap_or(false)
+}
+
+/// land 阶段再校验结果。
+enum Revalidate {
+    /// dev 未动或独立改动（已干净 re-sync）→ 可直接落地。
+    /// `verify`=true 表示是「独立改动免重测」直落（集成态未被整体测过）→ 落地后补一发
+    /// 合并后集成测试作为安全网（Phase 3 lite：失败经现有测试机制登记为 bug 需求告警，
+    /// 不做危险的自动 revert）。`verify`=false 表示落的就是 premerge 测过的精确组合，无需补测。
+    Land { verify: bool },
+    /// 重叠改动、re-sync 干净 → 已重排 premerge 补测，调用方返回。
+    Requeued,
+    /// re-sync 冲突 → 已置 merge_conflict（可选 AI 解冲突），调用方返回。
+    Conflict,
+}
+
+/// §5 决策树：比对 premerge 时的 `tested_dev_sha` 与当前 dev tip。
+async fn revalidate(
+    db: &Db,
+    tx: &JobSender,
+    app: &tauri::AppHandle,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+    project: &crate::models::project::Project,
+    cr_id: &str,
+) -> Result<Revalidate> {
+    let wt = GitProxy::new(&session.worktree_path);
+    let _ = wt.run(&["fetch", "origin", &project.branch_dev]).await;
+    let dev_ref = resolve_dev_ref(&wt, &project.branch_dev).await;
+    let dev_now = wt
+        .run(&["rev-parse", &dev_ref])
+        .await
+        .ok()
+        .filter(|(c, _, _)| *c == 0)
+        .map(|(_, o, _)| o.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let tested = session.tested_dev_sha.clone();
+
+    // ① dev 未动：落的就是测过的组合，零额外成本，无需合并后补测。
+    if let (Some(t), Some(n)) = (&tested, &dev_now) {
+        if t == n {
+            return Ok(Revalidate::Land { verify: false });
+        }
+    }
+
+    // dev 前进了：判断兄弟 CR 的改动是否与本 CR 文件相交。
+    let disjoint = match (&tested, &dev_now) {
+        (Some(t), Some(n)) => {
+            let moved = diff_name_only(&wt, t, n).await;
+            let cr_files = parse_changeset_files(session.diff_content.as_deref());
+            !cr_files.is_empty() && moved.is_disjoint(&cr_files)
+        }
+        _ => false,
+    };
+
+    // Re-sync 最新 dev 进分支，使 land 必为干净 squash。
+    match sync_dev_into_worktree(&session.worktree_path, &session.branch_name, &project.branch_dev)
+        .await
+    {
+        DevSync::Conflict { files, diff } => {
+            let files_json = serde_json::to_string(&files).unwrap_or_else(|_| "[]".into());
+            let report = format!(
+                "## 合并冲突\n\n落地前再次并入 `{}` 到 `{}` 时发生冲突（{} 个文件）：\n\n{}\n\n可在审核页三方解决、一键重试，或交由 AI 自动解冲突。",
+                project.branch_dev,
+                session.branch_name,
+                files.len(),
+                files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+            );
+            let _ = sqlx::query(
+                "UPDATE worktree_sessions SET conflict_files=?, conflict_diff=?, report_content=?, tested_dev_sha=NULL WHERE id=?",
+            )
+            .bind(&files_json)
+            .bind(&diff)
+            .bind(&report)
+            .bind(&session.id)
+            .execute(db)
+            .await;
+            set_status(db, cr_id, &cr.issue_id, "merge_conflict").await?;
+            event::emit(
+                app,
+                event::AppEvent::MergeConflict {
+                    cr_id: cr_id.to_string(),
+                    files: files.clone(),
+                },
+            );
+            info!("revalidate dev-sync conflict for cr {} ({} files)", cr_id, files.len());
+            if crate::core::gate::auto_conflict_resolve_enabled(db).await {
+                let (db2, tx2, app2, cr2) = (db.clone(), tx.clone(), app.clone(), cr_id.to_string());
+                tokio::spawn(async move {
+                    if let Err(e) = ai_resolve_conflict(&db2, &tx2, &app2, &cr2).await {
+                        info!("AI conflict-resolve failed for {}: {}", cr2, e);
+                    }
+                });
+            }
+            Ok(Revalidate::Conflict)
+        }
+        DevSync::Clean { .. } => {
+            if disjoint {
+                // 独立改动：兄弟 CR 落地的文件与本 CR 不相交，premerge 测试结论仍成立 → 直落。
+                // verify=true：落地后补一发集成测试做安全网（文件不相交≠语义兼容）。
+                info!("revalidate: cr {} independent of advanced dev, landing without retest", cr_id);
+                Ok(Revalidate::Land { verify: true })
+            } else {
+                // 重叠（或无 diff 信息）：必须在集成后的代码上重测 → 退回 premerge（锁外重测）。
+                info!("revalidate: cr {} overlaps advanced dev, re-queuing premerge for retest", cr_id);
+                let _ = sqlx::query(
+                    "UPDATE worktree_sessions SET tested_dev_sha=NULL WHERE id=?",
+                )
+                .bind(&session.id)
+                .execute(db)
+                .await;
+                set_status(db, cr_id, &cr.issue_id, "merge_testing").await?;
+                let _ = enqueue(
+                    db,
+                    tx,
+                    "premerge",
+                    &format!("premerge:{}:revalidate:{}", cr_id, uuid::Uuid::new_v4()),
+                    JobPayload::Premerge {
+                        change_request_id: cr_id.to_string(),
+                    },
+                )
+                .await;
+                Ok(Revalidate::Requeued)
+            }
+        }
+    }
+}
+
+/// `git diff --name-only a..b` → 文件名集合。
+async fn diff_name_only(wt: &GitProxy, a: &str, b: &str) -> std::collections::HashSet<String> {
+    wt.run(&["diff", "--name-only", &format!("{}..{}", a, b)])
+        .await
+        .ok()
+        .filter(|(c, _, _)| *c == 0)
+        .map(|(_, o, _)| {
+            o.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从快照的统一 diff 中解析本 CR 改动的文件集（`diff --git a/<path> b/<path>` 行）。
+fn parse_changeset_files(diff: Option<&str>) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let Some(d) = diff else {
+        return set;
+    };
+    for line in d.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some(idx) = rest.find(" b/") {
+                let p = rest[..idx].trim();
+                if !p.is_empty() {
+                    set.insert(p.to_string());
+                }
+            }
+        }
+    }
+    set
+}
+
+/// 把 dev 并入分支前快照本 CR 相对分叉点的 diff（worktree 删除后审核页据此回看）。
+async fn snapshot_cr_diff(
+    db: &Db,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+) {
     if let Some(diff) = crate::commands::change_requests::compute_worktree_diff(
         &session.worktree_path,
         &session.branch_name,
@@ -748,10 +1123,67 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
                 .await;
         }
     }
+}
 
+/// 同时把 CR 与其 issue 置为同一状态（合并流水线全程二者保持一致）。
+async fn set_status(db: &Db, cr_id: &str, issue_id: &str, status: &str) -> Result<()> {
+    sqlx::query("UPDATE change_requests SET status=?, updated_at=datetime('now') WHERE id=?")
+        .bind(status)
+        .bind(cr_id)
+        .execute(db)
+        .await?;
+    sqlx::query("UPDATE issues SET status=?, updated_at=datetime('now') WHERE id=?")
+        .bind(status)
+        .bind(issue_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// worktree 缺失的统一收尾：置 merge_failed + 引导重新执行。
+async fn fail_missing_worktree(
+    db: &Db,
+    app: &tauri::AppHandle,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+    cr_id: &str,
+) -> Result<()> {
+    let msg = "CR worktree 不存在，无法在正确的分支上测试/合并；请「重新执行」基于最新代码重建后再合并。";
+    let _ = sqlx::query("UPDATE worktree_sessions SET report_content=? WHERE id=?")
+        .bind(msg)
+        .bind(&session.id)
+        .execute(db)
+        .await;
+    set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
+    event::emit(
+        app,
+        event::AppEvent::WorktreeUpdate {
+            cr_id: cr_id.to_string(),
+            status: "merge_failed".to_string(),
+            message: Some(msg.to_string()),
+        },
+    );
+    Ok(())
+}
+
+/// premerge 闸结果。`Stopped` 表示某道闸已置态（冲突/测试失败/安全拦截）并返回。
+enum GateResult {
+    Pass { tested_dev_sha: Option<String> },
+    Stopped,
+}
+
+/// Phase 1 dev-sync + 测试门 + 安全门。只操作 CR worktree、不碰共享 dev，故 legacy `run`
+/// （持 merge_lock）与并行 `premerge_run`（仅持 cr_lock）共用。任一闸失败已置态 → `Stopped`。
+async fn run_premerge_gates(
+    db: &Db,
+    tx: &JobSender,
+    app: &tauri::AppHandle,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+    project: &crate::models::project::Project,
+    cr_id: &str,
+) -> Result<GateResult> {
     // ── Phase 1：合并前自动把 dev 并入 CR 分支 ──────────────────────────────
-    // 让下面的测试门跑在【集成后】的代码上，且最终 land_on_dev 必为无冲突合并。
-    // 冲突 → 保留现场、置 merge_conflict，按自动开关决定是否走 AI 自动解冲突。
     let dev_merged = match sync_dev_into_worktree(
         &session.worktree_path,
         &session.branch_name,
@@ -778,10 +1210,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .bind(&session.id)
             .execute(db)
             .await;
-            sqlx::query("UPDATE change_requests SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
-                .bind(cr_id).execute(db).await?;
-            sqlx::query("UPDATE issues SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
-                .bind(&cr.issue_id).execute(db).await?;
+            set_status(db, cr_id, &cr.issue_id, "merge_conflict").await?;
             event::emit(
                 app,
                 event::AppEvent::MergeConflict {
@@ -791,10 +1220,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             );
             info!("pre-merge dev-sync conflict for cr {} ({} files)", cr_id, files.len());
 
-            // 自动解冲突开关 ON → 交 AI 处理。**spawn 到后台**而非在持有合并锁时 await：
-            // AI 解冲突可能跑数分钟（claude CLI），期间不应占着该项目的合并锁饿死其它 CR。
-            // ai_resolve 只在本 CR 自己的 worktree 内操作、解完回代码审核（绝不落 dev），与其它
-            // 合并无共享可变状态，脱锁后台执行安全。失败则维持 merge_conflict 等人。
+            // 自动解冲突开关 ON → 交 AI 后台处理（不占锁）。
             if crate::core::gate::auto_conflict_resolve_enabled(db).await {
                 info!("auto conflict-resolve enabled, handing cr {} to AI (background)", cr_id);
                 let (db2, tx2, app2, cr2) =
@@ -805,9 +1231,20 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
                     }
                 });
             }
-            return Ok(());
+            return Ok(GateResult::Stopped);
         }
     };
+
+    // 记录测试所基于的 dev 提交 SHA（land 阶段再校验用）。
+    let wt = GitProxy::new(&session.worktree_path);
+    let dev_ref = resolve_dev_ref(&wt, &project.branch_dev).await;
+    let tested_dev_sha = wt
+        .run(&["rev-parse", &dev_ref])
+        .await
+        .ok()
+        .filter(|(c, _, _)| *c == 0)
+        .map(|(_, o, _)| o.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     event::emit(
         app,
@@ -818,11 +1255,10 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     );
 
-    // Quality gate: run configured tests on the un-merged worktree branch
-    // FIRST. A failing gate must block the merge (spec: testing.md).
+    // Quality gate（spec: testing.md）：失败必须阻断合并。
     let passed = crate::tasks::testing::run_and_gate(db, tx, app, cr_id).await?;
 
-    // D3：CR 级测试遥测——把这次合并前自动测试的整体结果落一条记录（吞吐质量趋势）。
+    // D3：CR 级测试遥测。
     let _ = sqlx::query(
         "INSERT INTO cr_test_runs (id, cr_id, result, summary, run_by)
          VALUES (?, ?, ?, ?, 'auto')",
@@ -835,8 +1271,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     .await;
 
     if !passed {
-        // 若失败发生在【刚把 dev 并入分支】之后，归为 merge_conflict（集成破坏，走冲突
-        // 兜底 UI / AI 解冲突）；否则是 CR 自身测试失败 → 维持 merge_failed。均阻断落地。
+        // 刚把 dev 并入后失败 → merge_conflict（集成破坏）；否则 CR 自身失败 → merge_failed。
         let fail_status = if dev_merged { "merge_conflict" } else { "merge_failed" };
         let fail_msg = if dev_merged {
             "并入 dev 后测试未通过（集成破坏），已阻断合并"
@@ -847,16 +1282,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             "pre-merge tests failed for cr {} (dev_merged={}), blocking merge",
             cr_id, dev_merged
         );
-        sqlx::query("UPDATE change_requests SET status=?, updated_at=datetime('now') WHERE id=?")
-            .bind(fail_status)
-            .bind(cr_id)
-            .execute(db)
-            .await?;
-        sqlx::query("UPDATE issues SET status=?, updated_at=datetime('now') WHERE id=?")
-            .bind(fail_status)
-            .bind(&cr.issue_id)
-            .execute(db)
-            .await?;
+        set_status(db, cr_id, &cr.issue_id, fail_status).await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -865,14 +1291,10 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
                 message: Some(fail_msg.to_string()),
             },
         );
-        return Ok(());
+        return Ok(GateResult::Stopped);
     }
 
-    // Shift-left security gate: a fast, deterministic heuristic scan of the CR
-    // diff runs BEFORE the merge. High/critical findings (secrets, rm -rf /,
-    // os.system, shell=True, …) block the merge so risky code never reaches dev.
-    // Reuses `merge_failed` so the existing audit recovery UI (retry/delete)
-    // surfaces it; the report makes clear it is a security block, not a conflict.
+    // Shift-left 安全门：高危发现阻断合并（复用 merge_failed 的恢复 UI）。
     if let Some(reason) =
         crate::tasks::security_audit::pre_merge_gate(db, &project.repo_path, cr_id).await
     {
@@ -882,18 +1304,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .bind(&session.id)
             .execute(db)
             .await;
-        sqlx::query(
-            "UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(cr_id)
-        .execute(db)
-        .await?;
-        sqlx::query(
-            "UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&cr.issue_id)
-        .execute(db)
-        .await?;
+        set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
         crate::core::notify::dispatch(db, "security_high", "安全门拦截合并", cr_id).await;
         event::emit(
             app,
@@ -903,15 +1314,26 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
                 message: Some("合并前安全扫描发现高危问题，已阻断合并".to_string()),
             },
         );
-        return Ok(());
+        return Ok(GateResult::Stopped);
     }
 
+    Ok(GateResult::Pass { tested_dev_sha })
+}
+
+/// 落地 dev：dev_is_live 检测 + 合并信息 + `land_on_dev` + `finalize_merged`。
+/// 调用方须已持 `merge_lock`（land 必须串行）。
+async fn land_core(
+    db: &Db,
+    tx: &JobSender,
+    app: &tauri::AppHandle,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+    project: &crate::models::project::Project,
+    cr_id: &str,
+) -> Result<()> {
     let git = GitProxy::new(&project.repo_path);
 
-    // Detect whether dev is the branch currently checked out in the project's
-    // main working tree. When it is (AutoForge managing its own running repo),
-    // we must NOT merge in place — see `land_on_dev`. `branch --show-current`
-    // prints empty for a detached HEAD, so this stays false off-dev.
+    // dev 是否为主工作树当前签出分支（自管理场景）。detached HEAD 时为空 → false。
     let live_branch = git
         .run(&["branch", "--show-current"])
         .await
@@ -919,9 +1341,6 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .map(|(_, out, _)| out.trim().to_string())
         .unwrap_or_default();
     let dev_is_live = !live_branch.is_empty() && live_branch == project.branch_dev;
-
-    // (CR diff was snapshotted earlier — before Phase 1 merged dev into the branch —
-    // so it stays scoped to the CR's own changes against its fork point.)
 
     event::emit(
         app,
@@ -932,7 +1351,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     );
 
-    // 人审填写的合并信息（持久化在 CR 上，retry/AI 解冲突回落均复用）；空则回退默认模板。
+    // 人审填写的合并信息；空则回退默认模板。
     let merge_msg = match cr
         .merge_commit_message
         .as_deref()
@@ -940,72 +1359,63 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         .filter(|s| !s.is_empty())
     {
         Some(s) => s.to_string(),
-        None => default_merge_message(db, &cr).await,
+        None => default_merge_message(db, cr).await,
     };
 
-    let merge_commit = match land_on_dev(&git, &project, &session, cr_id, dev_is_live, &merge_msg).await {
+    let merge_commit = match land_on_dev(&git, project, session, cr_id, dev_is_live, &merge_msg).await
+    {
         Ok(sha) => sha,
         Err((merge_code, merge_err)) => {
-        info!("merge failed ({}): {}", merge_code, merge_err);
-        let fail_reason = format!(
-            "## 合并失败\n\n无法将分支 `{}` 合并到 `{}`（退出码 {}）。常见原因为代码冲突，可在修复后重新执行。\n\n```\n{}\n```\n",
-            session.branch_name, project.branch_dev, merge_code,
-            merge_err.chars().take(2000).collect::<String>()
-        );
-        let _ = sqlx::query(
-            "UPDATE worktree_sessions SET report_content=? WHERE id=?",
-        )
-        .bind(&fail_reason)
-        .bind(&session.id)
-        .execute(db)
-        .await;
-        sqlx::query(
-            "UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(cr_id)
-        .execute(db)
-        .await?;
-        sqlx::query(
-            "UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&cr.issue_id)
-        .execute(db)
-        .await?;
-        event::emit(
-            app,
-            event::AppEvent::WorktreeUpdate {
-                cr_id: cr_id.to_string(),
-                status: "merge_failed".to_string(),
-                message: Some(merge_err.chars().take(300).collect()),
-            },
-        );
-        return Err(anyhow!("merge failed for {}: {}", cr_id, merge_err));
+            info!("merge failed ({}): {}", merge_code, merge_err);
+            let fail_reason = format!(
+                "## 合并失败\n\n无法将分支 `{}` 合并到 `{}`（退出码 {}）。常见原因为代码冲突，可在修复后重新执行。\n\n```\n{}\n```\n",
+                session.branch_name,
+                project.branch_dev,
+                merge_code,
+                merge_err.chars().take(2000).collect::<String>()
+            );
+            let _ = sqlx::query("UPDATE worktree_sessions SET report_content=? WHERE id=?")
+                .bind(&fail_reason)
+                .bind(&session.id)
+                .execute(db)
+                .await;
+            set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
+            event::emit(
+                app,
+                event::AppEvent::WorktreeUpdate {
+                    cr_id: cr_id.to_string(),
+                    status: "merge_failed".to_string(),
+                    message: Some(merge_err.chars().take(300).collect()),
+                },
+            );
+            return Err(anyhow!("merge failed for {}: {}", cr_id, merge_err));
         }
     };
 
-    // Remove worktree
+    finalize_merged(db, tx, app, &git, session, cr, merge_commit).await
+}
+
+/// 落地成功后的统一收尾：删 worktree、置 merged、终止预览、发事件、入队安全审计、Innate 后台沉淀。
+async fn finalize_merged(
+    db: &Db,
+    tx: &JobSender,
+    app: &tauri::AppHandle,
+    git: &GitProxy,
+    session: &crate::models::worktree::WorktreeSession,
+    cr: &crate::models::change_request::ChangeRequest,
+    merge_commit: String,
+) -> Result<()> {
+    let cr_id = cr.id.as_str();
+
     if std::path::Path::new(&session.worktree_path).exists() {
         let _ = git
             .run(&["worktree", "remove", "--force", &session.worktree_path])
             .await;
     }
 
-    // Update CR and issue
-    sqlx::query(
-        "UPDATE change_requests SET status='merged', updated_at=datetime('now') WHERE id=?",
-    )
-    .bind(cr_id)
-    .execute(db)
-    .await?;
+    set_status(db, cr_id, &cr.issue_id, "merged").await?;
 
-    // Find issue to update
-    sqlx::query("UPDATE issues SET status='merged', updated_at=datetime('now') WHERE id=?")
-        .bind(&cr.issue_id)
-        .execute(db)
-        .await?;
-
-    // Persist the squash commit SHA so "撤销该需求改动" can later `git revert` it.
-    // Empty (nothing-staged / capture failed) → store NULL so the UI degrades gracefully.
+    // 持久化 squash 提交 SHA（供「撤销该需求改动」revert）；空 → NULL 优雅降级。
     let merge_commit_opt: Option<&str> = if merge_commit.is_empty() {
         None
     } else {
@@ -1034,10 +1444,10 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         },
     );
 
-    // Note: tests already ran as a pre-merge gate above, so there is no
-    // post-merge testing job to enqueue here.
+    // Note: tests already ran as a pre-merge gate, so no post-merge testing job here
+    // (Phase 3 集成门将在合并后另行去抖触发，见实施方案 §9)。
 
-    // Node 07: run a security audit on the merged diff.
+    // Node 07：合并 diff 安全审计。
     let _ = enqueue(
         db,
         tx,
@@ -1049,13 +1459,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     )
     .await;
 
-    // ── 合并后副作用：脱锁后台执行 ─────────────────────────────────────────────
-    // 到此合并主流程已完成（CR/issue 已置 merged、CrMerged 事件已发出、worktree 已删）。
-    // 余下的「通知分发 + Innate 知识沉淀/召回反馈/蒸馏」全是合并后副作用，其中 kb_evolve
-    // 是 LLM 蒸馏、notify::dispatch 可能走外部 HTTP，inline `.await` 会在仍持有
-    // merge_lock + cr_lock 的情况下把锁占满整段时长，饿死同项目下一个 CR 的合并（合并慢
-    // 的主因之一）。整体 spawn 到后台，让 run() 立即返回释放锁。只依赖可克隆的 db 与
-    // 字符串，不引用任何 Tauri 类型（符合后端独立化铁律）。
+    // ── 合并后副作用：脱锁后台执行（通知 + Innate 蒸馏，避免占着 merge_lock）。
     {
         let db2 = db.clone();
         let cr_id2 = cr_id.to_string();
@@ -1065,8 +1469,6 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         tokio::spawn(async move {
             crate::core::notify::dispatch(&db2, "cr_merged", "已合并到 dev", &cr_id2).await;
 
-            // Innate: capture the merged implementation as a SUCCESS exemplar (positive signal) —
-            // 它已通过代码审核 + 测试并合并，是"这类需求该怎么改"的高质量样本，供需求分析/代码实现角色召回。
             let issue_title: String =
                 sqlx::query_as::<_, (String,)>("SELECT title FROM issues WHERE id=?")
                     .bind(&issue_id2)
@@ -1085,13 +1487,8 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
                     format!("实现该项目同类需求时可参考的成功改动方案；相关需求：{}", issue_title);
                 crate::knowledge::kb_add(&project_id2, &content, &trigger).await;
             }
-
-            // Innate: close the recall feedback loop — the recalled knowledge fed code
-            // that passed review 2 + tests and merged, so reinforce it (positive signal).
             crate::knowledge::consume_recall_trace(&db2, "change_request", &cr_id2, "ok", Some("up"))
                 .await;
-
-            // Innate: distil this project's accumulated logs into knowledge after a successful merge.
             crate::knowledge::kb_evolve(&project_id2).await;
         });
     }
@@ -1256,6 +1653,8 @@ mod tests {
             merge_commit: None,
             conflict_files: None,
             conflict_diff: None,
+            tested_dev_sha: None,
+            premerge_at: None,
             started_at: None,
             completed_at: None,
         }
@@ -1366,6 +1765,52 @@ mod tests {
         );
         git(&repo, &["checkout", "-q", "dev"]);
         assert_eq!(std::fs::read_to_string(repo.join("g.txt")).unwrap(), "g1\n");
+
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// revalidate 的 disjoint 判定核心①：从快照的统一 diff 解析出本 CR 改动的文件集。
+    #[test]
+    fn parse_changeset_files_extracts_paths() {
+        let diff = "diff --git a/src/foo.rs b/src/foo.rs\n\
+                    index 111..222 100644\n--- a/src/foo.rs\n+++ b/src/foo.rs\n\
+                    @@ -1 +1 @@\n-old\n+new\n\
+                    diff --git a/docs/README.md b/docs/README.md\n\
+                    new file mode 100644\n+++ b/docs/README.md\n";
+        let set = parse_changeset_files(Some(diff));
+        assert!(set.contains("src/foo.rs"), "got {set:?}");
+        assert!(set.contains("docs/README.md"), "got {set:?}");
+        assert_eq!(set.len(), 2);
+        // 无 diff / 空 → 空集（land_run 据此把「无 diff 信息」当重叠，保守补测）。
+        assert!(parse_changeset_files(None).is_empty());
+        assert!(parse_changeset_files(Some("")).is_empty());
+    }
+
+    /// revalidate 的 disjoint 判定核心②：`git diff --name-only a..b` 取兄弟 CR 落地的文件集。
+    #[tokio::test]
+    async fn diff_name_only_lists_advanced_files() {
+        let (repo, _wt) = setup("nameonly");
+        let sha = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        // setup: dev 从 main 分叉并只改了 f.txt → diff main..dev 应恰为 {f.txt}。
+        let g = GitProxy::new(repo.to_str().unwrap());
+        let moved = diff_name_only(&g, &sha("main"), &sha("dev")).await;
+        assert!(moved.contains("f.txt"), "got {moved:?}");
+        assert_eq!(moved.len(), 1);
+
+        // 与一个改 g.txt 的 CR 文件集 → 不相交（disjoint），land 可不重测直落。
+        let cr_files: std::collections::HashSet<String> = ["g.txt".to_string()].into_iter().collect();
+        assert!(moved.is_disjoint(&cr_files));
+        // 与一个也改 f.txt 的 CR → 相交（overlap），land 须退回补测。
+        let cr_files2: std::collections::HashSet<String> =
+            ["f.txt".to_string()].into_iter().collect();
+        assert!(!moved.is_disjoint(&cr_files2));
 
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }

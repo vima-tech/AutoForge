@@ -186,6 +186,8 @@ pub async fn run_cycle(
 
         if cfg.scan_enabled && !repo_path.is_empty() && scanned_new < cfg.max_per_run {
             let mut payloads = scanner::scan_todos(&pid, &repo_path).await;
+            // 半成品/未实现桩：直击「功能只做了一半」的强信号（linter 覆盖不到）。
+            payloads.extend(scanner::scan_unfinished(&pid, &repo_path).await);
             payloads.extend(scanner::scan_cargo_audit(&pid, &repo_path).await);
             payloads.extend(scanner::scan_npm_audit(&pid, &repo_path).await);
             payloads.extend(scanner::scan_pip_audit(&pid, &repo_path).await);
@@ -249,9 +251,38 @@ pub async fn run_cycle(
         stats.discarded = denoise.discarded;
     }
 
+    // proposer 健康巡检：连续多轮失败 → 进收件箱提醒（避免深度提议器静默空转无人知）。
+    if cfg.proposer_enabled {
+        check_proposer_health(db, app).await;
+    }
+
     // 记录本轮运行时间：下次调度据此按真实间隔计算，重启不再清零计时器。
     // 仅真实运行的路径会到达这里（已在跑的并发轮在函数开头就提前返回）。
     set_setting(db, "autosupply.last_run_at", &now_unix().to_string()).await;
 
     stats
+}
+
+/// proposer 健康巡检：最近多次结构化产出全部失败（status=error，多为模型工具调用格式不兼容
+/// 或 proposer 未绑定可用 LLM）→ 发 `AutosupplyDegraded` 进收件箱提醒操作者。
+/// 通知按 thread_key 折叠为一行，不会逐轮刷屏。
+async fn check_proposer_health(db: &Db, app: &AppHandle) {
+    const WINDOW: i64 = 6; // 巡检最近 6 次 proposer 产出
+    const MIN_STREAK: usize = 3; // 至少连续 3 次失败才告警，避免偶发抖动误报
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM agent_outputs WHERE role='proposer' ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(WINDOW)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if rows.len() >= MIN_STREAK && rows.iter().all(|s| s == "error") {
+        emit(
+            app,
+            AppEvent::AutosupplyDegraded {
+                reason: "最近多轮结构化产出解析失败（status=error）。常见原因：所选模型的工具调用格式不被支持，或 proposer 角色未绑定可用 LLM。建议改用支持原生 function-calling 的强推理模型。"
+                    .to_string(),
+            },
+        );
+    }
 }

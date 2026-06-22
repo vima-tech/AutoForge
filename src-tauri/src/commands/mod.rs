@@ -4,6 +4,7 @@ pub mod asr;
 pub mod backup;
 pub mod change_requests;
 pub mod code_agents;
+pub mod code_agent_skills;
 pub mod conflicts;
 pub mod intake;
 pub mod conversations;
