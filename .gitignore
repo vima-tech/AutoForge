@@ -1,9 +1,9 @@
 # Frontend
-node_modules/
+node_modules
 dist/
 
 # Rust / Tauri
-src-tauri/target/
+src-tauri/target
 
 # App data (local SQLite DB and worktrees)
 *.db

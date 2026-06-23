@@ -362,7 +362,10 @@ pub(crate) async fn finalize_resolution(
 ) -> Result<bool> {
     let wt = GitProxy::new(&session.worktree_path);
     // Stage everything and verify there are no leftover conflict markers / unmerged paths.
-    let _ = wt.run(&["add", "-A"]).await;
+    let add_args =
+        crate::core::stack::git_add_all_args(std::path::Path::new(&session.worktree_path));
+    let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
+    let _ = wt.run(&add_refs).await;
     let markers_clean = wt
         .run(&["diff", "--cached", "--check"])
         .await

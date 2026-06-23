@@ -492,7 +492,17 @@ pub fn dep_cache_dirs(dir: &Path) -> Vec<String> {
 pub fn link_dep_caches(repo: &Path, dest: &Path) {
     #[cfg(unix)]
     {
-        if repo == dest {
+        // Callers do not always use the same lexical form for the main checkout
+        // (for example `/repo` vs `/repo/.`).  Comparing only `Path` values can
+        // therefore create an absolute symlink from a cache directory back to
+        // itself.  Besides destroying the cache, `git add -A` can then commit
+        // that symlink because `dir/` ignore rules do not match a symlink.
+        let same_dir = repo == dest
+            || match (repo.canonicalize(), dest.canonicalize()) {
+                (Ok(repo), Ok(dest)) => repo == dest,
+                _ => false,
+            };
+        if same_dir {
             return;
         }
         for rel in dep_cache_dirs(repo) {
@@ -510,6 +520,25 @@ pub fn link_dep_caches(repo: &Path, dest: &Path) {
     {
         let _ = (repo, dest);
     }
+}
+
+/// Arguments for staging a worktree while explicitly excluding dependency-cache
+/// links.  This is a second safety boundary in addition to `.gitignore`: older
+/// CR branches may predate the fixed ignore rules, and generated cache symlinks
+/// must never become product changes.
+pub fn git_add_all_args(dir: &Path) -> Vec<String> {
+    let mut args = vec![
+        "add".to_string(),
+        "-A".to_string(),
+        "--".to_string(),
+        ".".to_string(),
+    ];
+    args.extend(
+        dep_cache_dirs(dir)
+            .into_iter()
+            .map(|rel| format!(":(exclude){rel}")),
+    );
+    args
 }
 
 /// 适用于该仓库的内置**静态代码分析器**标识（去重）——clippy/ruff/go_vet/eslint。
@@ -788,6 +817,26 @@ mod tests {
         assert!(dep_cache_dirs(&d).is_empty());
         std::fs::create_dir_all(d.join("node_modules")).unwrap();
         assert_eq!(dep_cache_dirs(&d), vec!["node_modules".to_string()]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn git_add_excludes_detected_dependency_caches() {
+        let d = tmp("git-add-cache-excludes");
+        write(&d, "src-tauri/tauri.conf.json", "{}");
+        write(
+            &d,
+            "package.json",
+            r#"{"scripts":{"dev":"vite","tauri:dev":"tauri dev"}}"#,
+        );
+        std::fs::create_dir_all(d.join("node_modules")).unwrap();
+        std::fs::create_dir_all(d.join("src-tauri/target")).unwrap();
+
+        let args = git_add_all_args(&d);
+        assert_eq!(&args[..4], ["add", "-A", "--", "."]);
+        assert!(args.contains(&":(exclude)node_modules".to_string()));
+        assert!(args.contains(&":(exclude)src-tauri/target".to_string()));
+
         std::fs::remove_dir_all(&d).ok();
     }
 

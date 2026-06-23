@@ -14,6 +14,7 @@
 
 use crate::db::Db;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -78,14 +79,24 @@ fn current_tags() -> TraceTags {
 }
 
 /// 设置关联标签覆盖 `f` 执行期间（best-effort；用于编排/直聊/分析等入口）。
-pub async fn with_tags<F: Future>(tags: TraceTags, f: F) -> F::Output {
-    TAGS.scope(tags, f).await
+pub fn with_tags<'a, F>(tags: TraceTags, f: F) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>>
+where
+    F: Future + Send + 'a,
+{
+    Box::pin(TAGS.scope(tags, f))
 }
 
 /// 把 `f` 作为一次「Agent 调用」追踪：建立 trace_id（继承当前 tags + 取 Agent 维度），
 /// `f` 内部的 llm/tool span 会自动挂到该 trace 下。root span 需调用方在 `f` 结束后用
 /// [`record_root`] 补写（以拿到最终出参/状态/耗时）。
-pub async fn scope_run<F: Future>(db: &Db, agent: &crate::models::agent::Agent, f: F) -> F::Output {
+pub fn scope_run<'a, F>(
+    db: &'a Db,
+    agent: &'a crate::models::agent::Agent,
+    f: F,
+) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>>
+where
+    F: Future + Send + 'a,
+{
     scope_run_labeled(
         db,
         Some(agent.id.as_str()),
@@ -93,23 +104,25 @@ pub async fn scope_run<F: Future>(db: &Db, agent: &crate::models::agent::Agent, 
         Some(agent.name.as_str()),
         f,
     )
-    .await
 }
 
 /// 同 [`scope_run`]，但不要求 [`Agent`]——供没有 Agent 实体的 LLM 调用建立 trace（如直连
 /// claude CLI 的需求分析兜底、Layer-1 安全检测）。agent 维度按显式标签写入，缺省留空。
 /// 已在某个 run 内则复用（不新建 trace_id），与 [`scope_run`] 一致。
-pub async fn scope_run_labeled<F: Future>(
-    db: &Db,
-    agent_id: Option<&str>,
-    agent_role: Option<&str>,
-    agent_name: Option<&str>,
+pub fn scope_run_labeled<'a, F>(
+    db: &'a Db,
+    agent_id: Option<&'a str>,
+    agent_role: Option<&'a str>,
+    agent_name: Option<&'a str>,
     f: F,
-) -> F::Output {
+) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>>
+where
+    F: Future + Send + 'a,
+{
     // 已处于某个 trace run 中（如编排把 LLM 调用 + 写文件包进同一 run）→ 复用，
     // 避免新建 trace_id 把同一 Agent 动作拆成多条互不关联的 trace。
     if RUN.try_with(|_| ()).is_ok() {
-        return f.await;
+        return Box::pin(f);
     }
     let run = TraceRun {
         db: db.clone(),
@@ -120,7 +133,11 @@ pub async fn scope_run_labeled<F: Future>(
         agent_name: agent_name.and_then(nonempty),
         seq: Arc::new(AtomicI64::new(0)),
     };
-    RUN.scope(run, f).await
+    // Type-erase and heap-allocate the task-local wrapper.  Keeping this as an
+    // `async fn<F>` makes rustc build a poll stack frame proportional to F; the
+    // tool-enabled system-role future is large enough to overflow Tokio's 2 MiB
+    // worker stack (observed as SIGSEGV in this function prologue).
+    Box::pin(RUN.scope(run, f))
 }
 
 fn run() -> Option<TraceRun> {
@@ -272,4 +289,27 @@ pub async fn record_tool(name: &str, input: &str, output: &str, ok: bool, latenc
         false,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn trace_scope_erases_large_future_size() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let large_future = async move {
+            let payload = [0_u8; 256 * 1024];
+            std::hint::black_box(payload);
+        };
+
+        let scoped = scope_run_labeled(&db, None, None, None, large_future);
+        assert_eq!(
+            std::mem::size_of_val(&scoped),
+            std::mem::size_of::<usize>() * 2,
+            "trace wrappers must remain boxed instead of copying F onto a worker stack"
+        );
+    }
 }

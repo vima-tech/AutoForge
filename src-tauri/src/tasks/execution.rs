@@ -610,7 +610,10 @@ pub async fn run(
     // "nothing to commit" 非零退出，被下面误判成提交失败。CR diff 始终以 fork 点为基
     // （compute_worktree_diff 的 `git diff <base>`），committed/uncommitted 均能正确捕获。
     let (commit_code, commit_err) = if has_uncommitted {
-        let _ = wt_git.run(&["add", "-A"]).await;
+        let add_args =
+            crate::core::stack::git_add_all_args(std::path::Path::new(&worktree_path));
+        let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
+        let _ = wt_git.run(&add_refs).await;
         let commit_msg = format!("AutoForge: {} (i{})", issue.title, iteration);
         wt_git
             .run(&[
