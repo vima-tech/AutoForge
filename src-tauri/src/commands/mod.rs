@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod asr;
 pub mod backup;
 pub mod change_requests;
+pub mod change_summary;
 pub mod code_agents;
 pub mod code_agent_skills;
 pub mod conflicts;

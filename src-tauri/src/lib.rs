@@ -348,6 +348,7 @@ pub fn run() {
             commands::change_requests::get_default_merge_message,
             commands::change_requests::get_worktree_session,
             commands::change_requests::get_code_diff,
+            commands::change_summary::generate_change_summary,
             commands::change_requests::get_merge_conflict,
             commands::change_requests::retry_merge,
             commands::change_requests::ai_resolve_merge_conflict,

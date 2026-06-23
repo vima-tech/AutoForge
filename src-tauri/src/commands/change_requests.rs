@@ -254,12 +254,19 @@ pub async fn compute_worktree_diff(
 
 #[tauri::command]
 pub async fn get_code_diff(cr_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    load_cr_diff(&state.db, &cr_id).await
+}
+
+/// 计算某 CR 的完整代码 diff（纯 Rust，零 Tauri 类型）。优先取 worktree 实时 diff，
+/// worktree 已销毁（合并后）则回退合并时落库的快照。供 `get_code_diff` 命令与
+/// `change_summary` 等内部消费者复用，避免重复 git 调用 / 大 diff 在 IPC 上往返两次。
+pub async fn load_cr_diff(db: &crate::db::Db, cr_id: &str) -> Result<String, String> {
     // Get worktree session
     let session: Option<WorktreeSession> = sqlx::query_as(
         "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
     )
-    .bind(&cr_id)
-    .fetch_optional(&state.db)
+    .bind(cr_id)
+    .fetch_optional(db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -270,8 +277,8 @@ pub async fn get_code_diff(cr_id: String, state: State<'_, AppState>) -> Result<
 
     // Get the CR's base branch (worktree diffs need it to scope the change).
     let cr: Option<ChangeRequest> = sqlx::query_as("SELECT * FROM change_requests WHERE id=?")
-        .bind(&cr_id)
-        .fetch_optional(&state.db)
+        .bind(cr_id)
+        .fetch_optional(db)
         .await
         .map_err(|e| e.to_string())?;
     let target_branch = cr.map(|c| c.target_branch).unwrap_or_default();

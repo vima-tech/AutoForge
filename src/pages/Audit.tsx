@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
+import ChangeSummaryCard from '../components/ChangeSummaryCard';
 import { ConfirmModal } from '../components/ProjectDialogs';
 import { ReaderToc } from '../components/ReaderToc';
 import { toggleMaximizeOnDoubleClick } from '../lib/window';
@@ -3114,6 +3115,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                     </div>
                   </div>
                   <div className="diff-viewport scroll">
+                    {/* AI 变更摘要卡片：报告 tab 顶部，基于 diff 实时生成（仅有实际改动的 CR）。 */}
+                    {tab === 'report' && !NO_CHANGE_STATUSES.includes(cr.status) && !FAILED_STATUSES.includes(cr.status) && (
+                      <ChangeSummaryCard crId={cr.id} enabled={!crLoading} />
+                    )}
                     {tab === 'report' ? renderReportBody() : tab === 'diff' ? renderDiffBody() : renderLogsBody()}
                   </div>
 

@@ -534,6 +534,22 @@ export const getCodeAgentRun = (id: string) =>
   ipc<CodeAgentRunLog | null>('get_code_agent_run', { id });
 export const getCodeDiff = (crId: string) =>
   ipc<string>('get_code_diff', { crId });
+
+// AI 变更摘要：基于 CR 的代码 diff 生成结构化摘要（文件清单 + 业务意图分类 + 敏感标签）。
+// 实时生成、不落库；LLM 失败时后端降级返回确定性部分（status='degraded'），前端据此提示。
+export interface SummaryFile { path: string; change: 'added' | 'modified' | 'deleted' | 'renamed'; note: string }
+export interface IntentGroup { kind: string; detail: string }
+export interface SensitiveTag { kind: string; label: string; detail: string }
+export interface ChangeSummary {
+  overview: string;
+  files: SummaryFile[];
+  intents: IntentGroup[];
+  sensitive: SensitiveTag[];
+  status: 'ok' | 'degraded' | 'empty';
+  note: string | null;
+}
+export const generateChangeSummary = (crId: string) =>
+  ipc<ChangeSummary>('generate_change_summary', { crId });
 export type MergeConflictView = { files: string[]; diff: string };
 export const getMergeConflict = (crId: string) =>
   ipc<MergeConflictView>('get_merge_conflict', { crId });
