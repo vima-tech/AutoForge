@@ -426,15 +426,17 @@ pub fn build_prompt(
         prompt.push_str(&format!("\n## autoforge.yaml / 项目配置快照\n{}\n", config));
     }
 
-    prompt.push_str(
+    // 报告标题用 REPORT_MARKER 单一真源拼装，确保提示词里要求的标题与 extract_report
+    // 抠取的标题永不漂移（两处都改才会同步失效，由 build_prompt_emits_report_marker 测试兜底）。
+    prompt.push_str(&format!(
         r#"
 ## 要求
 0. 全自主执行：本任务在无人值守的流水线中运行，无法向用户提问或等待确认。遇到方案取舍、技术选型、命名等不确定点，**直接采用你判断下的最佳/推荐方案并落地实现**，不要停下来征询意见、不要只给建议而不动手；把所选方案与理由记到下方「改动摘要」即可。
 1. 在当前 worktree 中实现上述需求
 2. 编写必要的测试
-3. 完成后输出实现报告，格式如下：
+3. 完成后输出实现报告，格式如下（标题请严格保留，便于流水线抠取）：
 
-## 改动摘要
+{marker}
 （简述做了什么）
 
 ## 修改文件列表
@@ -446,7 +448,8 @@ pub fn build_prompt(
 ## 潜在风险
 （可能的风险点）
 "#,
-    );
+        marker = REPORT_MARKER
+    ));
 
     prompt
 }
@@ -637,13 +640,57 @@ fn read_project_file(repo_path: &str, name: &str) -> Option<String> {
     std::fs::read_to_string(std::path::Path::new(repo_path).join(name)).ok()
 }
 
-/// Extract the report section starting at "## 改动摘要"
+/// 报告区起始标题的规范文本。`build_prompt` 要求 agent 以此为标题输出实现报告，
+/// `extract_report` 据此从混杂输出中切出报告区。两处共用此常量，避免字面量漂移。
+pub const REPORT_MARKER: &str = "## 改动摘要";
+
+/// 报告标题的核心词（去掉 markdown 装饰后的纯文本）及其同义词。claude 严格遵循
+/// `## 改动摘要`，但 codex / opencode 不保证乖乖输出（提案 §6），可能改写标题级别、
+/// 加粗或换近义词；这里列出容错匹配的核心词。
+const REPORT_HEADINGS: &[&str] = &["改动摘要", "变更摘要", "修改摘要"];
+
+/// Extract the change-report section from raw agent output.
+///
+/// 设计来源：提案 §4「报告约定」+ §6「codex/opencode 不输出 `## 改动摘要`」风险项。
+/// claude 输出规范的 `## 改动摘要` 标题，但其它编码 CLI 常见变体有：标题级别不同
+/// （`# 改动摘要` / `### 改动摘要`）、加粗（`**改动摘要**`）、尾随标点（`## 改动摘要：`）、
+/// 前导空白、或近义词（`变更摘要`）。本函数对这些做**逐行容错匹配**，命中则从该标题行
+/// 行首返回到结尾；全部落空时退化为返回全文（绝不丢内容，与改造前一致）。
 pub fn extract_report(output: &str) -> &str {
-    if let Some(pos) = output.find("## 改动摘要") {
-        &output[pos..]
+    if let Some(start) = find_report_start(output) {
+        &output[start..]
     } else {
-        output
+        // 容错匹配未命中，再退一步：原始子串精确匹配（兼容标题非独占整行的边角情形），
+        // 仍找不到才返回全文。
+        output.find(REPORT_MARKER).map_or(output, |pos| &output[pos..])
     }
+}
+
+/// 扫描每一行，返回首个「改动摘要」标题行的起始字节偏移（行首第一个非空白字符处）。
+fn find_report_start(output: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in output.split_inclusive('\n') {
+        // 行内第一个非空白字符的字节偏移（保留 `#`，与旧行为返回标题起点一致）。
+        let lead_ws = line.len() - line.trim_start().len();
+        if is_report_heading(line) {
+            return Some(offset + lead_ws);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// 判断一行是否为「改动摘要」标题：剥离前后空白、markdown 标题 `#`、加粗 `*`/`_`
+/// 与尾随标点后，核心词命中 `REPORT_HEADINGS` 即为真。
+fn is_report_heading(line: &str) -> bool {
+    let mut core = line.trim();
+    // 去掉 markdown 标题前缀的 `#`（1~6 个）+ 其后空白。
+    core = core.trim_start_matches('#').trim_start();
+    // 去掉前后的加粗/强调标记与残余空白。
+    core = core.trim_matches(|c| c == '*' || c == '_' || c == ' ' || c == '\t');
+    // 去掉尾随的中英文标点（冒号/句号/读号等）。
+    core = core.trim_end_matches([':', '：', '。', '.', '、', ' ', '\t']);
+    REPORT_HEADINGS.contains(&core)
 }
 
 #[cfg(test)]
@@ -746,6 +793,50 @@ mod tests {
         // marker 缺失（codex/opencode 可能不输出标题）→ 返回全文，不丢内容。
         assert_eq!(extract_report("done, edited foo.rs"), "done, edited foo.rs");
         assert_eq!(extract_report("noise\n## 改动摘要\nx"), "## 改动摘要\nx");
+    }
+
+    #[test]
+    fn extract_report_tolerates_heading_variants() {
+        // 标题级别不同（# / ###）。
+        assert_eq!(extract_report("噪声\n# 改动摘要\n正文"), "# 改动摘要\n正文");
+        assert_eq!(extract_report("噪声\n### 改动摘要\n正文"), "### 改动摘要\n正文");
+        // 加粗标题。
+        assert_eq!(extract_report("噪声\n**改动摘要**\n正文"), "**改动摘要**\n正文");
+        // 尾随冒号（中/英）。
+        assert_eq!(extract_report("噪声\n## 改动摘要：\n正文"), "## 改动摘要：\n正文");
+        assert_eq!(extract_report("噪声\n## 改动摘要:\n正文"), "## 改动摘要:\n正文");
+        // 前导空白（缩进的标题）。
+        assert_eq!(extract_report("噪声\n  ## 改动摘要\n正文"), "## 改动摘要\n正文");
+        // 近义词。
+        assert_eq!(extract_report("噪声\n## 变更摘要\n正文"), "## 变更摘要\n正文");
+        // 标题在末行无换行结尾。
+        assert_eq!(extract_report("噪声\n## 改动摘要"), "## 改动摘要");
+    }
+
+    #[test]
+    fn extract_report_does_not_match_inline_or_unrelated_headings() {
+        // 「改动摘要」作为正文内嵌词、非独占标题行 → 不应被当成报告起点（旧的 .find 会误命中行内词）。
+        let s = "前文提到改动摘要这个词\n## 真正标题\n## 改动摘要\n报告";
+        assert_eq!(extract_report(s), "## 改动摘要\n报告");
+        // 无关标题不误命中。
+        assert_eq!(extract_report("## 修改文件列表\nfoo"), "## 修改文件列表\nfoo");
+    }
+
+    #[test]
+    fn extract_report_picks_first_heading_occurrence() {
+        // 多个标题取第一个（报告应位于其后，第一处即真实起点）。
+        let s = "## 改动摘要\nA\n## 改动摘要\nB";
+        assert_eq!(extract_report(s), "## 改动摘要\nA\n## 改动摘要\nB");
+    }
+
+    #[test]
+    fn build_prompt_emits_report_marker() {
+        // 提示词中要求的报告标题必须与 extract_report 抠取的标题来自同一常量，防漂移。
+        let prompt = build_prompt("标题", "描述", "摘要", None, None, 1, "/tmp/nonexistent-repo", None, None);
+        assert!(prompt.contains(REPORT_MARKER), "build_prompt 必须包含报告标题 {REPORT_MARKER}");
+        // 端到端：从一段以 build_prompt 模板尾部为蓝本的「agent 输出」里能抠回报告。
+        let fake_output = format!("一些思考过程……\n{REPORT_MARKER}\n做了 X");
+        assert_eq!(extract_report(&fake_output), format!("{REPORT_MARKER}\n做了 X"));
     }
 
     #[tokio::test]
