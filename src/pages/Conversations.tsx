@@ -1494,8 +1494,8 @@ function EditGroupModal({ conversation, projects, onClose, onSave }: {
 }
 
 // 只读归档消息行：用快照里去规范化的发言人信息渲染，不依赖 live agents，无右键菜单/编辑。
-function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
-  m: ArchivedMessage; agents: Agent[]; isGroup: boolean; projectId?: string;
+function ArchiveMessageRow({ m, agents, isGroup, projectId, highlight }: {
+  m: ArchivedMessage; agents: Agent[]; isGroup: boolean; projectId?: string; highlight?: string;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const liveAgent = !m.is_me && !m.is_innate && m.from_agent ? agentMap[m.from_agent] : null;
@@ -1534,7 +1534,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
           </div>
         )}
         <div ref={bubbleRef} className={'bubble' + (longDoc ? ' doc' : '')} style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
-          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} highlight={highlight} />)}
         </div>
         {quote && (
           <div className="bubble-quote" title={`${quote.author}: ${quote.text}`}>
@@ -1561,6 +1561,8 @@ function ArchiveBrowser({ agents, projects, onClose }: {
   const [confirmDelete, setConfirmDelete] = useState<ConversationArchiveSummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
+  const [expanded, setExpanded] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   const refreshList = useCallback(async () => {
     try { setSummaries(await listConversationArchives()); }
@@ -1607,6 +1609,15 @@ function ArchiveBrowser({ agents, projects, onClose }: {
   };
 
   const searching = q.trim().length > 0;
+  // 选中归档加载完且有搜索词时，自动滚动到右侧正文第一个高亮命中处。
+  useEffect(() => {
+    if (loading || !searching || messages.length === 0) return;
+    const t = setTimeout(() => {
+      bodyRef.current?.querySelector('.search-mark')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
+    return () => clearTimeout(t);
+  }, [loading, searching, messages, q]);
+
   const rows: (ConversationArchiveSummary & { match_count?: number; snippet?: string })[] =
     searching ? hits : summaries;
   const projectName = (s: ConversationArchiveSummary) =>
@@ -1615,13 +1626,16 @@ function ArchiveBrowser({ agents, projects, onClose }: {
 
   return (
     <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
-      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-strong)', borderRadius: 14, width: 'min(980px, 92vw)', height: 'min(680px, 88vh)', display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-strong)', borderRadius: 14, width: expanded ? '100%' : 'min(1180px, 94vw)', height: expanded ? '100%' : 'min(820px, 92vh)', display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: 'var(--shadow-lg)', transition: 'width .16s, height .16s' }} onClick={e => e.stopPropagation()}>
         <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '13px 16px', borderBottom: '1px solid var(--border)' }}>
           <Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />
           <div style={{ flex: 1 }}>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: 'var(--text-section)', fontWeight: 700 }}>归档区</div>
             <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>READ-ONLY · 只读快照检索与回顾</div>
           </div>
+          <button className="icon-btn" title={expanded ? '还原窗口' : '放大窗口 · 沉浸阅读'} onClick={() => setExpanded(e => !e)}>
+            <Icon name={expanded ? 'minimize' : 'maximize'} size={16} />
+          </button>
           <button className="icon-btn" title="关闭" onClick={onClose}><Icon name="x" size={16} /></button>
         </div>
         {err && <div style={{ padding: '6px 16px', color: 'var(--red)', fontSize: 'var(--text-label)' }}>{err}</div>}
@@ -1685,11 +1699,11 @@ function ArchiveBrowser({ agents, projects, onClose }: {
                     <Icon name="trash" size={14} /> 彻底删除
                   </button>
                 </div>
-                <div className="msgs scroll" style={{ flex: 1 }}>
+                <div ref={bodyRef} className="msgs scroll" style={{ flex: 1 }}>
                   {loading
                     ? <div className="empty" style={{ color: 'var(--text-3)', padding: 30 }}>加载中…</div>
                     : messages.map((m, i) => (
-                        <ArchiveMessageRow key={i} m={m} agents={agents} isGroup={isGroupMeta} projectId={selectedMeta.project_id ?? undefined} />
+                        <ArchiveMessageRow key={i} m={m} agents={agents} isGroup={isGroupMeta} projectId={selectedMeta.project_id ?? undefined} highlight={searching ? q.trim() : ''} />
                       ))}
                 </div>
               </>

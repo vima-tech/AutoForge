@@ -1694,7 +1694,7 @@ export default function ProjectsPage() {
               <div style={{ flex: 1, overflow: 'hidden', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                 {activeTab === 'info'      && <ProjectInfoTab project={selectedProject} />}
                 {activeTab === 'materials' && <MaterialsPanel key={selectedProject.id} projectId={selectedProject.id} />}
-                {activeTab === 'intake'    && <IntakePanel key={selectedProject.id} projectId={selectedProject.id} />}
+                {activeTab === 'intake'    && <IntakePanel key={selectedProject.id} projectId={selectedProject.id} tabOrder={['webhook', 'github', 'bulk', 'manual']} />}
                 {activeTab === 'spec'      && <SpecPanel key={selectedProject.id} projectId={selectedProject.id} />}
                 {activeTab === 'config'    && <ConfigPanel key={selectedProject.id} project={selectedProject} onSaved={load} />}
               </div>

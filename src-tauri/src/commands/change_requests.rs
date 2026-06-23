@@ -1170,6 +1170,21 @@ pub async fn delete_change_request(
         .bind(&cr_id)
         .execute(&state.db)
         .await;
+    // Merge/scan test gates leave test_sessions rows whose change_request_id is a
+    // FK to change_requests. With PRAGMA foreign_keys=ON these block the CR delete
+    // below — which is exactly why merge-failed CRs (always tested) couldn't be
+    // removed. scan_findings.test_session_id is in turn a NOT NULL FK to those
+    // sessions, so clear the findings before the sessions before the CR.
+    let _ = sqlx::query(
+        "DELETE FROM scan_findings WHERE test_session_id IN (SELECT id FROM test_sessions WHERE change_request_id=?)",
+    )
+    .bind(&cr_id)
+    .execute(&state.db)
+    .await;
+    let _ = sqlx::query("DELETE FROM test_sessions WHERE change_request_id=?")
+        .bind(&cr_id)
+        .execute(&state.db)
+        .await;
     let _ = sqlx::query("DELETE FROM worktree_sessions WHERE change_request_id=?")
         .bind(&cr_id)
         .execute(&state.db)
@@ -1178,6 +1193,19 @@ pub async fn delete_change_request(
         .bind(&cr_id)
         .execute(&state.db)
         .await;
+    // CR-keyed side data without a FK constraint: doesn't block the delete but
+    // would linger as orphans, so clean it too (matches this command's intent).
+    for tbl in [
+        "security_audits",
+        "deployments",
+        "kb_traces",
+        "code_agent_run_logs",
+    ] {
+        let _ = sqlx::query(&format!("DELETE FROM {tbl} WHERE change_request_id=?"))
+            .bind(&cr_id)
+            .execute(&state.db)
+            .await;
+    }
     sqlx::query("DELETE FROM change_requests WHERE id=?")
         .bind(&cr_id)
         .execute(&state.db)
@@ -1186,6 +1214,18 @@ pub async fn delete_change_request(
 
     // Remove the requirement itself so it doesn't linger as an orphan issue.
     let _ = sqlx::query("DELETE FROM issue_analyses WHERE issue_id=?")
+        .bind(&cr.issue_id)
+        .execute(&state.db)
+        .await;
+    // Sever issue-side FKs that would otherwise block (or be left dangling by)
+    // the issue delete: scan findings that spawned it, and duplicate-of links
+    // from other issues' analyses pointing at this one. Null rather than delete
+    // so unrelated scan/analysis data survives.
+    let _ = sqlx::query("UPDATE scan_findings SET issue_entry_id=NULL WHERE issue_entry_id=?")
+        .bind(&cr.issue_id)
+        .execute(&state.db)
+        .await;
+    let _ = sqlx::query("UPDATE issue_analyses SET duplicate_of=NULL WHERE duplicate_of=?")
         .bind(&cr.issue_id)
         .execute(&state.db)
         .await;

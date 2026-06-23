@@ -18,7 +18,7 @@ import {
   startPreviewLogTail, stopPreviewLogTail,
   getMergeConflict, retryMerge, aiResolveMergeConflict, revertChangeRequest, restoreChangeRequest, getCustomMergeMessageEnabled, getDefaultMergeMessage,
   getConflictDetail, resolveConflictManually, openConflictWorkspace,
-  issueSourceMeta, listCodeAgentRuns, getCodeAgentRun,
+  issueSourceMeta, listCodeAgentRuns, getCodeAgentRun, getRunningCodeAgentLog,
   type CodeAgentRunMeta, type CodeAgentRunLog,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
   type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
@@ -58,7 +58,7 @@ const STATUS_LABEL: Record<string, string> = {
   executing: 'AI 执行中',
   pending_code_review: '待代码审核',
   pending_merge: '待合并',
-  merge_testing: '合并测试中',
+  merge_testing: '合并中',
   merge_ready: '待落地',
   execution_failed: '执行失败',
   merge_failed: '合并失败',
@@ -221,6 +221,18 @@ function parseLogLines(raw: string): { text: string; tone: string }[] {
   return arr;
 }
 
+// 单行日志：React.memo 让流式追加时仅渲染新增的尾行——前缀行 props 按值相等会被跳过，
+// 避免每来一段增量就把上千行全量重新协调。配合 .log-line 的 content-visibility，
+// 视口外的行连布局/绘制都省掉，长日志也能秒开、滚动不卡。
+const LogLine = React.memo(function LogLine({ n, text, tone }: { n: number; text: string; tone: string }) {
+  return (
+    <div className={'log-line' + (tone ? ' ' + tone : '')}>
+      <span className="log-gut">{n}</span>
+      <span className="log-code">{text || ' '}</span>
+    </div>
+  );
+});
+
 // 预览进程生命周期阶段（喂给日志窗口头部状态灯，让用户分清「仍在启动」与「已退出/报错」）。
 type LogPhase = 'starting' | 'running' | 'stopped' | null;
 const LOG_PHASE_META: Record<'starting' | 'running' | 'stopped', { dot: string; label: string }> = {
@@ -295,10 +307,7 @@ function LiveLogModal({ title, sig, phase, onClose }: {
           {lines.length <= 1 && !raw
             ? <div className="log-empty">（暂无日志输出 —— 进程可能尚未启动，或启动命令本身未产生输出）</div>
             : lines.map((l, i) => (
-                <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
-                  <span className="log-gut">{i + 1}</span>
-                  <span className="log-code">{l.text || ' '}</span>
-                </div>
+                <LogLine key={i} n={i + 1} text={l.text} tone={l.tone} />
               ))}
         </div>
       </div>
@@ -932,7 +941,7 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
 const LEDGER_STATUS_LABEL: Record<string, string> = {
   triage: '待整理', pending_analysis: '分析中', analysis_failed: '分析失败',
   pending_issue_review: '需求审核', pending_execution: '待编码', executing: '编码中',
-  pending_code_review: '代码审核', pending_merge: '待合并', merge_testing: '合并测试中', merge_ready: '待落地', merged: '已合并',
+  pending_code_review: '代码审核', pending_merge: '待合并', merge_testing: '合并中', merge_ready: '待落地', merged: '已合并',
   reverting: '撤销中', reverted: '已撤销',
   rejected: '已拒绝', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
 };
@@ -2254,24 +2263,50 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     return () => { if (timer) clearTimeout(timer); unlisten?.(); };
   }, [activeProject, loadList, loadProjectReviewCounts]);
 
-  // 实时日志监听：只累积当前选中 CR 的代码 Agent 输出增量；运行结束（worktree_update）
-  // 时刷新已落库的执行日志列表，让完整日志接替实时缓冲。随 activeCr 重订阅。
+  // 实时日志监听：累积当前选中 CR 的代码 Agent 输出。中途进入时 realtime 事件只能拿到订阅
+  // 之后的增量（日志会从「现在」而非 00:00 开始），故订阅就绪后再拉一次运行中缓冲快照回灌已
+  // 错过的开头，并按 chunk 序号去重无缝续接（快照含 [0, next_seq)，事件 seq≥next_seq 才追加）。
+  // 运行结束（worktree_update）时刷新已落库列表，让完整日志接替实时缓冲。随 activeCr 重订阅。
   useEffect(() => {
     if (!activeCr) return;
     const cr = activeCr;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    listen<{ type?: string; cr_id?: string; stream?: string; chunk?: string }>('AutoForge://event', e => {
+    let seeded = false;          // 快照是否已回灌；回灌前到达的增量先缓存，回灌后按序补放
+    let seq = -1;                // 已并入 liveLog 的最高 chunk 序号
+    const pending: { s: number; c: string }[] = [];
+    const cap = (n: string) => (n.length > 400000 ? n.slice(-300000) : n);
+    const apply = (s: number, c: string) => {
+      if (s <= seq) return;      // 已包含（与快照或先到事件重叠）→ 跳过，避免重复
+      seq = s;
+      setLiveLog(prev => cap(prev + c));
+    };
+    listen<{ type?: string; cr_id?: string; stream?: string; chunk?: string; seq?: number }>('AutoForge://event', e => {
       const ev = e.payload;
       if (ev?.cr_id !== cr) return;
       if (ev.type === 'code_agent_log' && ev.chunk) {
-        const chunk = ev.chunk;
-        // 直接拼字符串（chunk 自带换行/打字增量）；上限保护：超 400K 字符保留尾部 300K。
-        setLiveLog(prev => { const n = prev + chunk; return n.length > 400000 ? n.slice(-300000) : n; });
+        const s = ev.seq ?? 0;
+        if (!seeded) { pending.push({ s, c: ev.chunk }); return; }
+        apply(s, ev.chunk);
       } else if (ev.type === 'worktree_update') {
         listCodeAgentRuns(cr).then(setRuns).catch(() => {});
       }
-    }).then(fn => { if (cancelled) fn(); else unlisten = fn; });
+    }).then(fn => {
+      if (cancelled) { fn(); return; }
+      unlisten = fn;
+      // 订阅就绪后再取快照：保证快照时间晚于订阅，中间增量必被事件捕获，按序号去重即可无缝衔接。
+      const finish = (text: string, nextSeq: number) => {
+        if (cancelled) return;
+        if (text) setLiveLog(text);   // 直接置为快照全文（覆盖切 CR 时的空串）
+        seq = nextSeq - 1;
+        seeded = true;
+        for (const p of pending) apply(p.s, p.c);
+        pending.length = 0;
+      };
+      getRunningCodeAgentLog(cr)
+        .then(snap => finish(snap.text, snap.next_seq))
+        .catch(() => finish('', 0));
+    });
     return () => { cancelled = true; unlisten?.(); };
   }, [activeCr]);
 
@@ -2716,9 +2751,22 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.6 }}>
             {crLoading ? '加载中…' : (session?.report_content || '未捕获到失败详情，请重新执行或查看日志。')}
           </pre>
-          <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
-            可使用右上角「重新执行」重试，或「删除需求」清除该条异常数据。
-          </div>
+          {cr!.status === 'merge_failed' ? (
+            <>
+              <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
+                该需求并入 dev 时合并/集成校验未通过。若已修复 dev 或判断为偶发，可「再次合并」（回到合并队列、在最新 dev 上重测后落地）；若需基于最新 dev 重建实现，则用右上角「重新执行」。
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
+                  <Icon name="refresh" size={13} />再次合并
+                </button>
+              </div>
+            </>
+          ) : (
+            <div style={{ marginTop: 12, fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>
+              可使用右上角「重新执行」重试，或「删除需求」清除该条异常数据。
+            </div>
+          )}
         </div>
       ) : (<>
       {session && (session.iteration_count ?? 0) >= 3 && (
@@ -2831,15 +2879,17 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     });
   };
   // 统一渲染日志正文（解析 + 过滤 + 行号）。空时给占位。
-  const renderLogBody = (raw: string, emptyHint: string) => {
-    const lines = filterLogLines(parseLogLines(raw));
+  // 解析（含 ANSI 剥离 + 逐行正则判色）是日志渲染里最重的一步，按各来源 memo，
+  // 避免无关重渲染（进度心跳、hover 等）反复全量重解析整段日志。
+  const liveParsed = useMemo(() => parseLogLines(liveLog), [liveLog]);
+  const stdoutParsed = useMemo(() => parseLogLines(activeRun?.stdout ?? ''), [activeRun]);
+  const stderrParsed = useMemo(() => parseLogLines(activeRun?.stderr ?? ''), [activeRun]);
+  const renderLogBody = (parsed: { text: string; tone: string }[], raw: string, emptyHint: string) => {
     if (!raw.trim()) return <div className="log-empty">{emptyHint}</div>;
+    const lines = filterLogLines(parsed);
     if (lines.length === 0) return <div className="log-empty">（当前过滤下无内容）</div>;
     return lines.map((l, i) => (
-      <div key={i} className={'log-line' + (l.tone ? ' ' + l.tone : '')}>
-        <span className="log-gut">{i + 1}</span>
-        <span className="log-code">{l.text || ' '}</span>
-      </div>
+      <LogLine key={i} n={i + 1} text={l.text} tone={l.tone} />
     ));
   };
   // 过滤开关条（实时与历史详情共用）。
@@ -2878,7 +2928,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               const el = e.currentTarget;
               setLiveAutoScroll(el.scrollHeight - el.scrollTop - el.clientHeight < 40);
             }}>
-            {renderLogBody(liveLog, '（等待输出…）')}
+            {renderLogBody(liveParsed, liveLog, '（等待输出…）')}
             <div ref={liveEndRef} />
           </div>
         </div>
@@ -2935,7 +2985,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             </div>
           )}
           <div className="log-body scroll" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-            {renderLogBody(runStream === 'stdout' ? activeRun.stdout : activeRun.stderr, '（该流无输出）')}
+            {renderLogBody(runStream === 'stdout' ? stdoutParsed : stderrParsed, runStream === 'stdout' ? activeRun.stdout : activeRun.stderr, '（该流无输出）')}
           </div>
         </>)}
       </>)}
@@ -3227,7 +3277,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
 
       {intakeOpen && activeProject && (
         <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
-          <div style={{ width: 720, maxHeight: 'min(800px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+          <div style={{ width: 720, height: 'min(800px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
             <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}>
                 <span className="cn">需求入口</span>
@@ -3236,7 +3286,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               <button className="icon-btn" onClick={() => setIntakeOpen(false)}><Icon name="x" size={18} /></button>
             </div>
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-              <IntakePanel key={activeProject.id} projectId={activeProject.id} />
+              <IntakePanel key={activeProject.id} projectId={activeProject.id} tabOrder={['bulk', 'manual', 'github', 'webhook']} />
             </div>
           </div>
         </div>
@@ -3248,9 +3298,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           <div onMouseDown={e => e.stopPropagation()}
             style={{ width: 'min(820px, calc(100vw - 64px))', height: 'min(680px, calc(100vh - 64px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             <div style={{ padding: '16px 20px 12px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}>
+              <div className="eyebrow" style={{ fontSize: 'var(--text-section)', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
                 <span className="cn">全量需求总账</span>
-                <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginLeft: 8, fontFamily: 'var(--font-sans)', letterSpacing: 0, textTransform: 'none' }}>所有状态 · 看 / 下钻 / 整理</span>
+                {activeProject && <span className="chip ember">{activeProject.name}</span>}
+                <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-sans)', letterSpacing: 0, textTransform: 'none' }}>所有状态 · 看 / 下钻 / 整理</span>
               </div>
               <button className="icon-btn" onClick={() => setShowLedger(false)}><Icon name="x" size={18} /></button>
             </div>

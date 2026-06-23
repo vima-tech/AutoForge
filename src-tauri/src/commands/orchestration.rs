@@ -1041,10 +1041,11 @@ async fn run_agent_for_step(
             crate::agents::roles::OUTPUT_FORMAT_GUIDE
         )
     };
-    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 代码扫描(项目仓库) + 勾选的 MCP server 工具。
+    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 只读代码情报(绑定项目时无条件补齐)
+    // + 勾选的 MCP server 工具。用 chat 版装配，确保群聊里 Agent 总能真正读到项目代码而非空口承诺。
     let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
     let registry =
-        crate::agents::tools::build_registry_for_agent(&db, &agent, &tool_ctx).await;
+        crate::agents::tools::build_registry_for_chat_agent(&db, &agent, &tool_ctx).await;
     // 多模态：收集最近上下文窗口内的图片附件，交给绑定多模态 LLM 的 Agent 识别。
     // 非多模态 LLM 会在 llm 层静默忽略这些图片（快照里仍保留「[图片: …]」文字描述）。
     let images = collect_context_images(&db, &conversation_id, 40, 6).await;

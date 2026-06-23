@@ -408,6 +408,8 @@ pub async fn run(
         let cr = cr_id.to_string();
         tokio::spawn(async move {
             while let Some(c) = log_rx.recv().await {
+                // 先入累计缓冲（供中途进入回灌），再带序号推事件（供实时滚动 + 去重续接）。
+                let seq = crate::state::running_log_append(&cr, &c.text);
                 event::emit(
                     &app,
                     event::AppEvent::CodeAgentLog {
@@ -415,6 +417,7 @@ pub async fn run(
                         phase: "execution".to_string(),
                         stream: c.stream.to_string(),
                         chunk: c.text,
+                        seq,
                     },
                 );
             }
@@ -426,6 +429,7 @@ pub async fn run(
         .unwrap_or_else(|e| (-1, format!("Agent error: {}", e), String::new()));
     drop(log_tx); // 关闭 sink，让转发任务收尾
     let _ = forward.await;
+    crate::state::running_log_clear(cr_id); // 完整日志已得，清理实时缓冲（落库列表接管）
 
     // 完整执行日志落库（含超时被杀前的输出），便于事后发现/调试问题。失败不阻断主流程。
     crate::agents::code_agent::log_run(

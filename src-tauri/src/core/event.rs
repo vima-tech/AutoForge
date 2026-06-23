@@ -108,6 +108,9 @@ pub enum AppEvent {
         phase: String,
         stream: String,
         chunk: String,
+        /// 该 chunk 在本次运行内的序号（0-based）。前端中途进入时据此与
+        /// `get_running_code_agent_log` 快照去重，无缝衔接已错过的开头与后续增量。
+        seq: u64,
     },
     /// 预览/dev-server 启动日志的实时增量。`key` 与前端日志弹窗的 `sig` 对应
     /// （`cr:<id>` 或 `branch:<pid>:<branch>`），供前端只累积当前打开的那个日志。

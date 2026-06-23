@@ -1044,6 +1044,10 @@ button { font-family: inherit; cursor: pointer; }
 }
 .search input { border: none; background: none; outline: none; color: var(--text); font-size: var(--text-control); width: 100%; font-family: var(--font-sans); }
 .search svg { width: 15px; height: 15px; color: var(--text-3); flex: none; }
+/* 搜索框内的清空按钮：清零原生 button 内边距，并覆盖 .search svg / .icon-btn svg
+   的尺寸冲突，让 X 图标在小尺寸按钮里真正居中、不溢出。 */
+.search .icon-btn { padding: 0; }
+.search .icon-btn svg { width: 13px; height: 13px; }
 
 .content {
   flex: 1; min-width: 0;
@@ -2000,7 +2004,10 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 /* 实时日志窗口（行号 + 按行高亮 + 跟随滚动） */
 .log-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 0; background: var(--code-bg); font-family: var(--font-mono); font-size: var(--text-caption); line-height: 1.65; }
 .log-empty { padding: 20px 18px; color: var(--text-faint); font-family: var(--font-sans); font-size: var(--text-label); }
-.log-line { display: flex; align-items: flex-start; padding: 0 14px 0 0; border-left: 2px solid transparent; }
+/* content-visibility: 视口外的日志行跳过布局/绘制，上千行长日志也能秒开、滚动不卡；
+   contain-intrinsic-size 的 auto 记住实测高度（行可换行高度不定），未渲染时回退约一行高，
+   保证滚动条尺寸与跳转（含自动滚到底）稳定。配合 LogLine 的 React.memo 一并降本。 */
+.log-line { display: flex; align-items: flex-start; padding: 0 14px 0 0; border-left: 2px solid transparent; content-visibility: auto; contain-intrinsic-size: auto 18px; }
 .log-line:hover { background: var(--surface-hover); }
 .log-gut {
   flex: none; width: 46px; padding-right: 12px; text-align: right;

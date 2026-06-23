@@ -192,6 +192,22 @@ pub async fn list_code_agent_runs(
     .map_err(|e| e.to_string())
 }
 
+/// 运行中编码 Agent 的实时日志快照（自任务开始累计的全文 + 下一个 chunk 序号）。
+#[derive(serde::Serialize)]
+pub struct RunningCodeAgentLog {
+    pub text: String,
+    pub next_seq: u64,
+}
+
+/// 取某 CR 运行中编码 Agent 的实时日志快照。前端中途进入「执行日志」时用它回灌已错过的开头
+/// （realtime 事件只能拿到订阅之后的增量），再据 `next_seq` 与增量事件去重无缝续接。
+/// 任务未运行/已结束时返回空（完整日志改由 `list_code_agent_runs` 落库列表呈现）。
+#[tauri::command]
+pub fn get_running_code_agent_log(cr_id: String) -> RunningCodeAgentLog {
+    let (text, next_seq) = crate::state::running_log_snapshot(&cr_id);
+    RunningCodeAgentLog { text, next_seq }
+}
+
 /// 取单条执行日志的完整正文（stdout/stderr），用于详情查看。
 #[tauri::command]
 pub async fn get_code_agent_run(

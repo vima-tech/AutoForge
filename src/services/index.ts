@@ -532,6 +532,10 @@ export const listCodeAgentRuns = (crId: string) =>
   ipc<CodeAgentRunMeta[]>('list_code_agent_runs', { crId });
 export const getCodeAgentRun = (id: string) =>
   ipc<CodeAgentRunLog | null>('get_code_agent_run', { id });
+// 运行中编码 Agent 的实时日志快照：中途进入「执行日志」时回灌已错过的开头。
+// next_seq 为下一个 chunk 序号，前端据此与增量事件去重无缝续接。
+export const getRunningCodeAgentLog = (crId: string) =>
+  ipc<{ text: string; next_seq: number }>('get_running_code_agent_log', { crId });
 export const getCodeDiff = (crId: string) =>
   ipc<string>('get_code_diff', { crId });
 

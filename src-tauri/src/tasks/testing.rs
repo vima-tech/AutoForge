@@ -4,6 +4,7 @@ use crate::models::job::JobPayload;
 use crate::tasks::runner::{enqueue, JobSender};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -111,6 +112,45 @@ pub async fn run_and_gate(
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
         results.push(run_check(&test_path, name, command, timeout).await);
+    }
+
+    // 差量安全门 + 自动供料：security(cargo audit)从「绝对门」改成「回归门」——合并前测试只
+    // 看本次改动有没有**新引入**依赖漏洞；项目基线本来就有的（rsa、Tauri GTK3 链等）不阻断
+    // 合并，而是作为需求自动供料进传送带（见 demote_preexisting_security）。
+    let preexisting_adv =
+        demote_preexisting_security(&mut results, &test_path, &project.branch_dev).await;
+    for adv in &preexisting_adv {
+        let title = format!("[安全] 依赖公告 {}（基线既有，非本次引入）", adv);
+        let description = format!(
+            "项目依赖树存在安全公告 {}，非本次改动引入，已放行合并。建议评估修复或在 \
+             .cargo/audit.toml 登记接受。\nhttps://rustsec.org/advisories/{}",
+            adv, adv
+        );
+        // 稳定 fingerprint（仅取决于 advisory id）+ INSERT OR IGNORE → 跨多次合并自动去重。
+        let fp = security::fingerprint("dep-advisory", adv);
+        let issue_id = Uuid::new_v4().to_string();
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO issues
+             (id, project_id, source_type, title, description, category, severity, priority, status, fingerprint)
+             VALUES (?, ?, 'security_audit', ?, ?, 'Debt', 'medium', 5, 'pending_analysis', ?)",
+        )
+        .bind(&issue_id)
+        .bind(&project.id)
+        .bind(&title)
+        .bind(&description)
+        .bind(&fp)
+        .execute(db)
+        .await;
+        if matches!(inserted, Ok(ref r) if r.rows_affected() > 0) {
+            let _ = enqueue(
+                db,
+                tx,
+                "analysis",
+                &format!("analysis:{}", issue_id),
+                JobPayload::Analysis { issue_id },
+            )
+            .await;
+        }
     }
 
     let failed = results.iter().filter(|r| !r.ok).collect::<Vec<_>>();
@@ -266,6 +306,201 @@ pub async fn run_and_gate(
     }
 
     Ok(failed.is_empty())
+}
+
+/// 差量安全门：把 security(cargo audit)检查从「绝对门」改成「回归门」。
+///
+/// 只有本 CR 的 Cargo.lock 相对 **dev 基线新引入**的 advisory 才保持失败、阻断合并；项目基线
+/// 本来就存在的 advisory（rsa、Tauri 2.x GTK3 链等，几乎都来自传递依赖而非本次改动）不阻断
+/// ——它们作为「基线既有」返回给调用方走自动供料登记需求。
+///
+/// 仅处理 `cargo audit` 命令（其它语言的 security 命令保持原样）。基线取自 **CR 分支与 dev 的
+/// 合并基（fork 点）** 的同名 lock；拿不到基线时按用户优先级「不卡合并」放行（视为全部既有）。
+/// 返回：被判定为「基线既有」的 advisory id 集（去重排序），供调用方自动供料。
+async fn demote_preexisting_security(
+    results: &mut [CheckResult],
+    worktree: &str,
+    branch_dev: &str,
+) -> Vec<String> {
+    let mut preexisting: Vec<String> = Vec::new();
+    for r in results.iter_mut() {
+        if r.name != "security" || r.ok || !r.command.contains("cargo audit") {
+            continue;
+        }
+        let lock = audit_file_arg(&r.command).unwrap_or_else(|| "Cargo.lock".to_string());
+        // 当前 CR 的 advisory 集（在 worktree 跑，应用其 .cargo/audit.toml 忽略规则）。
+        // 跑不出来（缺工具/DB/解析失败）→ 不是「项目本来的漏洞」语义，保留原失败、不误放行。
+        let Some(cur) = cargo_audit_vuln_ids(worktree, &lock).await else {
+            continue;
+        };
+        let base = baseline_vuln_ids(worktree, branch_dev, &lock).await;
+        let mut new_ids: Vec<String> = cur.iter().filter(|id| !base.contains(*id)).cloned().collect();
+        new_ids.sort();
+        let mut pre: Vec<String> = cur.iter().filter(|id| base.contains(*id)).cloned().collect();
+        pre.sort();
+        preexisting.extend(pre.iter().cloned());
+
+        if new_ids.is_empty() {
+            // 没有新引入 → 不阻断合并。改写为通过，输出说明（供报告/遥测）。
+            r.ok = true;
+            r.code = 0;
+            r.stdout = format!(
+                "差量安全门：本次改动未新引入依赖漏洞，放行合并。\n基线既有 advisory（不阻断，已自动供料登记需求）：{}",
+                if pre.is_empty() { "无".into() } else { pre.join(", ") }
+            );
+            r.stderr.clear();
+        } else {
+            // 有新引入 → 仍阻断，但只报新增的，避免淹没在基线噪音里。
+            r.stderr = format!(
+                "本次改动新引入依赖漏洞（阻断合并）：{}\n基线既有问题不计入：{}",
+                new_ids.join(", "),
+                if pre.is_empty() { "无".into() } else { pre.join(", ") }
+            );
+        }
+    }
+    preexisting.sort();
+    preexisting.dedup();
+    preexisting
+}
+
+/// 解析 cargo audit 命令里的 `--file <path>`（lockfile 路径）；无则 None（用默认 Cargo.lock）。
+fn audit_file_arg(command: &str) -> Option<String> {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    toks.iter()
+        .position(|t| *t == "--file")
+        .and_then(|i| toks.get(i + 1))
+        .map(|s| s.to_string())
+}
+
+/// 在 `cwd` 内跑 `cargo audit --no-fetch --file <lock_path> --json`，返回 vulnerability 的
+/// advisory id 集（应用 cwd 下 .cargo/audit.toml 的忽略规则）。工具/DB 缺失或解析失败 → None。
+async fn cargo_audit_vuln_ids(cwd: &str, lock_path: &str) -> Option<HashSet<String>> {
+    let cmd = format!("cargo audit --no-fetch --file {} --json", lock_path);
+    let mut c = crate::core::platform::shell(&cmd);
+    c.current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = c.output().await.ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let list = v.get("vulnerabilities")?.get("list")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|it| it.get("advisory")?.get("id")?.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// 基线 advisory 集：取 **CR 分支与 dev 的合并基（fork 点）** 的同名 lock 写临时文件后在
+/// worktree 内审计（同一忽略规则）。
+///
+/// 用 fork 点而非 dev tip 是关键——「本次改动引入」只能相对 CR 的**起点**算：fork 后 dev 并行
+/// 修复（如 quinn 0185 在 dev 上已修，但 CR 从更早的 dev 切出仍带旧版）或 dev 并行引入的问题，
+/// 都不该算到本 CR 头上。若 Phase-1 已把 dev 并入 worktree，则 dev 成为 HEAD 祖先、merge-base
+/// 自然就是 dev tip，逻辑退化为「只看 CR 在最新 dev 上的净新增」，同样正确。
+///
+/// 在 worktree 内跑 git（HEAD=CR 分支；worktree 与主仓库共享对象库，可 show 任意 sha）。拿不到
+/// 合并基则回退 dev tip，再不行 → 空集（按「不卡合并」放行）。
+async fn baseline_vuln_ids(worktree: &str, branch_dev: &str, lock_rel: &str) -> HashSet<String> {
+    let git = crate::core::git::GitProxy::new(worktree);
+    // fork 点：CR 分支 HEAD 与 dev 的合并基。拿不到则回退 dev tip。
+    let base_ref = git
+        .run(&["merge-base", "HEAD", branch_dev])
+        .await
+        .ok()
+        .filter(|(c, _, _)| *c == 0)
+        .map(|(_, o, _)| o.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| branch_dev.to_string());
+    let spec = format!("{}:{}", base_ref, lock_rel);
+    let content = match git.run(&["show", &spec]).await {
+        Ok((0, out, _)) if !out.trim().is_empty() => out,
+        _ => return HashSet::new(),
+    };
+    let tmp = std::env::temp_dir().join(format!("af-baseline-{}.lock", Uuid::new_v4()));
+    if std::fs::write(&tmp, content.as_bytes()).is_err() {
+        return HashSet::new();
+    }
+    let ids = cargo_audit_vuln_ids(worktree, &tmp.to_string_lossy())
+        .await
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    ids
+}
+
+/// 从某 CR 最近一次合并门测试会话提取失败详情，组装成可读 Markdown 回写到 worktree
+/// `report_content`，供审核页「合并失败原因」展示真正有用的测试输出——否则该字段仍是
+/// 编码 Agent 的实现摘要（「## 改动摘要」），对诊断合并失败毫无帮助。
+///
+/// 仅应在测试失败导致 merge_failed / merge_conflict 时调用；找不到失败会话则不动
+/// `report_content`（保留原实现摘要）。与安全门 / 落地失败写 `report_content` 的现有
+/// 模式一致。best-effort，任何 DB 错误都静默吞掉、不影响闸口结果。
+pub(crate) async fn persist_test_failure_report(db: &Db, cr_id: &str) {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT summary, results_json FROM test_sessions
+         WHERE change_request_id=? AND trigger='pre_merge' AND status='failed'
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let Some((summary, results_json)) = row else {
+        return;
+    };
+
+    // 取字符串尾部 n 个字符（失败信息通常在编译/测试输出末尾）。
+    fn tail_chars(s: &str, n: usize) -> String {
+        let mut v: Vec<char> = s.chars().rev().take(n).collect();
+        v.reverse();
+        v.into_iter().collect()
+    }
+
+    let mut body = String::new();
+    if let Some(checks) = results_json
+        .as_deref()
+        .and_then(|rj| serde_json::from_str::<serde_json::Value>(rj).ok())
+        .and_then(|v| v.get("checks").and_then(|c| c.as_array()).cloned())
+    {
+        for c in &checks {
+            if c.get("ok").and_then(|b| b.as_bool()).unwrap_or(true) {
+                continue;
+            }
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("check");
+            let command = c.get("command").and_then(|x| x.as_str()).unwrap_or("");
+            let code = c
+                .get("code")
+                .and_then(|x| x.as_i64())
+                .map(|c| format!("　退出码：{}", c))
+                .unwrap_or_default();
+            let stderr = c.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
+            let stdout = c.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
+            let out = if stderr.trim().is_empty() { stdout } else { stderr };
+            let tail = tail_chars(out, 2000);
+            let tail = if tail.trim().is_empty() {
+                "(无输出)".to_string()
+            } else {
+                tail.trim().to_string()
+            };
+            body.push_str(&format!(
+                "### `{}`\n\n命令：`{}`{}\n\n```\n{}\n```\n\n",
+                name, command, code, tail
+            ));
+        }
+    }
+    if body.is_empty() {
+        body.push_str("（未捕获到具体检查输出，请查看测试会话或执行日志。）\n");
+    }
+    let report = format!("## 合并前测试失败\n\n{}，已阻断合并。\n\n{}", summary, body);
+
+    let _ = sqlx::query(
+        "UPDATE worktree_sessions SET report_content=?
+         WHERE id=(SELECT id FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1)",
+    )
+    .bind(&report)
+    .bind(cr_id)
+    .execute(db)
+    .await;
 }
 
 pub(crate) fn configured_checks(config_yaml: Option<&str>) -> Vec<(String, String, u64)> {

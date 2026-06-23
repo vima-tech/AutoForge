@@ -461,6 +461,7 @@ pub fn run() {
             commands::code_agents::check_code_agent_auth,
             commands::code_agents::list_code_agent_runs,
             commands::code_agents::get_code_agent_run,
+            commands::code_agents::get_running_code_agent_log,
             commands::code_agent_skills::list_code_agent_skills,
             commands::code_agent_skills::upsert_code_agent_skill,
             commands::code_agent_skills::delete_code_agent_skill,

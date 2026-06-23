@@ -106,6 +106,62 @@ pub fn set_build_slots(slots: usize) {
     }
 }
 
+/// 运行中编码 Agent 的实时日志缓冲（按 cr_id）。前端中途进入「执行日志」时，realtime
+/// `CodeAgentLog` 事件只能拿到订阅之后的增量；此缓冲自任务开始累计全文，供
+/// `get_running_code_agent_log` 一次性回灌，使日志从头完整可见。append-only + 上限保护
+/// （超 CAP 保留尾部 KEEP，与前端一致），任务结束 `running_log_clear` 清理（此后完整日志由
+/// `code_agent_run_logs` 落库列表接管）。零 Tauri、进程内全局，非 Tauri 入口也能用。
+struct RunningLog {
+    text: String,
+    /// 已追加的 chunk 数；每段事件携带各自序号（0-based），前端据此与快照去重，避免回灌重叠。
+    seq: u64,
+}
+static RUNNING_LOGS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RunningLog>>> =
+    std::sync::OnceLock::new();
+const RUNNING_LOG_CAP: usize = 400_000;
+const RUNNING_LOG_KEEP: usize = 300_000;
+
+/// 追加一段实时日志，返回该 chunk 的序号（0-based）。
+pub fn running_log_append(cr_id: &str, chunk: &str) -> u64 {
+    let map = RUNNING_LOGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    let entry = guard
+        .entry(cr_id.to_string())
+        .or_insert_with(|| RunningLog {
+            text: String::new(),
+            seq: 0,
+        });
+    let seq = entry.seq;
+    entry.seq += 1;
+    entry.text.push_str(chunk);
+    // 超上限则保留尾部 KEEP 字符（按 UTF-8 字符边界裁，避免切坏多字节字符）。
+    if entry.text.len() > RUNNING_LOG_CAP {
+        let mut cut = entry.text.len() - RUNNING_LOG_KEEP;
+        while cut < entry.text.len() && !entry.text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        entry.text = entry.text.split_off(cut);
+    }
+    seq
+}
+
+/// 取某 CR 当前实时日志快照：(全文, 下一个 chunk 序号)。无缓冲（未运行/已清理）返回 ("", 0)。
+pub fn running_log_snapshot(cr_id: &str) -> (String, u64) {
+    let map = RUNNING_LOGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let guard = map.lock().unwrap();
+    match guard.get(cr_id) {
+        Some(e) => (e.text.clone(), e.seq),
+        None => (String::new(), 0),
+    }
+}
+
+/// 任务结束时清理某 CR 的实时日志缓冲（完整日志已落库，realtime 缓冲不再需要）。
+pub fn running_log_clear(cr_id: &str) {
+    if let Some(map) = RUNNING_LOGS.get() {
+        map.lock().unwrap().remove(cr_id);
+    }
+}
+
 static WORKTREES_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ATTACHMENTS_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static MATERIALS_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

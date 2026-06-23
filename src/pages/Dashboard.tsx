@@ -31,7 +31,7 @@ const STATUS_LABEL: Record<string, string> = {
   executing: 'AI 执行中',
   pending_code_review: '待代码审核',
   pending_merge: '待合并',
-  merge_testing: '合并测试中',
+  merge_testing: '合并中',
   merge_ready: '待落地',
   execution_failed: '执行失败',
   merge_failed: '合并失败',

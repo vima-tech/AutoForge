@@ -92,6 +92,11 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
+    /// 是否已注册某名称的工具（供会话型装配补齐只读工具时去重）。
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     /// 所有工具的声明，供 llm.rs 渲染成 provider 的 tools 字段。
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
@@ -274,6 +279,37 @@ pub async fn build_registry_for_agent(
         }
     }
 
+    reg
+}
+
+/// 只读代码情报工具名（读/搜/列项目文件，均无副作用）。绑定项目的会话中无条件可用。
+pub const READONLY_CODE_TOOLS: [&str; 3] =
+    ["read_project_file", "search_project_code", "list_project_files"];
+
+/// 会话型 Agent（群聊/直聊）专用注册表：在 [`build_registry_for_agent`] 之上，**当会话绑定的
+/// 项目能解析出仓库根时，无条件补齐只读代码情报工具**（read/search/list），不受 capabilities 白名单限制。
+///
+/// 理由：绑定项目的会话本就允许 Agent 只读全部项目文件（见 CLAUDE.md「会议室系统」）；这三个工具
+/// 无副作用，却常因角色未勾选白名单而缺席，导致 Agent「承诺去看代码却无工具可用」、只能空转出一句
+/// 前导语就收场。无项目（repo_root 为空）时行为与 [`build_registry_for_agent`] 完全一致（零回归）。
+pub async fn build_registry_for_chat_agent(
+    db: &crate::db::Db,
+    agent: &crate::models::agent::Agent,
+    ctx: &ToolContext,
+) -> ToolRegistry {
+    let mut reg = build_registry_for_agent(db, agent, ctx).await;
+    if ctx.repo_root.is_none() {
+        return reg;
+    }
+    for factory in builtin_catalog() {
+        let name = factory.info().name;
+        if !READONLY_CODE_TOOLS.contains(&name) || reg.contains(name) {
+            continue;
+        }
+        if let Some(tool) = factory.build(db, ctx).await {
+            reg.register(tool);
+        }
+    }
     reg
 }
 

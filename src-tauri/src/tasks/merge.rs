@@ -407,6 +407,8 @@ pub(crate) async fn finalize_resolution(
         .await
         .unwrap_or(false);
     if !passed {
+        // 把测试失败详情回写报告，供审核页「合并失败原因」展示有用信息（而非实现摘要）。
+        crate::tasks::testing::persist_test_failure_report(db, &cr.id).await;
         sqlx::query("UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
             .bind(&cr.id).execute(db).await?;
         sqlx::query("UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
@@ -551,6 +553,7 @@ pub async fn ai_resolve_conflict(
             let cr = cr_id.to_string();
             tokio::spawn(async move {
                 while let Some(c) = log_rx.recv().await {
+                    let seq = crate::state::running_log_append(&cr, &c.text);
                     crate::core::event::emit(
                         &app,
                         crate::core::event::AppEvent::CodeAgentLog {
@@ -558,6 +561,7 @@ pub async fn ai_resolve_conflict(
                             phase: "conflict_resolve".to_string(),
                             stream: c.stream.to_string(),
                             chunk: c.text,
+                            seq,
                         },
                     );
                 }
@@ -569,6 +573,7 @@ pub async fn ai_resolve_conflict(
             .unwrap_or((-1, String::new(), String::new()));
         drop(log_tx);
         let _ = forward.await;
+        crate::state::running_log_clear(cr_id); // 清理实时缓冲（落库列表接管）
         // 解冲突也是一次代码 Agent 执行，完整日志同样落库（phase=conflict_resolve）。
         crate::agents::code_agent::log_run(
             db,
@@ -753,6 +758,20 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     // can't write the same worktree underneath us. Order: merge_lock → cr_lock (no deadlock).
     let cr_lock = crate::state::cr_lock(cr_id);
     let _cr_guard = cr_lock.lock().await;
+
+    // 串行合并路径此前全程停在 pending_merge（「待合并」）直到翻成 merged——用户看不到「正在
+    // 合并」。这里一进入实际合并就推进到 merge_testing（「合并中」），与并行 premerge 路径一致；
+    // 启动恢复已覆盖 merge_testing（重启会重排 premerge），故崩溃也不会卡死。发 WorktreeUpdate
+    // 触发审核页列表重载、让状态 chip 立刻翻成「合并中」（task_progress 只更新进度 note，不刷状态）。
+    set_status(db, cr_id, &cr.issue_id, "merge_testing").await?;
+    event::emit(
+        app,
+        event::AppEvent::WorktreeUpdate {
+            cr_id: cr_id.to_string(),
+            status: "merge_testing".to_string(),
+            message: Some(format!("正在合并到 {}…", project.branch_dev)),
+        },
+    );
 
     // Snapshot the CR's own diff before Phase 1 merges dev in (keeps it scoped).
     snapshot_cr_diff(db, &session, &cr).await;
@@ -1282,6 +1301,8 @@ async fn run_premerge_gates(
             "pre-merge tests failed for cr {} (dev_merged={}), blocking merge",
             cr_id, dev_merged
         );
+        // 把测试失败详情回写报告，供审核页「合并失败原因」展示有用信息（而非实现摘要）。
+        crate::tasks::testing::persist_test_failure_report(db, cr_id).await;
         set_status(db, cr_id, &cr.issue_id, fail_status).await?;
         event::emit(
             app,

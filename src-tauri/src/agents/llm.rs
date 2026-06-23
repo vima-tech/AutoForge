@@ -587,6 +587,43 @@ async fn run_anthropic(
     text.ok_or_else(|| anyhow!("Anthropic 响应缺少 content[].text"))
 }
 
+/// 工具循环提醒语：当 Agent 有可用工具却只回了「我去看看…」这类未兑现前导语、且未发出工具调用时，
+/// 用它促模型立即真正调用工具或直接给出完整答复，避免把空口承诺当最终回复返回。
+const TOOL_NUDGE: &str = "你刚才表示要进一步查看/检索/分析，但本轮没有实际调用任何工具。你现在就有可用工具（如 read_project_file / search_project_code / list_project_files 等）——请**立即调用**所需工具获取信息后再作答；若已掌握足够信息，请直接输出完整的最终答复，不要只描述你打算做什么。";
+
+/// 判断模型正文是否是「只宣告意图、未实际动手」的前导语（如「让我先看看…再…」）。
+/// 仅对**短**回复触发（实质答复通常更长，不应被打断），命中关键开场白线索即视为前导语。
+fn looks_like_unfulfilled_preamble(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > 120 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    const CUES: [&str; 20] = [
+        "让我先",
+        "让我看",
+        "让我查",
+        "让我检查",
+        "让我分析",
+        "让我读",
+        "让我了解",
+        "我先看",
+        "我先查",
+        "我来看",
+        "我去看",
+        "我看一下",
+        "我查一下",
+        "稍等",
+        "请稍候",
+        "马上为你",
+        "let me look",
+        "let me check",
+        "i'll look",
+        "i'll check",
+    ];
+    CUES.iter().any(|c| lower.contains(*c))
+}
+
 /// OpenAI 兼容工具调用循环：声明 tools → 解析 message.tool_calls → 执行 → 以
 /// role=tool 消息回灌 → 续轮，直到模型不再调用工具或达到轮数上限。
 async fn run_openai_tool_loop(
@@ -603,6 +640,8 @@ async fn run_openai_tool_loop(
     messages.push(json!({ "role": "user", "content": prompt }));
     // 记录最近一次模型正文，供轮数耗尽时优雅兜底（返回已有内容而非直接报错）。
     let mut last_content = String::new();
+    // 是否已就「只说不做的前导语」提醒过一次（每个对话至多提醒一次，防止反复空转）。
+    let mut nudged = false;
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut req = client
@@ -684,6 +723,25 @@ async fn run_openai_tool_loop(
                 messages.push(json!({ "role": "user", "content": feedback }));
                 continue;
             }
+            // 有可用工具，但模型只回了「让我先看看…」这类未兑现的前导语、且没发出任何工具调用：
+            // 追加一次提醒促其真正调用工具，避免把空口承诺当最终答复返回。每个对话至多提醒一次。
+            if !nudged
+                && !registry.is_empty()
+                && iter + 1 < MAX_TOOL_ITERS
+                && looks_like_unfulfilled_preamble(&content_str)
+            {
+                nudged = true;
+                messages.push(json!({ "role": "assistant", "content": content_str }));
+                messages.push(json!({ "role": "user", "content": TOOL_NUDGE }));
+                continue;
+            }
+            // 观测：有工具可用却仍以前导语收尾（提醒后依旧不调用），记一条告警便于复盘此类空转。
+            if !registry.is_empty() && looks_like_unfulfilled_preamble(&content_str) {
+                eprintln!(
+                    "[tools] Agent 在有工具可用时仅返回前导语、未调用任何工具，按现状返回：{}",
+                    content_str.chars().take(80).collect::<String>()
+                );
+            }
             // 无工具调用（或已到末轮）：返回正文作为最终回答。
             return Some(content_str)
                 .filter(|s| !s.is_empty())
@@ -732,6 +790,8 @@ async fn run_anthropic_tool_loop(
     let client = http_client()?;
     let tools = anthropic_tools(registry);
     let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": prompt })];
+    // 是否已就「只说不做的前导语」提醒过一次（每个对话至多提醒一次，防止反复空转）。
+    let mut nudged = false;
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut body = json!({
@@ -791,6 +851,24 @@ async fn run_anthropic_tool_loop(
                 .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // 有可用工具，但模型只回了未兑现的前导语、且没发出 tool_use：提醒一次促其真正调用工具。
+            if !nudged
+                && !registry.is_empty()
+                && iter + 1 < MAX_TOOL_ITERS
+                && looks_like_unfulfilled_preamble(&text)
+            {
+                nudged = true;
+                messages.push(json!({ "role": "assistant", "content": content.clone() }));
+                messages.push(json!({ "role": "user", "content": TOOL_NUDGE }));
+                continue;
+            }
+            // 观测：有工具可用却仍以前导语收尾，记一条告警便于复盘此类空转。
+            if !registry.is_empty() && looks_like_unfulfilled_preamble(&text) {
+                eprintln!(
+                    "[tools] Agent 在有工具可用时仅返回前导语、未调用任何工具，按现状返回：{}",
+                    text.chars().take(80).collect::<String>()
+                );
+            }
             return Some(text)
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| anyhow!("Anthropic 响应缺少最终 text"));
