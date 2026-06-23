@@ -1,0 +1,18 @@
+# cargo-audit 策略（被合并安全门与巡检 scanner 读取，cwd=仓库根目录时生效）。
+# 这里集中登记「已评估、可接受」的 advisory，取代散落在 run-config 命令串里的 --ignore。
+# 新增忽略项 = 在此加一行并写明理由（可评审），不要再往命令行塞 --ignore。
+[advisories]
+ignore = [
+    # rsa 0.9.x：Marvin 时序侧信道，上游至今无修复版本（patched 为空）。仅经 sqlx-mysql
+    # 被动引入，而本项目只启用 sqlite feature、rsa 不会被编译进二进制。故接受并忽略。
+    "RUSTSEC-2023-0071",
+    # 以下为 Tauri 2.x 在 Linux 下 webkit2gtk 后端强依赖的 gtk-rs 0.18 / glib 链，
+    # 全部是 unmaintained / unsound 警告（cargo audit 本就不因 warning 失败，此处显式登记
+    # 以净化门禁报告）。在 Tauri/wry 迁离 GTK3 之前结构性无法消除。
+    "RUSTSEC-2024-0411", "RUSTSEC-2024-0412", "RUSTSEC-2024-0413", "RUSTSEC-2024-0414",
+    "RUSTSEC-2024-0415", "RUSTSEC-2024-0416", "RUSTSEC-2024-0417", "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419", "RUSTSEC-2024-0420", "RUSTSEC-2024-0429",
+    # proc-macro-error / unic-* ：构建期宏与 Unicode 表，均 unmaintained 警告，无运行时风险。
+    "RUSTSEC-2024-0370", "RUSTSEC-2025-0075", "RUSTSEC-2025-0080", "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098", "RUSTSEC-2025-0100",
+]

@@ -1,7 +1,26 @@
 {
   "dev": {
     "app_command": "npm run tauri:dev",
-    "command": "npm run dev",
+    "command": "npm run dev -- --port {port}",
     "kind": "tauri"
+  },
+  "preview": {
+    "build": {
+      "command": "npm run tauri:build"
+    }
+  },
+  "project": {
+    "framework": "tauri",
+    "language": "rust+typescript"
+  },
+  "quality": {
+    "lint": "cargo clippy --manifest-path src-tauri/Cargo.toml",
+    "security": "cargo audit --no-fetch --file src-tauri/Cargo.lock",
+    "typing": "npx tsc --noEmit"
+  },
+  "test": {
+    "unit": {
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml"
+    }
   }
 }

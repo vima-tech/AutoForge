@@ -274,7 +274,10 @@ fn detect_tauri(dir: &Path) -> Option<DetectedStack> {
     s.build_command = Some("cargo build --manifest-path src-tauri/Cargo.toml".to_string());
     s.test_unit = Some("cargo test --manifest-path src-tauri/Cargo.toml".to_string());
     s.lint = Some("cargo clippy --manifest-path src-tauri/Cargo.toml".to_string());
-    s.security = Some("cargo audit --file src-tauri/Cargo.lock".to_string());
+    // --no-fetch：合并安全门用本地缓存的 advisory-db，不在每次合并时实时拉取——避免上游
+    // 新发布（后又撤回/收窄）的 advisory 非确定性地卡死合并；忽略项集中放仓库 .cargo/audit.toml。
+    // advisory-db 的更新由周期巡检 scanner 负责（它会 fetch 并把新漏洞登记为需求）。
+    s.security = Some("cargo audit --no-fetch --file src-tauri/Cargo.lock".to_string());
     // 软链 node_modules 免重装；软链 src-tauri/target 复用主仓库的编译产物——
     // 否则每个分支预览 worktree 都要从零全量编译 Rust（数分钟），这是「拉起很慢」主因。
     // cargo 对 target 目录有文件锁，并发构建会串行而非损坏，安全。
@@ -294,7 +297,8 @@ fn detect_rust(dir: &Path) -> Option<DetectedStack> {
     s.build_command = Some("cargo build --release".to_string());
     s.test_unit = Some("cargo test".to_string());
     s.lint = Some("cargo clippy --all-targets".to_string());
-    s.security = Some("cargo audit".to_string());
+    // --no-fetch：合并门用缓存 advisory-db，避免实时拉取导致的非确定性阻断（见 tauri 分支注释）。
+    s.security = Some("cargo audit --no-fetch".to_string());
     // 软链 target 复用主仓库编译缓存，避免分支预览每次冷构建（同 tauri 理由）。
     s.dep_cache_dirs = vec!["target".to_string()];
     s.scanners = vec!["cargo_audit"];
