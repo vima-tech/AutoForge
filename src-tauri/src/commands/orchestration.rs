@@ -857,15 +857,17 @@ async fn run_plan_step(
         calls.push(run_agent_for_step(
             db.clone(),
             app.clone(),
-            task_id.to_string(),
-            step_id.clone(),
-            conversation_id.to_string(),
             agent_id.clone(),
-            instruction.to_string(),
-            snapshot.to_string(),
-            accumulated.to_string(),
-            roster.to_string(),
-            project_id.map(str::to_string),
+            StepAgentContext {
+                task_id: task_id.to_string(),
+                step_id: step_id.clone(),
+                conversation_id: conversation_id.to_string(),
+                instruction: instruction.to_string(),
+                snapshot: snapshot.to_string(),
+                accumulated: accumulated.to_string(),
+                roster: roster.to_string(),
+                project_id: project_id.map(str::to_string),
+            },
         ));
     }
 
@@ -985,19 +987,37 @@ fn detect_mentioned_agents(text: &str, members: &[Agent]) -> Vec<String> {
     found
 }
 
-async fn run_agent_for_step(
-    db: crate::db::Db,
-    app: AppHandle,
+/// Step-level context shared by every agent fanned out within a single plan
+/// step. Bundled into one struct so `run_agent_for_step` stays under the
+/// `clippy::too_many_arguments` threshold; only `db`/`app` (core deps) and the
+/// per-agent `agent_id` remain standalone parameters.
+struct StepAgentContext {
     task_id: String,
     step_id: String,
     conversation_id: String,
-    agent_id: String,
     instruction: String,
     snapshot: String,
     accumulated: String,
     roster: String,
     project_id: Option<String>,
+}
+
+async fn run_agent_for_step(
+    db: crate::db::Db,
+    app: AppHandle,
+    agent_id: String,
+    ctx: StepAgentContext,
 ) -> Result<AgentOutcome, String> {
+    let StepAgentContext {
+        task_id,
+        step_id,
+        conversation_id,
+        instruction,
+        snapshot,
+        accumulated,
+        roster,
+        project_id,
+    } = ctx;
     let run_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO conversation_task_runs
