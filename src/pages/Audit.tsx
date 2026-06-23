@@ -982,8 +982,8 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
 }) {
   const [search, setSearch] = useState('');
   const [dq, setDq] = useState('');            // 防抖后的查询串（喂给后端）
-  // 创建时间排序方向：true=正序（最早在前，默认——旧需求置前避免积压），false=倒序。
-  const [sortAsc, setSortAsc] = useState(true);
+  // 创建时间排序方向：true=正序（最早在前），false=倒序（最新在前，默认——总账看全量数据，新需求置前）。
+  const [sortAsc, setSortAsc] = useState(false);
   const [statusFilter, setStatusFilter] = useState(initialStatus ?? 'all');
   // 预置筛选变化时（如已打开的总账被再次定向到另一环节）同步应用。
   useEffect(() => { if (initialStatus) setStatusFilter(initialStatus); }, [initialStatus]);
