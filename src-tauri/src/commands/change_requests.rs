@@ -509,8 +509,13 @@ async fn approve_issue_review_1(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Only requirements still awaiting review 1 may be approved (guards stale/batch ids).
-    if issue.status != "pending_issue_review" {
+    // Requirements awaiting review 1 — and those whose auto-analysis FAILED — may be
+    // approved straight into coding. Approving an `analysis_failed` issue deliberately
+    // skips the (missing/empty) analysis spec; execution still runs off the raw issue
+    // description. Other states (executing/merged/rejected…) are guarded against
+    // stale/batch ids. The "不可审核通过" error string is matched by review_1_batch to
+    // skip (not error) such ids.
+    if issue.status != "pending_issue_review" && issue.status != "analysis_failed" {
         return Err(format!("需求当前状态为 {}，不可审核通过", issue.status));
     }
 

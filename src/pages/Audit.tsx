@@ -412,7 +412,7 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
-  onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, gate,
+  onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, onBatchReanalyze, onBatchReject, gate,
   width, hasMoreMerged, mergedLoading, onLoadMoreMerged }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
@@ -422,6 +422,10 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   onBatchApprove: (ids: string[]) => Promise<void> | void;
   // 批量代码审核：通过选中的待代码审核 变更请求（各自排队合并）。
   onBatchApproveCrs: (ids: string[]) => Promise<void> | void;
+  // 批量重新分析：把选中的需求（待审核 / 分析失败）重新送回分析队列。
+  onBatchReanalyze: (ids: string[]) => Promise<void> | void;
+  // 批量拒绝：拒绝/归档选中的需求（待审核 / 分析失败）。
+  onBatchReject: (ids: string[]) => Promise<void> | void;
   // 当前审核闸口：'issue' 只显示待需求审核，'code' 只显示变更请求各态。
   gate: 'issue' | 'code';
   width: number;
@@ -435,8 +439,24 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   const mergedSentinelRef = React.useRef<HTMLDivElement>(null);
   // 批量审核选区：审核需求闸作用于 pending_issue_review 需求，审核代码闸作用于 pending_code_review CR。
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [confirmBatch, setConfirmBatch] = useState(false);
+  // 批量动作确认：需求闸有「通过进入编码 / 重新分析 / 拒绝」三种，代码闸只有「通过」。
+  // null = 无待确认动作。
+  const [confirmBatch, setConfirmBatch] = useState<null | 'approve' | 'reanalyze' | 'reject'>(null);
   const [batching, setBatching] = useState(false);
+  // 需求闸批量动作下拉：按钮过多会折行，收进单个「批量操作」下拉菜单（mention-pop 模式）。
+  const [actionMenuOpen, setActionMenuOpen] = useState(false);
+  const actionMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!actionMenuOpen) return;
+    const close = (e: PointerEvent) => {
+      if (e.target instanceof Node && actionMenuRef.current?.contains(e.target)) return;
+      setActionMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [actionMenuOpen]);
+  // 选区清空 / 切闸口时收起动作菜单。
+  useEffect(() => { if (selected.size === 0) setActionMenuOpen(false); }, [selected]);
 
   // 列表模糊过滤：按标题或需求编号（短/全 id）筛选当前闸口列表。
   const [search, setSearch] = useState('');
@@ -489,8 +509,9 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   // 切换闸口时清空搜索与来源过滤，避免跨闸口残留筛选条件。
   useEffect(() => { setSearch(''); setSourceFilter(new Set()); setSourceMenuOpen(false); }, [gate]);
 
-  // 仅 pending_issue_review 可批量通过（analysis_failed 需先重分析，不可直接过审）；批量仅作用于当前筛选可见集。
-  const selectablePending = useMemo(() => filteredIssues.filter(i => i.status === 'pending_issue_review'), [filteredIssues]);
+  // 需求闸可批量操作的对象：待需求审核 + 分析失败（后者支持重新分析 / 拒绝 / 直接通过进入编码）。
+  // 批量仅作用于当前筛选可见集。
+  const selectablePending = useMemo(() => filteredIssues.filter(i => i.status === 'pending_issue_review' || i.status === 'analysis_failed'), [filteredIssues]);
   // 仅 pending_code_review 的 CR 可批量通过（执行中/已合并等态不可直接过审）。
   const selectableCrs = useMemo(() => filteredCrs.filter(r => r.status === 'pending_code_review'), [filteredCrs]);
   // 当前闸口下可批量操作的目标 id 集合。
@@ -528,11 +549,16 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     return n;
   });
   const runBatch = () => {
-    if (batching || selected.size === 0) return;
+    if (batching || selected.size === 0 || !confirmBatch) return;
     setBatching(true);
-    const fn = gate === 'issue' ? onBatchApprove : onBatchApproveCrs;
-    Promise.resolve(fn([...selected]))
-      .finally(() => { setBatching(false); setConfirmBatch(false); setSelected(new Set()); });
+    const ids = [...selected];
+    const fn =
+      gate === 'code' ? onBatchApproveCrs
+      : confirmBatch === 'reanalyze' ? onBatchReanalyze
+      : confirmBatch === 'reject' ? onBatchReject
+      : onBatchApprove;
+    Promise.resolve(fn(ids))
+      .finally(() => { setBatching(false); setConfirmBatch(null); setSelected(new Set()); });
   };
 
   useEffect(() => {
@@ -663,7 +689,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
             <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{filteredIssues.length}</span>
             {/* 批量审核：全选 / 取消全选可批量通过的待审核需求 */}
             {selectablePending.length > 0 && (
-              <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选待审核需求'}
+              <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选可批量操作的需求（待审核 / 分析失败）'}
                 style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
                 <LedgerCheck on={allSelectableSelected} /> 全选
               </button>
@@ -671,17 +697,18 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           </div>
         )}
         {gate === 'issue' && filteredIssues.map(issue => {
-          const canSelect = issue.status === 'pending_issue_review';
+          const canSelect = issue.status === 'pending_issue_review' || issue.status === 'analysis_failed';
+          const failed = issue.status === 'analysis_failed';
           return (
             <div key={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
               <div className="req-item-top">
                 {canSelect && (
-                  <span onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
+                  <span onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量操作">
                     <LedgerCheck on={selected.has(issue.id)} />
                   </span>
                 )}
                 <span className="req-id">{issue.id.slice(0, 8)}</span>
-                <span className="chip amber" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>需求审核</span>
+                <span className={'chip ' + (failed ? 'red' : 'amber')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{failed ? '分析失败' : '需求审核'}</span>
                 <span className="req-time">{fmtShort(issue.created_at)}</span>
               </div>
               <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
@@ -742,32 +769,76 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         )}
       </div>
 
-      {/* 批量审核操作条：选中后出现，一键全部通过（需求→编码 / 代码→合并） */}
+      {/* 批量操作条：选中后出现。代码闸只有「批量通过」单按钮；需求闸三种动作收进「批量操作」下拉，避免折行。 */}
       {selected.size > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderTop: '1px solid var(--border)', background: 'var(--bg-2)' }}>
           <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>已选 {selected.size}</span>
           <span style={{ flex: 1 }} />
-          <button className="btn btn-sm" disabled={batching} onClick={() => setConfirmBatch(true)}
-            title={gate === 'issue' ? '批量通过选中的待审核需求（进入编码）' : '批量通过选中的待审核代码（进入合并）'}
-            style={{ color: 'var(--green)' }}>
-            <Icon name={batching ? 'brain' : 'check'} size={13} className={batching ? 'spin' : undefined} />
-            {batching ? '通过中…' : `批量通过 (${selected.size})`}
-          </button>
+          {gate === 'issue' ? (
+            <div style={{ position: 'relative' }} ref={actionMenuRef}>
+              <button className="btn btn-sm" disabled={batching} onClick={() => setActionMenuOpen(o => !o)}
+                title="对选中的需求批量操作">
+                <Icon name={batching ? 'brain' : 'layers'} size={13} className={batching ? 'spin' : undefined} />
+                {batching ? '处理中…' : `批量操作 (${selected.size})`}
+                <Icon name="chevDown" size={13} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: actionMenuOpen ? 'rotate(180deg)' : 'none' }} />
+              </button>
+              {actionMenuOpen && (
+                <div className="mention-pop" style={{ right: 0, left: 'auto', bottom: 'calc(100% + 6px)', top: 'auto', minWidth: 200, marginBottom: 0 }}>
+                  <div className="mention-row" onClick={() => { setActionMenuOpen(false); setConfirmBatch('approve'); }}>
+                    <Icon name="check" size={14} style={{ color: 'var(--green)', flexShrink: 0 }} />
+                    <div style={{ minWidth: 0, flex: 1 }}><div className="nm">通过进入编码</div></div>
+                  </div>
+                  <div className="mention-row" onClick={() => { setActionMenuOpen(false); setConfirmBatch('reanalyze'); }}>
+                    <Icon name="refresh" size={14} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                    <div style={{ minWidth: 0, flex: 1 }}><div className="nm">重新分析</div></div>
+                  </div>
+                  <div className="mention-row" onClick={() => { setActionMenuOpen(false); setConfirmBatch('reject'); }}>
+                    <Icon name="x" size={14} style={{ color: 'var(--red)', flexShrink: 0 }} />
+                    <div style={{ minWidth: 0, flex: 1 }}><div className="nm" style={{ color: 'var(--red)' }}>拒绝</div></div>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <button className="btn btn-sm" disabled={batching} onClick={() => setConfirmBatch('approve')}
+              title="批量通过选中的待审核代码（进入合并）" style={{ color: 'var(--green)' }}>
+              <Icon name={batching ? 'brain' : 'check'} size={13} className={batching ? 'spin' : undefined} />
+              {batching ? '处理中…' : `批量通过 (${selected.size})`}
+            </button>
+          )}
           <button className="btn btn-sm btn-ghost" disabled={batching} onClick={() => setSelected(new Set())}>清空</button>
         </div>
       )}
     </div>
-    {confirmBatch && (
+    {confirmBatch === 'approve' && (
       <ConfirmModal
         msg={gate === 'issue'
           ? `确定批量通过选中的 ${selected.size} 条需求？`
           : `确定批量通过选中的 ${selected.size} 条变更请求？`}
         sub={gate === 'issue'
-          ? '通过后将各自生成变更请求并进入 AI 编码，无法撤销。'
+          ? '通过后将各自生成变更请求并进入 AI 编码，无法撤销。其中「分析失败」的需求将跳过分析直接进入编码（仅凭原始描述）。'
           : '通过后将各自执行测试并进入自动合并，无法撤销。'}
         okLabel="批量通过"
         onOk={runBatch}
-        onCancel={() => setConfirmBatch(false)}
+        onCancel={() => setConfirmBatch(null)}
+      />
+    )}
+    {confirmBatch === 'reanalyze' && (
+      <ConfirmModal
+        msg={`确定将选中的 ${selected.size} 条需求重新分析？`}
+        sub="将各自送回分析队列重新评估，完成后回到需求审核。"
+        okLabel="重新分析"
+        onOk={runBatch}
+        onCancel={() => setConfirmBatch(null)}
+      />
+    )}
+    {confirmBatch === 'reject' && (
+      <ConfirmModal
+        msg={`确定拒绝选中的 ${selected.size} 条需求？`}
+        sub="拒绝后将从待办队列移除（可在总账中查看）。"
+        okLabel="拒绝"
+        onOk={runBatch}
+        onCancel={() => setConfirmBatch(null)}
       />
     )}
     </>
@@ -779,20 +850,49 @@ type HunkChoice = { mode: 'ours' | 'theirs' | 'both' | 'manual'; manual?: string
 const HUNK_LABELS: Record<HunkChoice['mode'], string> = {
   ours: '采用本分支', theirs: '采用 dev', both: '两者保留', manual: '手动编辑',
 };
-function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
+// 冲突现场缓存（模块级，按 crId）：切换需求时命中即秒显，避免每次重读（后端要 git 物化冲突态，较慢）。
+// 失效：解冲突收尾的 worktree_update 事件、或用户点「重读现场」/提交解决后——见 invalidateConflictCache。
+const conflictDetailCache = new Map<string, ConflictDetail>();
+const conflictViewCache = new Map<string, MergeConflictView>();
+// 逐 hunk 决策也缓存：切走再切回时保留已做的选择，不丢工作。
+const conflictChoiceCache = new Map<string, Record<string, HunkChoice>>();
+function invalidateConflictCache(crId: string) {
+  conflictDetailCache.delete(crId);
+  conflictViewCache.delete(crId);
+  conflictChoiceCache.delete(crId);
+}
+// 上下文折叠：超过 头+尾+1 行的无关上下文段，默认只显头/尾各若干行，中间一键展开。
+const CTX_HEAD = 3, CTX_TAIL = 3;
+function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy, resolving }: {
   crId: string; onAiResolve: () => void; onRefresh: () => void;
-  showError: (m: string) => void; busy: boolean;
+  showError: (m: string) => void; busy: boolean; resolving: boolean;
 }) {
-  const [detail, setDetail] = useState<ConflictDetail | null>(null);
+  const [detail, setDetail] = useState<ConflictDetail | null>(() => conflictDetailCache.get(crId) ?? null);
   const [loading, setLoading] = useState(false);
   const [activeFile, setActiveFile] = useState(0);
-  const [choices, setChoices] = useState<Record<string, HunkChoice>>({});
+  const [choices, setChoices] = useState<Record<string, HunkChoice>>(() => conflictChoiceCache.get(crId) ?? {});
   const [submitting, setSubmitting] = useState(false);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});  // 已展开的上下文段（key=fi:si）
+  const [reopened, setReopened] = useState<Record<string, boolean>>({});   // 已决策但又点开重新编辑的冲突块
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const hunkRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
-  const load = useCallback(() => {
+  const load = useCallback((force = false) => {
+    if (!force) {
+      const cached = conflictDetailCache.get(crId);
+      if (cached) {
+        setDetail(cached); setChoices(conflictChoiceCache.get(crId) ?? {});
+        setActiveFile(0); setExpanded({}); setReopened({}); setLoading(false);
+        return;
+      }
+    }
     setLoading(true);
     getConflictDetail(crId)
-      .then(d => { setDetail(d); setActiveFile(0); setChoices({}); })
+      .then(d => {
+        conflictDetailCache.set(crId, d);
+        setDetail(d); setActiveFile(0); setChoices(conflictChoiceCache.get(crId) ?? {});
+        setExpanded({}); setReopened({});
+      })
       .catch(e => showError('读取冲突现场失败：' + String(e)))
       .finally(() => setLoading(false));
   }, [crId, showError]);
@@ -800,14 +900,41 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
 
   const segKey = (fi: number, si: number) => `${fi}:${si}`;
   const setChoice = (fi: number, si: number, c: HunkChoice) =>
-    setChoices(prev => ({ ...prev, [segKey(fi, si)]: c }));
+    setChoices(prev => {
+      const next = { ...prev, [segKey(fi, si)]: c };
+      conflictChoiceCache.set(crId, next);  // 写穿缓存：切走再切回保留选择
+      return next;
+    });
 
   const preCode: React.CSSProperties = {
     margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
     fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-2)', lineHeight: 1.5,
   };
 
-  if (loading) return <div className="empty-compact" style={{ padding: '16px 0' }}>读取冲突现场…</div>;
+  // 上下文段渲染：长段折叠为头/尾各 CTX_* 行 + 「展开 N 行」，压缩无关代码。
+  const renderContext = (text: string | null, si: number) => {
+    if (!text) return null;
+    const key = segKey(activeFile, si);
+    const lines = text.split('\n');
+    if (lines.length <= CTX_HEAD + CTX_TAIL + 1 || expanded[key]) {
+      return <pre key={si} style={{ ...preCode, color: 'var(--text-faint)' }}>{text}</pre>;
+    }
+    const head = lines.slice(0, CTX_HEAD).join('\n');
+    const tail = lines.slice(lines.length - CTX_TAIL).join('\n');
+    const hidden = lines.length - CTX_HEAD - CTX_TAIL;
+    return (
+      <div key={si}>
+        <pre style={{ ...preCode, color: 'var(--text-faint)' }}>{head}</pre>
+        <button className="btn btn-sm btn-ghost" onClick={() => setExpanded(e => ({ ...e, [key]: true }))}
+          style={{ width: '100%', justifyContent: 'center', color: 'var(--text-3)', fontSize: 'var(--text-micro)', margin: '3px 0', padding: '2px' }}>
+          <Icon name="chevDown" size={12} />展开 {hidden} 行无关代码
+        </button>
+        <pre style={{ ...preCode, color: 'var(--text-faint)' }}>{tail}</pre>
+      </div>
+    );
+  };
+
+  if (loading && !detail) return <div className="empty-compact" style={{ padding: '16px 0' }}>读取冲突现场…</div>;
   if (!detail) return null;
 
   let totalHunks = 0, decided = 0;
@@ -841,7 +968,7 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
     const files = assemble();
     if (!files) { showError('仍有未决策的冲突块'); return; }
     setSubmitting(true);
-    try { await resolveConflictManually(crId, files); onRefresh(); }
+    try { await resolveConflictManually(crId, files); invalidateConflictCache(crId); onRefresh(); }
     catch (e) { showError('提交解决失败：' + String(e)); }
     finally { setSubmitting(false); }
   };
@@ -851,7 +978,7 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
   };
   const doExternalDone = async () => {
     setSubmitting(true);
-    try { await resolveConflictManually(crId, null); onRefresh(); }
+    try { await resolveConflictManually(crId, null); invalidateConflictCache(crId); onRefresh(); }
     catch (e) { showError('提交失败：' + String(e)); }
     finally { setSubmitting(false); }
   };
@@ -863,18 +990,29 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
           冲突已可自动消解（rerere / 无实际冲突）。可直接提交并回到代码审核复审。
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button className="btn btn-primary btn-sm" disabled={submitting} onClick={doExternalDone}><Icon name="check" size={13} />提交并复审</button>
-          <button className="btn btn-sm" disabled={busy || submitting} onClick={onAiResolve}><Icon name="zap" size={13} />AI 解冲突</button>
+          <button className="btn btn-primary btn-sm" disabled={busy || submitting} onClick={doExternalDone}><Icon name="check" size={13} />提交并复审</button>
+          <button className="btn btn-sm" disabled={busy || submitting} onClick={onAiResolve}>
+            <Icon name={resolving ? 'brain' : 'zap'} size={13} className={resolving ? 'spin' : undefined} />{resolving ? 'AI 解冲突中…' : 'AI 解冲突'}
+          </button>
         </div>
       </div>
     );
   }
 
   const f = detail.files[activeFile];
+  // 当前文件的冲突块（用于快速跳转编号 + 上一/下一）。
+  const conflictList = f.binary ? [] : f.segments.map((s, si) => ({ s, si })).filter(x => x.s.kind === 'conflict');
+  const jumpTo = (si: number) => hunkRefs.current[si]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   return (
     <div>
-      <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 10 }}>
-        逐处选择保留哪一侧（或两者保留 / 手动编辑）。已解决 <b style={{ color: 'var(--text-2)' }}>{decided}/{totalHunks}</b>。
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', flex: 1 }}>
+          逐处选择保留哪一侧（或两者保留 / 手动编辑）。已解决 <b style={{ color: 'var(--text-2)' }}>{decided}/{totalHunks}</b>。
+        </div>
+        <button className="btn btn-sm btn-ghost" disabled={loading || submitting} onClick={() => load(true)}
+          title="重新读取冲突现场（默认走缓存，切换需求秒显）">
+          <Icon name="refresh" size={13} className={loading ? 'spin' : undefined} />重读现场
+        </button>
       </div>
       {detail.files.length > 1 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
@@ -889,48 +1027,79 @@ function ConflictResolver({ crId, onAiResolve, onRefresh, showError, busy }: {
           })}
         </div>
       )}
-      <div style={{ background: 'var(--code-bg)', borderRadius: 8, padding: '10px 12px', maxHeight: 420, overflow: 'auto' }}>
+      {/* 快速跳转：当前文件有多个冲突块时，按编号一键滚动到对应块（已决策显示绿色）。 */}
+      {conflictList.length > 1 && (
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '.1em' }}>跳转冲突</span>
+          {conflictList.map((x, k) => {
+            const done = !!choices[segKey(activeFile, x.si)];
+            return (
+              <button key={x.si} className={'chip ' + (done ? 'green' : '')} title={done ? '已决策' : '待决策'}
+                style={{ cursor: 'pointer', fontSize: 'var(--text-micro)', minWidth: 22, justifyContent: 'center' }}
+                onClick={() => jumpTo(x.si)}>{k + 1}</button>
+            );
+          })}
+        </div>
+      )}
+      <div ref={scrollRef} style={{ background: 'var(--code-bg)', borderRadius: 8, padding: '10px 12px', maxHeight: 460, overflow: 'auto' }}>
         {f.binary ? (
           <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>二进制文件冲突，无法逐 hunk 解决，请用「外部编辑器打开」处理。</div>
         ) : f.segments.map((s, si) => {
-          if (s.kind === 'context') {
-            if (!s.text) return null;
-            return <pre key={si} style={{ ...preCode, color: 'var(--text-faint)' }}>{s.text}</pre>;
-          }
-          const c = choices[segKey(activeFile, si)];
+          if (s.kind === 'context') return renderContext(s.text, si);
+          const key = segKey(activeFile, si);
+          const c = choices[key];
+          const k = conflictList.findIndex(x => x.si === si) + 1;
+          // 已决策（非手动）默认折叠为单行摘要，压缩内容；点「修改」展开重新编辑。
+          const collapsed = !!c && c.mode !== 'manual' && !reopened[key];
           return (
-            <div key={si} style={{ border: '1px solid var(--border-strong)', borderRadius: 8, margin: '8px 0', overflow: 'hidden' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
-                <div style={{ background: 'var(--bg-2)', padding: '6px 8px' }}>
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', marginBottom: 4 }}>dev（传入）</div>
-                  <pre style={preCode}>{s.theirs || '（空）'}</pre>
-                </div>
-                <div style={{ background: 'var(--bg-2)', padding: '6px 8px' }}>
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', marginBottom: 4 }}>本分支（你的）</div>
-                  <pre style={preCode}>{s.ours || '（空）'}</pre>
-                </div>
+            <div key={si} ref={el => { hunkRefs.current[si] = el; }}
+              style={{ border: '1px solid ' + (c ? 'var(--border)' : 'var(--border-strong)'), borderLeft: '3px solid ' + (c ? 'var(--green)' : 'var(--amber)'), borderRadius: 8, margin: '8px 0', overflow: 'hidden' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', background: 'var(--bg-2)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)' }}>
+                <span style={{ color: c ? 'var(--green)' : 'var(--amber)', fontWeight: 700 }}>冲突 #{k}</span>
+                {c && <span className="chip green" style={{ fontSize: 'var(--text-micro)' }}>{HUNK_LABELS[c.mode]}</span>}
+                <span style={{ flex: 1 }} />
+                {collapsed && (
+                  <button className="btn btn-sm btn-ghost" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)' }}
+                    onClick={() => setReopened(r => ({ ...r, [key]: true }))}><Icon name="edit" size={12} />修改</button>
+                )}
               </div>
-              <div style={{ display: 'flex', gap: 6, padding: '6px 8px', flexWrap: 'wrap', background: 'var(--bg-2)' }}>
-                {(['ours', 'theirs', 'both', 'manual'] as const).map(mode => (
-                  <button key={mode} className={'chip ' + (c?.mode === mode ? 'ember' : '')} style={{ cursor: 'pointer', fontSize: 'var(--text-micro)' }}
-                    onClick={() => setChoice(activeFile, si, { mode, manual: mode === 'manual' ? (c?.manual ?? [s.ours, s.theirs].filter(x => x).join('\n')) : undefined })}>
-                    {HUNK_LABELS[mode]}
-                  </button>
-                ))}
-              </div>
-              {c?.mode === 'manual' && (
-                <textarea value={c.manual ?? ''} onChange={e => setChoice(activeFile, si, { mode: 'manual', manual: e.target.value })}
-                  style={{ width: '100%', minHeight: 80, boxSizing: 'border-box', background: 'var(--bg-3)', border: 'none', borderTop: '1px solid var(--border)', color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', padding: '6px 8px', resize: 'vertical' }} />
+              {!collapsed && (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
+                    <div style={{ background: 'var(--bg-2)', padding: '6px 8px', opacity: c?.mode === 'ours' ? 0.45 : 1 }}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', marginBottom: 4 }}>dev（传入）</div>
+                      <pre style={preCode}>{s.theirs || '（空）'}</pre>
+                    </div>
+                    <div style={{ background: 'var(--bg-2)', padding: '6px 8px', opacity: c?.mode === 'theirs' ? 0.45 : 1 }}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', marginBottom: 4 }}>本分支（你的）</div>
+                      <pre style={preCode}>{s.ours || '（空）'}</pre>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, padding: '6px 8px', flexWrap: 'wrap', background: 'var(--bg-2)' }}>
+                    {(['ours', 'theirs', 'both', 'manual'] as const).map(mode => (
+                      <button key={mode} className={'chip ' + (c?.mode === mode ? 'ember' : '')} style={{ cursor: 'pointer', fontSize: 'var(--text-micro)' }}
+                        onClick={() => { setChoice(activeFile, si, { mode, manual: mode === 'manual' ? (c?.manual ?? [s.ours, s.theirs].filter(x => x).join('\n')) : undefined }); if (mode !== 'manual') setReopened(r => ({ ...r, [key]: false })); }}>
+                        {HUNK_LABELS[mode]}
+                      </button>
+                    ))}
+                  </div>
+                  {c?.mode === 'manual' && (
+                    <textarea value={c.manual ?? ''} onChange={e => setChoice(activeFile, si, { mode: 'manual', manual: e.target.value })}
+                      style={{ width: '100%', minHeight: 80, boxSizing: 'border-box', background: 'var(--bg-3)', border: 'none', borderTop: '1px solid var(--border)', color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', padding: '6px 8px', resize: 'vertical' }} />
+                  )}
+                </>
               )}
             </div>
           );
         })}
       </div>
       <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-        <button className="btn btn-primary btn-sm" disabled={!allDecided || submitting} onClick={doConfirm}><Icon name="check" size={13} />确认解决并复审</button>
-        <button className="btn btn-sm" disabled={busy || submitting} onClick={onAiResolve}><Icon name="zap" size={13} />AI 解冲突</button>
-        <button className="btn btn-sm" disabled={submitting} onClick={doExternalOpen}><Icon name="external" size={13} />外部编辑器打开</button>
-        <button className="btn btn-sm" disabled={submitting} onClick={doExternalDone}><Icon name="check" size={13} />我已在外部解决·复审</button>
+        <button className="btn btn-primary btn-sm" disabled={!allDecided || busy || submitting} onClick={doConfirm}><Icon name="check" size={13} />确认解决并复审</button>
+        <button className="btn btn-sm" disabled={busy || submitting} onClick={onAiResolve}>
+          <Icon name={resolving ? 'brain' : 'zap'} size={13} className={resolving ? 'spin' : undefined} />{resolving ? 'AI 解冲突中…' : 'AI 解冲突'}
+        </button>
+        <button className="btn btn-sm" disabled={busy || submitting} onClick={doExternalOpen}><Icon name="external" size={13} />外部编辑器打开</button>
+        <button className="btn btn-sm" disabled={busy || submitting} onClick={doExternalDone}><Icon name="check" size={13} />我已在外部解决·复审</button>
       </div>
     </div>
   );
@@ -1245,42 +1414,64 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
   // 其余区块（根因·实现计划·验收·约束·风险·执行工单）统一收进可展开的「完整分析」。
   // 注意：仅折叠展示，不删除任何生成内容——完整 spec 仍原样喂给 Claude Code 执行。
   const [fullOpen, setFullOpen] = useState(false);
-  const u = spec.understanding, rc = spec.root_cause, sc = spec.scope;
-  const plan = spec.implementation_plan, b = spec.claude_code_brief;
-  const steps = [...plan.steps].sort((a, z) => a.order - z.order);
+  // spec 来自 LLM 输出，字段可能缺失或为空对象（如分析失败仅落 {} 占位）。任何字段都做
+  // 防御性兜底——缺失绝不能让渲染抛错，否则 WebKitGTK 渲染进程崩溃会直接关闭窗口（主进程仍在）。
+  const u = spec.understanding ?? ({} as Partial<NonNullable<IssueAnalysisSpec['understanding']>>);
+  const rc = spec.root_cause;
+  const sc = spec.scope ?? ({} as Partial<NonNullable<IssueAnalysisSpec['scope']>>);
+  const plan = spec.implementation_plan ?? ({} as Partial<NonNullable<IssueAnalysisSpec['implementation_plan']>>);
+  const b = spec.claude_code_brief ?? ({} as Partial<NonNullable<IssueAnalysisSpec['claude_code_brief']>>);
+  const reproSteps = u.reproduction_steps ?? [];
+  const affectedFiles = sc.affected_files ?? [];
+  const relatedFiles = sc.related_files ?? [];
+  const entryPoints = sc.entry_points ?? [];
+  const outOfScope = sc.out_of_scope ?? [];
+  const openQuestions = spec.open_questions ?? [];
+  const acceptance = spec.acceptance_criteria ?? [];
+  const mustList = spec.constraints?.must ?? [];
+  const mustNotList = spec.constraints?.must_not ?? [];
+  const risks = spec.risks ?? [];
+  const instructions = b.instructions ?? [];
+  const doList = b.do ?? [];
+  const dontList = b.dont ?? [];
+  const dod = b.definition_of_done ?? [];
+  const dataModelChanges = plan.data_model_changes ?? [];
+  const newDeps = plan.new_dependencies ?? [];
+  const suspectedLocations = rc?.suspected_locations ?? [];
+  const steps = [...(plan.steps ?? [])].sort((a, z) => a.order - z.order);
 
   const hasRoot = !!(rc && rc.hypothesis);
   const hasPlan = !!plan.approach || steps.length > 0;
-  const hasAcceptance = spec.acceptance_criteria.length > 0;
-  const hasConstraints = spec.constraints.must.length > 0 || spec.constraints.must_not.length > 0;
-  const hasRisks = spec.risks.length > 0;
-  const hasBrief = !!(b.objective || b.instructions.length > 0);
+  const hasAcceptance = acceptance.length > 0;
+  const hasConstraints = mustList.length > 0 || mustNotList.length > 0;
+  const hasRisks = risks.length > 0;
+  const hasBrief = !!(b.objective || instructions.length > 0);
   const hasFull = hasRoot || hasPlan || hasAcceptance || hasConstraints || hasRisks || hasBrief;
 
   return (
     <>
       {/* ── 关键核心：默认可见 ── */}
-      {((u.restated_issue || u.restated_requirement) || u.reproduction_steps.length > 0) && (
+      {((u.restated_issue || u.restated_requirement) || reproSteps.length > 0) && (
         <>
           <SpecH2 icon="search" color="var(--blue)">需求理解</SpecH2>
           {u.problem_type && <p style={{ margin: '0 0 8px' }}><span className="chip">{u.problem_type}</span></p>}
           {(u.restated_issue || u.restated_requirement) && <p style={{ whiteSpace: 'pre-line' }}>{u.restated_issue || u.restated_requirement}</p>}
           {u.current_behavior && <p style={liStyle}><b>当前行为：</b>{u.current_behavior}</p>}
           {u.expected_behavior && <p style={liStyle}><b>期望行为：</b>{u.expected_behavior}</p>}
-          {u.reproduction_steps.length > 0 && (
+          {reproSteps.length > 0 && (
             <ol style={{ paddingLeft: 18, margin: '6px 0', display: 'flex', flexDirection: 'column', gap: 3 }}>
-              {u.reproduction_steps.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
+              {reproSteps.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
             </ol>
           )}
         </>
       )}
 
-      {(sc.affected_files.length > 0 || sc.related_files.length > 0) && (
+      {(affectedFiles.length > 0 || relatedFiles.length > 0) && (
         <>
           <SpecH2 icon="file" color="var(--violet)">影响文件{sc.blast_radius ? <span className="chip" style={{ marginLeft: 8, fontSize: 'var(--text-micro)' }}>{sc.blast_radius}</span> : null}</SpecH2>
-          {sc.affected_files.length > 0 && (
+          {affectedFiles.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {sc.affected_files.map((f, i) => (
+              {affectedFiles.map((f, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
                   <span className={'chip ' + (CHANGE_CHIP[f.change_type] || '')} style={{ fontSize: 'var(--text-micro)' }}>{f.change_type}</span>
                   <span style={monoPath}>{f.path}</span>
@@ -1289,28 +1480,28 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
               ))}
             </div>
           )}
-          {sc.related_files.length > 0 && (
-            <div style={{ marginTop: sc.affected_files.length > 0 ? 10 : 0 }}>
+          {relatedFiles.length > 0 && (
+            <div style={{ marginTop: affectedFiles.length > 0 ? 10 : 0 }}>
               <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', letterSpacing: '.06em', textTransform: 'uppercase', marginBottom: 4 }}>相关文件（需阅读，不一定改动）</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {sc.related_files.map((p, i) => (
+                {relatedFiles.map((p, i) => (
                   <span key={i} className="chip" style={{ ...monoPath, fontSize: 'var(--text-micro)' }}>{p}</span>
                 ))}
               </div>
             </div>
           )}
-          {sc.entry_points.length > 0 && <p style={{ ...liStyle, marginTop: 8 }}><b>入手点：</b>{sc.entry_points.join('；')}</p>}
-          {sc.out_of_scope.length > 0 && <p style={liStyle}><b>不在范围：</b>{sc.out_of_scope.join('；')}</p>}
+          {entryPoints.length > 0 && <p style={{ ...liStyle, marginTop: 8 }}><b>入手点：</b>{entryPoints.join('；')}</p>}
+          {outOfScope.length > 0 && <p style={liStyle}><b>不在范围：</b>{outOfScope.join('；')}</p>}
         </>
       )}
 
-      {spec.open_questions.length > 0 && (
+      {openQuestions.length > 0 && (
         <div className="iter-warn" style={{ marginTop: 14 }}>
           <Icon name="alert" size={20} />
           <div>
             <b>待澄清（批准前请确认）</b>
             <ul style={{ paddingLeft: 18, margin: '4px 0 0', display: 'flex', flexDirection: 'column', gap: 2 }}>
-              {spec.open_questions.map((q, i) => <li key={i}>{q}</li>)}
+              {openQuestions.map((q, i) => <li key={i}>{q}</li>)}
             </ul>
           </div>
         </div>
@@ -1328,9 +1519,9 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
                 <>
                   <SpecH2 icon="alert" color="var(--amber)">根因分析</SpecH2>
                   <p style={{ whiteSpace: 'pre-line' }}>{rc!.hypothesis}</p>
-                  {rc!.suspected_locations.length > 0 && (
+                  {suspectedLocations.length > 0 && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }}>
-                      {rc!.suspected_locations.map((l, i) => (
+                      {suspectedLocations.map((l, i) => (
                         <div key={i} style={liStyle}>
                           <span style={monoPath}>{l.file}{l.symbol ? ` :: ${l.symbol}` : ''}</span>
                           <span style={{ color: 'var(--text-3)' }}> — {l.reason}</span>
@@ -1356,10 +1547,10 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
                       ))}
                     </ol>
                   )}
-                  {plan.data_model_changes.filter(d => d.kind !== 'none' && d.description).map((d, i) => (
+                  {dataModelChanges.filter(d => d.kind !== 'none' && d.description).map((d, i) => (
                     <p key={i} style={liStyle}><span className="chip violet" style={{ fontSize: 'var(--text-micro)' }}>{d.kind}</span> {d.description}</p>
                   ))}
-                  {plan.new_dependencies.length > 0 && <p style={liStyle}><b style={{ color: 'var(--amber)' }}>新增依赖：</b>{plan.new_dependencies.join(', ')}</p>}
+                  {newDeps.length > 0 && <p style={liStyle}><b style={{ color: 'var(--amber)' }}>新增依赖：</b>{newDeps.join(', ')}</p>}
                 </>
               )}
 
@@ -1367,7 +1558,7 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
                 <>
                   <SpecH2 icon="check" color="var(--green)">验收标准</SpecH2>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                    {spec.acceptance_criteria.map((ac, i) => (
+                    {acceptance.map((ac, i) => (
                       <div key={i} style={liStyle}><span style={{ fontFamily: 'var(--font-mono)', color: 'var(--green)', fontSize: 'var(--text-caption)' }}>{ac.id}</span> {ac.statement}</div>
                     ))}
                   </div>
@@ -1378,8 +1569,8 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
                 <>
                   <SpecH2 icon="shield" color="var(--blue)">约束</SpecH2>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {spec.constraints.must.map((m, i) => <div key={'m' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {m}</div>)}
-                    {spec.constraints.must_not.map((m, i) => <div key={'n' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {m}</div>)}
+                    {mustList.map((m, i) => <div key={'m' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {m}</div>)}
+                    {mustNotList.map((m, i) => <div key={'n' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {m}</div>)}
                   </div>
                 </>
               )}
@@ -1388,7 +1579,7 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
                 <>
                   <SpecH2 icon="alert" color="var(--red)">风险</SpecH2>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                    {spec.risks.map((r, i) => (
+                    {risks.map((r, i) => (
                       <div key={i} style={liStyle}>
                         <span className={'chip ' + (RISK_CHIP[r.severity] || '')} style={{ fontSize: 'var(--text-micro)' }}>{r.severity}</span> {r.description}
                         {r.mitigation && <span style={{ color: 'var(--text-3)' }}>（缓解：{r.mitigation}）</span>}
@@ -1403,15 +1594,15 @@ function AnalysisSpecView({ spec }: { spec: IssueAnalysisSpec }) {
                   <SpecH2 icon="code" color="var(--text-3)">代码 Agent 执行工单</SpecH2>
                   <div className="panel" style={{ padding: '12px 14px' }}>
                     {b.objective && <p style={{ margin: '0 0 8px' }}><b>目标：</b>{b.objective}</p>}
-                    {b.instructions.length > 0 && (
+                    {instructions.length > 0 && (
                       <ol style={{ paddingLeft: 18, margin: '0 0 8px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-                        {b.instructions.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
+                        {instructions.map((s, i) => <li key={i} style={liStyle}>{s}</li>)}
                       </ol>
                     )}
-                    {b.do.map((d, i) => <div key={'d' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {d}</div>)}
-                    {b.dont.map((d, i) => <div key={'x' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {d}</div>)}
-                    {b.definition_of_done.length > 0 && (
-                      <p style={{ ...liStyle, marginTop: 8 }}><b>完成判定：</b>{b.definition_of_done.join('；')}</p>
+                    {doList.map((d, i) => <div key={'d' + i} style={liStyle}><span style={{ color: 'var(--green)' }}>✓</span> {d}</div>)}
+                    {dontList.map((d, i) => <div key={'x' + i} style={liStyle}><span style={{ color: 'var(--red)' }}>✕</span> {d}</div>)}
+                    {dod.length > 0 && (
+                      <p style={{ ...liStyle, marginTop: 8 }}><b>完成判定：</b>{dod.join('；')}</p>
                     )}
                   </div>
                 </>
@@ -1778,6 +1969,11 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [diff, setDiff] = useState('');
   const [conflict, setConflict] = useState<MergeConflictView | null>(null);
   const [conflictBusy, setConflictBusy] = useState(false);
+  // AI 解冲突是后台长任务：命令立即返回、CR 全程停在 merge_conflict，仅靠事件反映进度。
+  // 记录「正在解冲突」的 CR id，给出持续的进行中指示（避免点完无反馈、以为没反应）。
+  // 置位：点击 / 收到该 CR 的 resolving_conflict 事件（覆盖自动解冲突）；
+  // 清除：收到该 CR 的 worktree_update 事件（finalize 成功/失败都发）。
+  const [resolvingCrId, setResolvingCrId] = useState<string | null>(null);
   // 「撤销已合并需求」二次确认弹窗开关。
   const [revertConfirm, setRevertConfirm] = useState(false);
   const [revertBusy, setRevertBusy] = useState(false);
@@ -2181,8 +2377,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       if (origIssue) setIssuesById(prev => ({ ...prev, [origIssue.id]: origIssue }));
       setCrLoading(false);
       // 合并冲突态：按需拉取冲突现场（文件列表 + 带标记 diff）供三方视图渲染。
+      // 走模块级缓存，切换需求时命中即秒显，避免每次让后端重新 git 物化冲突态（较慢）。
       if (crs.find(c => c.id === crId)?.status === 'merge_conflict') {
-        getMergeConflict(crId).then(c => { if (loadReqRef.current === reqId) setConflict(c); }).catch(() => {});
+        const cached = conflictViewCache.get(crId);
+        if (cached) {
+          setConflict(cached);
+        } else {
+          getMergeConflict(crId).then(c => { conflictViewCache.set(crId, c); if (loadReqRef.current === reqId) setConflict(c); }).catch(() => {});
+        }
       }
     })();
     // activeCrUpdatedAt 入依赖：同一 CR 修改/重新执行后 updated_at 变化即重新拉取
@@ -2254,7 +2456,15 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       // 进度心跳：即时更新（不防抖），让用户在长任务期间看到阶段流动。
       if (ev?.type === 'task_progress' && ev.cr_id) {
         setCrProgress(prev => ({ ...prev, [ev.cr_id as string]: { phase: ev.phase || '', note: ev.note } }));
+        // AI 解冲突进行中：点亮该 CR 的「解决中」指示（也覆盖自动解冲突触发的场景）。
+        if (ev.phase === 'resolving_conflict') setResolvingCrId(ev.cr_id);
         return;
+      }
+      // worktree_update 在解冲突收尾（成功/失败）时必发 → 收到即熄灭该 CR 的「解决中」指示，
+      // 并失效其冲突现场缓存（现场已变/已消解，下次查看须重读）。
+      if (ev?.type === 'worktree_update' && ev.cr_id) {
+        setResolvingCrId(prev => (prev === ev.cr_id ? null : prev));
+        invalidateConflictCache(ev.cr_id);
       }
       // 实时日志是高频事件，由专门的监听器处理，这里直接跳过——否则每段增量都会触发列表重载。
       if (ev?.type === 'code_agent_log') return;
@@ -2360,13 +2570,18 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   };
 
   // 合并冲突闭环：交 AI 自动解冲突（解完回代码审核 复审，不直接落 dev）。
+  // 命令立即返回（后台长任务），故点击即点亮持续的「解决中」指示 + 即时提示，避免误以为没反应；
+  // 真正结束由 worktree_update 事件熄灭指示。
   const doAiResolve = async () => {
-    if (!activeCr || conflictBusy) return;
+    if (!activeCr || conflictBusy || resolvingCrId === activeCr) return;
     setConflictBusy(true);
+    setResolvingCrId(activeCr);
     try {
       await aiResolveMergeConflict(activeCr);
+      showOk('AI 解冲突已启动，正在后台处理（完成后回到代码审核复审）…');
       if (activeProject) await loadList(activeProject.id);
     } catch (e) {
+      setResolvingCrId(prev => (prev === activeCr ? null : prev));
       showError('AI 解冲突启动失败：' + String(e));
     } finally { setConflictBusy(false); }
   };
@@ -2478,6 +2693,19 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       await loadProjectReviewCounts();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     }
+  };
+
+  // 需求审核（批量）：把选中的需求（待审核 / 分析失败）重新送回分析队列。无批量后端命令，
+  // 逐条复用单条 retry_analysis（非法状态后端自行拦截，allSettled 不让单条失败影响整体）。
+  const doBatchReanalyze = async (ids: string[]) => {
+    if (!ids.length) return;
+    const rs = await Promise.allSettled(ids.map(id => retryAnalysis(id)));
+    const ok = rs.filter(r => r.status === 'fulfilled').length;
+    const fail = rs.length - ok;
+    showOk(`已重新分析：送回队列 ${ok}` + (fail ? ` · 跳过/失败 ${fail}` : ''));
+    if (activeProject) await loadList(activeProject.id);
+    await loadProjectReviewCounts();
+    window.dispatchEvent(new Event('AutoForge:badges-refresh'));
   };
 
   // 代码审核（批量）：一键通过选中的待代码审核 变更请求，各自排队合并，快速清空代码审核 队列。
@@ -2708,10 +2936,21 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           </div>
         </div>
       ) : cr!.status === 'merge_conflict' ? (
+        (() => {
+        const resolving = resolvingCrId === cr!.id;
+        const busy = conflictBusy || resolving;
+        return (
         <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--amber)', borderRadius: 10, padding: '14px 16px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--amber)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
             <Icon name="alert" size={18} />{conflict && conflict.files.length > 0 ? '合并冲突 · 并入 dev 时发生代码冲突' : '合并受阻 · 并入 dev 后集成校验未通过'}
           </div>
+          {/* AI 解冲突进行中：持续的进度横幅（后台长任务，全程停在 merge_conflict，靠它给反馈）。 */}
+          {resolving && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, padding: '10px 12px', borderRadius: 8, background: 'var(--ember-tint)', border: '1px solid var(--border-strong)', color: 'var(--text-2)', fontSize: 'var(--text-label)' }}>
+              <Icon name="brain" size={15} className="spin" style={{ color: 'var(--ember)', flexShrink: 0 }} />
+              <span>AI 正在后台解决冲突，完成后会自动回到代码审核复审。可在「执行日志」查看实时进度，期间无需操作。</span>
+            </div>
+          )}
           <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginBottom: 12 }}>
             {conflict && conflict.files.length > 0
               ? '该需求分支与 dev 上的其他改动冲突。可一键重试合并（dev 已含解时即可干净落地），或交由 AI 自动解决冲突（解完回到代码审核复审，不直接落 dev）。'
@@ -2721,28 +2960,31 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             <>
               <ConflictResolver
                 crId={cr!.id}
-                busy={conflictBusy}
+                busy={busy}
+                resolving={resolving}
                 onAiResolve={doAiResolve}
                 onRefresh={() => { if (activeProject) loadList(activeProject.id); window.dispatchEvent(new Event('AutoForge:badges-refresh')); }}
                 showError={showError}
               />
               <div style={{ marginTop: 10 }}>
-                <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
+                <button className="btn btn-sm" disabled={busy} onClick={doRetryMerge}>
                   <Icon name="refresh" size={13} />重试合并（dev 已含解时直接落地）
                 </button>
               </div>
             </>
           ) : (
             <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-primary btn-sm" disabled={conflictBusy} onClick={doAiResolve}>
-                <Icon name="zap" size={13} />AI 解冲突并合并
+              <button className="btn btn-primary btn-sm" disabled={busy} onClick={doAiResolve}>
+                <Icon name={resolving ? 'brain' : 'zap'} size={13} className={resolving ? 'spin' : undefined} />{resolving ? 'AI 解冲突中…' : 'AI 解冲突并合并'}
               </button>
-              <button className="btn btn-sm" disabled={conflictBusy} onClick={doRetryMerge}>
+              <button className="btn btn-sm" disabled={busy} onClick={doRetryMerge}>
                 <Icon name="refresh" size={13} />重试合并
               </button>
             </div>
           )}
         </div>
+        );
+        })()
       ) : FAILED_STATUSES.includes(cr!.status) ? (
         <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderLeft: '3px solid var(--red)', borderRadius: 10, padding: '14px 16px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: 'var(--red)', fontWeight: 700, fontSize: 'var(--text-body)' }}>
@@ -3049,6 +3291,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           onOpenLedger={() => setShowLedger(true)}
           onBatchApprove={doBatchReview1}
           onBatchApproveCrs={doBatchReview2}
+          onBatchReanalyze={doBatchReanalyze}
+          onBatchReject={rejectIssuesItems}
           gate={gate}
           width={listWidth}
           hasMoreMerged={showMerged && mergedLoaded < mergedTotal}

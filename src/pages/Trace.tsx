@@ -122,6 +122,14 @@ function SpanRow({ span }: { span: LlmTrace }) {
             {span.prompt_tokens != null && <span>in: {span.prompt_tokens}</span>}
             {span.completion_tokens != null && <span>out: {span.completion_tokens}</span>}
             {meta?.iteration != null && <span>iter: {meta.iteration}</span>}
+            {meta?.stage && <span>stage: <b style={{ color: 'var(--text-2)' }}>{meta.stage}</b></span>}
+            {meta?.terminated_by && (
+              <span>收尾: <b style={{ color: meta.terminated_by === 'model_final' ? 'var(--text-2)' : 'var(--amber)' }}>{meta.terminated_by}</b></span>
+            )}
+            {meta?.iters != null && <span>轮数: {meta.iters}</span>}
+            {meta?.tool_calls != null && (
+              <span>工具: {meta.tool_calls}{meta.tool_errors ? <b style={{ color: 'var(--red)' }}> ({meta.tool_errors} 失败)</b> : null}</span>
+            )}
             <span>{fmtTime(span.created_at)}</span>
           </div>
           {span.error && <TraceBlock label="错误" text={span.error} tone="error" />}
@@ -237,8 +245,8 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
             </div>
           )}
           {rows.map(r => (
-            <div key={r.id} className="cfg-card" onClick={() => open(r.id)}
-              style={{ margin: '8px 10px', padding: '10px 12px', cursor: 'pointer', ...(selected === r.id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+            <div key={r.id} className={'cfg-card selectable' + (selected === r.id ? ' picked' : '')} onClick={() => open(r.id)}
+              style={{ margin: '8px 10px', padding: '10px 12px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{r.role}</span>
                 <span className={'chip ' + (OUT_STATUS_CHIP[r.status] ?? '')} style={{ fontSize: 'var(--text-micro)' }}>{r.status}</span>
@@ -506,9 +514,9 @@ export default function TracePage() {
             )}
             {traces.map(t => (
               <div key={t.trace_id}
-                className="cfg-card"
+                className={'cfg-card selectable' + (selected === t.trace_id ? ' picked' : '')}
                 onClick={() => openTrace(t.trace_id)}
-                style={{ margin: '8px 10px', padding: '10px 12px', cursor: 'pointer', ...(selected === t.trace_id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+                style={{ margin: '8px 10px', padding: '10px 12px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{t.agent_name || t.agent_role || 'agent'}</span>
                   {t.status === 'error' && <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}>error</span>}

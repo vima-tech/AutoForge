@@ -104,6 +104,14 @@ pub async fn run_and_gate(
 
     let checks = configured_checks(crate::commands::run_config::effective_config(&project).as_deref());
 
+    // 测试在 CR 的 worktree 里跑，而 gitignore 的 node_modules/target 不随 worktree 创建。
+    // 跑命令前幂等软链依赖缓存，否则 `npx tsc --noEmit` 等命令因缺 node_modules 退化为联网
+    // 抓占位假包而失败。覆盖旧 worktree（创建时未软链的）；test_path==repo 时自动跳过。
+    crate::core::stack::link_dep_caches(
+        std::path::Path::new(&project.repo_path),
+        std::path::Path::new(&test_path),
+    );
+
     // 构建池：占一个全局许可再跑编译/测试，限制跨项目/CR 的并发编译数，避免批量合并时
     // 多个 rustc/tsc 同时把 CPU/内存打满。持有至本 CR 全部 check 跑完后随作用域释放。
     let build_pool = crate::state::build_pool();
@@ -114,44 +122,11 @@ pub async fn run_and_gate(
         results.push(run_check(&test_path, name, command, timeout).await);
     }
 
-    // 差量安全门 + 自动供料：security(cargo audit)从「绝对门」改成「回归门」——合并前测试只
-    // 看本次改动有没有**新引入**依赖漏洞；项目基线本来就有的（rsa、Tauri GTK3 链等）不阻断
-    // 合并，而是作为需求自动供料进传送带（见 demote_preexisting_security）。
-    let preexisting_adv =
-        demote_preexisting_security(&mut results, &test_path, &project.branch_dev).await;
-    for adv in &preexisting_adv {
-        let title = format!("[安全] 依赖公告 {}（基线既有，非本次引入）", adv);
-        let description = format!(
-            "项目依赖树存在安全公告 {}，非本次改动引入，已放行合并。建议评估修复或在 \
-             .cargo/audit.toml 登记接受。\nhttps://rustsec.org/advisories/{}",
-            adv, adv
-        );
-        // 稳定 fingerprint（仅取决于 advisory id）+ INSERT OR IGNORE → 跨多次合并自动去重。
-        let fp = security::fingerprint("dep-advisory", adv);
-        let issue_id = Uuid::new_v4().to_string();
-        let inserted = sqlx::query(
-            "INSERT OR IGNORE INTO issues
-             (id, project_id, source_type, title, description, category, severity, priority, status, fingerprint)
-             VALUES (?, ?, 'security_audit', ?, ?, 'Debt', 'medium', 5, 'pending_analysis', ?)",
-        )
-        .bind(&issue_id)
-        .bind(&project.id)
-        .bind(&title)
-        .bind(&description)
-        .bind(&fp)
-        .execute(db)
-        .await;
-        if matches!(inserted, Ok(ref r) if r.rows_affected() > 0) {
-            let _ = enqueue(
-                db,
-                tx,
-                "analysis",
-                &format!("analysis:{}", issue_id),
-                JobPayload::Analysis { issue_id },
-            )
-            .await;
-        }
-    }
+    // 差量安全门（diff 驱动）：security(cargo audit)只针对**本 CR 的 diff**——如果本次改动没碰过
+    // 依赖锁文件，依赖树就是从基线继承来的、非本次引入，直接放行；只有改了依赖、且相对 fork 点
+    // **新引入**了 advisory 才阻断。项目本来就有/上游的 advisory 不在合并门处理（交周期巡检按
+    // 项目维度发现），避免拿「不是这次引入的版本」卡合并。见 demote_preexisting_security。
+    demote_preexisting_security(&mut results, &test_path, &project.branch_dev).await;
 
     let failed = results.iter().filter(|r| !r.ok).collect::<Vec<_>>();
     let status = if failed.is_empty() {
@@ -308,59 +283,66 @@ pub async fn run_and_gate(
     Ok(failed.is_empty())
 }
 
-/// 差量安全门：把 security(cargo audit)检查从「绝对门」改成「回归门」。
+/// 差量安全门（diff 驱动）：把 security(cargo audit)从「审计整棵依赖树」改成「只查本次 diff」。
 ///
-/// 只有本 CR 的 Cargo.lock 相对 **dev 基线新引入**的 advisory 才保持失败、阻断合并；项目基线
-/// 本来就存在的 advisory（rsa、Tauri 2.x GTK3 链等，几乎都来自传递依赖而非本次改动）不阻断
-/// ——它们作为「基线既有」返回给调用方走自动供料登记需求。
+/// 合并前测试只对**本 CR 实际改动**的依赖负责：
+/// 1. 本 CR 的 diff（fork..HEAD）若**没碰过依赖锁文件** → 依赖树是从基线继承来的、非本次引入
+///    → 直接放行（不拿「不是这次引入的版本」卡合并）。这是绝大多数功能改动的情况。
+/// 2. 若 diff **改动了**依赖锁文件 → 审计当前 lock，只对相对 fork 点**新引入**的 advisory 阻断；
+///    fork 点既有的（CR 从更早的 dev 切出而带的旧版、或 dev 并行修复/引入的）不计入。
 ///
-/// 仅处理 `cargo audit` 命令（其它语言的 security 命令保持原样）。基线取自 **CR 分支与 dev 的
-/// 合并基（fork 点）** 的同名 lock；拿不到基线时按用户优先级「不卡合并」放行（视为全部既有）。
-/// 返回：被判定为「基线既有」的 advisory id 集（去重排序），供调用方自动供料。
-async fn demote_preexisting_security(
-    results: &mut [CheckResult],
-    worktree: &str,
-    branch_dev: &str,
-) -> Vec<String> {
-    let mut preexisting: Vec<String> = Vec::new();
+/// 项目本来就有/上游的 advisory 一律不在合并门处理——那是「项目维度」的债，应由周期巡检（scanner）
+/// 发现并登记，而不是在每个 CR 合并时反复纠缠。仅处理 `cargo audit` 命令；拿不到 git 信息时按
+/// 用户优先级「不卡合并」放行。
+async fn demote_preexisting_security(results: &mut [CheckResult], worktree: &str, branch_dev: &str) {
     for r in results.iter_mut() {
         if r.name != "security" || r.ok || !r.command.contains("cargo audit") {
             continue;
         }
         let lock = audit_file_arg(&r.command).unwrap_or_else(|| "Cargo.lock".to_string());
-        // 当前 CR 的 advisory 集（在 worktree 跑，应用其 .cargo/audit.toml 忽略规则）。
-        // 跑不出来（缺工具/DB/解析失败）→ 不是「项目本来的漏洞」语义，保留原失败、不误放行。
+        let git = crate::core::git::GitProxy::new(worktree);
+        // fork 点：CR 分支 HEAD 与 dev 的合并基（拿不到则回退 dev tip）。
+        let fork = git
+            .run(&["merge-base", "HEAD", branch_dev])
+            .await
+            .ok()
+            .filter(|(c, _, _)| *c == 0)
+            .map(|(_, o, _)| o.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| branch_dev.to_string());
+
+        // 本 CR 的 diff 是否改动了依赖锁文件？`git diff --quiet`：有差异 exit!=0、无差异 exit==0。
+        let touched_deps = match git.run(&["diff", "--quiet", &fork, "HEAD", "--", &lock]).await {
+            Ok((code, _, _)) => code != 0,
+            Err(_) => false, // 拿不到 diff → 视为未改动，按「不卡合并」放行。
+        };
+        if !touched_deps {
+            mark_security_pass(r, "本次改动未改动依赖锁文件，依赖树继承自基线、非本次引入，放行合并。");
+            continue;
+        }
+
+        // CR 确实改了依赖 → 审计当前 vs fork 点，只对本次新引入的 advisory 阻断。
+        // 当前集跑不出来（缺工具/DB/解析失败）→ 保留原失败、不误放行。
         let Some(cur) = cargo_audit_vuln_ids(worktree, &lock).await else {
             continue;
         };
-        let base = baseline_vuln_ids(worktree, branch_dev, &lock).await;
+        let base = vuln_ids_for_ref(worktree, &git, &fork, &lock).await;
         let mut new_ids: Vec<String> = cur.iter().filter(|id| !base.contains(*id)).cloned().collect();
         new_ids.sort();
-        let mut pre: Vec<String> = cur.iter().filter(|id| base.contains(*id)).cloned().collect();
-        pre.sort();
-        preexisting.extend(pre.iter().cloned());
-
         if new_ids.is_empty() {
-            // 没有新引入 → 不阻断合并。改写为通过，输出说明（供报告/遥测）。
-            r.ok = true;
-            r.code = 0;
-            r.stdout = format!(
-                "差量安全门：本次改动未新引入依赖漏洞，放行合并。\n基线既有 advisory（不阻断，已自动供料登记需求）：{}",
-                if pre.is_empty() { "无".into() } else { pre.join(", ") }
-            );
-            r.stderr.clear();
+            mark_security_pass(r, "本次改动调整了依赖但未新引入漏洞，放行合并。");
         } else {
-            // 有新引入 → 仍阻断，但只报新增的，避免淹没在基线噪音里。
-            r.stderr = format!(
-                "本次改动新引入依赖漏洞（阻断合并）：{}\n基线既有问题不计入：{}",
-                new_ids.join(", "),
-                if pre.is_empty() { "无".into() } else { pre.join(", ") }
-            );
+            r.stderr = format!("本次改动新引入依赖漏洞（阻断合并）：{}", new_ids.join(", "));
         }
     }
-    preexisting.sort();
-    preexisting.dedup();
-    preexisting
+}
+
+/// 把一个 security 检查结果改判为通过，并写入说明（供报告/遥测）。
+fn mark_security_pass(r: &mut CheckResult, reason: &str) {
+    r.ok = true;
+    r.code = 0;
+    r.stdout = format!("差量安全门：{reason}");
+    r.stderr.clear();
 }
 
 /// 解析 cargo audit 命令里的 `--file <path>`（lockfile 路径）；无则 None（用默认 Cargo.lock）。
@@ -390,28 +372,16 @@ async fn cargo_audit_vuln_ids(cwd: &str, lock_path: &str) -> Option<HashSet<Stri
     )
 }
 
-/// 基线 advisory 集：取 **CR 分支与 dev 的合并基（fork 点）** 的同名 lock 写临时文件后在
-/// worktree 内审计（同一忽略规则）。
-///
-/// 用 fork 点而非 dev tip 是关键——「本次改动引入」只能相对 CR 的**起点**算：fork 后 dev 并行
-/// 修复（如 quinn 0185 在 dev 上已修，但 CR 从更早的 dev 切出仍带旧版）或 dev 并行引入的问题，
-/// 都不该算到本 CR 头上。若 Phase-1 已把 dev 并入 worktree，则 dev 成为 HEAD 祖先、merge-base
-/// 自然就是 dev tip，逻辑退化为「只看 CR 在最新 dev 上的净新增」，同样正确。
-///
-/// 在 worktree 内跑 git（HEAD=CR 分支；worktree 与主仓库共享对象库，可 show 任意 sha）。拿不到
-/// 合并基则回退 dev tip，再不行 → 空集（按「不卡合并」放行）。
-async fn baseline_vuln_ids(worktree: &str, branch_dev: &str, lock_rel: &str) -> HashSet<String> {
-    let git = crate::core::git::GitProxy::new(worktree);
-    // fork 点：CR 分支 HEAD 与 dev 的合并基。拿不到则回退 dev tip。
-    let base_ref = git
-        .run(&["merge-base", "HEAD", branch_dev])
-        .await
-        .ok()
-        .filter(|(c, _, _)| *c == 0)
-        .map(|(_, o, _)| o.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| branch_dev.to_string());
-    let spec = format!("{}:{}", base_ref, lock_rel);
+/// 某 git ref 的同名 lock 的 advisory 集：`git show <ref>:<lock>` 取出内容写临时文件后在 worktree
+/// 内审计（套用同一 .cargo/audit.toml 忽略规则）。worktree 与主仓库共享对象库，可 show 任意 sha。
+/// 拿不到（show 失败/空/写盘失败）→ 空集，按「不卡合并」放行。
+async fn vuln_ids_for_ref(
+    worktree: &str,
+    git: &crate::core::git::GitProxy,
+    git_ref: &str,
+    lock_rel: &str,
+) -> HashSet<String> {
+    let spec = format!("{}:{}", git_ref, lock_rel);
     let content = match git.run(&["show", &spec]).await {
         Ok((0, out, _)) if !out.trim().is_empty() => out,
         _ => return HashSet::new(),

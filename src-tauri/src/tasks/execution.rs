@@ -209,6 +209,13 @@ pub async fn run(
         return Err(anyhow!("worktree add failed for {}: {}", cr_id, wt_err));
     }
 
+    // 软链依赖缓存目录（gitignore 的 node_modules[+ target] 不在 worktree 内），让编码 Agent
+    // 与合并前测试门能找到本地 tsc/eslint。run_and_gate 跑测试前还会再幂等软链一次兜底。
+    crate::core::stack::link_dep_caches(
+        std::path::Path::new(&project.repo_path),
+        std::path::Path::new(&worktree_path),
+    );
+
     event::emit(
         app,
         event::AppEvent::TaskProgress {

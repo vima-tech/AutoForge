@@ -2715,11 +2715,13 @@ function SelfUpdateSettings() {
     }).catch(() => {});
   }, []);
 
-  const refresh = async (id: string) => {
+  // keepResult: after a pull we re-read status but must NOT wipe the just-set
+  // pull message (the old code cleared it here → failures silently vanished).
+  const refresh = async (id: string, keepResult = false) => {
     if (!id) return;
-    setLoading(true); setResult(null); setSt(null);
+    setLoading(true); if (!keepResult) setResult(null); setSt(null);
     try { setSt(await selfUpdateStatus(id)); }
-    catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
+    catch (e) { if (!keepResult) setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
     finally { setLoading(false); }
   };
   useEffect(() => { refresh(pid); /* eslint-disable-next-line */ }, [pid]);
@@ -2728,7 +2730,7 @@ function SelfUpdateSettings() {
     setConfirm(false); setPulling(true); setResult(null);
     try { setResult(await selfUpdatePull(pid)); }
     catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
-    finally { setPulling(false); refresh(pid); }
+    finally { setPulling(false); refresh(pid, true); }
   };
 
   return (
@@ -2773,13 +2775,24 @@ function SelfUpdateSettings() {
                 <span className="set-nav-badge" style={{ marginLeft: 6 }}>{st.behind}</span>
               )}
             </button>
-            {result && (
+          </div>
+
+          {result && (
+            <div className="field full" style={{
+              flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: '12px 14px', borderRadius: 'var(--radius-sm)',
+              background: result.ok
+                ? 'color-mix(in srgb, var(--green) 12%, transparent)'
+                : 'color-mix(in srgb, var(--red) 12%, transparent)',
+              border: `1px solid color-mix(in srgb, ${result.ok ? 'var(--green)' : 'var(--red)'} 45%, transparent)`,
+            }}>
+              <Icon name={result.ok ? 'check' : 'alert'} size={16}
+                style={{ flexShrink: 0, marginTop: 1, color: result.ok ? 'var(--green-soft)' : 'var(--red)' }} />
               <span style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap',
                 lineHeight: 'var(--leading-normal)', color: result.ok ? 'var(--green-soft)' : 'var(--red)' }}>
                 {result.message}
               </span>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
 

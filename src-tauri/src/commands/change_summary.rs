@@ -18,13 +18,14 @@ use crate::db::Db;
 use crate::models::agent::Agent;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tauri::State;
 
 /// 喂给 LLM 的 diff 上限（字符）。超出做头部截断 + 提示，避免超 token 导致整体失败。
 const MAX_DIFF_CHARS: usize = 48_000;
 
 /// 结构化变更摘要（前端 ChangeSummaryCard 消费）。
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ChangeSummary {
     /// 概述：一句话本次变更做了什么（LLM 生成，失败时为空）。
     pub overview: String,
@@ -41,7 +42,7 @@ pub struct ChangeSummary {
 }
 
 /// 单个变更文件。
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SummaryFile {
     pub path: String,
     /// `added` | `modified` | `deleted` | `renamed`
@@ -60,7 +61,7 @@ pub struct IntentGroup {
 }
 
 /// 敏感模块标签。
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SensitiveTag {
     /// 机器可读类别：`database` | `api` | `permission` | `secret` | `migration`。
     pub kind: String,
@@ -102,13 +103,72 @@ struct LlmSensitive {
 }
 
 /// IPC 命令：为指定 CR 生成 AI 变更摘要。后端自取 diff（单一真源、避免大 diff 在 IPC 往返两次）。
+///
+/// 缓存策略：摘要只随 diff 内容变化。按 `cr_id` 缓存并记录所依据 diff 的 sha256；
+/// 命中且哈希一致则直接返回缓存——切换需求/CR 不重跑 LLM。`force=true`（卡片「重新生成」按钮）
+/// 跳过缓存强制重算。只缓存成功结果（status=ok），degraded/empty 不落库以便下次自动重试。
 #[tauri::command]
 pub async fn generate_change_summary(
     cr_id: String,
+    force: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ChangeSummary, String> {
     let diff = crate::commands::change_requests::load_cr_diff(&state.db, &cr_id).await?;
-    Ok(build_change_summary(&state.db, &diff).await)
+    let diff_hash = hex::encode(sha2::Sha256::digest(diff.as_bytes()));
+
+    if !force.unwrap_or(false) {
+        if let Some(cached) = load_cached_summary(&state.db, &cr_id, &diff_hash).await {
+            return Ok(cached);
+        }
+    }
+
+    let summary = build_change_summary(&state.db, &diff).await;
+    // 仅缓存完整成功的摘要；降级 / 空态不落库，下次自动重试。
+    if summary.status == "ok" {
+        save_cached_summary(&state.db, &cr_id, &diff_hash, &summary).await;
+    }
+    Ok(summary)
+}
+
+/// 读取命中缓存：要求 cr_id 存在且 diff_hash 与当前 diff 一致（diff 变化则视为未命中，触发重算）。
+async fn load_cached_summary(db: &Db, cr_id: &str, diff_hash: &str) -> Option<ChangeSummary> {
+    let json: String = sqlx::query_scalar(
+        "SELECT summary_json FROM change_summaries WHERE cr_id = ? AND diff_hash = ?",
+    )
+    .bind(cr_id)
+    .bind(diff_hash)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// 写入 / 覆盖缓存（按 cr_id upsert，diff 变化时新哈希覆盖旧摘要）。失败仅记日志，不影响返回。
+async fn save_cached_summary(db: &Db, cr_id: &str, diff_hash: &str, summary: &ChangeSummary) {
+    let json = match serde_json::to_string(summary) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[change_summary] 摘要序列化失败，跳过缓存: {e}");
+            return;
+        }
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO change_summaries (cr_id, diff_hash, summary_json, created_at)
+         VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT(cr_id) DO UPDATE SET
+           diff_hash = excluded.diff_hash,
+           summary_json = excluded.summary_json,
+           created_at = excluded.created_at",
+    )
+    .bind(cr_id)
+    .bind(diff_hash)
+    .bind(&json)
+    .execute(db)
+    .await
+    {
+        eprintln!("[change_summary] 缓存写入失败（不影响展示）: {e}");
+    }
 }
 
 /// 组装摘要（纯逻辑，便于单测）：确定性文件清单 + 关键词敏感标签 + 可选 LLM 语义增强。

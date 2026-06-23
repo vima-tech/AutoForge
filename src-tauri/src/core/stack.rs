@@ -485,6 +485,33 @@ pub fn dep_cache_dirs(dir: &Path) -> Vec<String> {
     seen
 }
 
+/// 把仓库的依赖缓存目录（gitignore 的 node_modules / target 等不在 worktree 内）软链进
+/// 目标目录，幂等：已存在则跳过，`dest == repo` 时自然跳过（src==dst 已存在）。
+/// 让编码 Agent 与合并前测试门能找到本地 tsc/eslint，否则 `npx tsc` 因缺 node_modules
+/// 退化为联网抓占位假包而失败。非 unix 平台为 no-op（symlink 语义不一致，预览同样仅 unix）。
+pub fn link_dep_caches(repo: &Path, dest: &Path) {
+    #[cfg(unix)]
+    {
+        if repo == dest {
+            return;
+        }
+        for rel in dep_cache_dirs(repo) {
+            let src = repo.join(&rel);
+            let dst = dest.join(&rel);
+            if src.exists() && !dst.exists() {
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::os::unix::fs::symlink(&src, &dst);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (repo, dest);
+    }
+}
+
 /// 适用于该仓库的内置**静态代码分析器**标识（去重）——clippy/ruff/go_vet/eslint。
 /// 供自喂料/扫描发现真实代码问题（区别于只查依赖漏洞的安全扫描器）。
 pub fn code_analyzers(dir: &Path) -> Vec<&'static str> {

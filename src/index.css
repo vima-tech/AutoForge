@@ -2233,9 +2233,22 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .set-h { font-family: var(--font-display); font-size: var(--text-page-title); font-weight: 800; letter-spacing: -.01em; }
 .set-desc { color: var(--text-3); font-size: var(--text-body); margin: 6px 0 22px; line-height: var(--leading-relaxed); }
 
-.cfg-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 15px; padding: 16px 18px; margin-bottom: 13px; transition: border-color .14s; }
+.cfg-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 15px; padding: 16px 18px; margin-bottom: 13px; transition: border-color .14s, background .14s, box-shadow .14s; }
 .cfg-card.add { border-style: dashed; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-3); cursor: pointer; padding: 18px; font-weight: 600; }
 .cfg-card.add:hover { border-color: var(--ember); color: var(--ember); }
+/* 可选列表项的悬停/选中态：呼应 .filter-chip.on / .conv-item.active 的 ember 激活语言，
+   选中态用 ember 实色描边 + tint 底 + 光环 + 左侧 ember 指示条，区别于仅微调描边的旧实现，
+   保证各 palette × dark/light 下「当前选中哪一条」一目了然。 */
+.cfg-card.selectable { position: relative; cursor: pointer; }
+.cfg-card.selectable:hover { border-color: var(--border-strong); background: var(--surface-hover); }
+.cfg-card.picked {
+  border-color: var(--ember); background: var(--ember-tint);
+  box-shadow: var(--shadow-sm), 0 0 0 3px var(--ember-tint);
+}
+.cfg-card.picked::before {
+  content: ""; position: absolute; left: 0; top: 12px; bottom: 12px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--ember); pointer-events: none;
+}
 .cfg-top { display: flex; align-items: center; gap: 12px; }
 .cfg-logo { width: 40px; height: 40px; border-radius: 11px; display: grid; place-items: center; color: #fff; font-weight: 800; font-family: var(--font-display); flex: none; }
 .cfg-name { font-weight: 700; font-size: var(--text-title); }

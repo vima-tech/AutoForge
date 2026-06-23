@@ -18,8 +18,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// 单条 I/O 文本入库上限，避免超大 prompt 撑爆 trace 表。
+/// 单条 system_prompt / error 文本入库上限，避免超大 prompt 撑爆 trace 表。
 const MAX_FIELD_CHARS: usize = 16_000;
+
+/// 入/出参（llm/tool 的 input/output）单独放宽到更大上限：工具循环里 messages 数组逐轮
+/// 膨胀，按 16K 截断会把最早的原始 prompt / 首批工具结果截没，排查时丢上下文。64K 兼顾留存与体积。
+const MAX_IO_CHARS: usize = 64_000;
 
 /// 关联标签（用于按需求/会议室/项目/任务筛选 trace）。
 #[derive(Clone, Default)]
@@ -46,13 +50,22 @@ tokio::task_local! {
     static RUN: TraceRun;
 }
 
-fn truncate(s: &str) -> String {
-    if s.chars().count() <= MAX_FIELD_CHARS {
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        let head: String = s.chars().take(MAX_FIELD_CHARS).collect();
-        format!("{head}\n…[已截断 {} 字符]", s.chars().count() - MAX_FIELD_CHARS)
+        let head: String = s.chars().take(max).collect();
+        format!("{head}\n…[已截断 {} 字符]", s.chars().count() - max)
     }
+}
+
+fn truncate(s: &str) -> String {
+    truncate_to(s, MAX_FIELD_CHARS)
+}
+
+/// 入/出参专用截断（更大上限），用于 llm/tool 的 input/output。
+fn truncate_io(s: &str) -> String {
+    truncate_to(s, MAX_IO_CHARS)
 }
 
 fn nonempty(s: &str) -> Option<String> {
@@ -147,8 +160,8 @@ async fn insert(
     .bind(system_prompt.map(truncate))
     .bind(status)
     .bind(error.map(truncate))
-    .bind(input.map(truncate))
-    .bind(output.map(truncate))
+    .bind(input.map(truncate_io))
+    .bind(output.map(truncate_io))
     .bind(prompt_tokens)
     .bind(completion_tokens)
     .bind(total_tokens)
@@ -162,6 +175,7 @@ async fn insert(
 }
 
 /// 写 root（kind=agent）span：整体出入参 + 状态 + 耗时。seq=-1 置顶。
+#[allow(clippy::too_many_arguments)]
 pub async fn record_root(
     input: &str,
     system_prompt: Option<&str>,
@@ -169,6 +183,7 @@ pub async fn record_root(
     status: &str,
     error: Option<&str>,
     latency_ms: i64,
+    metadata_json: Option<&str>,
 ) {
     let Some(run) = run() else { return };
     let id = run.trace_id.clone();
@@ -177,7 +192,7 @@ pub async fn record_root(
         run.agent_name.clone().as_deref(),
         None, None, system_prompt, status, error,
         Some(input), Some(output),
-        None, None, None, Some(latency_ms), None,
+        None, None, None, Some(latency_ms), metadata_json,
     )
     .await;
 }
@@ -218,9 +233,12 @@ pub async fn record_tool(name: &str, input: &str, output: &str, ok: bool, latenc
     let seq = run.seq.fetch_add(1, Ordering::Relaxed);
     let id = Uuid::new_v4().to_string();
     let trace_id = run.trace_id.clone();
+    // 失败时把失败内容也写进 error 列（而非仅留在 output），以便按
+    // `WHERE kind='mcp' AND status='error'` 直接扫出失败原因，无需逐条打开 output。
+    let error = if ok { None } else { nonempty(output) };
     insert(
         &run, &id, Some(&trace_id), seq, kind, Some(name),
-        None, None, None, if ok { "ok" } else { "error" }, None,
+        None, None, None, if ok { "ok" } else { "error" }, error.as_deref(),
         Some(input), Some(output),
         None, None, None, Some(latency_ms), None,
     )

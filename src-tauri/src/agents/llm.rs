@@ -8,7 +8,40 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// 工具循环最大轮数，防止模型无限调用工具。每轮 = 一次模型调用 + 一批工具执行。
-const MAX_TOOL_ITERS: usize = 6;
+/// 深度分析类 Agent（带 CodeGraph MCP + 项目文件工具）常需多轮检索取证，6 轮过紧会在
+/// 模型仍在调工具时被截断；耗尽后由 `*_final_synthesis` 强制收口，保证仍产出真实答复。
+const MAX_TOOL_ITERS: usize = 10;
+
+/// 工具预算耗尽时的「强制收口」指令：要求模型基于已收集到的全部信息直接给出完整最终答复，
+/// 不得再请求工具、不得只写前导语。用于把「轮数耗尽」从「返回半截前导语 / 未执行的
+/// <tool_call> 残文」救成「真正作答」。
+const FINAL_SYNTHESIS_DIRECTIVE: &str = "工具调用预算已用尽。请**立即基于你已经收集到的全部信息，直接输出完整的最终答复**。不要再请求或描述任何工具调用，不要再写 <tool_call>/<function> 标签，也不要只写「让我看看 / 我来查一下」之类的前导语——现在就给出你能给出的最完整、最有用的结论。";
+
+/// 工具循环的诊断统计，回填到 root(agent) span 的 `metadata_json`，让「为什么这样收尾」
+/// 一眼可判，而不必扫完全部子 span。`terminated_by` 取值见各 `*_tool_loop` 的返回点。
+#[derive(Clone, Copy)]
+struct LoopStats {
+    iters: usize,
+    tool_calls: usize,
+    tool_errors: usize,
+    terminated_by: &'static str, // model_final | budget_exhausted | no_tools | degraded_no_tools
+}
+
+impl LoopStats {
+    /// 非工具循环路径（无工具单轮 / 降级）的零计数统计。
+    fn flat(terminated_by: &'static str) -> Self {
+        LoopStats { iters: 0, tool_calls: 0, tool_errors: 0, terminated_by }
+    }
+    fn to_metadata(self) -> String {
+        json!({
+            "iters": self.iters,
+            "tool_calls": self.tool_calls,
+            "tool_errors": self.tool_errors,
+            "terminated_by": self.terminated_by,
+        })
+        .to_string()
+    }
+}
 
 /// 注入 Innate 召回内容时使用的小节标题（不含 `## `）。这是 trace 判定「本次 LLM 调用
 /// 是否触发了记忆召回」的唯一锚点——`commands/trace.rs` 据此对 system_prompt 做 LIKE 匹配，
@@ -263,9 +296,9 @@ pub async fn run_agent_text_with_tools(
         let result =
             run_agent_text_with_tools_inner(db, agent, prompt, system_prompt, image_paths, registry)
                 .await;
-        let (status, output, error) = match &result {
-            Ok(s) => ("ok", s.clone(), None),
-            Err(e) => ("error", String::new(), Some(e.to_string())),
+        let (status, output, error, stats) = match &result {
+            Ok((s, st)) => ("ok", s.clone(), None, Some(*st)),
+            Err(e) => ("error", String::new(), Some(e.to_string()), None),
         };
         crate::core::trace::record_root(
             prompt,
@@ -274,9 +307,10 @@ pub async fn run_agent_text_with_tools(
             status,
             error.as_deref(),
             t0.elapsed().as_millis() as i64,
+            stats.map(|s| s.to_metadata()).as_deref(),
         )
         .await;
-        result
+        result.map(|(s, _)| s)
     })
     .await
 }
@@ -288,10 +322,11 @@ async fn run_agent_text_with_tools_inner(
     system_prompt: Option<&str>,
     image_paths: &[PathBuf],
     registry: &ToolRegistry,
-) -> Result<String> {
+) -> Result<(String, LoopStats)> {
     // 无工具 / 带图片 / 无自定义 LLM → 老路径，保持既有行为。
     if registry.is_empty() || !image_paths.is_empty() || agent.llm_id.is_none() {
-        return run_agent_text(db, agent, prompt, system_prompt, image_paths).await;
+        let text = run_agent_text(db, agent, prompt, system_prompt, image_paths).await?;
+        return Ok((text, LoopStats::flat("no_tools")));
     }
 
     let llm_id = agent.llm_id.as_ref().unwrap();
@@ -315,14 +350,17 @@ async fn run_agent_text_with_tools_inner(
     };
 
     match loop_result {
-        Ok(text) => Ok(text),
+        Ok(pair) => Ok(pair),
         Err(e) => {
             // 端点可能不支持 tools 字段等 → 优雅降级为无工具单轮。
+            // 标记 terminated_by=degraded_no_tools，让 trace 一眼看出「这次是降级路径产出的」，
+            // 而非误以为是正常工具循环（mimo 吐裸 <tool_call> 残文即源于此前不可见的降级）。
             eprintln!(
                 "[tools] 工具循环失败，回退无工具单轮（agent={}, spec={}): {}",
                 agent.name, spec, e
             );
-            run_agent_text(db, agent, prompt, system_prompt, image_paths).await
+            let text = run_agent_text(db, agent, prompt, system_prompt, image_paths).await?;
+            Ok((text, LoopStats::flat("degraded_no_tools")))
         }
     }
 }
@@ -631,7 +669,7 @@ async fn run_openai_tool_loop(
     prompt: &str,
     system_prompt: Option<&str>,
     registry: &ToolRegistry,
-) -> Result<String> {
+) -> Result<(String, LoopStats)> {
     let client = http_client()?;
     let tools = openai_tools(registry);
     let mut messages: Vec<Value> = Vec::new();
@@ -642,6 +680,9 @@ async fn run_openai_tool_loop(
     let mut last_content = String::new();
     // 是否已就「只说不做的前导语」提醒过一次（每个对话至多提醒一次，防止反复空转）。
     let mut nudged = false;
+    // 诊断计数：工具调用总数 / 其中失败数，回填 root span metadata。
+    let mut tool_calls_count = 0usize;
+    let mut tool_errors_count = 0usize;
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut req = client
@@ -665,7 +706,7 @@ async fn run_openai_tool_loop(
                 crate::core::trace::record_llm(
                     "openai", &cfg.model, system_prompt, &req_input, "", "error",
                     Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
-                    Some(&json!({ "iteration": iter }).to_string()),
+                    Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
                 )
                 .await;
                 return Err(e);
@@ -680,7 +721,7 @@ async fn run_openai_tool_loop(
         crate::core::trace::record_llm(
             "openai", &cfg.model, system_prompt, &req_input,
             &serde_json::to_string(&msg).unwrap_or_default(), "ok", None, pt, ct, tt, latency,
-            Some(&json!({ "iteration": iter }).to_string()),
+            Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
         )
         .await;
 
@@ -703,14 +744,16 @@ async fn run_openai_tool_loop(
             // 原生 tool_calls 为空：兜底解析正文里的「文本式工具调用」（Qwen/MIMO/Hermes 系）。
             // 命中则执行并以 user 文本回灌结果（避免 OpenAI 的 tool_call_id 配对约束），续轮。
             let textual = parse_textual_tool_calls(&content_str);
-            if !textual.is_empty() && iter + 1 < MAX_TOOL_ITERS {
+            if !textual.is_empty() {
                 messages.push(json!({ "role": "assistant", "content": content_str }));
                 let mut feedback = String::from(
                     "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（严格 JSON，不要再写 <tool_call>/<function> 标签）：\n",
                 );
                 for (name, args) in &textual {
                     let outcome = registry.invoke(name, args.clone()).await;
+                    tool_calls_count += 1;
                     if !outcome.ok {
+                        tool_errors_count += 1;
                         eprintln!("[tools] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
                     }
                     feedback.push_str(&format!(
@@ -743,9 +786,18 @@ async fn run_openai_tool_loop(
                 );
             }
             // 无工具调用（或已到末轮）：返回正文作为最终回答。
-            return Some(content_str)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("OpenAI-compatible 响应缺少最终 content"));
+            if content_str.is_empty() {
+                return Err(anyhow!("OpenAI-compatible 响应缺少最终 content"));
+            }
+            return Ok((
+                content_str,
+                LoopStats {
+                    iters: iter + 1,
+                    tool_calls: tool_calls_count,
+                    tool_errors: tool_errors_count,
+                    terminated_by: "model_final",
+                },
+            ));
         }
 
         // 助手回合（含 tool_calls）必须原样回灌，否则下一轮无法对应工具结果。
@@ -762,7 +814,9 @@ async fn run_openai_tool_loop(
                 .unwrap_or("{}");
             let args = serde_json::from_str::<Value>(args_str).unwrap_or_else(|_| json!({}));
             let outcome = registry.invoke(fname, args).await;
+            tool_calls_count += 1;
             if !outcome.ok {
+                tool_errors_count += 1;
                 eprintln!("[tools] 工具 `{}` 返回失败/被拦截：{}", fname, outcome.content);
             }
             messages.push(json!({
@@ -772,11 +826,71 @@ async fn run_openai_tool_loop(
             }));
         }
     }
-    // 轮数耗尽：优雅兜底——返回最近一次模型正文（多数情况下已含可解析结果），
-    // 而非直接报错丢弃整轮工作；确无任何正文时才报错。
-    Some(last_content)
+    // 轮数耗尽：强制收口——去掉工具、附收口指令再请求一次，把模型逼到「直接作答」，
+    // 而不是把半截前导语 / 未执行的 <tool_call> 残文当最终答复返回（这是会议室 Agent
+    // 「答不出来」的主因）。收口失败时才回退到最近一次正文。
+    let text = openai_final_synthesis(cfg, system_prompt, messages, &last_content).await?;
+    Ok((
+        text,
+        LoopStats {
+            iters: MAX_TOOL_ITERS,
+            tool_calls: tool_calls_count,
+            tool_errors: tool_errors_count,
+            terminated_by: "budget_exhausted",
+        },
+    ))
+}
+
+/// 工具预算耗尽后的强制收口（OpenAI 兼容）：去掉 tools 字段、追加收口指令再请求一次，
+/// 逼模型基于已收集信息直接作答。失败 / 空则回退 `fallback`（最近一次正文），仍空才报错。
+async fn openai_final_synthesis(
+    cfg: &LlmConfig,
+    system_prompt: Option<&str>,
+    mut messages: Vec<Value>,
+    fallback: &str,
+) -> Result<String> {
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let client = http_client()?;
+    // 注意：不带 tools / tool_choice，强制模型走纯文本回复。
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&json!({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature
+        }));
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+    let req_input = serde_json::to_string(&messages).unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let text = match send_json(req).await {
+        Ok(body) => {
+            let msg = body.pointer("/choices/0/message").cloned().unwrap_or_default();
+            let (pt, ct, tt) = openai_usage(&body);
+            crate::core::trace::record_llm(
+                "openai", &cfg.model, system_prompt, &req_input,
+                &serde_json::to_string(&msg).unwrap_or_default(), "ok", None, pt, ct, tt,
+                t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            msg.get("content").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).unwrap_or_default()
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                "openai", &cfg.model, system_prompt, &req_input, "", "error",
+                Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            String::new()
+        }
+    };
+    Some(text)
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+        .or_else(|| Some(fallback.trim().to_string()).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，强制收口仍无正文", MAX_TOOL_ITERS))
 }
 
 /// Anthropic 工具调用循环：声明 tools → 解析 content[].type=tool_use → 执行 →
@@ -786,12 +900,17 @@ async fn run_anthropic_tool_loop(
     prompt: &str,
     system_prompt: Option<&str>,
     registry: &ToolRegistry,
-) -> Result<String> {
+) -> Result<(String, LoopStats)> {
     let client = http_client()?;
     let tools = anthropic_tools(registry);
     let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": prompt })];
     // 是否已就「只说不做的前导语」提醒过一次（每个对话至多提醒一次，防止反复空转）。
     let mut nudged = false;
+    // 记录最近一次模型正文，供轮数耗尽时强制收口的回退用。
+    let mut last_text = String::new();
+    // 诊断计数：工具调用总数 / 其中失败数，回填 root span metadata。
+    let mut tool_calls_count = 0usize;
+    let mut tool_errors_count = 0usize;
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut body = json!({
@@ -819,7 +938,7 @@ async fn run_anthropic_tool_loop(
                 crate::core::trace::record_llm(
                     "anthropic", &cfg.model, system_prompt, &req_input, "", "error",
                     Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
-                    Some(&json!({ "iteration": iter }).to_string()),
+                    Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
                 )
                 .await;
                 return Err(e);
@@ -836,7 +955,7 @@ async fn run_anthropic_tool_loop(
         crate::core::trace::record_llm(
             "anthropic", &cfg.model, system_prompt, &req_input,
             &serde_json::to_string(&content).unwrap_or_default(), "ok", None, pt, ct, tt, latency,
-            Some(&json!({ "iteration": iter }).to_string()),
+            Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
         )
         .await;
         let stop = value.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("");
@@ -869,11 +988,30 @@ async fn run_anthropic_tool_loop(
                     text.chars().take(80).collect::<String>()
                 );
             }
-            return Some(text)
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| anyhow!("Anthropic 响应缺少最终 text"));
+            if text.trim().is_empty() {
+                return Err(anyhow!("Anthropic 响应缺少最终 text"));
+            }
+            return Ok((
+                text,
+                LoopStats {
+                    iters: iter + 1,
+                    tool_calls: tool_calls_count,
+                    tool_errors: tool_errors_count,
+                    terminated_by: "model_final",
+                },
+            ));
         }
 
+        // 记录本轮伴随 tool_use 的正文（若有），作为耗尽时强制收口的回退文本。
+        let turn_text = content
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !turn_text.trim().is_empty() {
+            last_text = turn_text;
+        }
         // 助手回合（含 tool_use 块）原样回灌。
         messages.push(json!({ "role": "assistant", "content": content.clone() }));
         let mut results = Vec::new();
@@ -885,7 +1023,9 @@ async fn run_anthropic_tool_loop(
             let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
             let outcome = registry.invoke(name, input).await;
+            tool_calls_count += 1;
             if !outcome.ok {
+                tool_errors_count += 1;
                 eprintln!("[tools] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
             }
             results.push(json!({
@@ -896,7 +1036,81 @@ async fn run_anthropic_tool_loop(
         }
         messages.push(json!({ "role": "user", "content": results }));
     }
-    Err(anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+    // 轮数耗尽：强制收口——去掉 tools 再请求一次，逼模型基于已收集信息直接作答，
+    // 而非直接报错丢弃整轮取证工作。
+    let text = anthropic_final_synthesis(cfg, system_prompt, messages, &last_text).await?;
+    Ok((
+        text,
+        LoopStats {
+            iters: MAX_TOOL_ITERS,
+            tool_calls: tool_calls_count,
+            tool_errors: tool_errors_count,
+            terminated_by: "budget_exhausted",
+        },
+    ))
+}
+
+/// 工具预算耗尽后的强制收口（Anthropic）：去掉 tools 字段、追加收口指令再请求一次，
+/// 逼模型基于已收集信息直接作答。失败 / 空则回退 `fallback`，仍空才报错。
+async fn anthropic_final_synthesis(
+    cfg: &LlmConfig,
+    system_prompt: Option<&str>,
+    mut messages: Vec<Value>,
+    fallback: &str,
+) -> Result<String> {
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let client = http_client()?;
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": cfg.temperature
+    });
+    body["system"] = anthropic_system_cached(&compose_tool_system(system_prompt));
+    let req_input = serde_json::to_string(&messages).unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let text = match send_json(
+        client
+            .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+            .header("x-api-key", &cfg.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body),
+    )
+    .await
+    {
+        Ok(value) => {
+            let content = value.get("content").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let (pt, ct, tt) = anthropic_usage(&value);
+            crate::core::trace::record_llm(
+                "anthropic", &cfg.model, system_prompt, &req_input,
+                &serde_json::to_string(&content).unwrap_or_default(), "ok", None, pt, ct, tt,
+                t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            content
+                .iter()
+                .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string()
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                "anthropic", &cfg.model, system_prompt, &req_input, "", "error",
+                Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            String::new()
+        }
+    };
+    Some(text)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some(fallback.trim().to_string()).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，强制收口仍无正文", MAX_TOOL_ITERS))
 }
 
 fn openai_tools(registry: &ToolRegistry) -> Vec<Value> {

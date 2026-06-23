@@ -37,20 +37,22 @@ export default function ChangeSummaryCard({ crId, enabled }: Props) {
   const [error, setError] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
-  const load = useCallback(() => {
+  // force=false：走后端缓存（按 cr_id + diff 哈希），切换需求/CR 命中即返回、不重跑 LLM。
+  // force=true：用户点「重新生成」时跳过缓存强制重算。
+  const load = useCallback((force = false) => {
     if (!enabled) { setSummary(null); return; }
     let alive = true;
     setLoading(true);
     setError(false);
     setSummary(null);
-    generateChangeSummary(crId)
+    generateChangeSummary(crId, force)
       .then(s => { if (alive) setSummary(s); })
       .catch(() => { if (alive) setError(true); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, [crId, enabled]);
 
-  // crId / enabled 变化时自动请求；返回的 cleanup 取消上一请求的回写，避免竞态。
+  // crId / enabled 变化时自动请求（命中缓存不重算）；返回的 cleanup 取消上一请求的回写，避免竞态。
   useEffect(() => {
     const cleanup = load();
     return cleanup;
@@ -61,7 +63,7 @@ export default function ChangeSummaryCard({ crId, enabled }: Props) {
   if (summary?.status === 'empty') return null;
 
   return (
-    <div className="panel" style={{ marginBottom: 12, overflow: 'hidden' }}>
+    <div className="panel" style={{ margin: '0 clamp(8px, 1.4vw, 24px) 12px', overflow: 'hidden' }}>
       {/* 卡头：标题 + AI 生成提示 + 重新生成 / 折叠 */}
       <div
         className="panel-head"
@@ -77,7 +79,7 @@ export default function ChangeSummaryCard({ crId, enabled }: Props) {
           AI 生成
         </span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-          <button className="icon-btn" title="重新生成摘要" onClick={() => load()} disabled={loading}>
+          <button className="icon-btn" title="重新生成摘要" onClick={() => load(true)} disabled={loading}>
             <Icon name="refresh" size={14} />
           </button>
           <button
@@ -176,12 +178,15 @@ export default function ChangeSummaryCard({ crId, enabled }: Props) {
                       return (
                         <div
                           key={i}
-                          style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 'var(--text-label)' }}
+                          style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--text-label)' }}
                         >
-                          <Icon name={m.icon} size={13} style={{ color: m.color, flexShrink: 0, alignSelf: 'center' }} />
-                          <span title={f.change} style={{ flexShrink: 0, width: 38, color: m.color, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)' }}>{m.label}</span>
-                          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)', wordBreak: 'break-all' }}>{f.path}</span>
-                          {f.note && <span style={{ color: 'var(--text-3)' }}>— {f.note}</span>}
+                          <Icon name={m.icon} size={13} style={{ color: m.color, flexShrink: 0 }} />
+                          <span title={f.change} style={{ flexShrink: 0, width: 38, color: m.color, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', lineHeight: 'var(--leading-normal)' }}>{m.label}</span>
+                          {/* 路径与说明纵向堆叠，避免挤在一行导致路径断词、说明错位 */}
+                          <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)', overflowWrap: 'anywhere', lineHeight: 'var(--leading-normal)' }}>{f.path}</span>
+                            {f.note && <span style={{ color: 'var(--text-3)', lineHeight: 'var(--leading-normal)' }}>{f.note}</span>}
+                          </div>
                         </div>
                       );
                     })}

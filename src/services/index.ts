@@ -160,7 +160,13 @@ export interface IssueAnalysisSpec {
 
 export function parseAnalysisSpec(json: string | null | undefined): IssueAnalysisSpec | null {
   if (!json) return null;
-  try { return JSON.parse(json) as IssueAnalysisSpec; } catch { return null; }
+  try {
+    const v = JSON.parse(json);
+    // 分析失败时可能落 "{}" / null / 数组等占位；非「含实际内容的对象」一律视为无 spec，
+    // 让调用方回退到简单视图，避免下游组件在缺失字段上解引用而崩溃。
+    if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).length === 0) return null;
+    return v as IssueAnalysisSpec;
+  } catch { return null; }
 }
 export interface ChangeRequest {
   id: string; project_id: string; issue_id: string; status: string;
@@ -540,7 +546,8 @@ export const getCodeDiff = (crId: string) =>
   ipc<string>('get_code_diff', { crId });
 
 // AI 变更摘要：基于 CR 的代码 diff 生成结构化摘要（文件清单 + 业务意图分类 + 敏感标签）。
-// 实时生成、不落库；LLM 失败时后端降级返回确定性部分（status='degraded'），前端据此提示。
+// 后端按 cr_id + diff 哈希缓存：切换需求/CR 命中缓存直接返回，不重跑 LLM；diff 变化哈希自动失效重算。
+// force=true（卡片「重新生成」）跳过缓存强制重算；LLM 失败时降级返回确定性部分（status='degraded'）。
 export interface SummaryFile { path: string; change: 'added' | 'modified' | 'deleted' | 'renamed'; note: string }
 export interface IntentGroup { kind: string; detail: string }
 export interface SensitiveTag { kind: string; label: string; detail: string }
@@ -552,8 +559,8 @@ export interface ChangeSummary {
   status: 'ok' | 'degraded' | 'empty';
   note: string | null;
 }
-export const generateChangeSummary = (crId: string) =>
-  ipc<ChangeSummary>('generate_change_summary', { crId });
+export const generateChangeSummary = (crId: string, force = false) =>
+  ipc<ChangeSummary>('generate_change_summary', { crId, force });
 export type MergeConflictView = { files: string[]; diff: string };
 export const getMergeConflict = (crId: string) =>
   ipc<MergeConflictView>('get_merge_conflict', { crId });

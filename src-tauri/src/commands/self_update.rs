@@ -124,6 +124,38 @@ async fn conflicted_files(git: &GitProxy) -> Vec<String> {
     }
 }
 
+/// Pop the self-update stash after the update landed. On conflict the stash is
+/// kept intact and the working tree reset clean to the new HEAD, so the user's
+/// shelved edits are never lost; returns the conflicted files for the caller to
+/// surface. `Ok(())` means the edits were re-applied cleanly.
+async fn restore_stash(git: &GitProxy) -> Result<(), Vec<String>> {
+    let (pc, _, perr) = git
+        .run(&["stash", "pop"])
+        .await
+        .unwrap_or((-1, String::new(), String::new()));
+    if pc != 0 {
+        let files = conflicted_files(git).await;
+        let _ = git.run(&["reset", "--hard", "HEAD"]).await;
+        warn!(
+            "self_update_pull: stash pop 冲突，改动保留在 stash，文件={:?}: {}",
+            files,
+            perr.trim()
+        );
+        return Err(files);
+    }
+    info!("self_update_pull: 已恢复暂存改动");
+    Ok(())
+}
+
+/// Human-readable "涉及文件" suffix for a list of paths (empty when none).
+fn files_suffix(label: &str, files: &[String]) -> String {
+    if files.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}\n{}", label, files.join("\n"))
+    }
+}
+
 /// Behind-count for the self-managed project (the one whose working tree is
 /// currently on its `<dev>` branch). Powers the periodic badge poll on the
 /// "同步更新" control — cheap: only the matched project is fetched.
@@ -254,8 +286,10 @@ pub async fn self_update_pull(
 /// 1. refuse unless actually on `branch_dev` (never rewrite the wrong history);
 /// 2. refuse if the fetch failed (never act on a stale remote ref);
 /// 3. record a recovery branch before any rewrite;
-/// 4. clean repo → fast-forward; diverged repo → explicit stash + rerere-aided
-///    rebase, every failure rolled back so the repo is never left broken.
+/// 4. shelve uncommitted edits up-front (so a dirty tree blocks neither path),
+///    then: no local commits → fast-forward; diverged → rerere-aided rebase;
+///    re-apply the edits afterwards. Every failure is rolled back so the repo is
+///    never left broken, and the user's commits/edits are never lost.
 async fn run_self_update_pull(git: &GitProxy, project: &Project) -> SelfUpdateResult {
     let branch_dev = &project.branch_dev;
     let fail = |msg: String| SelfUpdateResult {
@@ -321,38 +355,12 @@ async fn run_self_update_pull(git: &GitProxy, project: &Project) -> SelfUpdateRe
     let _ = git.run(&["branch", "-f", backup_ref, "HEAD"]).await;
     info!("self_update_pull: 记录恢复点 {} -> {}", backup_ref, head);
 
-    // 4a) No local commits → plain fast-forward (zero risk of rewriting).
-    if ahead == 0 {
-        let (code, _, err) = git
-            .run(&["pull", "--ff-only", "origin", branch_dev])
-            .await
-            .unwrap_or((-1, String::new(), "git not available".to_string()));
-        info!("self_update_pull: ff-only 退出码={}", code);
-        if code == 0 {
-            info!("self_update_pull: 快进 {} 个提交成功", behind);
-            return SelfUpdateResult {
-                ok: true,
-                pulled: behind,
-                message: format!(
-                    "已拉取 {} 个提交。源码已更新，开发模式将自动重新编译并重启以生效。",
-                    behind
-                ),
-                restart_required: true,
-            };
-        }
-        warn!("self_update_pull: ff-only 失败 (code={}): {}", code, err.trim());
-        // ahead==0 yet ff failed → uncommitted changes would be overwritten.
-        let detail: String = err.chars().take(400).collect();
-        return fail(format!(
-            "本地有未提交改动会被覆盖，已阻止拉取。请先提交或暂存(git stash)后重试。\n\n{}",
-            detail
-        ));
-    }
-
-    // 4b) Diverged (ahead>0): replay local commits onto the new remote tip via
-    //     an explicit, fully recoverable rebase.
-    info!("self_update_pull: 检测到分叉(本地领先 {})，改用 rebase", ahead);
-
+    // 4) Shelve any uncommitted edits up-front so *neither* path is blocked by a
+    //    dirty tree. The live self-managed repo is dirty in the common case
+    //    (developer edits in flight), and git refuses a plain fast-forward over
+    //    files that would be overwritten — that is exactly the "merge failed"
+    //    the user hit. Stashing here makes both ff and rebase succeed, then we
+    //    re-apply the edits afterwards (or keep them safely stashed on conflict).
     let dirty = git
         .run(&["status", "--porcelain"])
         .await
@@ -374,6 +382,57 @@ async fn run_self_update_pull(git: &GitProxy, project: &Project) -> SelfUpdateRe
         stashed = true;
         info!("self_update_pull: 已暂存未提交改动");
     }
+
+    // 4a) No local commits → fast-forward onto the new remote tip (no rewrite).
+    if ahead == 0 {
+        let (code, _, err) = git
+            .run(&["pull", "--ff-only", "origin", branch_dev])
+            .await
+            .unwrap_or((-1, String::new(), "git not available".to_string()));
+        info!("self_update_pull: ff-only 退出码={}", code);
+        if code != 0 {
+            // Tree is clean now (we stashed), so a failure here is unexpected
+            // (e.g. remote rewound non-fast-forward). Restore the stash and stop.
+            warn!("self_update_pull: ff-only 失败 (code={}): {}", code, err.trim());
+            if stashed {
+                let _ = git.run(&["stash", "pop"]).await;
+            }
+            let detail: String = err.chars().take(400).collect();
+            return fail(format!(
+                "快进 origin/{} 失败（远端历史可能被改写，非快进）。已恢复到更新前状态，未提交改动未丢失。请手动检查后重试。\n\n{}",
+                branch_dev, detail
+            ));
+        }
+        info!("self_update_pull: 快进 {} 个提交成功", behind);
+        if stashed {
+            if let Err(files) = restore_stash(git).await {
+                return SelfUpdateResult {
+                    ok: true,
+                    pulled: behind,
+                    message: format!(
+                        "源码已更新到最新（合入 {} 个远端提交），但你之前未提交的改动与更新有冲突，已原样保留在 git stash（stash@{{0}}）。请手动 `git stash pop` 解决冲突。开发模式会自动重新编译并重启。{}",
+                        behind,
+                        files_suffix("涉及文件：", &files)
+                    ),
+                    restart_required: true,
+                };
+            }
+        }
+        return SelfUpdateResult {
+            ok: true,
+            pulled: behind,
+            message: format!(
+                "已拉取 {} 个提交{}。源码已更新，开发模式将自动重新编译并重启以生效。",
+                behind,
+                if stashed { "（未提交改动已自动暂存并恢复）" } else { "" }
+            ),
+            restart_required: true,
+        };
+    }
+
+    // 4b) Diverged (ahead>0): replay local commits onto the new remote tip via
+    //     an explicit, fully recoverable rebase.
+    info!("self_update_pull: 检测到分叉(本地领先 {})，改用 rebase", ahead);
 
     // Reuse remembered conflict resolutions (consistent with tasks/merge.rs).
     let _ = git.run(&["config", "rerere.enabled", "true"]).await;
@@ -397,50 +456,30 @@ async fn run_self_update_pull(git: &GitProxy, project: &Project) -> SelfUpdateRe
             files,
             rerr.trim()
         );
-        let flist = if files.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n冲突文件：\n{}", files.join("\n"))
-        };
         return fail(format!(
             "与 origin/{} 存在无法自动合并的冲突，已回滚到更新前状态（你的提交与未提交改动均未丢失，恢复点分支 {}）。请手动 rebase 解决冲突后重试。{}",
-            branch_dev, backup_ref, flist
+            branch_dev,
+            backup_ref,
+            files_suffix("冲突文件：", &files)
         ));
     }
 
     // Rebase succeeded — restore the shelved edits.
     if stashed {
-        let (pc, _, perr) = git
-            .run(&["stash", "pop"])
-            .await
-            .unwrap_or((-1, String::new(), String::new()));
-        if pc != 0 {
+        if let Err(files) = restore_stash(git).await {
             // Code is updated, but the user's uncommitted edits collide with the
-            // pulled changes. `stash pop` keeps the stash on conflict; reset the
-            // tree clean to the new HEAD and leave the edits safely stashed.
-            let files = conflicted_files(git).await;
-            let _ = git.run(&["reset", "--hard", "HEAD"]).await;
-            warn!(
-                "self_update_pull: stash pop 冲突，改动保留在 stash，文件={:?}: {}",
-                files,
-                perr.trim()
-            );
-            let flist = if files.is_empty() {
-                String::new()
-            } else {
-                format!("\n\n涉及文件：\n{}", files.join("\n"))
-            };
+            // pulled changes; they remain safely stashed.
             return SelfUpdateResult {
                 ok: true,
                 pulled: behind,
                 message: format!(
                     "源码已更新到最新（合入 {} 个远端提交），但你之前未提交的改动与更新有冲突，已原样保留在 git stash（stash@{{0}}）。请手动 `git stash pop` 解决冲突。开发模式会自动重新编译并重启。{}",
-                    behind, flist
+                    behind,
+                    files_suffix("涉及文件：", &files)
                 ),
                 restart_required: true,
             };
         }
-        info!("self_update_pull: 已恢复暂存改动");
     }
 
     info!(
