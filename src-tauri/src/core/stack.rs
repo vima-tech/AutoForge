@@ -445,10 +445,11 @@ pub fn detect_stacks(dir: &Path) -> Vec<DetectedStack> {
     }
 
     // 后端栈（可与前端共存，构成 Web 系统）。
-    for det in [detect_rust(dir), detect_java(dir), detect_go(dir), detect_python(dir)] {
-        if let Some(s) = det {
-            out.push(s);
-        }
+    for s in [detect_rust(dir), detect_java(dir), detect_go(dir), detect_python(dir)]
+        .into_iter()
+        .flatten()
+    {
+        out.push(s);
     }
 
     // 纯静态站兜底（仅当啥都没检测到时）。
