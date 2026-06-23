@@ -397,19 +397,22 @@ async fn execute_conversation_task(
     let mut next_step_index = 0usize;
 
     for step in plan.steps.iter() {
+        let ctx = ChatTaskCtx {
+            db: &db,
+            app: &app,
+            conversation_id: &payload.conversation_id,
+            snapshot: &snapshot,
+            accumulated: &accumulated,
+            roster: &roster,
+            project_id: conversation.project_id.as_deref(),
+        };
         let (outcomes, step_failed) = run_plan_step(
-            &db,
-            &app,
+            &ctx,
             &task_id,
-            &payload.conversation_id,
             next_step_index,
             &step.step_type,
             &step.agents,
             &step.instruction,
-            &snapshot,
-            &accumulated,
-            &roster,
-            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -447,19 +450,22 @@ async fn execute_conversation_task(
         let step_type = if to_run.len() > 1 { "parallel" } else { "single" };
         let instruction =
             "你在群聊中被其他 Agent @ 点名。请针对点名你的发言内容作出明确回应（同意/反对/补充并说明理由）。";
+        let ctx = ChatTaskCtx {
+            db: &db,
+            app: &app,
+            conversation_id: &payload.conversation_id,
+            snapshot: &snapshot,
+            accumulated: &accumulated,
+            roster: &roster,
+            project_id: conversation.project_id.as_deref(),
+        };
         let (outcomes, step_failed) = run_plan_step(
-            &db,
-            &app,
+            &ctx,
             &task_id,
-            &payload.conversation_id,
             next_step_index,
             step_type,
             &to_run,
             instruction,
-            &snapshot,
-            &accumulated,
-            &roster,
-            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -490,17 +496,16 @@ async fn execute_conversation_task(
 
     if asks_for_synthesis(&payload.instruction) && !plan_has_final_single {
         if let Some(summarizer) = load_system_role_agent(&db, "summarizer").await? {
-            let outcome = run_summarizer(
-                &db,
-                &app,
-                &payload.conversation_id,
-                &summarizer,
-                &payload.instruction,
-                &snapshot,
-                &accumulated,
-                conversation.project_id.as_deref(),
-            )
-            .await?;
+            let ctx = ChatTaskCtx {
+                db: &db,
+                app: &app,
+                conversation_id: &payload.conversation_id,
+                snapshot: &snapshot,
+                accumulated: &accumulated,
+                roster: &roster,
+                project_id: conversation.project_id.as_deref(),
+            };
+            let outcome = run_summarizer(&ctx, &summarizer, &payload.instruction).await?;
             if !outcome.ok {
                 any_failed = true;
             }
@@ -513,17 +518,16 @@ async fn execute_conversation_task(
 
     if asks_for_artifact(&payload.instruction) && !plan_has_final_single {
         if let Some(doc_writer) = load_system_role_agent(&db, "doc_writer").await? {
-            let outcome = run_doc_writer(
-                &db,
-                &app,
-                &payload.conversation_id,
-                &doc_writer,
-                &payload.instruction,
-                &snapshot,
-                &accumulated,
-                conversation.project_id.as_deref(),
-            )
-            .await?;
+            let ctx = ChatTaskCtx {
+                db: &db,
+                app: &app,
+                conversation_id: &payload.conversation_id,
+                snapshot: &snapshot,
+                accumulated: &accumulated,
+                roster: &roster,
+                project_id: conversation.project_id.as_deref(),
+            };
+            let outcome = run_doc_writer(&ctx, &doc_writer, &payload.instruction).await?;
             if !outcome.ok {
                 any_failed = true;
             }
@@ -844,19 +848,34 @@ fn fallback_plan(
 /// concurrently, then marks the step done). Returns each agent's outcome plus
 /// whether any agent in the step failed. Shared by the plan loop and the
 /// chained-@mention follow-up phase.
+/// Shared, borrowed context threaded through the group-chat (会议室) task
+/// execution family — plan steps, per-agent runs, and post-plan system agents
+/// (summarizer / doc_writer / markdown) all need the same handful of
+/// dependencies plus the running discussion snapshot. Bundling them keeps each
+/// helper's signature under the `clippy::too_many_arguments` threshold without
+/// changing behavior. All fields are borrows; a `ChatTaskCtx` is cheap to
+/// rebuild and only lives for one helper call, so it never outlives the
+/// borrowed data.
+struct ChatTaskCtx<'a> {
+    db: &'a crate::db::Db,
+    app: &'a AppHandle,
+    conversation_id: &'a str,
+    /// Frozen transcript of the conversation fed into each agent prompt.
+    snapshot: &'a str,
+    /// Running tail of replies produced earlier in this task pass.
+    accumulated: &'a str,
+    /// Human-readable roster of schedulable members (used by step agents only).
+    roster: &'a str,
+    project_id: Option<&'a str>,
+}
+
 async fn run_plan_step(
-    db: &crate::db::Db,
-    app: &AppHandle,
+    ctx: &ChatTaskCtx<'_>,
     task_id: &str,
-    conversation_id: &str,
     step_index: usize,
     step_type: &str,
     agents: &[String],
     instruction: &str,
-    snapshot: &str,
-    accumulated: &str,
-    roster: &str,
-    project_id: Option<&str>,
 ) -> Result<(Vec<AgentOutcome>, bool), String> {
     let step_id = Uuid::new_v4().to_string();
     let agent_ids_json = serde_json::to_string(agents).map_err(|e| e.to_string())?;
@@ -871,26 +890,18 @@ async fn run_plan_step(
     .bind(step_type)
     .bind(&agent_ids_json)
     .bind(instruction)
-    .execute(db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
     let mut calls = Vec::new();
     for agent_id in agents {
         calls.push(run_agent_for_step(
-            db.clone(),
-            app.clone(),
-            agent_id.clone(),
-            StepAgentContext {
-                task_id: task_id.to_string(),
-                step_id: step_id.clone(),
-                conversation_id: conversation_id.to_string(),
-                instruction: instruction.to_string(),
-                snapshot: snapshot.to_string(),
-                accumulated: accumulated.to_string(),
-                roster: roster.to_string(),
-                project_id: project_id.map(str::to_string),
-            },
+            ctx,
+            task_id,
+            &step_id,
+            agent_id,
+            instruction,
         ));
     }
 
@@ -929,7 +940,7 @@ async fn run_plan_step(
         None::<&str>
     })
     .bind(&step_id)
-    .execute(db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -1010,37 +1021,13 @@ fn detect_mentioned_agents(text: &str, members: &[Agent]) -> Vec<String> {
     found
 }
 
-/// Step-level context shared by every agent fanned out within a single plan
-/// step. Bundled into one struct so `run_agent_for_step` stays under the
-/// `clippy::too_many_arguments` threshold; only `db`/`app` (core deps) and the
-/// per-agent `agent_id` remain standalone parameters.
-struct StepAgentContext {
-    task_id: String,
-    step_id: String,
-    conversation_id: String,
-    instruction: String,
-    snapshot: String,
-    accumulated: String,
-    roster: String,
-    project_id: Option<String>,
-}
-
 async fn run_agent_for_step(
-    db: crate::db::Db,
-    app: AppHandle,
-    agent_id: String,
-    ctx: StepAgentContext,
+    ctx: &ChatTaskCtx<'_>,
+    task_id: &str,
+    step_id: &str,
+    agent_id: &str,
+    instruction: &str,
 ) -> Result<AgentOutcome, String> {
-    let StepAgentContext {
-        task_id,
-        step_id,
-        conversation_id,
-        instruction,
-        snapshot,
-        accumulated,
-        roster,
-        project_id,
-    } = ctx;
     let run_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO conversation_task_runs
@@ -1048,27 +1035,27 @@ async fn run_agent_for_step(
          VALUES (?, ?, ?, ?, 'running', datetime('now'))",
     )
     .bind(&run_id)
-    .bind(&task_id)
-    .bind(&step_id)
-    .bind(&agent_id)
-    .execute(&db)
+    .bind(task_id)
+    .bind(step_id)
+    .bind(agent_id)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let agent = load_agent(&db, &agent_id).await?;
-    let roster_section = if roster.trim().is_empty() {
+    let agent = load_agent(ctx.db, agent_id).await?;
+    let roster_section = if ctx.roster.trim().is_empty() {
         String::new()
     } else {
         format!(
             "群聊成员名单（了解在场成员；话题相关时可 @名字 点名协作）：\n{}\n\n",
-            roster
+            ctx.roster
         )
     };
     let prompt = format!(
         "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n优先自己把问题答完，不必为了协作而刻意 @ 别人；但当某部分确实更适合其他成员的专长、或你想就分歧点邀请其表态时，可以自然地用 @对方名字 点名（仅 @ 名单中的成员，且只 @ 与当前话题真正相关的成员）。不要为了凑发言或客套而 @ 无关成员。",
         roster_section,
-        snapshot,
-        if accumulated.trim().is_empty() { "无" } else { &accumulated },
+        ctx.snapshot,
+        if ctx.accumulated.trim().is_empty() { "无" } else { ctx.accumulated },
         instruction,
         agent.name
     );
@@ -1086,18 +1073,18 @@ async fn run_agent_for_step(
     };
     // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 只读代码情报(绑定项目时无条件补齐)
     // + 勾选的 MCP server 工具。用 chat 版装配，确保群聊里 Agent 总能真正读到项目代码而非空口承诺。
-    let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(ctx.db, ctx.project_id).await;
     let registry =
-        crate::agents::tools::build_registry_for_chat_agent(&db, &agent, &tool_ctx).await;
+        crate::agents::tools::build_registry_for_chat_agent(ctx.db, &agent, &tool_ctx).await;
     // 多模态：收集最近上下文窗口内的图片附件，交给绑定多模态 LLM 的 Agent 识别。
     // 非多模态 LLM 会在 llm 层静默忽略这些图片（快照里仍保留「[图片: …]」文字描述）。
-    let images = collect_context_images(&db, &conversation_id, 40, 6).await;
+    let images = collect_context_images(ctx.db, ctx.conversation_id, 40, 6).await;
     // 把「LLM 调用 + 解析 <write-file> + 落盘」包进同一个 trace run：写文件以 tool span
     // 挂在与本次 Agent 调用相同的 trace 下，链路追踪里即可审计 Agent 写了哪些工作区文件。
     let (ok, text, text_after_writes, error, write_blocks) =
-        crate::core::trace::scope_run(&db, &agent, async {
+        crate::core::trace::scope_run(ctx.db, &agent, async {
             let result = crate::agents::llm::run_agent_text_with_tools(
-                &db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
+                ctx.db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
             )
             .await;
             let (ok, text, error) = match result {
@@ -1111,7 +1098,7 @@ async fn run_agent_for_step(
             let (text_after_writes, file_writes) =
                 crate::commands::workspace::parse_agent_file_writes(&text);
             let write_blocks =
-                crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes)
+                crate::commands::workspace::execute_agent_writes(ctx.db, ctx.conversation_id, file_writes)
                     .await;
             (ok, text, text_after_writes, error, write_blocks)
         })
@@ -1127,7 +1114,7 @@ async fn run_agent_for_step(
         //    使「提交到流水线」按钮真正可用。
         if let Some(obj) = artifact.as_object_mut() {
             obj.insert("t".to_string(), serde_json::json!("artifact"));
-            if let Some(pid) = project_id.as_deref() {
+            if let Some(pid) = ctx.project_id {
                 let meta = obj
                     .entry("_meta")
                     .or_insert_with(|| serde_json::json!({}));
@@ -1149,10 +1136,10 @@ async fn run_agent_for_step(
          VALUES (?, ?, ?, ?)",
     )
     .bind(&message_id)
-    .bind(&conversation_id)
-    .bind(&agent_id)
+    .bind(ctx.conversation_id)
+    .bind(agent_id)
     .bind(&content_json)
-    .execute(&db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -1166,20 +1153,20 @@ async fn run_agent_for_step(
     .bind(&text)
     .bind(&error)
     .bind(&run_id)
-    .execute(&db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
     event::emit(
-        &app,
+        ctx.app,
         event::AppEvent::MessageReceived {
-            conversation_id,
+            conversation_id: ctx.conversation_id.to_string(),
             message_id,
         },
     );
 
     Ok(AgentOutcome {
-        agent_id,
+        agent_id: agent_id.to_string(),
         agent_name: agent.name,
         ok,
         text,
@@ -1187,33 +1174,27 @@ async fn run_agent_for_step(
 }
 
 async fn run_summarizer(
-    db: &crate::db::Db,
-    app: &AppHandle,
-    conversation_id: &str,
+    ctx: &ChatTaskCtx<'_>,
     agent: &Agent,
     instruction: &str,
-    snapshot: &str,
-    accumulated: &str,
-    project_id: Option<&str>,
 ) -> Result<AgentOutcome, String> {
     let prompt = format!(
         "以下是群聊对话快照：\n{}\n\n本轮 Agent 发言：\n{}\n\n用户原始请求：\n{}\n\n请作为群聊总结器输出最终结论。要求：\n- 综合各方观点，不重复完整原文。\n- 如果用户要求裁决，明确给出裁决和理由。\n- 输出后续行动建议。\n- 使用结构化 Markdown。",
-        snapshot,
-        if accumulated.trim().is_empty() { "无" } else { accumulated },
+        ctx.snapshot,
+        if ctx.accumulated.trim().is_empty() { "无" } else { ctx.accumulated },
         instruction
     );
     let fallback_system =
         "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。";
     run_system_agent_markdown(
-        db,
-        app,
+        ctx,
         &SystemAgentParams {
-            conversation_id,
+            conversation_id: ctx.conversation_id,
             agent,
             kind: "summarizer",
             prompt: &prompt,
             fallback_system_prompt: fallback_system,
-            project_id,
+            project_id: ctx.project_id,
             recall_key: Some(instruction),
         },
     )
@@ -1221,14 +1202,9 @@ async fn run_summarizer(
 }
 
 async fn run_doc_writer(
-    db: &crate::db::Db,
-    app: &AppHandle,
-    conversation_id: &str,
+    ctx: &ChatTaskCtx<'_>,
     agent: &Agent,
     instruction: &str,
-    snapshot: &str,
-    accumulated: &str,
-    project_id: Option<&str>,
 ) -> Result<AgentOutcome, String> {
     let default_kind = infer_artifact_kind(instruction);
     let prompt = format!(
@@ -1254,11 +1230,11 @@ JSON 结构：
 - body 要可直接作为 PRD、ADR、测试计划或实施方案的初稿使用。
 - 不要遗漏背景、目标、范围、约束、风险和下一步。
 - rows 控制在 3 到 6 行。"#,
-        snapshot,
-        if accumulated.trim().is_empty() {
+        ctx.snapshot,
+        if ctx.accumulated.trim().is_empty() {
             "无"
         } else {
-            accumulated
+            ctx.accumulated
         },
         instruction,
         default_kind
@@ -1266,25 +1242,25 @@ JSON 结构：
     let fallback_system =
         "你是 AutoForge 的系统文档生成器，负责把群聊讨论沉淀为可引用、可迭代的文档产物。";
     let (ok, raw) = run_system_agent_text(
-        db,
+        ctx.db,
         &SystemAgentParams {
-            conversation_id,
+            conversation_id: ctx.conversation_id,
             agent,
             kind: "doc_writer",
             prompt: &prompt,
             fallback_system_prompt: fallback_system,
-            project_id,
+            project_id: ctx.project_id,
             recall_key: Some(instruction),
         },
     )
     .await;
     if !ok {
         let message_id =
-            insert_agent_markdown_message(db, conversation_id, &agent.id, &raw).await?;
+            insert_agent_markdown_message(ctx.db, ctx.conversation_id, &agent.id, &raw).await?;
         event::emit(
-            app,
+            ctx.app,
             event::AppEvent::MessageReceived {
-                conversation_id: conversation_id.to_string(),
+                conversation_id: ctx.conversation_id.to_string(),
                 message_id,
             },
         );
@@ -1301,7 +1277,7 @@ JSON 结构：
         "[{}] {}\n\n{}",
         artifact.kind, artifact.title, artifact.body
     );
-    insert_agent_artifact_message(db, app, conversation_id, &agent.id, artifact).await?;
+    insert_agent_artifact_message(ctx.db, ctx.app, ctx.conversation_id, &agent.id, artifact).await?;
 
     Ok(AgentOutcome {
         agent_id: agent.id.clone(),
@@ -1312,15 +1288,15 @@ JSON 结构：
 }
 
 async fn run_system_agent_markdown(
-    db: &crate::db::Db,
-    app: &AppHandle,
+    ctx: &ChatTaskCtx<'_>,
     params: &SystemAgentParams<'_>,
 ) -> Result<AgentOutcome, String> {
-    let (ok, text) = run_system_agent_text(db, params).await;
+    let (ok, text) = run_system_agent_text(ctx.db, params).await;
     let message_id =
-        insert_agent_markdown_message(db, params.conversation_id, &params.agent.id, &text).await?;
+        insert_agent_markdown_message(ctx.db, params.conversation_id, &params.agent.id, &text)
+            .await?;
     event::emit(
-        app,
+        ctx.app,
         event::AppEvent::MessageReceived {
             conversation_id: params.conversation_id.to_string(),
             message_id,
