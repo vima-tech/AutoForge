@@ -25,7 +25,7 @@ function int16ToBase64(int16: Int16Array): string {
 
 /**
  * 实时语音识别会话：采集麦克风 PCM → 16kHz 分帧 → 经后端代理流式发往阿里 DashScope，
- * 识别结果经 AutoForge://event 的 asr_result 事件回调（增量 + 整句）。
+ * 识别结果经 autoforge://event 的 asr_result 事件回调（增量 + 整句）。
  */
 export class RealtimeAsr {
   private sessionId = '';
@@ -86,7 +86,7 @@ export class RealtimeAsr {
 
     const sessionId = await sessP;
 
-    const unlisten = await listen('AutoForge://event', (e) => {
+    const unlisten = await listen('autoforge://event', (e) => {
       const p = e.payload as { type?: string; session_id?: string; text?: string; is_final?: boolean };
       if (p?.type === 'asr_result' && p.session_id === sessionId) {
         onResult(p.text ?? '', Boolean(p.is_final));

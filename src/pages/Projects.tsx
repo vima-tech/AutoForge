@@ -1508,7 +1508,7 @@ export default function ProjectsPage() {
   useEffect(() => {
     load();
     let unlisten: (() => void) | undefined;
-    listen('AutoForge://event', () => load()).then(fn => { unlisten = fn; });
+    listen('autoforge://event', () => load()).then(fn => { unlisten = fn; });
     return () => unlisten?.();
   }, [load]);
 

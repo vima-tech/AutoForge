@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
@@ -124,12 +124,16 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
   const [triage, setTriage] = useState<Issue[]>([]);
   const [autosupply, setAutosupply] = useState<AutosupplySettings | null>(null);
   const operator = useOperator();
+  // 卸载守卫：Tauri invoke 不支持 AbortSignal，故用 mounted ref 在 await 之后、
+  // setState 之前拦截已卸载组件的状态更新，避免 React 警告与潜在内存泄漏。
+  const mounted = useRef(true);
 
   const loadAll = useCallback(async () => {
     const [s, ps, is, tri, supply] = await Promise.all([
       getPipelineStats(), listActiveProjects(), listIssues(),
       listTriageIssues().catch(() => [] as Issue[]), getAutosupplySettings().catch(() => null),
     ]);
+    if (!mounted.current) return;
     setTriage(tri);
     setAutosupply(supply);
     setStats(s);
@@ -140,6 +144,9 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
   }, []);
 
   useEffect(() => {
+    // 每次 effect 运行（含 StrictMode 的卸载→重挂载、loadAll 变更重订阅）都重置为
+    // true，否则首次 cleanup 置 false 后重挂载会永久跳过 setState。
+    mounted.current = true;
     loadAll();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const debounced = () => {
@@ -147,8 +154,10 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
       timer = setTimeout(() => { timer = null; loadAll(); }, 500);
     };
     let unlisten: (() => void) | undefined;
-    listen<unknown>('AutoForge://event', debounced).then(fn => { unlisten = fn; });
+    listen<unknown>('autoforge://event', debounced).then(fn => { unlisten = fn; });
     return () => {
+      // 置 false 同时覆盖初始 loadAll() 与 debounce 触发的 loadAll() 两条路径。
+      mounted.current = false;
       if (timer) clearTimeout(timer);
       unlisten?.();
     };

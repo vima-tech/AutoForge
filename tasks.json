@@ -139,7 +139,7 @@
       "area": "实时数据刷新",
       "description": "监听后端事件，收到 PipelineStatus/IssueCreated/CrMerged 后重载 Dashboard 数据",
       "frontend": "Dashboard.tsx（需新增 useEffect + event listen）",
-      "command": "listen('AutoForge://event')",
+      "command": "listen('autoforge://event')",
       "rust_file": "core/event.rs AppEvent::PipelineStatus",
       "data_needed": [
         "前端 listen + 触发数据重载"
@@ -238,7 +238,7 @@
       "area": "实时新消息推送",
       "description": "Agent 回复完成后通过事件推到前端，自动追加到消息流，无需用户刷新",
       "frontend": "Conversations.tsx（需新增 listen useEffect）",
-      "command": "listen('AutoForge://event') → MessageReceived",
+      "command": "listen('autoforge://event') → MessageReceived",
       "rust_file": "core/event.rs 新增 AppEvent::MessageReceived{conversation_id,message}",
       "data_needed": [
         "前端收到事件后 append 消息"
@@ -379,7 +379,7 @@
       "area": "实时状态刷新",
       "description": "审核提交后或 merge 完成时，通过事件刷新 CR 列表和当前状态显示",
       "frontend": "Audit.tsx（需新增 listen useEffect）",
-      "command": "listen('AutoForge://event') → WorktreeUpdate/CrMerged",
+      "command": "listen('autoforge://event') → WorktreeUpdate/CrMerged",
       "rust_file": "core/event.rs",
       "data_needed": [
         "前端收到事件后重载 CR 列表"
@@ -603,7 +603,7 @@
       "area": "实时事件总线",
       "description": "全局 listen 后端事件，分发给各页面（Pipeline/Review/消息/Merge）",
       "frontend": "App.tsx（需全局 listen + React Context 或 zustand 分发）",
-      "command": "listen('AutoForge://event')",
+      "command": "listen('autoforge://event')",
       "rust_file": "core/event.rs（已实现事件定义）",
       "data_needed": [
         "处理 PipelineStatus/ReviewNeeded/WorktreeUpdate/CrMerged/MessageReceived"

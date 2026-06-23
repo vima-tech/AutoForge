@@ -2070,7 +2070,7 @@ export default function ConversationsPage() {
     let unlisten: (() => void) | undefined;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    listen<unknown>('AutoForge://event', e => {
+    listen<unknown>('autoforge://event', e => {
       const ev = e.payload as { type?: string; conversation_id?: string; status?: string };
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
       // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。

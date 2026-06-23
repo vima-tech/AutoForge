@@ -143,7 +143,7 @@ impl AppEvent {
 }
 
 pub fn emit(app: &AppHandle, event: AppEvent) {
-    let _ = app.emit("AutoForge://event", &event);
+    let _ = app.emit("autoforge://event", &event);
 
     // 在传输适配层（本文件是唯一的 Tauri 事件出口）顺手把「有动作价值」的事件
     // 沉淀进通知收件箱——这样所有 emit 调用点零改动即可获得持久化活动流。
