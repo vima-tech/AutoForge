@@ -260,7 +260,7 @@ function LiveLogModal({ title, sig, phase, onClose }: {
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    listen<{ type?: string; key?: string; chunk?: string }>('AutoForge://event', e => {
+    listen<{ type?: string; key?: string; chunk?: string }>('autoforge://event', e => {
       const ev = e.payload;
       if (ev?.type !== 'preview_log' || ev.key !== sig || !ev.chunk) return;
       // 上限保护：累积超 400K 字符则保留尾部 300K，避免超长 build 日志撑爆内存。
@@ -2451,7 +2451,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       }, 500);
     };
     let unlisten: (() => void) | undefined;
-    listen<{ type?: string; cr_id?: string; phase?: string; note?: string }>('AutoForge://event', e => {
+    listen<{ type?: string; cr_id?: string; phase?: string; note?: string }>('autoforge://event', e => {
       const ev = e.payload;
       // 进度心跳：即时更新（不防抖），让用户在长任务期间看到阶段流动。
       if (ev?.type === 'task_progress' && ev.cr_id) {
@@ -2491,7 +2491,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       seq = s;
       setLiveLog(prev => cap(prev + c));
     };
-    listen<{ type?: string; cr_id?: string; stream?: string; chunk?: string; seq?: number }>('AutoForge://event', e => {
+    listen<{ type?: string; cr_id?: string; stream?: string; chunk?: string; seq?: number }>('autoforge://event', e => {
       const ev = e.payload;
       if (ev?.cr_id !== cr) return;
       if (ev.type === 'code_agent_log' && ev.chunk) {

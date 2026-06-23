@@ -92,7 +92,7 @@ pub async fn transcribe_recording_file(
 
 // ── 实时语音识别（阿里 DashScope 流式）────────────────────────────────────────
 
-/// 开启一个实时识别会话，返回 session_id。结果经 `AutoForge://event` 的 AsrResult 推送。
+/// 开启一个实时识别会话，返回 session_id。结果经 `autoforge://event` 的 AsrResult 推送。
 #[tauri::command]
 pub async fn asr_realtime_start(
     app: AppHandle,

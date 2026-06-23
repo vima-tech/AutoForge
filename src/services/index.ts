@@ -807,7 +807,7 @@ export const transcribeRecordingSegment = (pcm_base64: string) =>
 export const transcribeRecordingFile = (file_base64: string, mime?: string) =>
   ipc<string>('transcribe_recording_file', { fileBase64: file_base64, mime });
 
-// 实时语音识别（阿里 DashScope 流式）：start 返回 session_id，结果经 AutoForge://event 的
+// 实时语音识别（阿里 DashScope 流式）：start 返回 session_id，结果经 autoforge://event 的
 // asr_result 事件推送；前端按 16kHz/单声道/16bit PCM 分帧 feed，结束调 stop。
 export const asrRealtimeStart = () => ipc<string>('asr_realtime_start');
 export const asrRealtimeFeed = (session_id: string, audio_base64: string) =>

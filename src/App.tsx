@@ -307,7 +307,7 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
-  // Single consolidated listener for all AutoForge://event traffic.
+  // Single consolidated listener for all autoforge://event traffic.
   // Three separate listen() calls were previously registered here — each event
   // fired all three handlers simultaneously, causing 5+ concurrent IPC calls
   // (including a Rust check_auth() that spawns 2 subprocesses every time).
@@ -348,7 +348,7 @@ export default function App() {
     };
 
     let unlisten: (() => void) | undefined;
-    listen<Record<string, unknown>>('AutoForge://event', e => {
+    listen<Record<string, unknown>>('autoforge://event', e => {
       const ev = e.payload as {
         type?: string; issue_title?: string; stage?: number;
         cr_id?: string; iteration?: number; status?: string; summary?: string;

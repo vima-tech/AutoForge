@@ -430,7 +430,7 @@ function AutosupplySettings() {
     // 并订阅 AutosupplyStatus 事件实时跟随开始/结束（手动或周期调度均覆盖）。
     autosupplyIsRunning().then(setRunning).catch(() => {});
     let unlisten: (() => void) | undefined;
-    listen<{ type?: string; running?: boolean }>('AutoForge://event', e => {
+    listen<{ type?: string; running?: boolean }>('autoforge://event', e => {
       if (e.payload?.type === 'autosupply_status') setRunning(!!e.payload.running);
     }).then(fn => { unlisten = fn; });
     return () => { unlisten?.(); };
