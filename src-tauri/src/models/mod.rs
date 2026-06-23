@@ -13,6 +13,7 @@ pub mod conversation_archive;
 pub mod cr_grade;
 pub mod deployment;
 pub mod issue;
+pub mod issue_attachment;
 pub mod job;
 pub mod llm_config;
 pub mod llm_trace;

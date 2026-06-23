@@ -11,6 +11,7 @@ import {
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
+  draftCodingBrief, startConversationCoding,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
@@ -447,6 +448,132 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   );
 }
 
+// 会议室「立即编码」确认弹窗：AI 起草功能点工单 → 操作者编辑确认 → 自动建需求+CR并开始编码。
+// 跳过需求审核闸（操作者点「立即编码」即需求侧决策），代码审核仍是合并前唯一闸门。
+// 遵守 DESIGN：inset:var(--win-gutter)、不点遮罩关闭、仅 ✕/Esc、每屏 ≤1 个 btn-primary。
+function CodeNowModal({ conversationId, onClose, onError }: {
+  conversationId: string;
+  onClose: () => void;
+  onError: (message: string) => void;
+}) {
+  const [title, setTitle] = useState('');
+  const [brief, setBrief] = useState('');
+  const [drafting, setDrafting] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [done, setDone] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // AI 起草：把会议室讨论梳理成「标题：…」+ 功能点要点，填进输入框供编辑。
+  const handleDraft = async () => {
+    setDrafting(true);
+    try {
+      const text = await draftCodingBrief(conversationId);
+      // 草稿首行若是「标题：xxx」则拆出来填到标题框，余下作为功能点工单。
+      const lines = text.split('\n');
+      const first = (lines[0] ?? '').trim();
+      const m = first.match(/^标题[：:]\s*(.+)$/);
+      if (m) {
+        if (!title.trim()) setTitle(m[1].trim());
+        setBrief(lines.slice(1).join('\n').trim());
+      } else {
+        setBrief(text.trim());
+      }
+    } catch (e) {
+      onError(`梳理功能点失败：${String(e)}`);
+    } finally {
+      setDrafting(false);
+    }
+  };
+
+  const handleStart = async () => {
+    if (!title.trim() || !brief.trim()) { onError('请填写需求标题与功能点'); return; }
+    setSubmitting(true);
+    try {
+      const cr = await startConversationCoding({
+        conversation_id: conversationId,
+        title: title.trim(),
+        brief: brief.trim(),
+      });
+      setDone(cr.id);
+      setTimeout(onClose, 1600);
+    } catch (e) {
+      onError(`创建编码任务失败：${String(e)}`);
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
+      <div style={{ width: 540, maxWidth: '92vw', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 12 }}>
+          <Icon name="zap" size={20} style={{ color: 'var(--ember)' }} />
+          <div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">立即编码</span></div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-3)', marginTop: 4 }}>据本次讨论创建需求并直接交编码 Agent 实现（跳过需求审核，仍走代码审核）</div>
+          </div>
+          <button className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose}><Icon name="x" size={18} /></button>
+        </div>
+
+        {done ? (
+          <div style={{ padding: '28px 20px', textAlign: 'center' }}>
+            <Icon name="check" size={28} style={{ color: 'var(--green)' }} />
+            <div style={{ marginTop: 10, fontSize: 'var(--text-body)', color: 'var(--text)' }}>已创建需求并开始编码</div>
+            <div style={{ marginTop: 6, fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>CR {done}</div>
+            <div style={{ marginTop: 6, fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>进度与代码审核请见「变更审核」页</div>
+          </div>
+        ) : (
+          <>
+            <div style={{ padding: '16px 20px' }}>
+              <div className="field" style={{ marginBottom: 14 }}>
+                <label>需求标题</label>
+                <input value={title} onChange={e => setTitle(e.target.value)} placeholder="一句话描述要实现的需求" disabled={submitting} />
+              </div>
+              <div className="field" style={{ marginBottom: 6 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span>功能点工单</span>
+                  <button
+                    type="button"
+                    className="composer-quick-tag"
+                    style={{ marginLeft: 'auto' }}
+                    disabled={drafting || submitting}
+                    onClick={handleDraft}
+                  >
+                    {drafting ? <Icon name="refresh" size={13} className="spin" /> : <Icon name="brain" size={13} />}
+                    <span>{drafting ? '梳理中…' : 'AI 梳理功能点'}</span>
+                  </button>
+                </label>
+                <textarea
+                  value={brief}
+                  onChange={e => setBrief(e.target.value)}
+                  placeholder="要实现的功能点、涉及模块/文件范围、关键约束、验收要点。可点「AI 梳理功能点」据讨论自动起草后编辑。"
+                  disabled={submitting}
+                  style={{ minHeight: 180, resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-normal)' }}
+                />
+              </div>
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Icon name="layers" size={13} />
+                <span>将自动附带最近会话快照与项目上下文文档作为编码背景</span>
+              </div>
+            </div>
+            <div style={{ padding: '14px 20px 18px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button className="btn" onClick={onClose} disabled={submitting}>取消</button>
+              <button className="btn btn-primary" onClick={handleStart} disabled={submitting || drafting || !title.trim() || !brief.trim()}>
+                {submitting ? <Icon name="refresh" size={15} className="spin" /> : <Icon name="zap" size={15} />}
+                <span>{submitting ? '创建中…' : '创建需求并开始编码'}</span>
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, wsRefs, onRemoveWsRef, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
   onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
@@ -480,6 +607,8 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const [asrRecording, setAsrRecording] = useState(false);
   // 点击后到麦克风/后端就绪前的过渡态，用于立刻给出「连接中…」反馈，消除点击空窗。
   const [asrStarting, setAsrStarting] = useState(false);
+  // 会议室「立即编码」确认弹窗开关（仅绑定项目的群聊可用）。
+  const [codeNowOpen, setCodeNowOpen] = useState(false);
   const asrRef = useRef<RealtimeAsr | null>(null);
   const asrNodeRef = useRef<Text | null>(null);
   const asrCommittedRef = useRef('');
@@ -1068,6 +1197,13 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
 
   return (
     <div ref={composerRef} className="composer">
+      {codeNowOpen && (
+        <CodeNowModal
+          conversationId={conv.id}
+          onClose={() => setCodeNowOpen(false)}
+          onError={onError}
+        />
+      )}
       <div className="composer-tools">
         <input ref={fileInputRef} type="file" multiple accept={FILE_ACCEPT} hidden onChange={pickFiles('file')} />
         <input ref={imageInputRef} type="file" multiple accept={IMAGE_ACCEPT} hidden onChange={pickFiles('image')} />
@@ -1135,6 +1271,19 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             </button>
           );
         })}
+        {isG && conv.project_id && (
+          <button
+            type="button"
+            className="composer-quick-tag"
+            title="据本次讨论梳理功能点，自动创建需求并立即开始编码（跳过需求审核，仍走代码审核）"
+            disabled={busy}
+            onMouseDown={e => e.preventDefault()}
+            onClick={() => setCodeNowOpen(true)}
+          >
+            <Icon name="zap" size={13} />
+            <span>立即编码</span>
+          </button>
+        )}
         {pending.map(item => (
           <div key={item.id} className="composer-pending-item">
             <Icon name={item.mode === 'image' ? 'image' : 'file'} size={15} />

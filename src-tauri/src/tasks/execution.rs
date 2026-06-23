@@ -192,12 +192,8 @@ pub async fn run(
         .bind(cr_id)
         .execute(db)
         .await?;
-        sqlx::query(
-            "UPDATE issues SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&issue.id)
-        .execute(db)
-        .await?;
+        crate::commands::change_requests::set_cr_issues_status(db, cr_id, "execution_failed")
+            .await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -265,6 +261,50 @@ pub async fn run(
         None => String::new(),
     };
 
+    // 合并 CR（一个变更覆盖多个需求）：除主需求外加载其余成员需求 + 各自分析，拼成「附加需求」
+    // 工单段，并把它们的代码情报预查一并注入。单需求 CR 关联表只有 primary 一行 → 此循环不执行、
+    // merged_requirements 为空、codegraph_ctx 不变，与改造前完全一致（零回归）。
+    let member_ids = crate::commands::change_requests::cr_issue_ids(db, cr_id).await;
+    let mut merged_requirements = String::new();
+    let mut extra_codegraph = String::new();
+    let mut merged_index = 1u32;
+    for mid in member_ids.iter().filter(|id| **id != issue.id) {
+        let m_issue = match sqlx::query_as::<_, crate::models::issue::Issue>(
+            "SELECT * FROM issues WHERE id=?",
+        )
+        .bind(mid)
+        .fetch_optional(db)
+        .await?
+        {
+            Some(i) => i,
+            None => continue,
+        };
+        let m_spec = sqlx::query_as::<_, crate::models::issue::IssueAnalysis>(
+            "SELECT * FROM issue_analyses WHERE issue_id=?",
+        )
+        .bind(mid)
+        .fetch_optional(db)
+        .await?
+        .and_then(|a| a.analysis_json)
+        .as_deref()
+        .and_then(crate::agents::analysis::parse_spec);
+        merged_requirements.push_str(&crate::agents::code_agent::render_merged_requirement(
+            merged_index,
+            &m_issue.title,
+            &m_issue.description,
+            m_spec.as_ref(),
+        ));
+        if let Some(ref s) = m_spec {
+            let cg =
+                crate::agents::tools::code_intel::locate_context(db, &project.repo_path, s).await;
+            if !cg.trim().is_empty() {
+                extra_codegraph.push_str(&cg);
+            }
+        }
+        merged_index += 1;
+    }
+    let codegraph_ctx = format!("{}{}", codegraph_ctx, extra_codegraph);
+
     // Create WorktreeSession record
     let session_id = Uuid::new_v4().to_string();
     let prompt = crate::agents::code_agent::build_prompt(
@@ -279,6 +319,13 @@ pub async fn run(
         &project.repo_path,
         crate::commands::run_config::effective_config(&project).as_deref(),
         Some(codegraph_ctx.as_str()),
+        if merged_requirements.is_empty() {
+            None
+        } else {
+            Some(merged_requirements.as_str())
+        },
+        // 会议室「立即编码」express CR 携带的讨论上下文；普通 CR 为 NULL → None。
+        cr.work_context.as_deref().filter(|s| !s.trim().is_empty()),
     );
 
     sqlx::query(
@@ -342,10 +389,7 @@ pub async fn run(
     .bind(cr_id)
     .execute(db)
     .await?;
-    sqlx::query("UPDATE issues SET status='executing', updated_at=datetime('now') WHERE id=?")
-        .bind(&issue.id)
-        .execute(db)
-        .await?;
+    crate::commands::change_requests::set_cr_issues_status(db, cr_id, "executing").await?;
 
     event::emit(
         app,
@@ -486,12 +530,8 @@ pub async fn run(
         .bind(cr_id)
         .execute(db)
         .await?;
-        sqlx::query(
-            "UPDATE issues SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&issue.id)
-        .execute(db)
-        .await?;
+        crate::commands::change_requests::set_cr_issues_status(db, cr_id, "execution_failed")
+            .await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -553,12 +593,8 @@ pub async fn run(
         .bind(cr_id)
         .execute(db)
         .await?;
-        sqlx::query(
-            "UPDATE issues SET status='no_change_needed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&issue.id)
-        .execute(db)
-        .await?;
+        crate::commands::change_requests::set_cr_issues_status(db, cr_id, "no_change_needed")
+            .await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -611,12 +647,8 @@ pub async fn run(
         .bind(cr_id)
         .execute(db)
         .await?;
-        sqlx::query(
-            "UPDATE issues SET status='execution_failed', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&issue.id)
-        .execute(db)
-        .await?;
+        crate::commands::change_requests::set_cr_issues_status(db, cr_id, "execution_failed")
+            .await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -678,12 +710,7 @@ pub async fn run(
         .bind(cr_id)
         .execute(db)
         .await?;
-        sqlx::query(
-            "UPDATE issues SET status='pending_merge', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(&issue.id)
-        .execute(db)
-        .await?;
+        crate::commands::change_requests::set_cr_issues_status(db, cr_id, "pending_merge").await?;
         let _ = sqlx::query(
             "INSERT INTO admin_decisions (id, project_id, issue_id, change_request_id, stage, decision, admin_id, suggestions)
              VALUES (?, ?, ?, ?, 'review_2', 'auto_approved', 'auto', ?)",
@@ -718,12 +745,7 @@ pub async fn run(
     .bind(cr_id)
     .execute(db)
     .await?;
-    sqlx::query(
-        "UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?",
-    )
-    .bind(&issue.id)
-    .execute(db)
-    .await?;
+    crate::commands::change_requests::set_cr_issues_status(db, cr_id, "pending_code_review").await?;
 
     crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待代码审核").await;
 

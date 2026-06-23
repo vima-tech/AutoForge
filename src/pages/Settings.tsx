@@ -47,7 +47,7 @@ import {
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
   type JobFailure,
   listCodeAgents, upsertCodeAgent, deleteCodeAgent, setDefaultCodeAgent,
-  setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT,
+  setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT, type CodeAgentProbe,
   listCodeAgentSkills, upsertCodeAgentSkill, deleteCodeAgentSkill,
   type CodeAgentSkill as CodeAgentSkillT,
 } from '../services';
@@ -1170,6 +1170,18 @@ function RoleSlotCard({ slot, llms, onApply }: {
         <span className={'chip ' + status.c} style={{ flexShrink: 0 }}>{status.t}</span>
         <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
+      {open && slot.usage && (
+        <div className="rise" style={{
+          display: 'flex', alignItems: 'center', gap: 6, marginTop: 10,
+          padding: '4px 9px', borderRadius: 'var(--radius-sm)',
+          background: 'var(--ember-tint)', color: 'var(--text-2)',
+          fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-snug)',
+        }} title="该角色 LLM 在产品里被实际调用的位置">
+          <Icon name="at" size={12} style={{ color: 'var(--ember)', flexShrink: 0 }} />
+          <span style={{ color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', flexShrink: 0 }}>用于</span>
+          <span style={{ minWidth: 0 }}>{slot.usage}</span>
+        </div>
+      )}
       {open && slot.llm_only && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field full"><label>使用的 LLM</label>
@@ -1397,7 +1409,8 @@ const CODE_AGENT_KINDS = [
 function CodeAgentSettings() {
   const [agents, setAgents] = useState<CodeAgentT[]>([]);
   const [drafts, setDrafts] = useState<Record<string, CodeAgentDraft>>({});
-  const [auth, setAuth] = useState<Record<string, boolean | null | 'loading'>>({});
+  // 'loading' = 探测中；CodeAgentProbe = 探测结果；null = 调用失败；undefined = 未检测。
+  const [auth, setAuth] = useState<Record<string, CodeAgentProbe | null | 'loading'>>({});
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState('');
   // 默认全部折叠，只显示头部摘要；点击头部展开编辑。
@@ -1421,8 +1434,9 @@ function CodeAgentSettings() {
         setAgents(list);
         setDrafts(Object.fromEntries(list.map(a => [a.id, toDraft(a)])));
         // 进入页面自动检测每个 agent 的可用性，避免一直停在「未检测」。
+        // 自动检测只验证工具（轻量、不烧 token）；模型探测留给手动「检测可用性」按钮。
         // 检测命令走进程组隔离（detach_process_group），可安全在此调用。
-        if (autoCheck) list.forEach(a => checkAuth(a.id));
+        if (autoCheck) list.forEach(a => checkAuth(a.id, false));
       })
       .catch(() => setAgents([]))
       .finally(() => setLoading(false));
@@ -1458,9 +1472,11 @@ function CodeAgentSettings() {
     try { await deleteCodeAgent(a.id); load(); } catch (e) { setMsg(String(e)); }
   };
 
-  const checkAuth = async (id: string) => {
+  // probeModel=true 时额外用配置的模型发极小 prompt 验证模型本身可用（慢几秒）；
+  // 自动检测传 false 只验证工具。
+  const checkAuth = async (id: string, probeModel = false) => {
     setAuth(s => ({ ...s, [id]: 'loading' }));
-    try { const ok = await checkCodeAgentAuth(id); setAuth(s => ({ ...s, [id]: ok })); }
+    try { const r = await checkCodeAgentAuth(id, probeModel); setAuth(s => ({ ...s, [id]: r })); }
     catch { setAuth(s => ({ ...s, [id]: null })); }
   };
 
@@ -1496,8 +1512,11 @@ function CodeAgentSettings() {
       ) : agents.map(a => {
         const d = drafts[a.id]; if (!d) return null;
         const st = auth[a.id];
-        const dotColor = st === true ? 'var(--green)' : st === false || st === null ? 'var(--red)' : 'var(--text-faint)';
-        const authText = st === 'loading' ? '检测中…' : st === true ? '可用' : st === false ? '未就绪' : st === null ? '检测失败' : '未检测';
+        const loadingA = st === 'loading';
+        const probe = st && st !== 'loading' ? st : null; // CodeAgentProbe | null
+        const tool = probe?.tool;
+        const dotColor = tool === true ? 'var(--green)' : (tool === false || st === null) ? 'var(--red)' : 'var(--text-faint)';
+        const authText = loadingA ? '检测中…' : tool === true ? '可用' : tool === false ? '未就绪' : st === null ? '检测失败' : '未检测';
         const isOpen = expanded.has(a.id);
         return (
           <div className="panel" key={a.id} style={{ marginBottom: 12 }}>
@@ -1510,6 +1529,11 @@ function CodeAgentSettings() {
               {!isOpen && !d.enabled && <span className="chip" style={{ color: 'var(--text-faint)' }}>已停用</span>}
               <span className="dot" style={{ background: dotColor, marginLeft: 'auto' }} />
               <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{authText}</span>
+              {probe?.model != null && (
+                <span className={`chip ${probe.model ? 'green' : 'red'}`} title={probe.detail || undefined}>
+                  模型 {probe.model ? '可用' : '不可用'}{probe.model_name ? ` · ${probe.model_name}` : ''}
+                </span>
+              )}
             </div>
             {isOpen && (
             <div className="cfg-fields" style={{ padding: '12px 14px' }}>
@@ -1545,9 +1569,16 @@ function CodeAgentSettings() {
                   <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)' }}>启用</span>
                 </div>
                 <button className="btn btn-primary btn-sm" onClick={() => save(a)}><Icon name="check" size={13} />保存</button>
-                <button className="btn btn-sm" onClick={() => checkAuth(a.id)}><Icon name="shield" size={13} />检测可用性</button>
+                <button className="btn btn-sm" disabled={loadingA} onClick={() => checkAuth(a.id, true)}
+                  title="验证 CLI 工具就绪，并用配置的模型发一个极小 prompt 确认模型可用（慢几秒、消耗极少量 token）">
+                  <Icon name="shield" size={13} />{loadingA ? '检测中…' : '检测可用性'}</button>
                 {!a.is_default && <button className="btn btn-sm btn-danger" style={{ marginLeft: 'auto' }} onClick={() => remove(a)}><Icon name="trash" size={13} />删除</button>}
               </div>
+              {probe?.detail && (
+                <div className="field full" style={{ marginTop: -4 }}>
+                  <span style={{ fontSize: 'var(--text-caption)', color: probe.model === false ? 'var(--red)' : 'var(--text-faint)', fontFamily: 'var(--font-mono)', wordBreak: 'break-word' }}>{probe.detail}</span>
+                </div>
+              )}
             </div>
             )}
           </div>
@@ -2971,40 +3002,40 @@ function BackupSettings() {
 
 const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string }[] }[] = [
   {
-    group: 'AI 核心', // 搭建智能体的地基（模型 → 能力 → 角色 → 记忆）
+    group: 'AI 核心', // LLM 底座 → 角色/代码 Agent → 能力扩展 → 记忆层
     items: [
       { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-      { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
       { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
+      { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
+      { id: 'codeskills',  name: '编码技能',     ic: 'layers' },
+      { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
       { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
     ],
   },
   {
-    group: '运行与流控',
+    group: '运行与流控', // 供料入口 → 并发控制 → 合并放行 → 安全守卫
     items: [
-      { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
-      { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
-      { id: 'codeskills',  name: '编码技能',     ic: 'layers' },
       { id: 'autosupply',  name: '自动供料',     ic: 'refresh' },
+      { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
       { id: 'gating',      name: '合并与放行',   ic: 'sliders' },
       { id: 'security',    name: '安全与权限',   ic: 'shield' },
     ],
   },
   {
-    group: '集成与通知',
+    group: '集成与通知', // 输入：Webhook / 语音 → 输出：通知
     items: [
-      { id: 'asr',         name: '语音录入',     ic: 'mic' },
       { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
+      { id: 'asr',         name: '语音录入',     ic: 'mic' },
       { id: 'notify',      name: '通知通道',     ic: 'bell' },
     ],
   },
   {
-    group: '系统',
+    group: '系统', // 运维：更新/备份 → 偏好：外观/快捷键 → 关于
     items: [
       { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
       { id: 'backup',      name: '配置备份',     ic: 'download' },
-      { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
       { id: 'theme',       name: '主题设置',     ic: 'palette' },
+      { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
       { id: 'about',       name: '关于 AutoForge', ic: 'box' },
     ],
   },

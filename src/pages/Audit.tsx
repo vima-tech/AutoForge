@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
+import AttachmentBar from '../components/AttachmentBar';
 import ChangeSummaryCard from '../components/ChangeSummaryCard';
 import { ConfirmModal } from '../components/ProjectDialogs';
 import { ReaderToc } from '../components/ReaderToc';
@@ -13,6 +14,7 @@ import {
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
+  listMergeCandidates, review1Merge, getChangeRequestIssues, type MergeCandidate, type CrIssueRef,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview,
   startPreviewLogTail, stopPreviewLogTail,
@@ -412,7 +414,7 @@ function BranchLauncher({ branches, branchPreviews, onStart, onStop, onShowLog, 
 // ── AuditList ────────────────────────────────────────────────────────────────
 
 function AuditList({ projects, activeProject, setActiveProject, projectReviewCounts, crs, pendingIssues, issueTitles, sel,
-  onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, onBatchReanalyze, onBatchReject, gate,
+  onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, onBatchReanalyze, onBatchReject, onMerge, gate,
   width, hasMoreMerged, mergedLoading, onLoadMoreMerged }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
   projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
@@ -426,6 +428,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   onBatchReanalyze: (ids: string[]) => Promise<void> | void;
   // 批量拒绝：拒绝/归档选中的需求（待审核 / 分析失败）。
   onBatchReject: (ids: string[]) => Promise<void> | void;
+  // 合并需求：把多条需求合并成一个 CR + 一次执行（同文件多需求合并）。
+  onMerge: (issueIds: string[], primaryId?: string) => Promise<void> | void;
   // 当前审核闸口：'issue' 只显示待需求审核，'code' 只显示变更请求各态。
   gate: 'issue' | 'code';
   width: number;
@@ -443,6 +447,39 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   // null = 无待确认动作。
   const [confirmBatch, setConfirmBatch] = useState<null | 'approve' | 'reanalyze' | 'reject'>(null);
   const [batching, setBatching] = useState(false);
+  // 同文件多需求合并候选（仅需求闸）：随项目/待审需求变化重算（纯规则、零 LLM）。
+  const [candidates, setCandidates] = useState<MergeCandidate[]>([]);
+  // 合并确认面板：待合并需求 id 集 + 可选预填候选（含共享文件/冲突提示）。null=未打开。
+  const [mergePanel, setMergePanel] = useState<{ ids: string[]; candidate?: MergeCandidate } | null>(null);
+  const [merging, setMerging] = useState(false);
+  useEffect(() => {
+    if (gate !== 'issue' || !activeProject) { setCandidates([]); return; }
+    let alive = true;
+    listMergeCandidates(activeProject.id)
+      .then(c => { if (alive) setCandidates(c); })
+      .catch(() => { if (alive) setCandidates([]); });
+    return () => { alive = false; };
+  }, [gate, activeProject?.id, pendingIssues]);
+  // 需求 id → 所属强候选组（行内「可合并」chip 用）；一个需求落多组时取首个强候选。
+  const issueStrongCandidate = useMemo(() => {
+    const m = new Map<string, MergeCandidate>();
+    for (const c of candidates) {
+      if (c.strength !== 'strong') continue;
+      for (const id of c.issue_ids) if (!m.has(id)) m.set(id, c);
+    }
+    return m;
+  }, [candidates]);
+  // 选区是否恰好等于某个探测出的候选组 → 合并面板可直接展示其共享文件/冲突提示。
+  const candidateForSelection = (ids: string[]): MergeCandidate | undefined => {
+    const key = [...ids].sort().join(',');
+    return candidates.find(c => [...c.issue_ids].sort().join(',') === key);
+  };
+  const runMerge = (primaryId: string) => {
+    if (merging || !mergePanel || mergePanel.ids.length < 2) return;
+    setMerging(true);
+    Promise.resolve(onMerge(mergePanel.ids, primaryId))
+      .finally(() => { setMerging(false); setMergePanel(null); setSelected(new Set()); });
+  };
   // 需求闸批量动作下拉：按钮过多会折行，收进单个「批量操作」下拉菜单（mention-pop 模式）。
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
   const actionMenuRef = useRef<HTMLDivElement>(null);
@@ -712,6 +749,21 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                 <span className="req-time">{fmtShort(issue.created_at)}</span>
               </div>
               <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
+              {(() => {
+                const cand = issueStrongCandidate.get(issue.id);
+                if (!cand) return null;
+                return (
+                  <div
+                    onClick={e => { e.stopPropagation(); setSelected(new Set(cand.issue_ids)); setMergePanel({ ids: cand.issue_ids, candidate: cand }); }}
+                    title={`与另外 ${cand.issue_ids.length - 1} 条需求共享 ${cand.shared_files.join('、')}，点击合并为一次变更`}
+                    style={{ marginTop: 4, display: 'inline-flex', alignItems: 'center', gap: 5, cursor: 'pointer', maxWidth: '100%' }}>
+                    <span className="chip ember" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>
+                      <Icon name="merge" size={11} /> 可合并 {cand.issue_ids.length}
+                    </span>
+                    <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{cand.shared_files[0]}</span>
+                  </div>
+                );
+              })()}
             </div>
           );
         })}
@@ -784,6 +836,17 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
               </button>
               {actionMenuOpen && (
                 <div className="mention-pop" style={{ right: 0, left: 'auto', bottom: 'calc(100% + 6px)', top: 'auto', minWidth: 200, marginBottom: 0 }}>
+                  {selected.size >= 2 && (
+                    <div className="mention-row" onClick={() => {
+                      setActionMenuOpen(false);
+                      const ids = [...selected];
+                      setMergePanel({ ids, candidate: candidateForSelection(ids) });
+                    }}
+                      title="把选中的需求合并成一个变更、一次编码（适合都改同一文件的需求）">
+                      <Icon name="merge" size={14} style={{ color: 'var(--ember)', flexShrink: 0 }} />
+                      <div style={{ minWidth: 0, flex: 1 }}><div className="nm">合并为一次变更…</div></div>
+                    </div>
+                  )}
                   <div className="mention-row" onClick={() => { setActionMenuOpen(false); setConfirmBatch('approve'); }}>
                     <Icon name="check" size={14} style={{ color: 'var(--green)', flexShrink: 0 }} />
                     <div style={{ minWidth: 0, flex: 1 }}><div className="nm">通过进入编码</div></div>
@@ -841,7 +904,97 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
         onCancel={() => setConfirmBatch(null)}
       />
     )}
+    {mergePanel && (
+      <MergeConfirm
+        members={mergePanel.ids.map(id => ({ id, title: pendingIssues.find(i => i.id === id)?.title || id.slice(0, 8) }))}
+        candidate={mergePanel.candidate}
+        busy={merging}
+        onConfirm={runMerge}
+        onCancel={() => { if (!merging) setMergePanel(null); }}
+      />
+    )}
     </>
+  );
+}
+
+// ── 合并确认面板：把多条需求合并成一个变更、一次编码 ────────────────────────────
+// 遵守 DESIGN：遮罩 inset:var(--win-gutter) + 圆角；不点遮罩关闭，仅 ✕ / Esc；每屏 ≤1 主操作。
+function MergeConfirm({ members, candidate, busy, onConfirm, onCancel }: {
+  members: { id: string; title: string }[];
+  candidate?: MergeCandidate;
+  busy: boolean;
+  onConfirm: (primaryId: string) => void;
+  onCancel: () => void;
+}) {
+  // 主需求默认取第一条（驱动 CR 标题 / Innate 召回）。
+  const [primary, setPrimary] = useState(members[0]?.id ?? '');
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onCancel(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [busy, onCancel]);
+  return (
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 230 }}>
+      <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 14, padding: '20px 22px', width: 480, maxWidth: '90vw', maxHeight: '82vh', overflow: 'auto', boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+          <Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />
+          <h3 style={{ margin: 0, fontSize: 'var(--text-section)', fontFamily: 'var(--font-display)' }}>合并 {members.length} 个需求为一次变更</h3>
+          <span style={{ flex: 1 }} />
+          <button className="icon-btn" onClick={onCancel} disabled={busy} title="关闭（Esc）"><Icon name="x" size={16} /></button>
+        </div>
+
+        {/* 共享文件（探测出的候选才有；手动合并则提示无预查信息） */}
+        {candidate && candidate.shared_files.length > 0 ? (
+          <div style={{ marginBottom: 12 }}>
+            <div className="field-label" style={{ marginBottom: 6 }}>共享文件</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {candidate.shared_files.map(f => (
+                <span key={f} className="chip ember" style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>{f}</span>
+              ))}
+            </div>
+            <div style={{ marginTop: 6, fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+              合并后预计改动 {candidate.total_files} 个文件
+            </div>
+          </div>
+        ) : (
+          <div style={{ marginBottom: 12, fontSize: 'var(--text-caption)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)' }}>
+            手动合并（非系统建议组）：将把这些需求作为同一变更一次性实现，请确认它们确属相关改动。
+          </div>
+        )}
+
+        {/* 冲突提示 */}
+        {candidate?.conflict_hint && (
+          <div style={{ marginBottom: 12, padding: '8px 10px', borderRadius: 9, background: 'var(--amber-tint, rgba(220,160,40,.14))', border: '1px solid var(--border)', fontSize: 'var(--text-caption)', color: 'var(--amber)', display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+            <Icon name="alert" size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>{candidate.conflict_hint}</span>
+          </div>
+        )}
+
+        {/* 成员需求 + 选主需求（主需求驱动 CR 标题与召回） */}
+        <div className="field-label" style={{ marginBottom: 6 }}>选择主需求（驱动变更标题）</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 18 }}>
+          {members.map(m => (
+            <div key={m.id} onClick={() => setPrimary(m.id)}
+              className="mention-row"
+              style={{ cursor: 'pointer', border: '1px solid ' + (primary === m.id ? 'var(--ember)' : 'var(--border)'), borderRadius: 9, background: primary === m.id ? 'var(--ember-tint)' : 'transparent' }}>
+              <span style={{ width: 14, height: 14, borderRadius: 99, flexShrink: 0, border: '2px solid ' + (primary === m.id ? 'var(--ember)' : 'var(--border-strong)'), background: primary === m.id ? 'var(--ember)' : 'transparent' }} />
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div className="nm" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={m.title}>{m.title}</div>
+                <div style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>{m.id.slice(0, 8)}{primary === m.id ? ' · 主需求' : ''}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onCancel} disabled={busy}>取消</button>
+          <button className="btn btn-primary" onClick={() => onConfirm(primary)} disabled={busy || !primary}>
+            <Icon name={busy ? 'brain' : 'merge'} size={15} className={busy ? 'spin' : undefined} />
+            {busy ? '合并中…' : '合并并进入编码'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1741,6 +1894,12 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
       <p style={{ whiteSpace: 'pre-line' }}>{issue.description || '（无描述）'}</p>
 
       <BugCarrier issue={issue} />
+
+      <h2><Icon name="paperclip" size={18} style={{ color: 'var(--ember)' }} />图片 / 附件</h2>
+      <div style={{ marginBottom: 4 }}>
+        <AttachmentBar issueId={issue.id} />
+      </div>
+
       <AcceptancePanel issue={issue} />
 
       {analysisFailed && (
@@ -1979,6 +2138,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [revertBusy, setRevertBusy] = useState(false);
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [grade, setGrade] = useState<CrGrade | null>(null);
+  // 该 CR 覆盖的全部需求（合并 CR 含多条）——用于头部「覆盖 N 个需求」展示。
+  const [crIssues, setCrIssues] = useState<CrIssueRef[]>([]);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [tab, setTab] = useState<'report' | 'diff' | 'logs'>('report');
   // 代码 Agent 执行日志：列表 meta + 当前展开的完整日志。
@@ -2350,6 +2511,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       .then(msg => { if (loadReqRef.current === reqId && msg) setCommitMsg(msg); })
       .catch(() => {});
     setSession(null);   // 清掉上一份（含上一版本）报告，避免显示过期内容
+    setCrIssues([]);    // 清掉上一条 CR 的覆盖需求列表
     setRuns([]); setActiveRun(null); setLiveLog(''); setLiveAutoScroll(true);  // 清掉上一条 CR 的执行日志 + 实时缓冲
     setDiff('');        // diff='' 时视图显示「加载中…」，重拉后替换
     setConflict(null);  // 清掉上一条 CR 的冲突现场
@@ -2360,13 +2522,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     // 报告页「需求原文」所需的原始需求：不再全量缓存，选中 CR 时按需补拉进 issuesById。
     const origIssueId = crs.find(c => c.id === crId)?.issue_id;
     (async () => {
-      const [s, d, g, pv, origIssue, rl] = await Promise.all([
+      const [s, d, g, pv, origIssue, rl, cis] = await Promise.all([
         getWorktreeSession(crId),
         getCodeDiff(crId),
         getCrGrade(crId).catch(() => null),
         getCrPreview(crId).catch(() => null),
         origIssueId ? getIssue(origIssueId).catch(() => null) : Promise.resolve(null),
         listCodeAgentRuns(crId).catch(() => [] as CodeAgentRunMeta[]),
+        getChangeRequestIssues(crId).catch(() => [] as CrIssueRef[]),
       ]);
       if (loadReqRef.current !== reqId) return;
       setSession(s);
@@ -2374,6 +2537,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       setDiff(d);
       setGrade(g);
       setRuns(rl);
+      setCrIssues(cis);
       if (origIssue) setIssuesById(prev => ({ ...prev, [origIssue.id]: origIssue }));
       setCrLoading(false);
       // 合并冲突态：按需拉取冲突现场（文件列表 + 带标记 diff）供三方视图渲染。
@@ -2688,6 +2852,21 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         + (r.errors ? ` · 失败 ${r.errors}` : ''));
     } catch (e) {
       showError('批量通过失败：' + String(e));
+    } finally {
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    }
+  };
+
+  // 合并需求（同文件多需求合并）：把多条需求合并成一个 CR + 一次编码执行。
+  const doMergeReview1 = async (ids: string[], primaryId?: string) => {
+    if (ids.length < 2) return;
+    try {
+      await review1Merge(ids, primaryId);
+      showOk(`已合并 ${ids.length} 条需求为一次变更，进入编码`);
+    } catch (e) {
+      showError('合并失败：' + String(e));
     } finally {
       if (activeProject) await loadList(activeProject.id);
       await loadProjectReviewCounts();
@@ -3293,6 +3472,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
           onBatchApproveCrs={doBatchReview2}
           onBatchReanalyze={doBatchReanalyze}
           onBatchReject={rejectIssuesItems}
+          onMerge={doMergeReview1}
           gate={gate}
           width={listWidth}
           hasMoreMerged={showMerged && mergedLoaded < mergedTotal}
@@ -3321,6 +3501,11 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                     <span className="audit-top-title" style={{ fontWeight: 700, fontSize: 'var(--text-title)' }} title={issueTitles[cr.issue_id] || 'Change Request'}>{issueTitles[cr.issue_id] || 'Change Request'}</span>
                     {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
                     {grade && <span className={'chip ' + (grade.tier === 'T3' ? 'red' : grade.tier === 'T2' ? 'amber' : grade.tier === 'T1' ? 'blue' : 'green')} title={grade.rationale}>风险 {grade.tier} · {grade.change_class}</span>}
+                    {crIssues.length > 1 && (
+                      <span className="chip ember" title={crIssues.map(c => `${c.role === 'primary' ? '主 · ' : ''}${c.title}`).join('\n')}>
+                        <Icon name="merge" size={12} />覆盖 {crIssues.length} 个需求
+                      </span>
+                    )}
                   </div>
                   <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                     <span>{STATUS_LABEL[cr.status] ?? cr.status} · {fmtFull(cr.updated_at)}</span>
@@ -3521,7 +3706,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
 
       {intakeOpen && activeProject && (
         <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 220 }}>
-          <div style={{ width: 720, height: 'min(800px, calc(100vh - 32px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+          <div style={{ width: 720, height: 'min(560px, calc(100vh - 40px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
             <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}>
                 <span className="cn">需求入口</span>

@@ -1,3 +1,6 @@
+use crate::commands::attachments_common::{
+    attachment_path_from_rel, sanitize_file_name, validate_attachment, MAX_ATTACHMENT_BYTES,
+};
 use crate::core::event;
 use crate::models::conversation::{
     AttachmentUpload, Conversation, ConversationAttachment, ConversationDetail, Message,
@@ -11,8 +14,6 @@ use std::path::{Component, Path, PathBuf};
 use tauri::{AppHandle, State};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-
-const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn list_conversations(
@@ -219,13 +220,6 @@ pub async fn send_message(
         .map_err(|e| e.to_string())
 }
 
-#[derive(Debug)]
-struct AttachmentPolicy {
-    ext: &'static str,
-    mime: &'static str,
-    kind: &'static str,
-}
-
 #[tauri::command]
 pub async fn import_attachment(
     payload: AttachmentUpload,
@@ -343,7 +337,7 @@ pub async fn attachment_data_url(
     if attachment.size_bytes as usize > MAX_ATTACHMENT_BYTES {
         return Err("图片超过预览大小上限".to_string());
     }
-    let path = attachment_path(&attachment)?;
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
     let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     Ok(format!(
         "data:{};base64,{}",
@@ -358,7 +352,7 @@ pub async fn open_attachment(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let attachment = load_attachment(&state.db, &attachment_id).await?;
-    let path = attachment_path(&attachment)?;
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
     if !path.exists() {
         return Err("附件文件不存在或已被移除".to_string());
     }
@@ -386,174 +380,6 @@ async fn load_attachment(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "附件不存在".to_string())
-}
-
-fn attachment_path(attachment: &ConversationAttachment) -> Result<PathBuf, String> {
-    let rel = Path::new(&attachment.rel_path);
-    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return Err("附件路径无效".to_string());
-    }
-    Ok(PathBuf::from(crate::state::attachments_base()).join(rel))
-}
-
-fn sanitize_file_name(name: &str) -> String {
-    let base = Path::new(name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("attachment");
-    let mut cleaned = String::with_capacity(base.len());
-    for ch in base.chars() {
-        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-            cleaned.push('_');
-        } else {
-            cleaned.push(ch);
-        }
-    }
-    let cleaned = cleaned
-        .trim_matches([' ', '.'])
-        .chars()
-        .take(120)
-        .collect::<String>();
-    if cleaned.is_empty() {
-        "attachment".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn validate_attachment(
-    name: &str,
-    mime_hint: &str,
-    bytes: &[u8],
-) -> Result<AttachmentPolicy, String> {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    let policy = match ext.as_str() {
-        "png" if is_png(bytes) => AttachmentPolicy {
-            ext: "png",
-            mime: "image/png",
-            kind: "image",
-        },
-        "jpg" | "jpeg" if is_jpeg(bytes) => AttachmentPolicy {
-            ext: "jpg",
-            mime: "image/jpeg",
-            kind: "image",
-        },
-        "webp" if is_webp(bytes) => AttachmentPolicy {
-            ext: "webp",
-            mime: "image/webp",
-            kind: "image",
-        },
-        "gif" if is_gif(bytes) => AttachmentPolicy {
-            ext: "gif",
-            mime: "image/gif",
-            kind: "image",
-        },
-        "pdf" if bytes.starts_with(b"%PDF-") => AttachmentPolicy {
-            ext: "pdf",
-            mime: "application/pdf",
-            kind: "file",
-        },
-        "txt" | "log" if is_safe_text(bytes) => AttachmentPolicy {
-            ext: "txt",
-            mime: "text/plain",
-            kind: "file",
-        },
-        "md" if is_safe_text(bytes) => AttachmentPolicy {
-            ext: "md",
-            mime: "text/markdown",
-            kind: "file",
-        },
-        "csv" if is_safe_text(bytes) => AttachmentPolicy {
-            ext: "csv",
-            mime: "text/csv",
-            kind: "file",
-        },
-        "json"
-            if is_safe_text(bytes)
-                && serde_json::from_slice::<serde_json::Value>(bytes).is_ok() =>
-        {
-            AttachmentPolicy {
-                ext: "json",
-                mime: "application/json",
-                kind: "file",
-            }
-        }
-        "yaml" | "yml" if is_safe_text(bytes) => AttachmentPolicy {
-            ext: "yaml",
-            mime: "application/x-yaml",
-            kind: "file",
-        },
-        "toml" if is_safe_text(bytes) => AttachmentPolicy {
-            ext: "toml",
-            mime: "application/toml",
-            kind: "file",
-        },
-        _ => {
-            return Err(
-                "不支持的附件类型。允许：PNG/JPG/WebP/GIF/PDF/TXT/MD/JSON/CSV/YAML/TOML，禁止脚本、HTML、SVG、压缩包和可执行文件。"
-                    .to_string(),
-            );
-        }
-    };
-
-    if !mime_hint.is_empty() && !mime_hint_matches(mime_hint, policy.mime) {
-        return Err("文件扩展名、浏览器 MIME 和内容特征不一致".to_string());
-    }
-
-    Ok(policy)
-}
-
-fn mime_hint_matches(hint: &str, canonical: &str) -> bool {
-    let hint = hint
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if hint.is_empty() || hint == "application/octet-stream" {
-        return true;
-    }
-    matches!(
-        (hint.as_str(), canonical),
-        ("image/jpeg", "image/jpeg")
-            | ("image/png", "image/png")
-            | ("image/webp", "image/webp")
-            | ("image/gif", "image/gif")
-            | ("application/pdf", "application/pdf")
-            | ("text/plain", "text/plain")
-            | ("text/plain", "text/markdown")
-            | ("text/markdown", "text/markdown")
-            | ("text/csv", "text/csv")
-            | ("application/json", "application/json")
-            | ("text/yaml", "application/x-yaml")
-            | ("application/x-yaml", "application/x-yaml")
-            | ("application/toml", "application/toml")
-    )
-}
-
-fn is_safe_text(bytes: &[u8]) -> bool {
-    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
-}
-
-fn is_png(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-}
-
-fn is_jpeg(bytes: &[u8]) -> bool {
-    bytes.len() >= 3 && bytes[0..3] == [0xff, 0xd8, 0xff]
-}
-
-fn is_gif(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
-}
-
-fn is_webp(bytes: &[u8]) -> bool {
-    bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
 }
 
 #[tauri::command]
@@ -1016,7 +842,7 @@ async fn load_text_attachment_content(
     if !TEXT_MIMES.contains(&attachment.mime.as_str()) {
         return Ok(None);
     }
-    let path = attachment_path(&attachment)?;
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
     let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
     // Truncate huge files so we don't blow up the context window.
@@ -1039,7 +865,7 @@ async fn get_attachment_file_path(
     db: &crate::db::Db,
 ) -> Result<PathBuf, String> {
     let attachment = load_attachment(db, attachment_id).await?;
-    let path = attachment_path(&attachment)?;
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
     if !path.exists() {
         return Err("图片文件不存在".to_string());
     }

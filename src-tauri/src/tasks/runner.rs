@@ -547,12 +547,9 @@ pub async fn recover_orphaned_reverts(db: &Db) -> usize {
         .bind(cr_id)
         .execute(db)
         .await;
-        let _ = sqlx::query(
-            "UPDATE issues SET status='merged', updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(issue_id)
-        .execute(db)
-        .await;
+        // 合并 CR：全部成员需求一并回滚到 merged。
+        let _ = crate::commands::change_requests::set_cr_issues_status(db, cr_id, "merged").await;
+        let _ = issue_id; // 兼容旧签名；真源走关联表。
         rolled += 1;
     }
     if rolled > 0 {
@@ -601,9 +598,14 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        // 全组联动真源表（迁移 0070）：撤销回滚据此把 CR 的全部成员需求一并置态。
+        sqlx::query("CREATE TABLE change_request_issues (change_request_id TEXT, issue_id TEXT, role TEXT, sort_order INTEGER)")
+            .execute(&db).await.unwrap();
         sqlx::query("INSERT INTO change_requests (id, issue_id, status) VALUES ('cr1','i1','reverting'), ('cr2','i2','merged')")
             .execute(&db).await.unwrap();
         sqlx::query("INSERT INTO issues (id, status) VALUES ('i1','reverting'), ('i2','merged')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO change_request_issues VALUES ('cr1','i1','primary',0), ('cr2','i2','primary',0)")
             .execute(&db).await.unwrap();
 
         let rolled = recover_orphaned_reverts(&db).await;

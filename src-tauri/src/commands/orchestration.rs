@@ -136,6 +136,170 @@ pub async fn start_conversation_task(
     Ok(task)
 }
 
+/// 会议室「立即编码」第一步（AI 起草）：把一次会议室讨论 + 项目上下文，用一次轻量 LLM
+/// pass 梳理成一份**可直接交给编码 AI 执行的工单草稿**（标题 + 功能点要点 + 范围/约束/验收）。
+/// 返回纯文本草稿，由前端填进确认弹窗供操作者编辑——草稿是辅助而非闸门，操作者确认才进入编码。
+#[tauri::command]
+pub async fn draft_coding_brief(
+    conversation_id: String,
+    window_size: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+
+    let prompt = format!(
+        "下面是一段会议室讨论与项目上下文。请把其中达成的开发意图梳理成一份**清晰、可直接交给\
+         编码 AI 执行的需求工单**，要求：\n\
+         1. 第一行用「标题：<一句话需求标题>」给出标题；\n\
+         2. 随后用要点列表写明：要实现的功能点、涉及的模块/文件范围、关键约束、验收要点；\n\
+         3. 只保留与「本次要编码的需求」直接相关的内容，剔除闲聊与已废弃的设想；\n\
+         4. 用中文，简洁明确，直接给工单，不要反问、不要寒暄、不要解释你在做什么。\n\n\
+         ## 讨论与项目上下文\n{context}"
+    );
+
+    crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 会议室「立即编码」入参：操作者在确认弹窗里给出标题 + 功能点工单（可由 `draft_coding_brief`
+/// 起草后编辑），可选会话窗口大小与操作者标识。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartConversationCoding {
+    pub conversation_id: String,
+    pub title: String,
+    pub brief: String,
+    pub window_size: Option<i64>,
+    pub admin_id: Option<String>,
+}
+
+/// 会议室「立即编码」第二步（直奔编码）：依据操作者确认的功能点工单，**自动创建需求 → 建 CR →
+/// 入队编码执行**，跳过需求审核（review_1）队列——操作者在会议室点「立即编码」即视为需求侧的
+/// 人工决策；代码审核（review_2）仍是合并前的唯一闸门，架构「双审核 / 合并唯一入口」不被破坏。
+/// 会话快照 + 项目上下文作为 `work_context` 随 CR 落库，注入编码工单的「需求来源」段。
+#[tauri::command]
+pub async fn start_conversation_coding(
+    payload: StartConversationCoding,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::models::change_request::ChangeRequest, String> {
+    let db = &state.db;
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&payload.conversation_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", payload.conversation_id))?;
+    let project_id = conversation
+        .project_id
+        .clone()
+        .ok_or_else(|| "仅绑定项目的群聊可使用「立即编码」".to_string())?;
+    let project =
+        sqlx::query_as::<_, crate::models::project::Project>("SELECT * FROM projects WHERE id=?")
+            .bind(&project_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    let title = payload.title.trim().to_string();
+    let brief = payload.brief.trim().to_string();
+    if title.is_empty() || brief.is_empty() {
+        return Err("需求标题与功能点不能为空".to_string());
+    }
+    // 工单内容会进编码 agent 工单，按安全规则过注入消毒（操作者输入也可能来自被污染的讨论）。
+    if crate::core::security::has_obvious_injection(&title)
+        || crate::core::security::has_obvious_injection(&brief)
+    {
+        return Err("内容包含可疑指令，已拦截".to_string());
+    }
+
+    // 组装会话 + 项目上下文作为编码背景（best-effort：失败不阻断，工单本身已足够编码）。
+    let window = payload.window_size.unwrap_or(30).clamp(5, 100);
+    let work_context = match assemble_conversation_context(db, &payload.conversation_id, window).await
+    {
+        Ok(c) if !c.trim().is_empty() => Some(c),
+        _ => None,
+    };
+
+    // 创建需求：express 路径直接落 pending_execution（不入分析/需求审核队列）。
+    let issue_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO issues (id, project_id, source_type, title, description, category, status, source_ref)
+         VALUES (?, ?, 'conversation', ?, ?, 'Feature', 'pending_execution', ?)",
+    )
+    .bind(&issue_id)
+    .bind(&project_id)
+    .bind(&title)
+    .bind(&brief)
+    .bind(&payload.conversation_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let issue = sqlx::query_as::<_, crate::models::issue::Issue>("SELECT * FROM issues WHERE id=?")
+        .bind(&issue_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let admin_id = payload.admin_id.unwrap_or_else(|| "admin".to_string());
+    let cr = crate::commands::change_requests::create_cr_for_issue(
+        db,
+        &state.job_tx,
+        &issue,
+        &project,
+        Some("会议室「立即编码」：操作者在讨论中确认功能点后直接进入编码"),
+        &admin_id,
+        work_context.as_deref(),
+    )
+    .await?;
+
+    // 操作者收件箱 + 总览：与正常录入一致地广播 IssueCreated。
+    event::emit(
+        &app,
+        event::AppEvent::IssueCreated {
+            issue_id: issue_id.clone(),
+            project_id: project_id.clone(),
+        },
+    );
+
+    // 回写一条会议室记录，让讨论留痕「这次讨论触发了哪条编码」（best-effort，失败不阻断）。
+    let note = format!(
+        "⚡ 已据本次讨论创建需求 **{title}** 并立即开始编码（CR `{}`）。进度与代码审核请见「变更审核」页。",
+        cr.id
+    );
+    if let Ok(Some(planner)) = load_planner_agent(db).await {
+        if let Ok(message_id) =
+            insert_agent_markdown_message(db, &payload.conversation_id, &planner.id, &note).await
+        {
+            event::emit(
+                &app,
+                event::AppEvent::MessageReceived {
+                    conversation_id: payload.conversation_id.clone(),
+                    message_id,
+                },
+            );
+        }
+    }
+
+    Ok(cr)
+}
+
 /// Recover conversation (会议室) AI tasks orphaned by a previous process exit.
 ///
 /// A task is created `running` and driven by an in-memory `tauri::async_runtime::spawn`
@@ -1458,6 +1622,41 @@ async fn build_context_snapshot(
         return Ok(conv_text);
     }
     Ok(format!("{}{}", project_prefix, conv_text))
+}
+
+/// 组装「会议室立即编码」用的上下文：项目上下文（claude.md/agents.md/pinned 文件/工作区
+/// 文件清单）+ 最近 `window` 条对话快照。复用与 AI 任务完全相同的取材，保证交给编码 agent
+/// 的背景与会议室里看到的一致。
+pub(crate) async fn assemble_conversation_context(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    window: i64,
+) -> Result<String, String> {
+    let project_prefix =
+        crate::commands::project_context::load_project_context_for_conversation(db, conversation_id)
+            .await;
+    build_context_snapshot(db, conversation_id, window, &project_prefix).await
+}
+
+/// 加载用于「梳理功能点」的 Agent：优先 forge_role=analysis 的分析 Agent（绑定低成本 LLM），
+/// 否则回退 planner 系统角色。两者皆缺 → 报错，提示去设置绑定 LLM。
+async fn load_brief_agent(db: &crate::db::Db) -> Result<Agent, String> {
+    if let Some(a) = sqlx::query_as::<_, Agent>(
+        "SELECT * FROM agents
+         WHERE (',' || COALESCE(forge_role, '') || ',') LIKE '%,analysis,%'
+           AND llm_id IS NOT NULL
+         ORDER BY created_at LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        return Ok(a);
+    }
+    if let Some(a) = load_planner_agent(db).await? {
+        return Ok(a);
+    }
+    Err("未配置可用于梳理需求的 Agent（请在设置中为「分析」或 planner 角色绑定 LLM）".to_string())
 }
 
 /// Truncate a string to at most `max_bytes`, keeping the tail (most recent

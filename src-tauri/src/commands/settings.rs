@@ -720,6 +720,7 @@ pub struct RoleSlot {
     pub group: String,   // orchestration | delivery | pipeline | knowledge
     pub binding: String, // system_kind | forge_role
     pub desc: String,
+    pub usage: String,
     pub color: String,
     pub icon: String,
     pub builtin_prompt: String,
@@ -774,6 +775,7 @@ pub async fn list_role_catalog(state: State<'_, AppState>) -> Result<Vec<RoleSlo
             group: group_str(def.group).to_string(),
             binding: binding.to_string(),
             desc: def.desc.to_string(),
+            usage: def.usage.to_string(),
             color: def.color.to_string(),
             icon: def.icon.to_string(),
             builtin_prompt: def.builtin_prompt.to_string(),

@@ -85,6 +85,89 @@ impl CliCodeAgent {
             .stderr(Stdio::piped());
         cmd
     }
+
+    /// 用配置的模型发一个极小 prompt，确认该模型确实被该 CLI 接受——
+    /// 区别于 `check_auth()` 只验证「工具已装/已登录」。失败时多半是模型名写错、
+    /// 该 provider 未授权或额度问题。返回 `(ok, detail)`，detail 为失败时 stdout/stderr 的首行摘要。
+    /// 仅在 model 非空时调用。会真的发起一次 LLM 调用（消耗极少量 token），故带超时 + 进程组兜底。
+    pub async fn probe_model(&self, model: &str, timeout: Duration) -> (bool, String) {
+        // 模型探测不写文件、不需要真实 worktree，用临时目录作 cwd 即可。
+        let dir = std::env::temp_dir();
+        let mut cmd = Command::new(self.program());
+        crate::core::platform::detach_process_group(&mut cmd);
+        cmd.current_dir(&dir)
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let feed_stdin = match self.profile.kind.as_str() {
+            "codex" => {
+                // read-only sandbox：探测只问不写；--skip-git-repo-check 容忍非仓库 cwd。
+                cmd.arg("exec")
+                    .arg("-s")
+                    .arg("read-only")
+                    .arg("--skip-git-repo-check")
+                    .arg("-m")
+                    .arg(model)
+                    .arg("-");
+                true
+            }
+            "opencode" => {
+                cmd.arg("run").arg("--dir").arg(&dir).arg("-m").arg(model).arg("ping");
+                false
+            }
+            // 默认 = claude：纯文本 --print，禁工具/会话持久化，最快返回。
+            _ => {
+                cmd.arg("--print")
+                    .arg("--permission-mode")
+                    .arg("dontAsk")
+                    .arg("--tools")
+                    .arg("")
+                    .arg("--disable-slash-commands")
+                    .arg("--no-session-persistence")
+                    .arg("--model")
+                    .arg(model);
+                true
+            }
+        };
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return (false, first_line_clip(&e.to_string(), 160)),
+        };
+        let pgid = child.id().unwrap_or(0);
+        crate::core::reaper::register(pgid);
+        let _guard = GroupGuard(pgid);
+        if feed_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"ping").await;
+                let _ = stdin.shutdown().await;
+            }
+        } else {
+            drop(child.stdin.take());
+        }
+        let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return (false, first_line_clip(&e.to_string(), 160)),
+            Err(_) => {
+                // 超时：探测进程多半在等模型响应或卡住，杀整组兜底。
+                crate::core::reaper::kill_group(pgid);
+                return (false, "模型探测超时".into());
+            }
+        };
+        if out.status.success() {
+            (true, String::new())
+        } else {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // 抽第一条非空行作失败摘要（模型错误信息通常在前几行）。
+            let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+            (false, first_line_clip(line, 160))
+        }
+    }
 }
 
 #[async_trait]

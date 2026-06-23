@@ -372,6 +372,11 @@ pub fn build_prompt(
     repo_path: &str,
     project_config: Option<&str>,
     codegraph_ctx: Option<&str>,
+    // 合并 CR 的附加需求工单段（由 render_merged_requirement 拼好）；单需求 CR 传 None。
+    merged_requirements: Option<&str>,
+    // 会议室「立即编码」express CR 的讨论上下文（对话快照 + 项目上下文文档），
+    // 作为「需求来源」背景注入；普通流水线 CR 传 None。
+    extra_context: Option<&str>,
 ) -> String {
     let mut prompt = format!(
         r#"# 需求实现任务
@@ -401,6 +406,19 @@ pub fn build_prompt(
         }
     }
 
+    // 合并 CR：本次变更一并实现的其它需求。放在主需求工单之后、管理员建议之前，
+    // 让 agent 把它们当作同一变更的组成部分一次性完成（每条都带各自的目标/验收/文件范围）。
+    if let Some(m) = merged_requirements {
+        if !m.trim().is_empty() {
+            prompt.push_str(
+                "\n## 合并的其它需求（本次一并实现）\n\
+                 本变更合并实现以下需求，请在同一 worktree 内**一次性全部完成**，\
+                 逐条满足各自的验收标准；改动文件以各需求点名的范围为准，避免外溢。\n",
+            );
+            prompt.push_str(m);
+        }
+    }
+
     if let Some(s) = admin_suggestions {
         if !s.is_empty() {
             prompt.push_str(&format!("\n## 管理员建议\n{}\n", s));
@@ -412,6 +430,20 @@ pub fn build_prompt(
             "\n## 注意\n这是第 {} 次迭代，请参考之前的实现继续改进。\n",
             iteration
         ));
+    }
+
+    // 会议室「立即编码」：本需求源于一次会议室讨论，附上讨论上下文与项目上下文文档作为背景，
+    // 帮助 agent 理解需求意图。注意这是背景资料而非逐字指令，仍以上方需求工单为准。
+    if let Some(ec) = extra_context {
+        if !ec.trim().is_empty() {
+            prompt.push_str(
+                "\n## 需求来源 · 会议室讨论（背景上下文）\n\
+                 以下是触发本需求的会议室讨论与项目上下文，供你理解需求意图；\
+                 以上方需求工单为准，讨论中的零散设想若与工单冲突以工单为准。\n\n",
+            );
+            prompt.push_str(ec);
+            prompt.push('\n');
+        }
     }
 
     let specs = read_project_specs(repo_path);
@@ -604,6 +636,53 @@ fn render_spec_brief(spec: &crate::agents::analysis::IssueAnalysisSpec) -> Strin
         }
     }
 
+    s
+}
+
+/// 渲染合并 CR 中一条「附加需求」的简要工单：序号 + 标题 + 目标 + 验收标准 + 改动文件范围。
+/// 比主需求的 render_spec_brief 精简，避免合并多条后 prompt 过长；缺分析 spec 时退化为标题+描述。
+pub fn render_merged_requirement(
+    idx: u32,
+    title: &str,
+    desc: &str,
+    spec: Option<&crate::agents::analysis::IssueAnalysisSpec>,
+) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "\n### 需求 {}：{}", idx, title);
+    let objective = spec
+        .map(|sp| sp.claude_code_brief.objective.trim())
+        .filter(|o| !o.is_empty());
+    if let Some(obj) = objective {
+        let _ = writeln!(s, "- 目标：{}", obj);
+    } else if !desc.trim().is_empty() {
+        let snippet: String = desc.trim().chars().take(400).collect();
+        let _ = writeln!(s, "- 描述：{}", snippet);
+    }
+    if let Some(sp) = spec {
+        if !sp.acceptance_criteria.is_empty() {
+            s.push_str("- 验收标准：\n");
+            for c in &sp.acceptance_criteria {
+                if !c.statement.trim().is_empty() {
+                    let _ = writeln!(s, "  - {}", c.statement.trim());
+                }
+            }
+        }
+        // 改动文件范围：优先 claude_code_brief.files_to_touch，回落 scope.affected_files。
+        let files: Vec<String> = if !sp.claude_code_brief.files_to_touch.is_empty() {
+            sp.claude_code_brief.files_to_touch.clone()
+        } else {
+            sp.scope
+                .affected_files
+                .iter()
+                .map(|f| f.path.clone())
+                .filter(|p| !p.trim().is_empty())
+                .collect()
+        };
+        if !files.is_empty() {
+            let _ = writeln!(s, "- 改动文件范围：{}", files.join(", "));
+        }
+    }
     s
 }
 
@@ -832,7 +911,19 @@ mod tests {
     #[test]
     fn build_prompt_emits_report_marker() {
         // 提示词中要求的报告标题必须与 extract_report 抠取的标题来自同一常量，防漂移。
-        let prompt = build_prompt("标题", "描述", "摘要", None, None, 1, "/tmp/nonexistent-repo", None, None);
+        let prompt = build_prompt(
+            "标题",
+            "描述",
+            "摘要",
+            None,
+            None,
+            1,
+            "/tmp/nonexistent-repo",
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(prompt.contains(REPORT_MARKER), "build_prompt 必须包含报告标题 {REPORT_MARKER}");
         // 端到端：从一段以 build_prompt 模板尾部为蓝本的「agent 输出」里能抠回报告。
         let fake_output = format!("一些思考过程……\n{REPORT_MARKER}\n做了 X");

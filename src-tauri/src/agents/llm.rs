@@ -137,7 +137,41 @@ fn parse_textual_tool_calls(content: &str) -> Vec<(String, Value)> {
     calls
 }
 
+/// 无工具单轮文本生成。**自身即一个 trace 边界**：把整次调用包进 [`scope_run`] 并补写
+/// root(agent) span，确保经由本函数的每条 LLM 请求（含直连 claude CLI 的兜底路径、以及
+/// 会议分析 / 变更摘要 / 立即编码草拟等直接调用方）都进 trace、不丢失。
+/// 已处于某个 run 内（如被 [`run_agent_text_with_tools`] 的无工具分支复用）时 `scope_run`
+/// 自动复用同一 trace_id，root 走 INSERT OR REPLACE 幂等，不产生重复。
 pub async fn run_agent_text(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+) -> Result<String> {
+    crate::core::trace::scope_run(db, agent, async {
+        let t0 = std::time::Instant::now();
+        let result = run_agent_text_inner(db, agent, prompt, system_prompt, image_paths).await;
+        let (status, output, error) = match &result {
+            Ok(s) => ("ok", s.clone(), None),
+            Err(e) => ("error", String::new(), Some(e.to_string())),
+        };
+        crate::core::trace::record_root(
+            prompt,
+            system_prompt,
+            &output,
+            status,
+            error.as_deref(),
+            t0.elapsed().as_millis() as i64,
+            None,
+        )
+        .await;
+        result
+    })
+    .await
+}
+
+async fn run_agent_text_inner(
     db: &crate::db::Db,
     agent: &Agent,
     prompt: &str,

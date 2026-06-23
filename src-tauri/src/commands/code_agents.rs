@@ -155,22 +155,75 @@ pub async fn set_project_code_agent(
     Ok(())
 }
 
-/// 探测指定 code agent 是否已安装并（可探测时）登录。
+/// `check_code_agent_auth` 的结果：工具可用性 + （可选）当前配置模型的探测结论。
+#[derive(serde::Serialize)]
+pub struct CodeAgentProbe {
+    /// CLI 已安装并（可探测时）登录。
+    pub tool: bool,
+    /// 配置模型的探测结论：None = 未探测或未配置模型；Some(true/false) = 模型可用/不可用。
+    pub model: Option<bool>,
+    /// 被探测的模型名（未配置/未探测时为空）。
+    pub model_name: String,
+    /// 失败原因或说明的简短文本（成功时为空）。
+    pub detail: String,
+}
+
+/// 探测指定 code agent 是否已安装并（可探测时）登录；
+/// `probe_model=true` 时额外用配置的模型发一个极小 prompt，验证模型本身可用
+/// （捕捉模型名写错 / provider 未授权 / 额度耗尽等仅靠工具探测发现不了的问题）。
+/// 进页面自动检测传 false（轻量、不烧 token）；点「检测可用性」按钮传 true。
 #[tauri::command]
-pub async fn check_code_agent_auth(id: String, state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn check_code_agent_auth(
+    id: String,
+    probe_model: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<CodeAgentProbe, String> {
     let row = sqlx::query_as::<_, CodeAgentRow>("SELECT * FROM code_agents WHERE id=?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "代码 Agent 不存在".to_string())?;
+    // 「当前配置的模型」= 主模型字段（快/强模型为按风险派生的可选项，留待执行时各自回落）。
+    let model_cfg = row
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let agent = CliCodeAgent::new(CliProfile {
         kind: row.kind,
         program: row.program,
         model: row.model,
         extra_args: crate::agents::code_agent::parse_extra_args(&row.extra_args_json),
     });
-    Ok(agent.check_auth().await)
+    let tool = agent.check_auth().await;
+    let mut probe = CodeAgentProbe {
+        tool,
+        model: None,
+        model_name: String::new(),
+        detail: String::new(),
+    };
+    if probe_model.unwrap_or(false) {
+        match model_cfg {
+            Some(m) if tool => {
+                let (ok, detail) =
+                    agent.probe_model(&m, std::time::Duration::from_secs(60)).await;
+                probe.model = Some(ok);
+                probe.model_name = m;
+                probe.detail = detail;
+            }
+            Some(m) => {
+                // 工具都没就绪，模型无从谈起。
+                probe.model_name = m;
+                probe.detail = "工具未就绪，跳过模型探测".into();
+            }
+            None => {
+                probe.detail = "未配置模型（执行时用 CLI 默认）".into();
+            }
+        }
+    }
+    Ok(probe)
 }
 
 /// 列出某个 CR 的代码 Agent 执行日志（轻量元信息，不含 stdout/stderr 正文）。

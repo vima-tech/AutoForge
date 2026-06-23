@@ -1679,6 +1679,27 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 @keyframes asr-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .composer-asr-dot { animation: none; } }
 [data-motion="off"] .composer-asr-dot { animation: none; }
+
+/* 骨架屏：加载占位条，ember 微光横扫，预示即将到来的内容布局。
+   只用表面层级 + ember-tint，尊重 reduced-motion / data-motion。 */
+.skel {
+  position: relative; overflow: hidden; border-radius: var(--radius-sm);
+  background: var(--bg-3);
+}
+.skel::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, var(--ember-tint), transparent);
+  transform: translateX(-100%);
+  animation: skel-sweep 1.4s ease-in-out infinite;
+}
+@keyframes skel-sweep { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .skel::after { animation: none; } }
+[data-motion="off"] .skel::after { animation: none; }
+/* 加载状态文案切换：淡入上浮，让巡回的步骤提示有连续感。 */
+.cs-phase { display: inline-block; animation: cs-phase-in .34s cubic-bezier(.2,.7,.3,1) both; }
+@keyframes cs-phase-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .cs-phase { animation: none; } }
+[data-motion="off"] .cs-phase { animation: none; }
 .composer-pending { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 8px; }
 .composer-pending-item {
   display: inline-flex; align-items: center; gap: 6px; max-width: 178px;

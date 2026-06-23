@@ -4,10 +4,11 @@ import Select from './Select';
 import { fmtFull } from '../utils/datetime';
 import {
   getIntakeConfig, updateIntakeConfig, syncGithubIssues, bulkImportIssues,
-  bulkImportFile, exportBulkTemplate, submitIssue,
+  bulkImportFile, exportBulkTemplate, submitIssue, importIssueAttachment,
   getProjectWebhookToken, regenerateProjectWebhookToken, getWebhookStatus,
   type IntakeConfig, type SyncResult, type BulkResult, type WidgetToken, type WebhookStatus,
 } from '../services';
+import AttachmentBar, { fileToUpload } from './AttachmentBar';
 
 // ── Intake helpers ────────────────────────────────────────────────────────────
 
@@ -49,19 +50,26 @@ function ProjectManualTab({ projectId }: { projectId: string }) {
   const [submitting, setSubmitting] = useState(false);
   const [okTitle, setOkTitle] = useState('');
   const [err, setErr] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
   const isBug = form.category === 'Bug';
 
   const submit = async () => {
     if (!form.title.trim()) { setErr('需求标题不能为空'); return; }
     setSubmitting(true); setErr(''); setOkTitle('');
     try {
-      await submitIssue({
+      const issue = await submitIssue({
         project_id: projectId, title: form.title, description: form.description,
         category: form.category, severity: form.severity,
         ...(isBug ? { repro_steps: form.repro_steps, environment: form.environment, expected: form.expected, actual: form.actual } : {}),
       });
+      // 两阶段：需求入库后把附件挂到该需求（图片可供 vision 分析）。
+      for (const f of files) {
+        try { await importIssueAttachment({ issue_id: issue.id, ...(await fileToUpload(f)) }); }
+        catch (e) { console.warn('附件上传失败', f.name, e); }
+      }
       setOkTitle(form.title.trim());
       setForm({ title: '', description: '', category: 'Feature', severity: 'medium', repro_steps: '', environment: '', expected: '', actual: '' });
+      setFiles([]);
     } catch (e) { setErr(String(e)); }
     finally { setSubmitting(false); }
   };
@@ -125,6 +133,11 @@ function ProjectManualTab({ projectId }: { projectId: string }) {
             </div>
           </>
         )}
+
+        <ISectionLabel>图片 / 附件</ISectionLabel>
+        <div style={{ marginBottom: 14 }}>
+          <AttachmentBar staged={files} onStaged={setFiles} />
+        </div>
 
         {okTitle && <IResultBanner ok>已提交「<strong>{okTitle}</strong>」，需求已进入分析队列</IResultBanner>}
         {err && <IResultBanner ok={false}>{err}</IResultBanner>}

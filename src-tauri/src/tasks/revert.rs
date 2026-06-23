@@ -186,10 +186,8 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
                 .bind(cr_id)
                 .execute(db)
                 .await?;
-            sqlx::query("UPDATE issues SET status='reverted', updated_at=datetime('now') WHERE id=?")
-                .bind(&cr.issue_id)
-                .execute(db)
-                .await?;
+            // 合并 CR：撤销整条 squash 提交即撤销全部成员需求 → 全组置 reverted。
+            crate::commands::change_requests::set_cr_issues_status(db, cr_id, "reverted").await?;
             crate::core::notify::dispatch(db, "cr_reverted", "需求改动已撤销", cr_id).await;
             event::emit(
                 app,
@@ -227,10 +225,9 @@ async fn restore_merged(db: &Db, app: &tauri::AppHandle, cr_id: &str, issue_id: 
         .bind(cr_id)
         .execute(db)
         .await;
-    let _ = sqlx::query("UPDATE issues SET status='merged', updated_at=datetime('now') WHERE id=?")
-        .bind(issue_id)
-        .execute(db)
-        .await;
+    // 合并 CR：全部成员需求一并回到 merged（revert 没落地）。
+    let _ = crate::commands::change_requests::set_cr_issues_status(db, cr_id, "merged").await;
+    let _ = issue_id; // 旧单需求参数保留以兼容签名；真源走关联表。
     event::emit(
         app,
         event::AppEvent::WorktreeUpdate {

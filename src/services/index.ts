@@ -57,7 +57,7 @@ export interface RoleSlot {
   kind: string; name: string; name_en: string;
   group: 'orchestration' | 'delivery' | 'pipeline' | 'knowledge';
   binding: 'system_kind' | 'forge_role';
-  desc: string; color: string; icon: string;
+  desc: string; usage: string; color: string; icon: string;
   builtin_prompt: string;
   llm_only: boolean;
   holder: Agent | null;
@@ -336,7 +336,17 @@ export const deleteCodeAgent = (id: string) => ipc<void>('delete_code_agent', { 
 export const setDefaultCodeAgent = (id: string) => ipc<void>('set_default_code_agent', { id });
 export const setProjectCodeAgent = (projectId: string, codeAgentId: string | null) =>
   ipc<void>('set_project_code_agent', { projectId, codeAgentId });
-export const checkCodeAgentAuth = (id: string) => ipc<boolean>('check_code_agent_auth', { id });
+// 代码 Agent 可用性探测结果：工具是否就绪 + （probeModel 时）当前配置模型的探测结论。
+export interface CodeAgentProbe {
+  tool: boolean;                  // CLI 已安装并（可探测时）登录
+  model: boolean | null;          // 模型探测结论：null=未探测/未配置模型；true/false=可用/不可用
+  model_name: string;             // 被探测的模型名（未配置/未探测为空）
+  detail: string;                 // 失败原因或说明（成功为空）
+}
+// probeModel=true 时额外发极小 prompt 验证配置的模型（慢几秒、烧极少量 token）；
+// 进页面自动检测传 false（仅工具探测，轻量）。
+export const checkCodeAgentAuth = (id: string, probeModel = false) =>
+  ipc<CodeAgentProbe>('check_code_agent_auth', { id, probeModel });
 
 // 编码 Agent 技能（Skill）：注入到 worktree 供编码 agent 消费的可复用指令包。
 // claude 写 .claude/skills 走原生渐进披露；codex/opencode 折叠进 prompt。
@@ -499,6 +509,40 @@ export const reanalyzeWithFeedback = (issueId: string, feedback: string) =>
 export const updateIssueAcceptance = (issueId: string, acceptanceJson: string) =>
   ipc<void>('update_issue_acceptance', { issueId, acceptanceJson });
 
+// ── 需求附件（图片/文档；图片可喂给 supports_vision 的分析 Agent）─────────────
+export interface IssueAttachment {
+  id: string; issue_id: string; original_name: string;
+  stored_name: string; rel_path: string; mime: string; kind: string;
+  size_bytes: number; sha256: string; created_at: string;
+}
+export const importIssueAttachment = (payload: {
+  issue_id: string; file_name: string; mime_hint: string; data_base64: string;
+}) => ipc<IssueAttachment>('import_issue_attachment', { payload });
+export const listIssueAttachments = (issueId: string) =>
+  ipc<IssueAttachment[]>('list_issue_attachments', { issueId });
+export const issueAttachmentDataUrl = (attachmentId: string) =>
+  ipc<string>('issue_attachment_data_url', { attachmentId });
+export const openIssueAttachment = (attachmentId: string) =>
+  ipc<void>('open_issue_attachment', { attachmentId });
+export const deleteIssueAttachment = (attachmentId: string) =>
+  ipc<void>('delete_issue_attachment', { attachmentId });
+
+// ── 项目蓝图向导（大需求 → PRD / 技术规格 / TASKLIST）─────────────────────────
+export interface BlueprintSpec { category: string; title: string; content_markdown: string; }
+export interface BlueprintTask { title: string; description: string; category: string; severity: string; }
+export interface BlueprintResult {
+  prd_markdown: string; specs: BlueprintSpec[]; tasklist: BlueprintTask[]; tasklist_markdown: string;
+}
+export const generateProjectBlueprint = (projectId: string, brief: string) =>
+  ipc<BlueprintResult>('generate_project_blueprint', { projectId, brief });
+export const applyProjectBlueprint = (
+  projectId: string, prdMarkdown: string, specs: BlueprintSpec[], tasklistMarkdown?: string | null,
+) => ipc<string>('apply_project_blueprint', {
+  projectId, prdMarkdown, specs, tasklistMarkdown: tasklistMarkdown ?? null,
+});
+export const enqueueBlueprintTasks = (projectId: string, tasks: BlueprintTask[]) =>
+  ipc<number>('enqueue_blueprint_tasks', { projectId, tasks });
+
 // CR 级测试遥测记录。
 export interface CrTestRun {
   id: string; cr_id: string; result: string; summary: string; run_by: string; run_at: string;
@@ -599,6 +643,40 @@ export const review1 = (issueId: string, decision: {
 export interface Review1BatchResult { approved: number; skipped: number; errors: number; }
 export const review1Batch = (issueIds: string[], suggestions?: string) =>
   ipc<Review1BatchResult>('review_1_batch', { issueIds, suggestions: suggestions || undefined });
+
+// ── 同文件多需求合并 ───────────────────────────────────────────────────────────
+// 合并候选组：命中同一实质文件、可合并成一次变更的待需求审核需求。
+export interface MergeCandidate {
+  issue_ids: string[];
+  titles: string[];
+  shared_files: string[];
+  total_files: number;
+  strength: 'strong' | 'weak';
+  conflict_hint: string | null;
+}
+/** 列出某项目需求审核队列里的合并候选组（按共享实质文件聚类，已剔除枢纽文件）。 */
+export const listMergeCandidates = (projectId: string) =>
+  ipc<MergeCandidate[]>('list_merge_candidates', { projectId });
+/** 合并需求审核：把多条需求合并成一个 CR + 一次执行；primaryId 缺省取第一条。 */
+export const review1Merge = (
+  issueIds: string[],
+  primaryId?: string,
+  suggestions?: string,
+) =>
+  ipc<ChangeRequest>('review_1_merge', {
+    issueIds,
+    primaryId: primaryId || undefined,
+    suggestions: suggestions || undefined,
+  });
+/** 从尚未进入执行的合并 CR 中拆出某成员需求，退回独立审核。 */
+export const splitChangeRequest = (crId: string, issueId: string) =>
+  ipc<void>('split_change_request', { crId, issueId });
+// 一个 CR 覆盖的需求引用（合并 CR 含多条；普通 CR 一条）。
+export interface CrIssueRef { issue_id: string; title: string; role: string; status: string; }
+/** 列出某 CR 覆盖的全部需求（primary 在前），供「覆盖 N 个需求」展示。 */
+export const getChangeRequestIssues = (crId: string) =>
+  ipc<CrIssueRef[]>('get_change_request_issues', { crId });
+
 export const review2 = (crId: string, decision: {
   decision: string; suggestions?: string; admin_id?: string; commit_message?: string;
 }) => ipc<ChangeRequest>('review_2', { crId, decision });
@@ -687,6 +765,12 @@ export const startConversationTask = (payload: {
 }) => ipc<ConversationTask>('start_conversation_task', { payload });
 export const listConversationTasks = (conversationId: string) =>
   ipc<ConversationTask[]>('list_conversation_tasks', { conversationId });
+// 会议室「立即编码」：① AI 起草功能点工单草稿；② 据确认工单直奔编码（建需求→CR→执行，跳过需求审核队列）。
+export const draftCodingBrief = (conversationId: string, windowSize?: number) =>
+  ipc<string>('draft_coding_brief', { conversationId, windowSize: windowSize ?? null });
+export const startConversationCoding = (payload: {
+  conversation_id: string; title: string; brief: string; window_size?: number | null;
+}) => ipc<ChangeRequest>('start_conversation_coding', { payload });
 // 总结/结论 + 压缩上下文：生成摘要并把当前窗口内历史消息移出后续上下文。
 export const compressConversationContext = (payload: {
   conversation_id: string; mode: 'summary' | 'conclusion';

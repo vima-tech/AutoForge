@@ -1,7 +1,9 @@
 pub mod agent_outputs;
 pub mod artifacts;
 pub mod asr;
+pub mod attachments_common;
 pub mod backup;
+pub mod blueprint;
 pub mod change_requests;
 pub mod change_summary;
 pub mod code_agents;
@@ -28,6 +30,7 @@ pub mod project_context;
 pub mod preview;
 pub mod projects;
 pub mod prototype;
+pub mod requirement_merge;
 pub mod run_config;
 pub mod scan;
 pub mod security;

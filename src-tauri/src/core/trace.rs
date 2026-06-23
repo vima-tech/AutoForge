@@ -86,6 +86,26 @@ pub async fn with_tags<F: Future>(tags: TraceTags, f: F) -> F::Output {
 /// `f` 内部的 llm/tool span 会自动挂到该 trace 下。root span 需调用方在 `f` 结束后用
 /// [`record_root`] 补写（以拿到最终出参/状态/耗时）。
 pub async fn scope_run<F: Future>(db: &Db, agent: &crate::models::agent::Agent, f: F) -> F::Output {
+    scope_run_labeled(
+        db,
+        Some(agent.id.as_str()),
+        Some(agent.role.as_str()),
+        Some(agent.name.as_str()),
+        f,
+    )
+    .await
+}
+
+/// 同 [`scope_run`]，但不要求 [`Agent`]——供没有 Agent 实体的 LLM 调用建立 trace（如直连
+/// claude CLI 的需求分析兜底、Layer-1 安全检测）。agent 维度按显式标签写入，缺省留空。
+/// 已在某个 run 内则复用（不新建 trace_id），与 [`scope_run`] 一致。
+pub async fn scope_run_labeled<F: Future>(
+    db: &Db,
+    agent_id: Option<&str>,
+    agent_role: Option<&str>,
+    agent_name: Option<&str>,
+    f: F,
+) -> F::Output {
     // 已处于某个 trace run 中（如编排把 LLM 调用 + 写文件包进同一 run）→ 复用，
     // 避免新建 trace_id 把同一 Agent 动作拆成多条互不关联的 trace。
     if RUN.try_with(|_| ()).is_ok() {
@@ -95,9 +115,9 @@ pub async fn scope_run<F: Future>(db: &Db, agent: &crate::models::agent::Agent, 
         db: db.clone(),
         trace_id: Uuid::new_v4().to_string(),
         tags: current_tags(),
-        agent_id: nonempty(&agent.id),
-        agent_role: nonempty(&agent.role),
-        agent_name: nonempty(&agent.name),
+        agent_id: agent_id.and_then(nonempty),
+        agent_role: agent_role.and_then(nonempty),
+        agent_name: agent_name.and_then(nonempty),
         seq: Arc::new(AtomicI64::new(0)),
     };
     RUN.scope(run, f).await
@@ -133,15 +153,21 @@ async fn insert(
     total_tokens: Option<i64>,
     latency_ms: Option<i64>,
     metadata_json: Option<&str>,
+    // root span 的 id 恒等于 trace_id，可能被嵌套调用层各自补写一次（如 run_agent_text
+    // 被 run_agent_text_with_tools 的无工具分支复用同一 RUN）。用 INSERT OR REPLACE 让
+    // 「最后一个收尾的外层」覆盖写入、保留最完整的出参/状态/metadata，且永不产生重复 root。
+    // llm/tool span 的 id 是唯一 uuid，走普通 INSERT。
+    replace: bool,
 ) {
-    let res = sqlx::query(
-        "INSERT INTO llm_traces (
+    let verb = if replace { "INSERT OR REPLACE INTO" } else { "INSERT INTO" };
+    let res = sqlx::query(&format!(
+        "{verb} llm_traces (
             id, trace_id, parent_id, seq, kind, name,
             agent_id, agent_role, agent_name, project_id, issue_id, conversation_id, task_id,
             provider, model, system_prompt, status, error, input, output,
             prompt_tokens, completion_tokens, total_tokens, latency_ms, metadata_json, ended_at
          ) VALUES (?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?, datetime('now'))",
-    )
+    ))
     .bind(id)
     .bind(&run.trace_id)
     .bind(parent_id)
@@ -193,6 +219,7 @@ pub async fn record_root(
         None, None, system_prompt, status, error,
         Some(input), Some(output),
         None, None, None, Some(latency_ms), metadata_json,
+        true, // root：INSERT OR REPLACE，幂等 + last-wins
     )
     .await;
 }
@@ -222,6 +249,7 @@ pub async fn record_llm(
         Some(provider), Some(model), system_prompt, status, error,
         Some(input), Some(output),
         prompt_tokens, completion_tokens, total_tokens, Some(latency_ms), metadata_json,
+        false,
     )
     .await;
 }
@@ -241,6 +269,7 @@ pub async fn record_tool(name: &str, input: &str, output: &str, ok: bool, latenc
         None, None, None, if ok { "ok" } else { "error" }, error.as_deref(),
         Some(input), Some(output),
         None, None, None, Some(latency_ms), None,
+        false,
     )
     .await;
 }

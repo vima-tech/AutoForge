@@ -20,6 +20,9 @@ const SENSITIVE_META: Record<string, { chip: string; icon: string }> = {
 };
 const sensitiveMeta = (t: SensitiveTag) => SENSITIVE_META[t.kind] ?? { chip: 'amber', icon: 'alert' };
 
+// 加载期巡回展示的阶段文案：让等待有「正在推进」的连续感，而非一句静态提示。
+const LOADING_PHASES = ['读取改动 diff…', '分析业务意图…', '标注敏感模块…', '整理文件清单…', '生成摘要中…'];
+
 interface Props {
   crId: string;
   /** 当前 CR 是否有可摘要的代码改动（无改动/失败/冲突态传 false，跳过请求）。 */
@@ -36,6 +39,14 @@ export default function ChangeSummaryCard({ crId, enabled }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [phase, setPhase] = useState(0);
+
+  // 加载期每 1.6s 推进一个阶段文案（停在最后一句，不回卷），制造持续进度感。
+  useEffect(() => {
+    if (!loading) { setPhase(0); return; }
+    const id = setInterval(() => setPhase(p => Math.min(p + 1, LOADING_PHASES.length - 1)), 1600);
+    return () => clearInterval(id);
+  }, [loading]);
 
   // force=false：走后端缓存（按 cr_id + diff 哈希），切换需求/CR 命中即返回、不重跑 LLM。
   // force=true：用户点「重新生成」时跳过缓存强制重算。
@@ -95,9 +106,30 @@ export default function ChangeSummaryCard({ crId, enabled }: Props) {
       {!collapsed && (
         <div style={{ padding: '12px 14px' }}>
           {loading ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>
-              <span className="dot amber" />
-              正在分析变更并生成摘要…
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {/* 巡回阶段文案 + typing 三点：传达「正在推进」而非卡死 */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>
+                <span className="typing" aria-hidden><i /><i /><i /></span>
+                <span key={phase} className="cs-phase" style={{ fontFamily: 'var(--font-mono)', letterSpacing: '.02em' }}>
+                  {LOADING_PHASES[phase]}
+                </span>
+              </div>
+              {/* 骨架屏：预示概述段 + 标签行 + 文件清单的最终布局 */}
+              <div className="skel" style={{ height: 13, width: '92%' }} />
+              <div className="skel" style={{ height: 13, width: '74%' }} />
+              <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+                <div className="skel" style={{ height: 18, width: 64, borderRadius: 99 }} />
+                <div className="skel" style={{ height: 18, width: 48, borderRadius: 99 }} />
+                <div className="skel" style={{ height: 18, width: 72, borderRadius: 99 }} />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 2 }}>
+                {[80, 64, 70].map((w, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div className="skel" style={{ height: 13, width: 32, flexShrink: 0 }} />
+                    <div className="skel" style={{ height: 13, width: `${w}%` }} />
+                  </div>
+                ))}
+              </div>
             </div>
           ) : error ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-3)', fontSize: 'var(--text-control)' }}>

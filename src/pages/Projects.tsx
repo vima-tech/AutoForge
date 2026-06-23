@@ -4,6 +4,7 @@ import Icon from '../components/Icon';
 import Select from '../components/Select';
 import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, ConfirmModal } from '../components/ProjectDialogs';
 import IntakePanel from '../components/IntakePanel';
+import BlueprintWizard from '../components/BlueprintWizard';
 import { parseTs, fmtFull } from '../utils/datetime';
 import {
   listProjects, updateProject, deleteProject, setDefaultProject, type Project,
@@ -1481,6 +1482,7 @@ export default function ProjectsPage() {
   const [showCreate, setShowCreate]     = useState(false);
   const [editProject, setEditProject]   = useState<Project | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
+  const [blueprintProject, setBlueprintProject] = useState<Project | null>(null);
   const [deleting, setDeleting]         = useState(false);
   const [showRecycle, setShowRecycle]   = useState(false);
   const [archived, setArchived]         = useState<Project[]>([]);
@@ -1661,6 +1663,9 @@ export default function ProjectsPage() {
                       <Icon name={selectedProject.status === 'active' ? 'pause' : 'play'} size={13} />
                       {selectedProject.status === 'active' ? '停用' : '启用'}
                     </button>
+                    <button className="btn btn-sm" onClick={() => setBlueprintProject(selectedProject)} title="把一段大需求炼成 PRD / 技术规格 / 任务清单">
+                      <Icon name="layers" size={13} />项目蓝图
+                    </button>
                     <button className="btn btn-sm" onClick={() => setEditProject(selectedProject)}>
                       <Icon name="edit" size={13} />编辑
                     </button>
@@ -1729,6 +1734,13 @@ export default function ProjectsPage() {
           project={deleteTarget}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={doDelete}
+        />
+      )}
+      {blueprintProject && (
+        <BlueprintWizard
+          project={blueprintProject}
+          onClose={() => setBlueprintProject(null)}
+          onApplied={() => { void load(); }}
         />
       )}
       {showRecycle && (

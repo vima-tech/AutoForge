@@ -602,6 +602,7 @@ pub async fn analyze(
     project_context: Option<&str>,
     project_id: Option<&str>,
     recalled: Option<&str>,
+    image_paths: &[std::path::PathBuf],
 ) -> Result<AnalysisResult> {
     let prompt = match project_context.filter(|c| !c.trim().is_empty()) {
         Some(ctx) => format!(
@@ -642,7 +643,7 @@ pub async fn analyze(
             // 包一层 scope_run（内部 LLM 调用复用同一 trace），以便取到 trace_id 链回下钻。
             crate::core::trace::scope_run(db, &agent, async {
                 let raw = crate::agents::llm::run_agent_text_with_tools(
-                    db, &agent, &prompt, Some(&sys), &[], &registry,
+                    db, &agent, &prompt, Some(&sys), image_paths, &registry,
                 )
                 .await?;
                 let tid = crate::core::trace::current_trace_id();
@@ -660,7 +661,36 @@ pub async fn analyze(
                 ),
                 None => SYSTEM_PROMPT.to_string(),
             };
-            (local_claude::run_text(&prompt, Some(&sys)).await?, None)
+            // 无分析 Agent 的兜底也走 claude CLI——同样建立 trace 边界（root + claude-cli
+            // llm span），确保这条 LLM 请求不丢；trace_id 链回 agent_outputs 下钻。
+            crate::core::trace::scope_run_labeled(
+                db,
+                None,
+                Some("需求分析"),
+                Some("Claude Code"),
+                async {
+                    let t0 = std::time::Instant::now();
+                    let res =
+                        local_claude::run_text_with_images(&prompt, Some(&sys), image_paths).await;
+                    let (status, out, err) = match &res {
+                        Ok(s) => ("ok", s.clone(), None),
+                        Err(e) => ("error", String::new(), Some(e.to_string())),
+                    };
+                    crate::core::trace::record_root(
+                        &prompt,
+                        Some(&sys),
+                        &out,
+                        status,
+                        err.as_deref(),
+                        t0.elapsed().as_millis() as i64,
+                        None,
+                    )
+                    .await;
+                    let tid = crate::core::trace::current_trace_id();
+                    res.map(|raw| (raw, tid))
+                },
+            )
+            .await?
         }
     };
 

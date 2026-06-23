@@ -37,7 +37,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     ];
     if !TRUSTED_SOURCES.contains(&issue.source_type.as_str()) {
         let combined = format!("{}\n{}", issue.title, issue.description);
-        if !crate::agents::local_claude::safety_check(&combined).await {
+        if !crate::agents::local_claude::safety_check(db, &combined).await {
             error!("issue {} rejected by Layer 1 LLM sanitizer", issue_id);
             sqlx::query(
                 "UPDATE issues SET status='rejected', updated_at=datetime('now') WHERE id=?",
@@ -116,6 +116,22 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     )
     .await;
     let recalled = Some(recall.text.as_str()).filter(|s| !s.trim().is_empty());
+    // 需求图片附件：把 kind='image' 的附件解析为磁盘绝对路径，喂给分析 Agent。
+    // 仅当分析 Agent 绑定的 LLM supports_vision=1 时图片才真正内联（analyze 内部判定），
+    // 否则静默忽略，纯文本分析（零回归）。
+    let image_paths: Vec<std::path::PathBuf> = sqlx::query_as::<_, (String,)>(
+        "SELECT rel_path FROM issue_attachments WHERE issue_id=? AND kind='image' ORDER BY created_at ASC",
+    )
+    .bind(issue_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|(rel,)| {
+        crate::commands::attachments_common::attachment_path_from_rel(&rel).ok()
+    })
+    .filter(|p| p.exists())
+    .collect();
     let result = match crate::core::trace::with_tags(
         trace_tags,
         crate::agents::analysis::analyze(
@@ -125,6 +141,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
             project_context.as_deref(),
             Some(issue.project_id.as_str()),
             recalled,
+            &image_paths,
         ),
     )
     .await

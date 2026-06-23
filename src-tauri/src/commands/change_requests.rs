@@ -395,14 +395,8 @@ pub async fn revert_change_request(cr_id: String, state: State<'_, AppState>) ->
     if res.rows_affected() == 0 {
         return Err("仅已合并的需求可撤销（可能已在撤销中或状态已变化）".to_string());
     }
-    let cr: ChangeRequest = sqlx::query_as("SELECT * FROM change_requests WHERE id=?")
-        .bind(&cr_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query("UPDATE issues SET status='reverting', updated_at=datetime('now') WHERE id=?")
-        .bind(&cr.issue_id)
-        .execute(&state.db)
+    // 合并 CR：撤销整条 squash 提交即撤销全部成员需求 → 全组置 reverting。
+    set_cr_issues_status(&state.db, &cr_id, "reverting")
         .await
         .map_err(|e| e.to_string())?;
     // 唯一 key：去重靠上面的状态门，而非 enqueue 幂等键。
@@ -527,11 +521,37 @@ async fn approve_issue_review_1(
             .await
             .map_err(|e| e.to_string())?;
 
-    // Create CR
+    // Innate: the analysis a human approved at review_1 was a good call —
+    // reinforce the experience that fed it (positive calibration signal).
+    crate::knowledge::consume_recall_trace(db, "issue", issue_id, "ok", Some("up")).await;
+
+    create_cr_for_issue(db, job_tx, &issue, &project, suggestions, admin_id, None).await
+}
+
+/// Create a CR for an already-loaded issue and enqueue its Execution job: insert the
+/// CR row (carrying optional express `work_context`), write the `primary` association
+/// row, record the `review_1` approval decision, flip the issue to `pending_execution`,
+/// and enqueue execution under the stable `execution:<cr_id>` idempotency key.
+///
+/// Shared by the normal review_1 path (`approve_issue_review_1`, `work_context=None`)
+/// and the 会议室「立即编码」express path (`start_conversation_coding`, which passes the
+/// conversation snapshot as `work_context` and skips the review_1 *queue* — the operator's
+/// click in the room IS the requirement-side decision; code review (review_2) still gates
+/// the merge). Pure deps (db + job sender) — no Tauri types.
+pub(crate) async fn create_cr_for_issue(
+    db: &crate::db::Db,
+    job_tx: &crate::tasks::runner::JobSender,
+    issue: &crate::models::issue::Issue,
+    project: &crate::models::project::Project,
+    suggestions: Option<&str>,
+    admin_id: &str,
+    work_context: Option<&str>,
+) -> Result<ChangeRequest, String> {
+    let issue_id = issue.id.as_str();
     let cr_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO change_requests (id, project_id, issue_id, status, admin_id, admin_suggestions_1, target_branch)
-         VALUES (?, ?, ?, 'pending_execution', ?, ?, ?)"
+        "INSERT INTO change_requests (id, project_id, issue_id, status, admin_id, admin_suggestions_1, target_branch, work_context)
+         VALUES (?, ?, ?, 'pending_execution', ?, ?, ?, ?)"
     )
     .bind(&cr_id)
     .bind(&issue.project_id)
@@ -539,9 +559,13 @@ async fn approve_issue_review_1(
     .bind(admin_id)
     .bind(suggestions.unwrap_or(""))
     .bind(&project.branch_dev)
+    .bind(work_context)
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
+
+    // 关联表 primary 行：单需求 CR 也写，保证「CR 的全部需求」恒等于 change_request_issues 查询。
+    add_cr_issue(db, &cr_id, issue_id, "primary", 0).await?;
 
     record_admin_decision(
         db,
@@ -556,10 +580,6 @@ async fn approve_issue_review_1(
         },
     )
     .await?;
-
-    // Innate: the analysis a human approved at review_1 was a good call —
-    // reinforce the experience that fed it (positive calibration signal).
-    crate::knowledge::consume_recall_trace(db, "issue", issue_id, "ok", Some("up")).await;
 
     // Update issue
     sqlx::query("UPDATE issues SET status='pending_execution', updated_at=datetime('now') WHERE id=?")
@@ -635,6 +655,220 @@ pub async fn review_1_batch(
     Ok(result)
 }
 
+/// 一个 CR 覆盖的需求引用（合并 CR 含多条；普通 CR 一条）。供审核页展示「覆盖 N 个需求」。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrIssueRef {
+    pub issue_id: String,
+    pub title: String,
+    pub role: String,
+    pub status: String,
+}
+
+/// 列出某 CR 覆盖的全部需求（primary 在前），供前端展示「本变更覆盖 N 个需求」。
+#[tauri::command]
+pub async fn get_change_request_issues(
+    cr_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<CrIssueRef>, String> {
+    let mut out = Vec::new();
+    for id in cr_issue_ids(&state.db, &cr_id).await {
+        if let Some((title, status)) =
+            sqlx::query_as::<_, (String, String)>("SELECT title, status FROM issues WHERE id=?")
+                .bind(&id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| e.to_string())?
+        {
+            let role: Option<(String,)> = sqlx::query_as(
+                "SELECT role FROM change_request_issues WHERE change_request_id=? AND issue_id=?",
+            )
+            .bind(&cr_id)
+            .bind(&id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            out.push(CrIssueRef {
+                issue_id: id,
+                title,
+                role: role.map(|(r,)| r).unwrap_or_else(|| "primary".to_string()),
+                status,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 合并需求审核：把多条**待需求审核**的需求合并成**一个** CR + 一次执行（同文件多需求合并）。
+/// primary 需求驱动 CR 标题/分支/Innate 召回，其余为 member。全部成员翻 `pending_execution`
+/// 并各记一条 review_1 审计，最后入队**一个** Execution job（执行层会拼多需求工单）。
+/// 校验：≥2 条、同项目、均为 `pending_issue_review`（或分析失败，可直接进编码）。
+#[tauri::command]
+pub async fn review_1_merge(
+    issue_ids: Vec<String>,
+    suggestions: Option<String>,
+    primary_id: Option<String>,
+    admin_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ChangeRequest, String> {
+    let admin_id = admin_id.unwrap_or_else(|| "admin".to_string());
+    let suggestions = suggestions.filter(|s| !s.trim().is_empty());
+    let db = &state.db;
+
+    // 去重，保持选择顺序。
+    let mut seen = std::collections::HashSet::new();
+    let ordered: Vec<String> = issue_ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    if ordered.len() < 2 {
+        return Err("合并至少需要 2 条需求".to_string());
+    }
+
+    // 加载全部需求，校验状态 + 同项目。
+    let mut issues = Vec::with_capacity(ordered.len());
+    for id in &ordered {
+        let iss = sqlx::query_as::<_, crate::models::issue::Issue>("SELECT * FROM issues WHERE id=?")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("需求不存在：{}", id))?;
+        if iss.status != "pending_issue_review" && iss.status != "analysis_failed" {
+            return Err(format!("需求「{}」状态为 {}，不可合并", iss.title, iss.status));
+        }
+        issues.push(iss);
+    }
+    let project_id = issues[0].project_id.clone();
+    if !issues.iter().all(|i| i.project_id == project_id) {
+        return Err("只能合并同一项目下的需求".to_string());
+    }
+
+    // 选 primary：用传入的（且在选区内）否则取第一条。
+    let primary = primary_id
+        .filter(|p| ordered.iter().any(|id| id == p))
+        .unwrap_or_else(|| ordered[0].clone());
+
+    let project =
+        sqlx::query_as::<_, crate::models::project::Project>("SELECT * FROM projects WHERE id=?")
+            .bind(&project_id)
+            .fetch_one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    // 创建一个 CR（issue_id = primary）。
+    let cr_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO change_requests (id, project_id, issue_id, status, admin_id, admin_suggestions_1, target_branch)
+         VALUES (?, ?, ?, 'pending_execution', ?, ?, ?)"
+    )
+    .bind(&cr_id)
+    .bind(&project_id)
+    .bind(&primary)
+    .bind(&admin_id)
+    .bind(suggestions.as_deref().unwrap_or(""))
+    .bind(&project.branch_dev)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 写关联表：primary + members（members 按选择顺序排 sort_order）。
+    let mut order = 1i64;
+    for id in &ordered {
+        if *id == primary {
+            add_cr_issue(db, &cr_id, id, "primary", 0).await?;
+        } else {
+            add_cr_issue(db, &cr_id, id, "member", order).await?;
+            order += 1;
+        }
+    }
+
+    // 全部成员：记 review_1 审计 + Innate 正校准 + 翻 pending_execution（走全组联动助手）。
+    for id in &ordered {
+        record_admin_decision(
+            db,
+            AdminDecisionRecord {
+                project_id: &project_id,
+                issue_id: id,
+                change_request_id: Some(&cr_id),
+                stage: "review_1",
+                decision: "approved",
+                admin_id: &admin_id,
+                suggestions: suggestions.as_deref(),
+            },
+        )
+        .await?;
+        crate::knowledge::consume_recall_trace(db, "issue", id, "ok", Some("up")).await;
+    }
+    set_cr_issues_status(db, &cr_id, "pending_execution")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 入队一个 Execution job（执行层据关联表拼多需求工单）。
+    let idem_key = format!("execution:{}", cr_id);
+    let _ = enqueue(
+        db,
+        &state.job_tx,
+        "execution",
+        &idem_key,
+        JobPayload::Execution {
+            change_request_id: cr_id.clone(),
+            project_id: project_id.clone(),
+        },
+    )
+    .await;
+
+    sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 从一个**尚未进入执行**（pending_execution）的合并 CR 中拆出某成员需求，退回
+/// `pending_issue_review` 重新独立审核。应对「合并后想撤回其中一条」。
+/// 仅允许在执行前拆（执行后 worktree/diff 已成型，拆分语义复杂，不在 MVP 内）；
+/// 不允许拆 primary（primary 驱动 CR 身份）；拆到只剩 1 条时不自动解散 CR（保持简单）。
+#[tauri::command]
+pub async fn split_change_request(
+    cr_id: String,
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = &state.db;
+    let cr = sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("变更请求不存在：{}", cr_id))?;
+    if cr.status != "pending_execution" {
+        return Err(format!("变更请求当前状态为 {}，仅可在进入执行前拆分", cr.status));
+    }
+    if cr.issue_id == issue_id {
+        return Err("不可拆分主需求（primary）".to_string());
+    }
+    let members = cr_issue_ids(db, &cr_id).await;
+    if !members.contains(&issue_id) {
+        return Err("该需求不属于此变更请求".to_string());
+    }
+
+    // 移除关联 + 需求退回独立审核。
+    sqlx::query("DELETE FROM change_request_issues WHERE change_request_id=? AND issue_id=?")
+        .bind(&cr_id)
+        .bind(&issue_id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE issues SET status='pending_issue_review', updated_at=datetime('now') WHERE id=?",
+    )
+    .bind(&issue_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Feed a review-2 human outcome into the change class trust state machine
 /// (a clean approval extends the streak toward auto-pass; reject/revision resets it).
 /// Shared by single `review_2` and the batch path so calibration stays identical.
@@ -680,19 +914,9 @@ async fn approve_cr_review_2(
 
     record_review_2_outcome(db, cr_id, true).await;
 
-    record_admin_decision(
-        db,
-        AdminDecisionRecord {
-            project_id: &cr.project_id,
-            issue_id: &cr.issue_id,
-            change_request_id: Some(cr_id),
-            stage: "review_2",
-            decision: "approved",
-            admin_id,
-            suggestions,
-        },
-    )
-    .await?;
+    // 合并 CR：全部成员需求各记一条「review_2 approved」审计。
+    record_admin_decision_all(db, &cr.project_id, cr_id, "review_2", "approved", admin_id, suggestions)
+        .await?;
 
     // 规整人工提交信息：去空白、空串落 NULL（合并任务回退默认模板）、限长 2KB。
     // 仅在「自定义提交信息」开关开启时采纳；关闭时强制 NULL，合并走默认模板。
@@ -759,17 +983,14 @@ pub async fn review_2(
     } else if decision.decision == "rejected" {
         // §7: reject resets the change-class trust streak.
         record_review_2_outcome(&state.db, &cr_id, false).await;
-        record_admin_decision(
+        record_admin_decision_all(
             &state.db,
-            AdminDecisionRecord {
-                project_id: &cr.project_id,
-                issue_id: &cr.issue_id,
-                change_request_id: Some(&cr_id),
-                stage: "review_2",
-                decision: "rejected",
-                admin_id: &admin_id,
-                suggestions: decision.suggestions.as_deref(),
-            },
+            &cr.project_id,
+            &cr_id,
+            "review_2",
+            "rejected",
+            &admin_id,
+            decision.suggestions.as_deref(),
         )
         .await?;
 
@@ -783,9 +1004,8 @@ pub async fn review_2(
         .await
         .map_err(|e| e.to_string())?;
 
-        sqlx::query("UPDATE issues SET status='rejected', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.issue_id)
-            .execute(&state.db)
+        // 合并 CR：全部成员需求一并置 rejected（单需求 CR 等价于只动那一条）。
+        set_cr_issues_status(&state.db, &cr_id, "rejected")
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1024,13 +1244,10 @@ pub async fn retry_change_request(
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
-    sqlx::query(
-        "UPDATE issues SET status='pending_execution', updated_at=datetime('now') WHERE id=?",
-    )
-    .bind(&cr.issue_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    // 合并 CR：全部成员需求一并回到 pending_execution。
+    set_cr_issues_status(&state.db, &cr_id, "pending_execution")
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Unique idempotency key so the retry is never swallowed by INSERT OR IGNORE.
     let idem_key = format!("execution:{}:retry:{}", cr_id, Uuid::new_v4());
@@ -1098,10 +1315,14 @@ pub async fn restore_change_request(
     // Clear leftover worktrees/previews from the prior attempt before re-running.
     cleanup_cr_worktrees(&state.db, &cr).await;
 
-    // Flag the issue as restored-from-revert so the queue can mark it with a small dot.
+    // Flag the issue(s) as restored-from-revert so the queue can mark them with a small dot.
+    // 合并 CR：全部成员需求一并恢复。
     sqlx::query(
-        "UPDATE issues SET status='pending_execution', restored_from_revert=1, updated_at=datetime('now') WHERE id=?",
+        "UPDATE issues SET status='pending_execution', restored_from_revert=1, updated_at=datetime('now')
+         WHERE id IN (SELECT issue_id FROM change_request_issues WHERE change_request_id=?)
+            OR id = ?",
     )
+    .bind(&cr_id)
     .bind(&cr.issue_id)
     .execute(&state.db)
     .await
@@ -1303,5 +1524,103 @@ async fn record_admin_decision(
     tokio::spawn(async move {
         crate::knowledge::kb_add(&pid, &content, &trigger).await;
     });
+    Ok(())
+}
+
+// ── 合并 CR 的成员需求关联（change_request_issues，迁移 0070）────────────────────
+
+/// 给某 CR 关联一条成员需求（role: 'primary'|'member'）。INSERT OR IGNORE 幂等。
+pub(crate) async fn add_cr_issue(
+    db: &crate::db::Db,
+    cr_id: &str,
+    issue_id: &str,
+    role: &str,
+    sort_order: i64,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO change_request_issues (change_request_id, issue_id, role, sort_order)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(cr_id)
+    .bind(issue_id)
+    .bind(role)
+    .bind(sort_order)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// CR 的全部成员需求 id（primary 在前，再按 sort_order）。关联表由迁移 0070 回填保证非空；
+/// 极端缺失时回落到 change_requests.issue_id，永不返回空集，防止全组联动退化为空操作。
+pub(crate) async fn cr_issue_ids(db: &crate::db::Db, cr_id: &str) -> Vec<String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT issue_id FROM change_request_issues WHERE change_request_id=?
+         ORDER BY CASE role WHEN 'primary' THEN 0 ELSE 1 END, sort_order, issue_id",
+    )
+    .bind(cr_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if !rows.is_empty() {
+        return rows.into_iter().map(|(id,)| id).collect();
+    }
+    // 兜底：关联表无行（理论不应发生）时用 CR 主需求。
+    sqlx::query_as::<_, (String,)>("SELECT issue_id FROM change_requests WHERE id=?")
+        .bind(cr_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|(id,)| vec![id])
+        .unwrap_or_default()
+}
+
+/// 把某 CR 的**全部成员需求**置为同一状态（合并 CR 全组联动；单需求 CR 只动那一条）。
+/// 关联表是真源，外加 OR id=(CR.issue_id) 兜底，确保即便关联行缺失也至少同步主需求。
+pub(crate) async fn set_cr_issues_status(
+    db: &crate::db::Db,
+    cr_id: &str,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE issues SET status=?, updated_at=datetime('now')
+         WHERE id IN (SELECT issue_id FROM change_request_issues WHERE change_request_id=?)
+            OR id = (SELECT issue_id FROM change_requests WHERE id=?)",
+    )
+    .bind(status)
+    .bind(cr_id)
+    .bind(cr_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// 对某 CR 的**全部成员需求**各记一条审核决策（合并 CR 的完整审计轨迹）。
+/// 单需求 CR 退化为一条，与改造前一致。
+async fn record_admin_decision_all(
+    db: &crate::db::Db,
+    project_id: &str,
+    cr_id: &str,
+    stage: &str,
+    decision: &str,
+    admin_id: &str,
+    suggestions: Option<&str>,
+) -> Result<(), String> {
+    for iid in cr_issue_ids(db, cr_id).await {
+        record_admin_decision(
+            db,
+            AdminDecisionRecord {
+                project_id,
+                issue_id: &iid,
+                change_request_id: Some(cr_id),
+                stage,
+                decision,
+                admin_id,
+                suggestions,
+            },
+        )
+        .await?;
+    }
     Ok(())
 }

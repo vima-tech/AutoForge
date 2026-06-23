@@ -1,8 +1,16 @@
+use crate::commands::attachments_common::{
+    attachment_path_from_rel, sanitize_file_name, validate_attachment, MAX_ATTACHMENT_BYTES,
+};
 use crate::intake::{gateway, IntakeMode, IntakePayload};
 use crate::models::issue::{CreateIssue, Issue, IssueAnalysis};
+use crate::models::issue_attachment::{IssueAttachment, IssueAttachmentUpload};
 use crate::models::job::JobPayload;
 use crate::state::AppState;
+use base64::{engine::general_purpose, Engine as _};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use tauri::{AppHandle, State};
+use uuid::Uuid;
 
 #[tauri::command]
 pub async fn list_issues(
@@ -368,6 +376,172 @@ pub async fn update_issue_acceptance(
     sqlx::query("UPDATE issues SET acceptance_json=?, updated_at=datetime('now') WHERE id=?")
         .bind(&acceptance_json)
         .bind(&issue_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── 需求附件（issue_attachments）──────────────────────────────────────────────
+// 镜像会议室附件（conversations.rs::import_attachment），存储基目录用
+// attachments_base()/issues/<issue_id>/，复用 attachments_common 的安全白名单。
+// 图片附件可经 supports_vision 的分析 Agent 内联识别（tasks/analysis.rs）。
+
+async fn load_issue_attachment(
+    db: &crate::db::Db,
+    attachment_id: &str,
+) -> Result<IssueAttachment, String> {
+    sqlx::query_as::<_, IssueAttachment>("SELECT * FROM issue_attachments WHERE id=?")
+        .bind(attachment_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "附件不存在".to_string())
+}
+
+#[tauri::command]
+pub async fn import_issue_attachment(
+    payload: IssueAttachmentUpload,
+    state: State<'_, AppState>,
+) -> Result<IssueAttachment, String> {
+    let issue_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM issues WHERE id=?")
+        .bind(&payload.issue_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if issue_exists.is_none() {
+        return Err(format!("issue {} not found", payload.issue_id));
+    }
+
+    if payload.data_base64.len() > (MAX_ATTACHMENT_BYTES * 4 / 3 + 16) {
+        return Err("附件超过 10 MB 上限".to_string());
+    }
+
+    let bytes = general_purpose::STANDARD
+        .decode(payload.data_base64.as_bytes())
+        .map_err(|_| "附件内容不是有效的 base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("附件不能为空".to_string());
+    }
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err("附件超过 10 MB 上限".to_string());
+    }
+
+    let clean_name = sanitize_file_name(&payload.file_name);
+    let policy = validate_attachment(&clean_name, payload.mime_hint.as_str(), &bytes)?;
+    let attachment_id = Uuid::new_v4().to_string();
+    let stored_name = format!("{}.{}", attachment_id, policy.ext);
+    // rel_path 含 `issues/` 段，使 attachment_path_from_rel（= attachments_base()/rel_path）
+    // 与下方落盘目录一致。
+    let rel_path = format!("issues/{}/{}", payload.issue_id, stored_name);
+    let issue_dir = PathBuf::from(crate::state::attachments_base())
+        .join("issues")
+        .join(&payload.issue_id);
+    let file_path = issue_dir.join(&stored_name);
+
+    tokio::fs::create_dir_all(&issue_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::fs::write(&file_path, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let insert_result = sqlx::query(
+        "INSERT INTO issue_attachments
+         (id, issue_id, original_name, stored_name, rel_path, mime, kind, size_bytes, sha256)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&attachment_id)
+    .bind(&payload.issue_id)
+    .bind(&clean_name)
+    .bind(&stored_name)
+    .bind(&rel_path)
+    .bind(policy.mime)
+    .bind(policy.kind)
+    .bind(bytes.len() as i64)
+    .bind(&sha256)
+    .execute(&state.db)
+    .await;
+
+    if let Err(e) = insert_result {
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return Err(e.to_string());
+    }
+
+    load_issue_attachment(&state.db, &attachment_id).await
+}
+
+#[tauri::command]
+pub async fn list_issue_attachments(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<IssueAttachment>, String> {
+    sqlx::query_as::<_, IssueAttachment>(
+        "SELECT * FROM issue_attachments WHERE issue_id=? ORDER BY created_at ASC",
+    )
+    .bind(&issue_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn issue_attachment_data_url(
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let attachment = load_issue_attachment(&state.db, &attachment_id).await?;
+    if attachment.kind != "image" {
+        return Err("只有图片附件支持内联预览".to_string());
+    }
+    if attachment.size_bytes as usize > MAX_ATTACHMENT_BYTES {
+        return Err("图片超过预览大小上限".to_string());
+    }
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
+    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    Ok(format!(
+        "data:{};base64,{}",
+        attachment.mime,
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command]
+pub async fn open_issue_attachment(
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let attachment = load_issue_attachment(&state.db, &attachment_id).await?;
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
+    if !path.exists() {
+        return Err("附件文件不存在或已被移除".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+
+    cmd.arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开附件：{}", e))
+}
+
+#[tauri::command]
+pub async fn delete_issue_attachment(
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let attachment = load_issue_attachment(&state.db, &attachment_id).await?;
+    if let Ok(path) = attachment_path_from_rel(&attachment.rel_path) {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    sqlx::query("DELETE FROM issue_attachments WHERE id=?")
+        .bind(&attachment_id)
         .execute(&state.db)
         .await
         .map_err(|e| e.to_string())?;

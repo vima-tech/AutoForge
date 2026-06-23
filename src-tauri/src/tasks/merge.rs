@@ -371,10 +371,7 @@ pub(crate) async fn finalize_resolution(
     let still_unmerged = !list_unmerged(&wt).await.is_empty();
     if !markers_clean || still_unmerged {
         let _ = wt.run(&["merge", "--abort"]).await;
-        sqlx::query("UPDATE change_requests SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.id).execute(db).await?;
-        sqlx::query("UPDATE issues SET status='merge_conflict', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.issue_id).execute(db).await?;
+        set_status(db, &cr.id, &cr.issue_id, "merge_conflict").await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -409,10 +406,7 @@ pub(crate) async fn finalize_resolution(
     if !passed {
         // 把测试失败详情回写报告，供审核页「合并失败原因」展示有用信息（而非实现摘要）。
         crate::tasks::testing::persist_test_failure_report(db, &cr.id).await;
-        sqlx::query("UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.id).execute(db).await?;
-        sqlx::query("UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.issue_id).execute(db).await?;
+        set_status(db, &cr.id, &cr.issue_id, "merge_failed").await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -425,10 +419,7 @@ pub(crate) async fn finalize_resolution(
     }
 
     // Route back to human review 2 — never land a resolved conflict directly.
-    sqlx::query("UPDATE change_requests SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
-        .bind(&cr.id).execute(db).await?;
-    sqlx::query("UPDATE issues SET status='pending_code_review', updated_at=datetime('now') WHERE id=?")
-        .bind(&cr.issue_id).execute(db).await?;
+    set_status(db, &cr.id, &cr.issue_id, "pending_code_review").await?;
     crate::core::notify::dispatch(db, "review_needed", &issue.title, "合并冲突已解决，待代码审核 复审").await;
     event::emit(
         app,
@@ -734,10 +725,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .bind(&session.id)
             .execute(db)
             .await;
-        sqlx::query("UPDATE change_requests SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
-            .bind(cr_id).execute(db).await?;
-        sqlx::query("UPDATE issues SET status='merge_failed', updated_at=datetime('now') WHERE id=?")
-            .bind(&cr.issue_id).execute(db).await?;
+        set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
         event::emit(
             app,
             event::AppEvent::WorktreeUpdate {
@@ -1144,18 +1132,25 @@ async fn snapshot_cr_diff(
     }
 }
 
-/// 同时把 CR 与其 issue 置为同一状态（合并流水线全程二者保持一致）。
+/// 同时把 CR 与其**全部成员需求**置为同一状态（合并流水线全程保持一致）。
+/// 合并 CR（一个 CR 覆盖多个需求）下全组联动；单需求 CR 等价于只动那一条。
+/// issue_id 参数保留为兜底（关联表缺失时仍同步主需求），真源是 change_request_issues。
 async fn set_status(db: &Db, cr_id: &str, issue_id: &str, status: &str) -> Result<()> {
     sqlx::query("UPDATE change_requests SET status=?, updated_at=datetime('now') WHERE id=?")
         .bind(status)
         .bind(cr_id)
         .execute(db)
         .await?;
-    sqlx::query("UPDATE issues SET status=?, updated_at=datetime('now') WHERE id=?")
-        .bind(status)
-        .bind(issue_id)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE issues SET status=?, updated_at=datetime('now')
+         WHERE id IN (SELECT issue_id FROM change_request_issues WHERE change_request_id=?)
+            OR id = ?",
+    )
+    .bind(status)
+    .bind(cr_id)
+    .bind(issue_id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
