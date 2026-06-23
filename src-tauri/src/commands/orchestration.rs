@@ -32,6 +32,20 @@ struct AgentOutcome {
     text: String,
 }
 
+/// 系统角色 Agent 执行入参聚合体。
+/// 把 run_system_agent_markdown / run_system_agent_text 共用的一组参数收拢成结构体，
+/// 避免函数签名参数过多（clippy::too_many_arguments）。字段均为借用，生命周期统一为 'a。
+#[derive(Debug, Clone)]
+struct SystemAgentParams<'a> {
+    conversation_id: &'a str,
+    agent: &'a Agent,
+    kind: &'a str,
+    prompt: &'a str,
+    fallback_system_prompt: &'a str,
+    project_id: Option<&'a str>,
+    recall_key: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArtifactPayload {
     kind: String,
@@ -271,7 +285,16 @@ async fn compress_context_now(
     };
 
     let (ok, summary) = run_system_agent_text(
-        db, &agent, used_kind, &prompt, fallback_system, project_id, Some(&source),
+        db,
+        &SystemAgentParams {
+            conversation_id,
+            agent: &agent,
+            kind: used_kind,
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id,
+            recall_key: Some(&source),
+        },
     )
     .await;
     if !ok {
@@ -1182,8 +1205,17 @@ async fn run_summarizer(
     let fallback_system =
         "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。";
     run_system_agent_markdown(
-        db, app, conversation_id, agent, "summarizer", &prompt, fallback_system,
-        project_id, Some(instruction),
+        db,
+        app,
+        &SystemAgentParams {
+            conversation_id,
+            agent,
+            kind: "summarizer",
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id,
+            recall_key: Some(instruction),
+        },
     )
     .await
 }
@@ -1234,7 +1266,16 @@ JSON 结构：
     let fallback_system =
         "你是 AutoForge 的系统文档生成器，负责把群聊讨论沉淀为可引用、可迭代的文档产物。";
     let (ok, raw) = run_system_agent_text(
-        db, agent, "doc_writer", &prompt, fallback_system, project_id, Some(instruction),
+        db,
+        &SystemAgentParams {
+            conversation_id,
+            agent,
+            kind: "doc_writer",
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id,
+            recall_key: Some(instruction),
+        },
     )
     .await;
     if !ok {
@@ -1273,27 +1314,21 @@ JSON 结构：
 async fn run_system_agent_markdown(
     db: &crate::db::Db,
     app: &AppHandle,
-    conversation_id: &str,
-    agent: &Agent,
-    kind: &str,
-    prompt: &str,
-    fallback_system_prompt: &str,
-    project_id: Option<&str>,
-    recall_key: Option<&str>,
+    params: &SystemAgentParams<'_>,
 ) -> Result<AgentOutcome, String> {
-    let (ok, text) =
-        run_system_agent_text(db, agent, kind, prompt, fallback_system_prompt, project_id, recall_key).await;
-    let message_id = insert_agent_markdown_message(db, conversation_id, &agent.id, &text).await?;
+    let (ok, text) = run_system_agent_text(db, params).await;
+    let message_id =
+        insert_agent_markdown_message(db, params.conversation_id, &params.agent.id, &text).await?;
     event::emit(
         app,
         event::AppEvent::MessageReceived {
-            conversation_id: conversation_id.to_string(),
+            conversation_id: params.conversation_id.to_string(),
             message_id,
         },
     );
     Ok(AgentOutcome {
-        agent_id: agent.id.clone(),
-        agent_name: agent.name.clone(),
+        agent_id: params.agent.id.clone(),
+        agent_name: params.agent.name.clone(),
         ok,
         text,
     })
@@ -1301,28 +1336,29 @@ async fn run_system_agent_markdown(
 
 async fn run_system_agent_text(
     db: &crate::db::Db,
-    agent: &Agent,
-    kind: &str,
-    prompt: &str,
-    fallback_system_prompt: &str,
-    project_id: Option<&str>,
-    recall_key: Option<&str>,
+    params: &SystemAgentParams<'_>,
 ) -> (bool, String) {
     // 用注册表内置提示词（按 prompt_mode）+ Innate 召回，让群聊系统角色随经验越用越好。
     let system_prompt = crate::agents::llm::build_role_system_prompt(
-        agent,
-        Some(kind),
-        Some(fallback_system_prompt),
-        project_id,
-        recall_key,
+        params.agent,
+        Some(params.kind),
+        Some(params.fallback_system_prompt),
+        params.project_id,
+        params.recall_key,
     )
     .await;
     // 系统角色也可按需用工具（代码扫描/web_search）：注册表按 capabilities 白名单 + 项目绑定装配；
     // 为空（未开启工具/无项目）时 run_agent_text_with_tools 自动回退到无工具单轮，行为不变。
-    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
-    let registry = crate::agents::tools::build_registry_for_agent(db, agent, &tool_ctx).await;
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, params.project_id).await;
+    let registry =
+        crate::agents::tools::build_registry_for_agent(db, params.agent, &tool_ctx).await;
     match crate::agents::llm::run_agent_text_with_tools(
-        db, agent, prompt, system_prompt.as_deref(), &[], &registry,
+        db,
+        params.agent,
+        params.prompt,
+        system_prompt.as_deref(),
+        &[],
+        &registry,
     )
     .await
     {
@@ -1375,7 +1411,16 @@ async fn maybe_compress_context(
     let fallback_system = "你是 AutoForge 的上下文压缩器，负责在长对话超过窗口条数后生成可靠摘要，降低后续 Agent 的上下文负担。";
     // 召回键用待压缩内容，命中该对话主题相关的项目经验。
     let (ok, summary) = run_system_agent_text(
-        db, &compressor, "context_compressor", &prompt, fallback_system, project_id, Some(&source),
+        db,
+        &SystemAgentParams {
+            conversation_id,
+            agent: &compressor,
+            kind: "context_compressor",
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id,
+            recall_key: Some(&source),
+        },
     )
     .await;
     if !ok {
