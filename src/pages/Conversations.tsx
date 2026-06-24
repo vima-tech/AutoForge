@@ -499,8 +499,15 @@ function CodeNowModal({ conversationId, onClose, onError }: {
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  // 卸载时置空存活标记
-  useEffect(() => () => { aliveRef.current = false; }, []);
+  // 存活标记：挂载置 true、卸载置 false。
+  // ⚠️ 必须在 mount 时重置为 true，不能只在 cleanup 里置 false：React 18 StrictMode（dev）会
+  // mount→卸载(置 false)→**重挂载**，而 useRef 跨这次模拟重挂载是同一对象。若不在 body 里重置，
+  // 重挂载后 aliveRef 永远停在 false，导致 handleDraft 的 promise resolve 后被 `!aliveRef` 拦截，
+  // 既不填表也不 setDrafting(false) → 文本已全出、计时器却永涨、弹窗毫无变化（即本 bug 症状）。
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
 
   // 思考日志增长时自动滚到底部
   useEffect(() => {
