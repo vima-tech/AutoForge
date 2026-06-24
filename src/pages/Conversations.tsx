@@ -11,7 +11,7 @@ import {
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
-  draftCodingBrief, draftCodingBriefDetailed, startConversationCoding,
+  draftCodingBrief, draftCodingBriefDetailed, draftCodingBriefStream, startConversationCoding,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
@@ -463,7 +463,8 @@ function CodeNowModal({ conversationId, onClose, onError }: {
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<string | null>(null);
   const [briefData, setBriefData] = useState<CodingBrief | null>(null);
-  const [elapsed, setElapsed] = useState(0);
+  const [thinkLog, setThinkLog] = useState('');
+  const thinkLogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -471,23 +472,38 @@ function CodeNowModal({ conversationId, onClose, onError }: {
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  // 订阅流式思考增量：后端 CodingBriefChunk 事件按本会话累积到思考日志
+  useEffect(() => {
+    const un = listen<{ type: string; conversation_id?: string; chunk?: string }>(
+      'autoforge://event',
+      (e) => {
+        const p = e.payload;
+        if (p?.type === 'coding_brief_chunk' && p.conversation_id === conversationId && p.chunk) {
+          setThinkLog(prev => prev + p.chunk);
+        }
+      },
+    );
+    return () => { un.then(f => f()); };
+  }, [conversationId]);
+
+  // 思考日志增长时自动滚到底部
+  useEffect(() => {
+    if (thinkLogRef.current) {
+      thinkLogRef.current.scrollTop = thinkLogRef.current.scrollHeight;
+    }
+  }, [thinkLog]);
+
   // 弹窗打开时自动梳理讨论内容
   useEffect(() => {
     handleDraft();
   }, [conversationId]);
 
-  // AI 梳理：调用详细版 API 获取结构化数据，自动填充表单供编辑
+  // AI 梳理：流式调用，实时显示思考过程，完成后解析结构化数据并填表
   const handleDraft = async () => {
     setDrafting(true);
-    setElapsed(0);
-
-    // 显示实时流逝的时间
-    const timerRef = setInterval(() => {
-      setElapsed(e => e + 1);
-    }, 1000);
-
+    setThinkLog('');
     try {
-      const codingBrief = await draftCodingBriefDetailed(conversationId);
+      const codingBrief = await draftCodingBriefStream(conversationId);
       setBriefData(codingBrief);
 
       // 自动填充标题和功能点
@@ -498,9 +514,7 @@ function CodeNowModal({ conversationId, onClose, onError }: {
     } catch (e) {
       onError(`梳理功能点失败：${String(e)}`);
     } finally {
-      clearInterval(timerRef);
       setDrafting(false);
-      setElapsed(0);
     }
   };
 
@@ -542,69 +556,57 @@ function CodeNowModal({ conversationId, onClose, onError }: {
           </div>
         ) : (
           <>
-            {/* 梳理中：显示真实进度 */}
+            {/* 梳理中：实时流式思考日志 */}
             {drafting ? (
-              <div style={{
-                padding: '80px 40px',
-                textAlign: 'center',
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                minHeight: 320,
-              }}>
-                {/* 脑图标动画 */}
-                <div style={{
-                  position: 'relative',
-                  width: 80,
-                  height: 80,
-                  marginBottom: 24,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}>
-                  <Icon name="brain" size={80} style={{
-                    color: 'var(--ember)',
-                    animation: 'pulse 2s ease-in-out infinite',
-                  }} />
-                  <div style={{
-                    position: 'absolute',
-                    width: 90,
-                    height: 90,
-                    border: `2px solid var(--ember)`,
-                    borderRadius: '50%',
-                    animation: 'pulse-ring 2s ease-out infinite',
-                    opacity: 0.3,
-                  }} />
+              <div style={{ padding: '18px 20px' }}>
+                {/* 标题行 */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                  <div style={{ position: 'relative', width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Icon name="brain" size={22} style={{ color: 'var(--ember)', animation: 'pulse 2s ease-in-out infinite' }} />
+                  </div>
+                  <div style={{ fontSize: 'var(--text-body)', color: 'var(--text)', fontWeight: 500 }}>
+                    AI 正在梳理讨论
+                  </div>
+                  <Icon name="refresh" size={14} className="spin" style={{ color: 'var(--text-3)', marginLeft: 'auto' }} />
                 </div>
 
-                {/* 进度文字 */}
-                <div style={{ fontSize: 'var(--text-body)', color: 'var(--text)', fontWeight: 500, marginBottom: 8 }}>
-                  AI 正在梳理讨论
-                </div>
-                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginBottom: 24 }}>
-                  已耗时 {elapsed}s • 分析需求 • 识别模块 • 评估风险
+                {/* 流式思考日志 */}
+                <div
+                  ref={thinkLogRef}
+                  style={{
+                    height: 280,
+                    overflowY: 'auto',
+                    padding: 14,
+                    background: 'var(--code-bg)',
+                    borderRadius: 'var(--radius)',
+                    border: '1px solid var(--border)',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 'var(--text-caption)',
+                    lineHeight: 'var(--leading-relaxed)',
+                    color: 'var(--text-2)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {thinkLog || (
+                    <span style={{ color: 'var(--text-faint)' }}>正在连接 AI…</span>
+                  )}
+                  {thinkLog && (
+                    <span style={{
+                      display: 'inline-block',
+                      width: 7,
+                      height: 14,
+                      marginLeft: 2,
+                      background: 'var(--ember)',
+                      verticalAlign: 'text-bottom',
+                      animation: 'pulse 1s steps(2) infinite',
+                    }} />
+                  )}
                 </div>
 
-                {/* 进度条 */}
-                <div style={{
-                  width: 240,
-                  height: 3,
-                  background: 'var(--bg-3)',
-                  borderRadius: 2,
-                  overflow: 'hidden',
-                  marginBottom: 16,
-                }}>
-                  <div style={{
-                    height: '100%',
-                    background: `linear-gradient(90deg, var(--ember) 0%, var(--ember-soft) 100%)`,
-                    animation: 'progress-pulse .8s ease-in-out infinite',
-                    width: '100%',
-                  }} />
-                </div>
-
-                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
-                  稍等片刻…
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginTop: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Icon name="layers" size={13} />
+                  <span>分析需求 · 识别关键模块 · 评估风险等级</span>
                 </div>
               </div>
             ) : (

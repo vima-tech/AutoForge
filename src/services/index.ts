@@ -780,6 +780,10 @@ export const draftCodingBrief = (conversationId: string, windowSize?: number) =>
   ipc<string>('draft_coding_brief', { conversationId, windowSize: windowSize ?? null });
 export const draftCodingBriefDetailed = (conversationId: string, windowSize?: number) =>
   ipc<CodingBrief>('draft_coding_brief_detailed', { conversationId, windowSize: windowSize ?? null });
+// 流式版：调用期间后端通过 CodingBriefChunk 事件实时推送 AI 思考增量，
+// promise resolve 时返回解析好的结构化 CodingBrief。前端订阅 autoforge://event 累积日志。
+export const draftCodingBriefStream = (conversationId: string, windowSize?: number) =>
+  ipc<CodingBrief>('draft_coding_brief_stream', { conversationId, windowSize: windowSize ?? null });
 export const startConversationCoding = (payload: {
   conversation_id: string; title: string; brief: string; window_size?: number | null;
 }) => ipc<ChangeRequest>('start_conversation_coding', { payload });

@@ -175,7 +175,17 @@ pub async fn draft_coding_brief(
     }
     let agent = load_brief_agent(&state.db).await?;
 
-    let prompt = format!(
+    let prompt = build_brief_prompt(&context);
+
+    crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 构造「立即编码」需求梳理的提示词。三个入口（非流式 / 详细 / 流式）共用一份，
+/// 保证不同路径产出的工单结构完全一致。
+fn build_brief_prompt(context: &str) -> String {
+    format!(
         "下面是一段会议室讨论与项目上下文。请把其中达成的开发意图梳理成一份**清晰、可直接交给\
          编码 AI 执行的需求工单**。\n\n\
          ## 输出格式\n\
@@ -202,11 +212,7 @@ pub async fn draft_coding_brief(
          3. 涉及的文件与模块要基于讨论背景与项目结构推测，帮助编码 AI 快速定位。\n\
          4. 用中文，简洁明确，直接给工单——不要反问、不要寒暄、不要解释你在做什么。\n\n\
          ## 讨论与项目上下文\n{context}"
-    );
-
-    crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
-        .await
-        .map_err(|e| e.to_string())
+    )
 }
 
 /// 从标记文本中提取 markdown 列表项
@@ -415,36 +421,7 @@ pub async fn draft_coding_brief_detailed(
         return Err("当前会议室没有可梳理的讨论内容".to_string());
     }
     let agent = load_brief_agent(&state.db).await?;
-
-    // 复用与 draft_coding_brief 相同的提示词
-    let prompt = format!(
-        "下面是一段会议室讨论与项目上下文。请把其中达成的开发意图梳理成一份**清晰、可直接交给\
-         编码 AI 执行的需求工单**。\n\n\
-         ## 输出格式\n\
-         严格按以下结构输出，不要省略任何环节：\n\n\
-         **标题：** <一句话需求标题，简洁有力>\n\n\
-         **功能点与需求：**\n\
-         - <功能点 1：用户故事或具体任务>\n\
-         - <功能点 2>\n\
-         - （如需多项功能，继续列举）\n\n\
-         **涉及的模块与文件：**\n\
-         根据讨论推断可能需要修改的关键模块/文件路径（如 src/pages/Dashboard.tsx, src-tauri/src/commands/issues.rs 等）。\n\
-         - <模块/文件 1>\n\
-         - <模块/文件 2>\n\
-         - （列出最可能受影响的 3-5 个关键点）\n\n\
-         **关键约束与技术考量：**\n\
-         - 列举讨论中提及的设计约束、兼容性需求、性能要求等\n\n\
-         **验收要点：**\n\
-         - 描述如何判断功能已正确实现\n\n\
-         **需求类型：** <功能新增 | 功能改进 | Bug修复 | 重构优化 | 其他>\n\
-         **初步风险等级：** <低 | 中 | 高>\n\n\
-         ## 输出原则\n\
-         1. 只保留与「本次要编码的需求」直接相关的内容，剔除闲聊与已废弃的设想。\n\
-         2. 推断（而非直译）讨论意图——从对话中读出隐含的功能需求。\n\
-         3. 涉及的文件与模块要基于讨论背景与项目结构推测，帮助编码 AI 快速定位。\n\
-         4. 用中文，简洁明确，直接给工单——不要反问、不要寒暄、不要解释你在做什么。\n\n\
-         ## 讨论与项目上下文\n{context}"
-    );
+    let prompt = build_brief_prompt(&context);
 
     let text = crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
         .await
@@ -452,6 +429,63 @@ pub async fn draft_coding_brief_detailed(
 
     let mut brief = parse_coding_brief(&text);
     // 根据需求特征精化风险评估
+    brief.risk_level = refine_risk_assessment(&brief);
+    Ok(brief)
+}
+
+/// 会议室「立即编码」流式版：边生成边把 AI 的思考增量通过 `CodingBriefChunk` 事件推给前端，
+/// 消除「干等」的等待感；生成结束后解析为结构化 `CodingBrief` 返回。前端订阅事件实时滚动日志，
+/// promise resolve 时拿到结构化结果填表。
+#[tauri::command]
+pub async fn draft_coding_brief_stream(
+    conversation_id: String,
+    window_size: Option<i64>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodingBrief, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+    let prompt = build_brief_prompt(&context);
+
+    // 每段增量转成 CodingBriefChunk 事件发射。闭包只捕获 AppHandle + conversation_id，
+    // 业务逻辑（llm.rs）仍对 Tauri 无感知——事件出口唯一走 event::emit。
+    let app_for_chunk = app.clone();
+    let conv_for_chunk = conversation_id.clone();
+    let mut on_chunk = move |chunk: &str| {
+        event::emit(
+            &app_for_chunk,
+            event::AppEvent::CodingBriefChunk {
+                conversation_id: conv_for_chunk.clone(),
+                chunk: chunk.to_string(),
+            },
+        );
+    };
+
+    let text = crate::agents::llm::run_agent_text_streaming(
+        &state.db,
+        &agent,
+        &prompt,
+        None,
+        &mut on_chunk,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut brief = parse_coding_brief(&text);
     brief.risk_level = refine_risk_assessment(&brief);
     Ok(brief)
 }

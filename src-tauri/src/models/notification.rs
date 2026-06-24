@@ -181,7 +181,8 @@ impl NotificationDraft {
             | AppEvent::AsrResult { .. }
             | AppEvent::AutosupplyStatus { .. }
             | AppEvent::CodeAgentLog { .. }
-            | AppEvent::PreviewLog { .. } => None,
+            | AppEvent::PreviewLog { .. }
+            | AppEvent::CodingBriefChunk { .. } => None,
         }
     }
 }

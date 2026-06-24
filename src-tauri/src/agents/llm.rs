@@ -659,6 +659,194 @@ async fn run_anthropic(
     text.ok_or_else(|| anyhow!("Anthropic 响应缺少 content[].text"))
 }
 
+// ── 流式文本生成（供「立即编码」实时思考日志） ──────────────────────────────
+//
+// 设计：保持 llm.rs 纯 Rust（零 Tauri）。流式增量通过 `on_chunk` 回调交给调用方
+// （命令层捕获 AppHandle 后转成 AppEvent 发射），本模块不感知事件系统。
+// 仅 openai / anthropic 两种 wire 格式走真流式（SSE）；未绑定 LLM / 绑定 Claude CLI
+// 时回退到非流式单次调用，把整段结果作为一个 chunk 回调，保证调用方逻辑统一。
+
+/// 流式文本生成：边生成边通过 `on_chunk` 回调吐出增量，返回完整文本。
+/// `on_chunk` 必须 `Send`（在 tokio 任务里跨 await 调用）。
+pub async fn run_agent_text_streaming(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    // 未绑定自定义 LLM（走本地 claude CLI）：无流式接口，回退非流式后整段回调。
+    let Some(llm_id) = &agent.llm_id else {
+        let text =
+            crate::agents::local_claude::run_text_with_images(prompt, system_prompt, &[]).await?;
+        on_chunk(&text);
+        return Ok(text);
+    };
+
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key).map_err(|e| anyhow!(e))?;
+    if !cfg.enabled {
+        return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
+    }
+
+    let t0 = std::time::Instant::now();
+    let result = match cfg.api_spec.to_ascii_lowercase().as_str() {
+        "anthropic" => run_anthropic_stream(&cfg, prompt, system_prompt, on_chunk).await,
+        _ => run_openai_stream(&cfg, prompt, system_prompt, on_chunk).await,
+    };
+
+    // trace：流式只在结束时落一条完整记录（增量已实时给了前端）。
+    let spec = if cfg.api_spec.eq_ignore_ascii_case("anthropic") { "anthropic" } else { "openai" };
+    let latency = t0.elapsed().as_millis() as i64;
+    match &result {
+        Ok(text) => {
+            crate::core::trace::record_llm(
+                spec, &cfg.model, system_prompt, prompt, text, "ok",
+                None, None, None, None, latency, None,
+            )
+            .await;
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                spec, &cfg.model, system_prompt, prompt, "", "error",
+                Some(&e.to_string()), None, None, None, latency, None,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+/// 解析 SSE 字节流：按行切分，对每个 `data: <payload>` 行调用 `handle`（payload 为 `[DONE]`
+/// 时跳过）。维护一个跨 chunk 的残行缓冲，处理被 TCP 包切断的半行。
+async fn parse_sse_stream(
+    resp: reqwest::Response,
+    mut handle: impl FnMut(&str),
+) -> Result<()> {
+    use futures_util::StreamExt;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("LLM HTTP {}: {}", status_code(status), trim_body(&text)));
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| anyhow!("流式读取失败: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        // 以换行为界处理完整行，保留最后一段可能不完整的残行。
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_string();
+            buf.drain(..=nl);
+            let Some(payload) = line.strip_prefix("data:") else { continue };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            handle(payload);
+        }
+    }
+    Ok(())
+}
+
+async fn run_openai_stream(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    let client = http_client()?;
+    let mut messages = Vec::new();
+    if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({ "role": "user", "content": prompt }));
+
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&json!({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "stream": true
+        }));
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+
+    let resp = req.send().await?;
+    let mut full = String::new();
+    parse_sse_stream(resp, |payload| {
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(delta) = v
+                .pointer("/choices/0/delta/content")
+                .and_then(|c| c.as_str())
+            {
+                if !delta.is_empty() {
+                    full.push_str(delta);
+                    on_chunk(delta);
+                }
+            }
+        }
+    })
+    .await?;
+
+    if full.trim().is_empty() {
+        return Err(anyhow!("OpenAI-compatible 流式响应为空"));
+    }
+    Ok(full.trim().to_string())
+}
+
+async fn run_anthropic_stream(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    let client = http_client()?;
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        body["system"] = anthropic_system_cached(system);
+    }
+
+    let resp = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await?;
+
+    let mut full = String::new();
+    parse_sse_stream(resp, |payload| {
+        // Anthropic 流式：content_block_delta 事件携带 delta.text 增量。
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(delta) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                if !delta.is_empty() {
+                    full.push_str(delta);
+                    on_chunk(delta);
+                }
+            }
+        }
+    })
+    .await?;
+
+    if full.trim().is_empty() {
+        return Err(anyhow!("Anthropic 流式响应为空"));
+    }
+    Ok(full.trim().to_string())
+}
+
 /// 工具循环提醒语：当 Agent 有可用工具却只回了「我去看看…」这类未兑现前导语、且未发出工具调用时，
 /// 用它促模型立即真正调用工具或直接给出完整答复，避免把空口承诺当最终回复返回。
 const TOOL_NUDGE: &str = "你刚才表示要进一步查看/检索/分析，但本轮没有实际调用任何工具。你现在就有可用工具（如 read_project_file / search_project_code / list_project_files 等）——请**立即调用**所需工具获取信息后再作答；若已掌握足够信息，请直接输出完整的最终答复，不要只描述你打算做什么。";
