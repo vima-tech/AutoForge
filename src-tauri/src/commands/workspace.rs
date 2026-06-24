@@ -22,14 +22,14 @@ fn validate_workspace_path(rel_path: &str) -> Result<(), String> {
             return Err("路径越界：只允许访问 .autoforge/ 目录内的文件".to_string());
         }
     }
-    // Must start with docs/ or specs/
+    // Must start with docs/ or specs/ or deliverables/
     let first = p
         .components()
         .next()
         .and_then(|c| if let Component::Normal(n) = c { Some(n.to_string_lossy().to_string()) } else { None });
     match first.as_deref() {
-        Some("docs") | Some("specs") => Ok(()),
-        _ => Err("只能读写 .autoforge/docs/ 或 .autoforge/specs/ 下的文件".to_string()),
+        Some("docs") | Some("specs") | Some("deliverables") => Ok(()),
+        _ => Err("只能读写 .autoforge/docs/ 或 .autoforge/specs/ 或 .autoforge/deliverables/ 下的文件".to_string()),
     }
 }
 
@@ -85,7 +85,10 @@ pub async fn ensure_workspace_dirs(
     tokio::fs::create_dir_all(base.join("specs"))
         .await
         .map_err(|e| e.to_string())?;
-    info!("[workspace] ensured .autoforge/{{docs,specs}} for project {}", project_id);
+    tokio::fs::create_dir_all(base.join("deliverables"))
+        .await
+        .map_err(|e| e.to_string())?;
+    info!("[workspace] ensured .autoforge/{{docs,specs,deliverables}} for project {}", project_id);
     Ok(())
 }
 
@@ -108,7 +111,7 @@ pub async fn list_workspace_files(
     let base = workspace_root(&repo_path);
     let mut files = Vec::new();
 
-    for subfolder in &["docs", "specs"] {
+    for subfolder in &["docs", "specs", "deliverables"] {
         let root = base.join(subfolder);
         if !root.exists() {
             continue;
@@ -359,8 +362,8 @@ pub fn parse_agent_file_writes(text: &str) -> (String, Vec<(String, String)>) {
             .or_else(|| raw_path.strip_prefix("autoforge/"))
             .unwrap_or(&raw_path)
             .to_string();
-        // Only keep writes targeting docs/ or specs/
-        if rel.starts_with("docs/") || rel.starts_with("specs/") {
+        // Only keep writes targeting docs/ or specs/ or deliverables/
+        if rel.starts_with("docs/") || rel.starts_with("specs/") || rel.starts_with("deliverables/") {
             writes.push((rel, content));
         }
         String::new()
@@ -505,7 +508,7 @@ pub async fn load_workspace_context(repo_path: &str) -> String {
 
     let mut parts: Vec<String> = Vec::new();
 
-    for subfolder in &["docs", "specs"] {
+    for subfolder in &["docs", "specs", "deliverables"] {
         let dir = base.join(subfolder);
         if !dir.exists() {
             continue;
@@ -563,6 +566,7 @@ pub const WORKSPACE_INSTRUCTIONS: &str = r#"
 你可以读写项目工作区 `.autoforge/` 目录下的文档：
 - `.autoforge/docs/`：产品文档、PRD、ADR、会议记录等
 - `.autoforge/specs/`：技术规格、接口定义、架构说明等
+- `.autoforge/deliverables/`：交付产物、报告、成果物等
 
 **只读**：项目根目录下的其他文件（代码、配置）仅供参考，禁止修改。
 
@@ -575,7 +579,7 @@ pub const WORKSPACE_INSTRUCTIONS: &str = r#"
 ```
 
 规则：
-- path 必须以 `.autoforge/docs/` 或 `.autoforge/specs/` 开头
+- path 必须以 `.autoforge/docs/`、`.autoforge/specs/` 或 `.autoforge/deliverables/` 开头
 - 会覆盖同名文件，首次创建时自动生成
 - 一次回复可写多个文件
 - 写完文件后简要告知用户写了什么，不要把全文再输出一遍

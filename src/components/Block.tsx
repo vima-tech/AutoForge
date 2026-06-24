@@ -34,11 +34,12 @@ function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: s
   const [saveErr, setSaveErr] = useState('');
   const tokens = tokenize(code);
 
-  const handleSave = async (subfolder: 'docs' | 'specs') => {
+  const handleSave = async (subfolder: 'docs' | 'specs' | 'deliverables') => {
     if (!projectId || saving) return;
     const ext = lang || 'txt';
     const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
-    const filename = `${subfolder === 'docs' ? 'doc' : 'spec'}_${ts}.${ext}`;
+    const prefix = subfolder === 'docs' ? 'doc' : subfolder === 'specs' ? 'spec' : 'deliverable';
+    const filename = `${prefix}_${ts}.${ext}`;
     const relPath = `${subfolder}/${filename}`;
     setSaving(true); setSaveErr('');
     try {
@@ -63,6 +64,9 @@ function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: s
               </button>
               <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} disabled={saving} onClick={() => handleSave('specs')} title="存入 .autoforge/specs/">
                 <Icon name="folder" size={10} />specs
+              </button>
+              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} disabled={saving} onClick={() => handleSave('deliverables')} title="存入 .autoforge/deliverables/">
+                <Icon name="folder" size={10} />deliverables
               </button>
             </>
           )}
@@ -107,7 +111,7 @@ function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: 
     finally { setDeciding(''); }
   };
 
-  const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs') => {
+  const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs' | 'deliverables') => {
     if (!effectiveProjectId || saving) return;
     const slug = b.title
       .toLowerCase()
@@ -174,6 +178,9 @@ function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: 
             </button>
             <button className="btn btn-sm" disabled={saving} onClick={() => handleSaveToWorkspace('specs')} title="存入 .autoforge/specs/">
               <Icon name="folder" size={12} />存入 specs
+            </button>
+            <button className="btn btn-sm" disabled={saving} onClick={() => handleSaveToWorkspace('deliverables')} title="存入 .autoforge/deliverables/">
+              <Icon name="folder" size={12} />存入 deliverables
             </button>
           </>
         )}

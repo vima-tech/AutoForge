@@ -1916,7 +1916,7 @@ export default function ConversationsPage() {
   const [idCopied,       setIdCopied]       = useState(false);
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
-  const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
+  const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs' | 'deliverables'>('docs');
   const [wsRefs,         setWsRefs]         = useState<WorkspaceRef[]>([]);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
@@ -2684,7 +2684,7 @@ export default function ConversationsPage() {
                         <Icon name="folder" size={12} style={{ color: 'var(--ember)' }} />
                         工作区文件
                         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-                          {(['docs', 'specs'] as const).map(tab => (
+                          {(['docs', 'specs', 'deliverables'] as const).map(tab => (
                             <button key={tab} onClick={() => setWorkspaceTab(tab)}
                               className="btn btn-sm"
                               style={{ padding: '1px 8px', fontSize: 'var(--text-micro)', background: workspaceTab === tab ? 'var(--ember)' : undefined, color: workspaceTab === tab ? '#fff' : undefined }}>
@@ -2770,7 +2770,7 @@ export default function ConversationsPage() {
                         </div>
                       ))}
                       <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', padding: '4px 8px 8px' }}>
-                        只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/ 和 .autoforge/specs/
+                        只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/、.autoforge/specs/ 和 .autoforge/deliverables/
                       </div>
                     </>
                   )}

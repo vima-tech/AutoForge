@@ -64,7 +64,7 @@
 
 - 合并唯一入口 = review_2 approved（或门控自动放行），且都经"合并前测试门禁"(worktree 上跑、失败阻断)。
 - 所有 git 经 GitProxy;worktree 内 Agent 禁远程 git(`GIT_ALLOW_PROTOCOL=""`)。
-- 工作区写入仅限 `.autoforge/docs|specs`,防 `..` 与 symlink 逃逸。
+- 工作区写入仅限 `.autoforge/docs|specs|deliverables`,防 `..` 与 symlink 逃逸。
 - 外部来源(含 GitHub/webhook/用户输入)必过 `has_obvious_injection` + LLM 安检;不可列为可信源。
 - LLM api_key 永不回传前端;密钥不入日志/事件。
 - 流水线计数在**所有终止路径**平衡(含 auto-merge 跳过 review_2 的支路)。
