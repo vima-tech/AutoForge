@@ -742,21 +742,29 @@ async fn parse_sse_stream(
     //  · 首 token 前（TTFT）：给足 90s 容纳大 prompt 的处理延迟；
     //  · 已收到内容后：正常 SSE 的 token 间隔 < 1s，故 12s 静默即判定生成结束，立即收尾——
     //    把这类网关下「文本已出完却仍空等到总超时」的体验从 ~90s 砍到 ~12s。
-    // 两者都远短于 reqwest 的 120s 总超时。合规网关（有终止符）根本走不到这里。
+    //
+    // ⚠️ 关键：idle 用「绝对截止时间」而非每轮新建的相对 timeout，且**只在收到真正的
+    // `data:` 行时才续期**。否则网关的 keep-alive（SSE 注释行 `:` / 空行 / ping）会让
+    // `stream.next()` 在 idle 窗口内不断返回，每轮都重置一个新的相对 timeout —— 计时器被
+    // 无限续命，生成早已停止却永不触发 idle，任务挂死到天荒地老（reqwest 的总超时对已
+    // 拿到 header 后手动消费的 body 流并不可靠）。绝对截止 + 仅 data 行续期可彻底免疫。
     const TTFT_TIMEOUT: Duration = Duration::from_secs(90);
     const POST_DATA_IDLE: Duration = Duration::from_secs(12);
-    let mut got_data = false;
+    // 截止时刻：首 data 行前用 TTFT，之后每见一条 data 行刷新为 now + POST_DATA_IDLE。
+    let mut deadline = tokio::time::Instant::now() + TTFT_TIMEOUT;
     loop {
-        let idle = if got_data { POST_DATA_IDLE } else { TTFT_TIMEOUT };
-        let chunk = match tokio::time::timeout(idle, stream.next()).await {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break; // 空闲超时：停止读取，调用方按已收内容判定
+        }
+        let chunk = match tokio::time::timeout(deadline - now, stream.next()).await {
             Ok(Some(c)) => c,
             Ok(None) => break,  // 流正常结束（连接关闭）
-            Err(_) => break,    // 空闲超时：停止读取，调用方按已收内容判定
+            Err(_) => break,    // 到达绝对截止：停止读取
         };
         let bytes = chunk.map_err(|e| anyhow!("流式读取失败: {}", e))?;
-        if !bytes.is_empty() {
-            got_data = true;
-        }
+        // 注意：不在此处因「收到任意字节」就续期 —— keep-alive 注释/空行也是字节，
+        // 那样会复现被无限重置的 bug。续期只发生在下方确认是 `data:` 行时。
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // 以换行为界处理完整行，保留最后一段可能不完整的残行。
         while let Some(nl) = buf.find('\n') {
@@ -767,6 +775,8 @@ async fn parse_sse_stream(
             if payload.is_empty() {
                 continue;
             }
+            // 见到真正的 data 行：刷新空闲截止（keep-alive 注释行/空行走不到这里）。
+            deadline = tokio::time::Instant::now() + POST_DATA_IDLE;
             // OpenAI 显式终止符：立即收尾，不再等连接关闭。
             if payload == "[DONE]" {
                 return Ok(());
@@ -1108,6 +1118,29 @@ async fn run_openai_tool_loop_streaming(
             last_text = text.clone();
         }
         if calls.is_empty() {
+            // 兜底：部分模型（Qwen/MIMO/Hermes 系）把工具调用写进正文而非结构化 tool_calls 字段。
+            // 解析并执行，避免把 <tool_call>/<function> 残文当最终答复落库（与非流式工具循环同构）。
+            let textual = parse_textual_tool_calls(&text);
+            if !textual.is_empty() && iter + 1 < MAX_TOOL_ITERS {
+                messages.push(json!({ "role": "assistant", "content": text }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    on_think(ThinkEvent::Tool { summary: tool_action_summary(name, args) });
+                    *emitted = true;
+                    let outcome = registry.invoke(name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[stream] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name, serde_json::to_string(args).unwrap_or_default(), outcome.content
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
             if text.trim().is_empty() {
                 return Err(anyhow!("OpenAI-compatible 流式响应缺少最终 content"));
             }
@@ -1245,6 +1278,28 @@ async fn run_anthropic_tool_loop_streaming(
             last_text = text.clone();
         }
         if calls.is_empty() {
+            // 兜底：非原生 function-calling 模型把工具调用写进正文。解析并执行，避免残文落库。
+            let textual = parse_textual_tool_calls(&text);
+            if !textual.is_empty() && iter + 1 < MAX_TOOL_ITERS {
+                messages.push(json!({ "role": "assistant", "content": text }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    on_think(ThinkEvent::Tool { summary: tool_action_summary(name, args) });
+                    *emitted = true;
+                    let outcome = registry.invoke(name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[stream] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name, serde_json::to_string(args).unwrap_or_default(), outcome.content
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
             if text.trim().is_empty() {
                 return Err(anyhow!("Anthropic 流式响应缺少最终 text"));
             }
