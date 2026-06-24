@@ -157,7 +157,7 @@ src-tauri/                    # Rust 后端
       conversations.rs        # 会议室（对话、成员、附件）
       orchestration.rs        # AI 编排（Planner + 多步骤 Agent 执行）
       project_context.rs      # 项目只读上下文（文件浏览、上下文 pin）
-      workspace.rs            # 项目工作区（.autoforge/docs + specs 读写）
+      workspace.rs            # 项目工作区（.autoforge/docs + specs + deliverables 读写）
       settings.rs             # LLM 配置、Agent 管理
       materials.rs            # 物料库文件管理
       specs.rs                # 项目规格（project_specs 表的 CRUD + AI 生成）
@@ -352,6 +352,9 @@ AutoForge 的长期方向是把 Rust 后端从 Tauri 桌面壳中**解耦为可�
     specs/      # 技术规范库
                 # 接口定义、架构说明、技术方案、测试计划…
                 # Agent 可直接写入；Artifact 块可一键"存入 specs"
+    deliverables/ # 交付产物库
+                # 报告、成果物、演示资料等
+                # Agent 可直接写入；Artifact 块可一键"存入 deliverables"
     claude.md   # （可选）项目级别的 AI 指引，自动注入群聊上下文
     agents.md   # （可选）项目专属 Agent 角色说明，自动注入群聊上下文
 ```
@@ -360,6 +363,7 @@ AutoForge 的长期方向是把 Rust 后端从 Tauri 桌面壳中**解耦为可�
 
 - **docs/** 面向产品/业务：PRD、需求文档、设计决策、会议产物
 - **specs/** 面向技术：接口规范、架构文档、实现方案、测试策略
+- **deliverables/** 面向交付：报告、成果物、演示资料、最终产物
 - **claude.md / agents.md**：每次 AI 任务自动注入，无需手动引用
 - 其他项目文件（代码、配置等）只读注入上下文，不可修改
 
@@ -436,7 +440,7 @@ AutoForge 的长期方向是把 Rust 后端从 Tauri 桌面壳中**解耦为可�
 1. **输入消毒**：所有外部来源的需求经 `core/security::has_obvious_injection()` 过滤
 2. **Git 代理**：所有 git 操作经 `GitProxy`，禁止 push main、force push 等危险命令
 3. **合并唯一入口**：`review_2` command 的 `approved` 分支是唯一触发 merge 的路径
-4. **工作区写入限制**：`workspace.rs` 强制验证写路径必须在 `.autoforge/docs/` 或 `.autoforge/specs/` 内，禁止路径越界（`..` 等）
+4. **工作区写入限制**：`workspace.rs` 强制验证写路径必须在 `.autoforge/docs/`、`.autoforge/specs/` 或 `.autoforge/deliverables/` 内，禁止路径越界（`..` 等）
 5. **附件安全**：白名单 MIME 类型，最大 10 MB，存储时 UUID 化文件名
 6. **API Key 存储**：所有密钥（LLM `api_key`、MCP `env_json`/`headers_json`、`web_search.api_key`）经 `core/secrets.rs` 信封加密落库——主密钥存系统钥匙环（`keyring` crate，无钥匙环时退化为 app 数据目录下 0600 文件），各密钥用 AES-256-GCM 加密为 `enc:v1:` 密文存 SQLite。写入走 `secrets::encrypt_field`，读取走 `secrets::decrypt`（非密文原样透传，兼容旧明文）；启动时 `migrate_plaintext_secrets` 幂等搬迁残留明文。直接打开 .db 看不到明文密钥
 

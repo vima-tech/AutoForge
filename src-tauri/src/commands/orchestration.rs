@@ -11,6 +11,19 @@ use tauri::{AppHandle, State};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+// 会议室「立即编码」草稿：AI 梳理讨论后的结构化需求描述
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodingBrief {
+    pub title: String,
+    pub functional_points: Vec<String>,
+    pub involved_modules: Vec<String>,
+    pub constraints: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub requirement_type: String,
+    pub risk_level: String,
+    pub raw_text: String, // 保留原始文本供编辑
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConversationPlan {
     steps: Vec<ConversationPlanStep>,
@@ -162,19 +175,319 @@ pub async fn draft_coding_brief(
     }
     let agent = load_brief_agent(&state.db).await?;
 
-    let prompt = format!(
-        "下面是一段会议室讨论与项目上下文。请把其中达成的开发意图梳理成一份**清晰、可直接交给\
-         编码 AI 执行的需求工单**，要求：\n\
-         1. 第一行用「标题：<一句话需求标题>」给出标题；\n\
-         2. 随后用要点列表写明：要实现的功能点、涉及的模块/文件范围、关键约束、验收要点；\n\
-         3. 只保留与「本次要编码的需求」直接相关的内容，剔除闲聊与已废弃的设想；\n\
-         4. 用中文，简洁明确，直接给工单，不要反问、不要寒暄、不要解释你在做什么。\n\n\
-         ## 讨论与项目上下文\n{context}"
-    );
+    let prompt = build_brief_prompt(&context);
 
     crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 构造「立即编码」需求梳理的提示词。三个入口（非流式 / 详细 / 流式）共用一份，
+/// 保证不同路径产出的工单结构完全一致。
+fn build_brief_prompt(context: &str) -> String {
+    format!(
+        "下面是一段会议室讨论与项目上下文。请把其中达成的开发意图梳理成一份**清晰、可直接交给\
+         编码 AI 执行的需求工单**。\n\n\
+         ## 输出格式\n\
+         严格按以下结构输出，不要省略任何环节：\n\n\
+         **标题：** <一句话需求标题，简洁有力>\n\n\
+         **功能点与需求：**\n\
+         - <功能点 1：用户故事或具体任务>\n\
+         - <功能点 2>\n\
+         - （如需多项功能，继续列举）\n\n\
+         **涉及的模块与文件：**\n\
+         根据讨论推断可能需要修改的关键模块/文件路径（如 src/pages/Dashboard.tsx, src-tauri/src/commands/issues.rs 等）。\n\
+         - <模块/文件 1>\n\
+         - <模块/文件 2>\n\
+         - （列出最可能受影响的 3-5 个关键点）\n\n\
+         **关键约束与技术考量：**\n\
+         - 列举讨论中提及的设计约束、兼容性需求、性能要求等\n\n\
+         **验收要点：**\n\
+         - 描述如何判断功能已正确实现\n\n\
+         **需求类型：** <功能新增 | 功能改进 | Bug修复 | 重构优化 | 其他>\n\
+         **初步风险等级：** <低 | 中 | 高>\n\n\
+         ## 输出原则\n\
+         1. 只保留与「本次要编码的需求」直接相关的内容，剔除闲聊与已废弃的设想。\n\
+         2. 推断（而非直译）讨论意图——从对话中读出隐含的功能需求。\n\
+         3. 涉及的文件与模块要基于讨论背景与项目结构推测，帮助编码 AI 快速定位。\n\
+         4. 用中文，简洁明确，直接给工单——不要反问、不要寒暄、不要解释你在做什么。\n\n\
+         ## 讨论与项目上下文\n{context}"
+    )
+}
+
+/// 从标记文本中提取 markdown 列表项
+fn extract_list_items(text: &str, start_marker: &str, end_marker: Option<&str>) -> Vec<String> {
+    let mut items = Vec::new();
+    if let Some(start) = text.find(start_marker) {
+        let after = &text[start + start_marker.len()..];
+        let end = if let Some(m) = end_marker {
+            after.find(m).unwrap_or(after.len())
+        } else {
+            after.len()
+        };
+        let section = &after[..end];
+        for line in section.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('-') || trimmed.starts_with('•') || trimmed.starts_with('*') {
+                let item = trimmed[1..].trim().to_string();
+                if !item.is_empty() && !item.starts_with('（') {
+                    items.push(item);
+                }
+            }
+        }
+    }
+    items
+}
+
+/// 提取简单的字段值（用于「字段：值」格式）
+fn extract_field(text: &str, field_name: &str) -> String {
+    let patterns = vec![
+        format!("**{}[：:] **", field_name),
+        format!("{}[：:]", field_name),
+        format!("**{}**[：:]", field_name),
+    ];
+    for pattern in patterns {
+        for line in text.lines() {
+            if line.contains(&pattern.replace("[：:]", ":")) || line.contains(&pattern.replace("[：:]", "：")) {
+                if let Some(colon_pos) = line.find(':').or_else(|| line.find('：')) {
+                    let value = line[colon_pos + 1..].trim().replace("**", "").trim().to_string();
+                    if !value.is_empty() {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// 根据需求的特征精化风险评估：考虑涉及的模块数、关键字、复杂度等
+fn refine_risk_assessment(brief: &CodingBrief) -> String {
+    let mut risk_score: i32 = 0;
+
+    // 1. 涉及模块数：超过 5 个模块为高风险
+    if brief.involved_modules.len() > 5 {
+        risk_score += 3;
+    } else if brief.involved_modules.len() > 2 {
+        risk_score += 2;
+    }
+
+    // 2. 功能点数：超过 5 个为高风险
+    if brief.functional_points.len() > 5 {
+        risk_score += 2;
+    }
+
+    // 3. 约束数：多个约束可能增加复杂度
+    if brief.constraints.len() > 3 {
+        risk_score += 1;
+    }
+
+    // 4. 关键字检测：某些操作词暗示高风险
+    let content = format!(
+        "{} {} {} {} {}",
+        brief.title,
+        brief.functional_points.join(" "),
+        brief.involved_modules.join(" "),
+        brief.constraints.join(" "),
+        brief.requirement_type
+    );
+
+    let high_risk_keywords = vec![
+        "重构", "迁移", "删除", "大规模", "底层", "API", "权限",
+        "安全", "性能优化", "并发", "分布式", "数据库", "核心",
+    ];
+    for keyword in high_risk_keywords {
+        if content.contains(keyword) {
+            risk_score += 2;
+            break; // 避免重复计分
+        }
+    }
+
+    let medium_risk_keywords = vec!["修改", "改进", "重新设计", "兼容"];
+    for keyword in medium_risk_keywords {
+        if content.contains(keyword) {
+            risk_score += 1;
+            break;
+        }
+    }
+
+    // 5. 需求类型：修复通常低风险，新增中等风险，重构高风险
+    match brief.requirement_type.as_str() {
+        "重构优化" => risk_score += 2,
+        "Bug修复" => risk_score = risk_score.saturating_sub(1),
+        "功能新增" => risk_score += 1,
+        _ => {}
+    }
+
+    // 计算最终风险等级
+    if risk_score >= 5 {
+        "高".to_string()
+    } else if risk_score >= 3 {
+        "中".to_string()
+    } else {
+        "低".to_string()
+    }
+}
+
+/// 会议室「立即编码」详细版（内部用）：返回结构化的代码草稿，前端用于展示预览信息。
+fn parse_coding_brief(text: &str) -> CodingBrief {
+    let mut brief = CodingBrief {
+        title: String::new(),
+        functional_points: Vec::new(),
+        involved_modules: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        requirement_type: "其他".to_string(),
+        risk_level: "中".to_string(),
+        raw_text: text.to_string(),
+    };
+
+    // 提取标题
+    for line in text.lines() {
+        if line.contains("标题") && (line.contains("：") || line.contains(":")) {
+            if let Some(colon_pos) = line.find(':').or_else(|| line.find('：')) {
+                let title = line[colon_pos + 1..].trim().replace("**", "").trim().to_string();
+                if !title.is_empty() {
+                    brief.title = title;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 提取功能点
+    brief.functional_points = extract_list_items(text, "功能点与需求", Some("涉及的模块"));
+    if brief.functional_points.is_empty() {
+        brief.functional_points = extract_list_items(text, "**功能点与需求**", Some("**涉及"));
+    }
+
+    // 提取涉及的模块与文件
+    brief.involved_modules = extract_list_items(text, "涉及的模块与文件", Some("关键约束"));
+    if brief.involved_modules.is_empty() {
+        brief.involved_modules = extract_list_items(text, "相关文件", Some("约束"));
+    }
+
+    // 提取约束和技术考量
+    brief.constraints = extract_list_items(text, "关键约束与技术考量", Some("验收要点"));
+    if brief.constraints.is_empty() {
+        brief.constraints = extract_list_items(text, "技术考量", Some("验收"));
+    }
+
+    // 提取验收要点
+    brief.acceptance_criteria = extract_list_items(text, "验收要点", Some("需求类型"));
+    if brief.acceptance_criteria.is_empty() {
+        brief.acceptance_criteria = extract_list_items(text, "验收标准", Some("需求"));
+    }
+
+    // 提取需求类型
+    brief.requirement_type = extract_field(text, "需求类型");
+    if brief.requirement_type.is_empty() {
+        brief.requirement_type = "其他".to_string();
+    }
+
+    // 提取风险等级
+    brief.risk_level = extract_field(text, "初步风险等级");
+    if brief.risk_level.is_empty() {
+        brief.risk_level = extract_field(text, "风险等级");
+    }
+    if brief.risk_level.is_empty() {
+        brief.risk_level = "中".to_string();
+    }
+
+    brief
+}
+
+/// 会议室「立即编码」详细版：返回结构化代码草稿，含标题、功能点、文件范围、风险等级等。
+/// 前端用这些数据展示预览信息，让操作者清晰了解背景。
+#[tauri::command]
+pub async fn draft_coding_brief_detailed(
+    conversation_id: String,
+    window_size: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<CodingBrief, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+    let prompt = build_brief_prompt(&context);
+
+    let text = crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut brief = parse_coding_brief(&text);
+    // 根据需求特征精化风险评估
+    brief.risk_level = refine_risk_assessment(&brief);
+    Ok(brief)
+}
+
+/// 会议室「立即编码」流式版：边生成边把 AI 的思考增量通过 `CodingBriefChunk` 事件推给前端，
+/// 消除「干等」的等待感；生成结束后解析为结构化 `CodingBrief` 返回。前端订阅事件实时滚动日志，
+/// promise resolve 时拿到结构化结果填表。
+#[tauri::command]
+pub async fn draft_coding_brief_stream(
+    conversation_id: String,
+    window_size: Option<i64>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodingBrief, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+    let prompt = build_brief_prompt(&context);
+
+    // 每段增量转成 CodingBriefChunk 事件发射。闭包只捕获 AppHandle + conversation_id，
+    // 业务逻辑（llm.rs）仍对 Tauri 无感知——事件出口唯一走 event::emit。
+    let app_for_chunk = app.clone();
+    let conv_for_chunk = conversation_id.clone();
+    let mut on_chunk = move |chunk: &str| {
+        event::emit(
+            &app_for_chunk,
+            event::AppEvent::CodingBriefChunk {
+                conversation_id: conv_for_chunk.clone(),
+                chunk: chunk.to_string(),
+            },
+        );
+    };
+
+    let text = crate::agents::llm::run_agent_text_streaming(
+        &state.db,
+        &agent,
+        &prompt,
+        None,
+        &mut on_chunk,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut brief = parse_coding_brief(&text);
+    brief.risk_level = refine_risk_assessment(&brief);
+    Ok(brief)
 }
 
 /// 会议室「立即编码」入参：操作者在确认弹窗里给出标题 + 功能点工单（可由 `draft_coding_brief`

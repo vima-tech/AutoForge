@@ -659,6 +659,688 @@ async fn run_anthropic(
     text.ok_or_else(|| anyhow!("Anthropic 响应缺少 content[].text"))
 }
 
+// ── 流式文本生成（供「立即编码」实时思考日志） ──────────────────────────────
+//
+// 设计：保持 llm.rs 纯 Rust（零 Tauri）。流式增量通过 `on_chunk` 回调交给调用方
+// （命令层捕获 AppHandle 后转成 AppEvent 发射），本模块不感知事件系统。
+// 仅 openai / anthropic 两种 wire 格式走真流式（SSE）；未绑定 LLM / 绑定 Claude CLI
+// 时回退到非流式单次调用，把整段结果作为一个 chunk 回调，保证调用方逻辑统一。
+
+/// 流式文本生成：边生成边通过 `on_chunk` 回调吐出增量，返回完整文本。
+/// `on_chunk` 必须 `Send`（在 tokio 任务里跨 await 调用）。
+pub async fn run_agent_text_streaming(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    // 未绑定自定义 LLM（走本地 claude CLI）：无流式接口，回退非流式后整段回调。
+    let Some(llm_id) = &agent.llm_id else {
+        let text =
+            crate::agents::local_claude::run_text_with_images(prompt, system_prompt, &[]).await?;
+        on_chunk(&text);
+        return Ok(text);
+    };
+
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key).map_err(|e| anyhow!(e))?;
+    if !cfg.enabled {
+        return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
+    }
+
+    let t0 = std::time::Instant::now();
+    let result = match cfg.api_spec.to_ascii_lowercase().as_str() {
+        "anthropic" => run_anthropic_stream(&cfg, prompt, system_prompt, on_chunk).await,
+        _ => run_openai_stream(&cfg, prompt, system_prompt, on_chunk).await,
+    };
+
+    // trace：流式只在结束时落一条完整记录（增量已实时给了前端）。
+    let spec = if cfg.api_spec.eq_ignore_ascii_case("anthropic") { "anthropic" } else { "openai" };
+    let latency = t0.elapsed().as_millis() as i64;
+    match &result {
+        Ok(text) => {
+            crate::core::trace::record_llm(
+                spec, &cfg.model, system_prompt, prompt, text, "ok",
+                None, None, None, None, latency, None,
+            )
+            .await;
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                spec, &cfg.model, system_prompt, prompt, "", "error",
+                Some(&e.to_string()), None, None, None, latency, None,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+/// 解析 SSE 字节流：按行切分，对每个 `data: <payload>` 行调用 `handle`。
+/// `handle` 返回 `true` 表示「流已结束、应立即停止读取」（如 Anthropic 的 `message_stop`）。
+/// OpenAI 的 `[DONE]` 终止符由本函数直接识别并返回——**这一步至关重要**：很多网关在
+/// `data: [DONE]` 后并不关闭底层连接（keep-alive），若不主动 break，`stream.next()` 会一直
+/// 阻塞到 120s 超时，表现为「结果已出但任务迟迟不结束、取消无反应」。维护跨 chunk 残行缓冲。
+async fn parse_sse_stream(
+    resp: reqwest::Response,
+    mut handle: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("LLM HTTP {}: {}", status_code(status), trim_body(&text)));
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    // 两段式空闲超时兜底：应对「既不发 [DONE]/finish_reason、也不关连接」的非合规网关。
+    //  · 首 token 前（TTFT）：给足 90s 容纳大 prompt 的处理延迟；
+    //  · 已收到内容后：正常 SSE 的 token 间隔 < 1s，故 12s 静默即判定生成结束，立即收尾——
+    //    把这类网关下「文本已出完却仍空等到总超时」的体验从 ~90s 砍到 ~12s。
+    //
+    // ⚠️ 关键：idle 用「绝对截止时间」而非每轮新建的相对 timeout，且**只在收到真正的
+    // `data:` 行时才续期**。否则网关的 keep-alive（SSE 注释行 `:` / 空行 / ping）会让
+    // `stream.next()` 在 idle 窗口内不断返回，每轮都重置一个新的相对 timeout —— 计时器被
+    // 无限续命，生成早已停止却永不触发 idle，任务挂死到天荒地老（reqwest 的总超时对已
+    // 拿到 header 后手动消费的 body 流并不可靠）。绝对截止 + 仅 data 行续期可彻底免疫。
+    const TTFT_TIMEOUT: Duration = Duration::from_secs(90);
+    const POST_DATA_IDLE: Duration = Duration::from_secs(12);
+    // 截止时刻：首 data 行前用 TTFT，之后每见一条 data 行刷新为 now + POST_DATA_IDLE。
+    let mut deadline = tokio::time::Instant::now() + TTFT_TIMEOUT;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break; // 空闲超时：停止读取，调用方按已收内容判定
+        }
+        let chunk = match tokio::time::timeout(deadline - now, stream.next()).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,  // 流正常结束（连接关闭）
+            Err(_) => break,    // 到达绝对截止：停止读取
+        };
+        let bytes = chunk.map_err(|e| anyhow!("流式读取失败: {}", e))?;
+        // 注意：不在此处因「收到任意字节」就续期 —— keep-alive 注释/空行也是字节，
+        // 那样会复现被无限重置的 bug。续期只发生在下方确认是 `data:` 行时。
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        // 以换行为界处理完整行，保留最后一段可能不完整的残行。
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_string();
+            buf.drain(..=nl);
+            let Some(payload) = line.strip_prefix("data:") else { continue };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            // 见到真正的 data 行：刷新空闲截止（keep-alive 注释行/空行走不到这里）。
+            deadline = tokio::time::Instant::now() + POST_DATA_IDLE;
+            // OpenAI 显式终止符：立即收尾，不再等连接关闭。
+            if payload == "[DONE]" {
+                return Ok(());
+            }
+            if handle(payload) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_openai_stream(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    let client = http_client()?;
+    let mut messages = Vec::new();
+    if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({ "role": "user", "content": prompt }));
+
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&json!({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "stream": true
+        }));
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+
+    let resp = req.send().await?;
+    let mut full = String::new();
+    parse_sse_stream(resp, |payload| {
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(delta) = v
+                .pointer("/choices/0/delta/content")
+                .and_then(|c| c.as_str())
+            {
+                if !delta.is_empty() {
+                    full.push_str(delta);
+                    on_chunk(delta);
+                }
+            }
+            // finish_reason 非空表示本次生成结束（[DONE] 之外的双保险）。
+            if v.pointer("/choices/0/finish_reason")
+                .map(|r| !r.is_null())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await?;
+
+    if full.trim().is_empty() {
+        return Err(anyhow!("OpenAI-compatible 流式响应为空"));
+    }
+    Ok(full.trim().to_string())
+}
+
+async fn run_anthropic_stream(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    let client = http_client()?;
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        body["system"] = anthropic_system_cached(system);
+    }
+
+    let resp = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await?;
+
+    let mut full = String::new();
+    parse_sse_stream(resp, |payload| {
+        // Anthropic 流式：content_block_delta 事件携带 delta.text 增量。
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(delta) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                if !delta.is_empty() {
+                    full.push_str(delta);
+                    on_chunk(delta);
+                }
+            }
+            // message_stop 事件表示整条消息结束 → 主动收尾，不等连接关闭。
+            if v.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
+                return true;
+            }
+        }
+        false
+    })
+    .await?;
+
+    if full.trim().is_empty() {
+        return Err(anyhow!("Anthropic 流式响应为空"));
+    }
+    Ok(full.trim().to_string())
+}
+
+// ── 带工具的流式文本生成（供会议室 Agent 回复的「实时活动流」） ────────────────
+//
+// 设计取舍：**不改写**久经考验的非流式工具循环（`run_*_tool_loop`），而是新增一条
+// 流式路径，把每一轮模型响应改走 SSE：正文 token 实时回调（`ThinkEvent::Token`），
+// 工具调用实时回调动作（`ThinkEvent::Tool`），工具结果回灌后续轮。任何一轮请求启动失败
+// （HTTP 错误 / 端点不支持 tools / 尚未吐出任何增量）即整体回退到非流式
+// `run_agent_text_with_tools`，把完整结果作为一个 token 块补发——保证「带流式反而答不出」
+// 不会比原来更糟（与既有 `degraded_no_tools` 降级同理）。llm.rs 仍保持纯 Rust、零 Tauri：
+// 事件出口由命令层用 `on_think` 闭包转成 `AppEvent`。
+
+/// 流式「思考」增量事件，交给调用方（命令层）转成 `AppEvent::AgentThinking`。
+pub enum ThinkEvent {
+    /// 回复正文的逐字增量。
+    Token(String),
+    /// Agent 正在执行的一次工具调用（已归一为可读动作描述）。
+    Tool { summary: String },
+}
+
+/// 由工具名 + 入参生成一句可读的「正在做什么」，用于实时活动流展示（如「检索代码「登录」」）。
+/// 未知工具（含外部 MCP）回退为「调用工具 <name>」。
+fn tool_action_summary(name: &str, args: &Value) -> String {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    match name {
+        "read_project_file" => format!("阅读文件 {}", s("path")),
+        "search_project_code" => format!("检索代码「{}」", s("query")),
+        "list_project_files" => {
+            let p = s("path");
+            if p.is_empty() { "浏览项目文件".to_string() } else { format!("浏览目录 {}", p) }
+        }
+        "read_spec" => {
+            let t = s("title");
+            format!("查阅规格 {}", if t.is_empty() { s("category") } else { t })
+        }
+        "list_specs" => "查阅项目规格".to_string(),
+        "web_search" => format!("联网搜索「{}」", s("query")),
+        "recall_memory" => "检索历史经验".to_string(),
+        "locate_symbol" => format!("定位符号 {}", s("symbol")),
+        "find_callers" => format!("分析调用者 {}", s("symbol")),
+        "impact_analysis" => format!("评估影响面 {}", s("symbol")),
+        _ => format!("调用工具 {}", name),
+    }
+}
+
+/// 带工具的流式文本生成（公开入口）：与 [`run_agent_text_with_tools`] 同构，但把模型生成
+/// 实时回调给 `on_think`。失败 / 不适用时回退到非流式实现并把整段结果作为一个 token 补发。
+/// 返回完整最终正文（用于落库 + 解析 `<write-file>`），与非流式版语义一致。
+pub async fn run_agent_text_with_tools_streaming(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+) -> Result<String> {
+    crate::core::trace::scope_run(db, agent, async {
+        let t0 = std::time::Instant::now();
+        let result = run_agent_text_with_tools_streaming_inner(
+            db, agent, prompt, system_prompt, image_paths, registry, on_think,
+        )
+        .await;
+        let (status, output, error) = match &result {
+            Ok(s) => ("ok", s.clone(), None),
+            Err(e) => ("error", String::new(), Some(e.to_string())),
+        };
+        crate::core::trace::record_root(
+            prompt, system_prompt, &output, status, error.as_deref(),
+            t0.elapsed().as_millis() as i64, None,
+        )
+        .await;
+        result
+    })
+    .await
+}
+
+async fn run_agent_text_with_tools_streaming_inner(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+) -> Result<String> {
+    // 无工具 / 无自定义 LLM：直接走真流式单轮（token 实时回调），覆盖纯聊天 Agent。
+    if registry.is_empty() && image_paths.is_empty() {
+        let mut cb = |c: &str| on_think(ThinkEvent::Token(c.to_string()));
+        return run_agent_text_streaming(db, agent, prompt, system_prompt, &mut cb).await;
+    }
+    // 带图片：流式 tool 循环不内联图片，回退非流式（含 vision 处理），整段作为一个 token 补发。
+    if !image_paths.is_empty() || agent.llm_id.is_none() {
+        let text = run_agent_text_with_tools(db, agent, prompt, system_prompt, image_paths, registry).await?;
+        on_think(ThinkEvent::Token(text.clone()));
+        return Ok(text);
+    }
+
+    let llm_id = agent.llm_id.as_ref().unwrap();
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key).map_err(|e| anyhow!(e))?;
+    if !cfg.enabled {
+        return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
+    }
+
+    let spec = cfg.api_spec.to_ascii_lowercase();
+    // 是否已向前端吐出过增量：决定出错时能否安全回退（已吐出则不再重跑，避免重复显示）。
+    let mut emitted = false;
+    let loop_result = if spec == "anthropic" {
+        run_anthropic_tool_loop_streaming(&cfg, prompt, system_prompt, registry, on_think, &mut emitted).await
+    } else {
+        run_openai_tool_loop_streaming(&cfg, prompt, system_prompt, registry, on_think, &mut emitted).await
+    };
+
+    match loop_result {
+        Ok(text) => Ok(text),
+        Err(e) if !emitted => {
+            // 尚未吐出任何增量 → 安全回退到非流式实现（保留全部健壮性），整段作为一个 token 补发。
+            eprintln!(
+                "[stream] 流式工具循环失败，回退非流式（agent={}, spec={}): {}",
+                agent.name, spec, e
+            );
+            let text = run_agent_text_with_tools(db, agent, prompt, system_prompt, image_paths, registry).await?;
+            on_think(ThinkEvent::Token(text.clone()));
+            Ok(text)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 单轮 OpenAI 流式（带 tools）：实时回调正文 token，并从增量里拼装 tool_calls。
+/// 返回 (本轮正文, 工具调用列表 [(id, name, arguments_json_str)])。
+async fn openai_stream_round(
+    cfg: &LlmConfig,
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    with_tools: bool,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<(String, Vec<(String, String, String)>)> {
+    let mut payload = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    if with_tools {
+        payload["tools"] = json!(tools);
+        payload["tool_choice"] = json!("auto");
+    }
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&payload);
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+    let resp = req.send().await?;
+
+    let mut text = String::new();
+    // index -> (id, name, arguments)；OpenAI 工具调用增量按 index 分片累积。
+    let mut tcs: std::collections::BTreeMap<i64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    parse_sse_stream(resp, |payload| {
+        let v = match serde_json::from_str::<Value>(payload) { Ok(v) => v, Err(_) => return false };
+        if let Some(d) = v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+            if !d.is_empty() {
+                text.push_str(d);
+                *emitted = true;
+                on_think(ThinkEvent::Token(d.to_string()));
+            }
+        }
+        if let Some(arr) = v.pointer("/choices/0/delta/tool_calls").and_then(|c| c.as_array()) {
+            for tc in arr {
+                let idx = tc.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let e = tcs.entry(idx).or_default();
+                if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                    if !id.is_empty() { e.0 = id.to_string(); }
+                }
+                if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                    if !n.is_empty() { e.1.push_str(n); }
+                }
+                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                    e.2.push_str(a);
+                }
+            }
+        }
+        v.pointer("/choices/0/finish_reason")
+            .map(|r| !r.is_null())
+            .unwrap_or(false)
+    })
+    .await?;
+    Ok((text, tcs.into_values().collect()))
+}
+
+/// OpenAI 流式工具循环：与 `run_openai_tool_loop` 同构但每轮走 SSE。耗尽 / 末轮直接以
+/// 已流式吐出的正文作答（不再二次合成，避免重复显示）。
+async fn run_openai_tool_loop_streaming(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<String> {
+    let client = http_client()?;
+    let tools = openai_tools(registry);
+    let mut messages: Vec<Value> = vec![
+        json!({ "role": "system", "content": compose_tool_system(system_prompt) }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+    let mut last_text = String::new();
+
+    for iter in 0..MAX_TOOL_ITERS {
+        let (text, calls) =
+            openai_stream_round(cfg, &client, &messages, &tools, true, on_think, emitted).await?;
+        if !text.trim().is_empty() {
+            last_text = text.clone();
+        }
+        if calls.is_empty() {
+            // 兜底：部分模型（Qwen/MIMO/Hermes 系）把工具调用写进正文而非结构化 tool_calls 字段。
+            // 解析并执行，避免把 <tool_call>/<function> 残文当最终答复落库（与非流式工具循环同构）。
+            let textual = parse_textual_tool_calls(&text);
+            if !textual.is_empty() && iter + 1 < MAX_TOOL_ITERS {
+                messages.push(json!({ "role": "assistant", "content": text }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    on_think(ThinkEvent::Tool { summary: tool_action_summary(name, args) });
+                    *emitted = true;
+                    let outcome = registry.invoke(name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[stream] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name, serde_json::to_string(args).unwrap_or_default(), outcome.content
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
+            if text.trim().is_empty() {
+                return Err(anyhow!("OpenAI-compatible 流式响应缺少最终 content"));
+            }
+            return Ok(text.trim().to_string());
+        }
+        // 助手回合（含 tool_calls）原样回灌，否则下一轮无法对应工具结果。
+        let tool_calls_json: Vec<Value> = calls
+            .iter()
+            .map(|(id, name, args)| {
+                json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args } })
+            })
+            .collect();
+        messages.push(json!({ "role": "assistant", "content": text, "tool_calls": tool_calls_json }));
+        for (id, name, args) in &calls {
+            let parsed = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+            on_think(ThinkEvent::Tool { summary: tool_action_summary(name, &parsed) });
+            *emitted = true;
+            let outcome = registry.invoke(name, parsed).await;
+            if !outcome.ok {
+                eprintln!("[stream] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+            }
+            messages.push(json!({ "role": "tool", "tool_call_id": id, "content": outcome.content }));
+        }
+        let _ = iter;
+    }
+    // 轮数耗尽：附收口指令，再走一轮无 tools 的流式请求逼模型直接作答（仍是真流式）。
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let (text, _) =
+        openai_stream_round(cfg, &client, &messages, &tools, false, on_think, emitted).await?;
+    Some(text.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(last_text.trim().to_string()).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，流式收口仍无正文", MAX_TOOL_ITERS))
+}
+
+/// 单轮 Anthropic 流式（带 tools）：实时回调正文 token，并从 content_block 增量拼装 tool_use。
+/// 返回 (本轮正文, 工具调用列表 [(id, name, input_json_str)])。
+async fn anthropic_stream_round(
+    cfg: &LlmConfig,
+    client: &reqwest::Client,
+    messages: &[Value],
+    system: &str,
+    tools: &[Value],
+    with_tools: bool,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<(String, Vec<(String, String, String)>)> {
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    body["system"] = anthropic_system_cached(system);
+    if with_tools {
+        body["tools"] = json!(tools);
+    }
+    let resp = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await?;
+
+    let mut text = String::new();
+    // content index -> (id, name, partial_json)；仅 tool_use 块入表。
+    let mut tools_acc: std::collections::BTreeMap<i64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    parse_sse_stream(resp, |payload| {
+        let Ok(v) = serde_json::from_str::<Value>(payload) else { return false };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_start") => {
+                let idx = v.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let cb = v.get("content_block");
+                if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = cb.and_then(|c| c.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let name = cb.and_then(|c| c.get("name")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    tools_acc.insert(idx, (id, name, String::new()));
+                }
+            }
+            Some("content_block_delta") => {
+                let idx = v.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let d = v.get("delta");
+                match d.and_then(|x| x.get("type")).and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(t) = d.and_then(|x| x.get("text")).and_then(|x| x.as_str()) {
+                            if !t.is_empty() {
+                                text.push_str(t);
+                                *emitted = true;
+                                on_think(ThinkEvent::Token(t.to_string()));
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(p) = d.and_then(|x| x.get("partial_json")).and_then(|x| x.as_str()) {
+                            if let Some(e) = tools_acc.get_mut(&idx) { e.2.push_str(p); }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // message_stop 表示整条消息结束 → 主动收尾，不等连接关闭。
+            Some("message_stop") => return true,
+            _ => {}
+        }
+        false
+    })
+    .await?;
+    Ok((text, tools_acc.into_values().collect()))
+}
+
+/// Anthropic 流式工具循环：与 `run_anthropic_tool_loop` 同构但每轮走 SSE。
+async fn run_anthropic_tool_loop_streaming(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<String> {
+    let client = http_client()?;
+    let tools = anthropic_tools(registry);
+    let system = compose_tool_system(system_prompt);
+    let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": prompt })];
+    let mut last_text = String::new();
+
+    for iter in 0..MAX_TOOL_ITERS {
+        let (text, calls) = anthropic_stream_round(
+            cfg, &client, &messages, &system, &tools, true, on_think, emitted,
+        )
+        .await?;
+        if !text.trim().is_empty() {
+            last_text = text.clone();
+        }
+        if calls.is_empty() {
+            // 兜底：非原生 function-calling 模型把工具调用写进正文。解析并执行，避免残文落库。
+            let textual = parse_textual_tool_calls(&text);
+            if !textual.is_empty() && iter + 1 < MAX_TOOL_ITERS {
+                messages.push(json!({ "role": "assistant", "content": text }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    on_think(ThinkEvent::Tool { summary: tool_action_summary(name, args) });
+                    *emitted = true;
+                    let outcome = registry.invoke(name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[stream] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name, serde_json::to_string(args).unwrap_or_default(), outcome.content
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
+            if text.trim().is_empty() {
+                return Err(anyhow!("Anthropic 流式响应缺少最终 text"));
+            }
+            return Ok(text.trim().to_string());
+        }
+        // 助手回合（text 块 + tool_use 块）原样回灌。
+        let mut content: Vec<Value> = Vec::new();
+        if !text.trim().is_empty() {
+            content.push(json!({ "type": "text", "text": text }));
+        }
+        for (id, name, args) in &calls {
+            let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+            content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
+        }
+        messages.push(json!({ "role": "assistant", "content": content }));
+        let mut results: Vec<Value> = Vec::new();
+        for (id, name, args) in &calls {
+            let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+            on_think(ThinkEvent::Tool { summary: tool_action_summary(name, &input) });
+            *emitted = true;
+            let outcome = registry.invoke(name, input).await;
+            if !outcome.ok {
+                eprintln!("[stream] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+            }
+            results.push(json!({ "type": "tool_result", "tool_use_id": id, "content": outcome.content }));
+        }
+        messages.push(json!({ "role": "user", "content": results }));
+        let _ = iter;
+    }
+    // 轮数耗尽：附收口指令，再走一轮无 tools 的流式请求逼模型直接作答。
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let (text, _) = anthropic_stream_round(
+        cfg, &client, &messages, &system, &tools, false, on_think, emitted,
+    )
+    .await?;
+    Some(text.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(last_text.trim().to_string()).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，流式收口仍无正文", MAX_TOOL_ITERS))
+}
+
 /// 工具循环提醒语：当 Agent 有可用工具却只回了「我去看看…」这类未兑现前导语、且未发出工具调用时，
 /// 用它促模型立即真正调用工具或直接给出完整答复，避免把空口承诺当最终回复返回。
 const TOOL_NUDGE: &str = "你刚才表示要进一步查看/检索/分析，但本轮没有实际调用任何工具。你现在就有可用工具（如 read_project_file / search_project_code / list_project_files 等）——请**立即调用**所需工具获取信息后再作答；若已掌握足够信息，请直接输出完整的最终答复，不要只描述你打算做什么。";

@@ -120,6 +120,13 @@ pub enum AppEvent {
         key: String,
         chunk: String,
     },
+    /// 会议室「立即编码」AI 梳理需求时的流式思考增量。`conversation_id` 标识哪个会议室
+    /// 的弹窗在等待，前端据此实时累积显示 AI 的思考过程，消除「干等」的等待感。
+    /// 高频 UI-only：不进通知收件箱、不归并 CR 线程。
+    CodingBriefChunk {
+        conversation_id: String,
+        chunk: String,
+    },
 }
 
 impl AppEvent {
