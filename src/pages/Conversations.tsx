@@ -1486,7 +1486,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
                     ? <Icon name="check" size={13} />
                     : <Icon name="zap" size={13} />}
                 <span>{active ? runLabel : doneNow ? '已完成' : '快捷操作'}</span>
-                <Icon name="chevron-down" size={12} style={{ opacity: 0.6 }} />
+                <Icon name="chevron" size={12} style={{ opacity: 0.6 }} />
               </button>
               {showQuickMenu && (
                 <div className="mention-pop" style={{ bottom: '100%', marginBottom: 4 }}>
