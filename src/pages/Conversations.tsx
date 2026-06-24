@@ -488,6 +488,7 @@ function CodeNowModal({ conversationId, onClose, onError }: {
   const [thinkLog, setThinkLog] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [viewMode, setViewMode] = useState<'preview' | 'edit'>('preview');
+  const [showThink, setShowThink] = useState(false);
   const thinkLogRef = useRef<HTMLDivElement>(null);
   // 组件卸载标记：避免流式 promise 在弹窗已关闭后还 setState（取消后仍「运行中」的根因之一）。
   const aliveRef = useRef(true);
@@ -730,15 +731,55 @@ function CodeNowModal({ conversationId, onClose, onError }: {
                   )}
                 </div>
 
-                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                {/* 可折叠：回看 AI 的原始思考过程（即便上游缓冲、token 一次性涌来也能复查） */}
+                {thinkLog.trim() && (
+                  <div style={{ marginTop: 10 }}>
+                    <button
+                      type="button"
+                      onClick={() => setShowThink(v => !v)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'var(--text-3)', fontSize: 'var(--text-caption)' }}
+                    >
+                      <Icon name={showThink ? 'chevron-down' : 'chevron-right'} size={13} />
+                      <span>AI 思考过程</span>
+                    </button>
+                    {showThink && (
+                      <div style={{
+                        marginTop: 8,
+                        maxHeight: 200,
+                        overflowY: 'auto',
+                        padding: 12,
+                        background: 'var(--code-bg)',
+                        borderRadius: 'var(--radius)',
+                        border: '1px solid var(--border)',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 'var(--text-caption)',
+                        lineHeight: 'var(--leading-relaxed)',
+                        color: 'var(--text-3)',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}>
+                        {thinkLog}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
                   <Icon name="layers" size={13} />
                   <span>将自动附带最近会话快照与项目上下文文档作为编码背景</span>
                 </div>
               </div>
             )}
 
-            <div style={{ padding: '14px 20px 18px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-              <button className="btn" onClick={onClose} disabled={submitting}>取消</button>
+            <div style={{ padding: '14px 20px 18px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+              {/* 重新梳理：结果不满意时一键重跑，无需关弹窗重开（梳理中禁用） */}
+              {!drafting && briefData && (
+                <button className="btn btn-ghost btn-sm" onClick={handleDraft} disabled={submitting} title="据当前讨论重新梳理需求">
+                  <Icon name="refresh" size={14} />
+                  <span>重新梳理</span>
+                </button>
+              )}
+              <button className="btn" style={{ marginLeft: 'auto' }} onClick={onClose} disabled={submitting}>取消</button>
               <button className="btn btn-primary" onClick={handleStart} disabled={submitting || drafting || !title.trim() || !brief.trim()}>
                 {submitting ? <Icon name="refresh" size={15} className="spin" /> : <Icon name="zap" size={15} />}
                 <span>{submitting ? '创建中…' : '创建需求并开始编码'}</span>
@@ -2198,6 +2239,9 @@ export default function ConversationsPage() {
   // 任务活动态：驱动「正在思考」气泡 + 顶部状态条；running 常驻，done/error 短暂闪现后自动清除。
   const [activity,       setActivity]       = useState<{ phase: 'running' | 'done' | 'error'; label: string } | null>(null);
   const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 实时活动流：会议室 Agent 回复时的真实思考过程，按 run_id 分流（并行步骤里多个 Agent 同时发言）。
+  // text=回复正文逐字累积；actions=Agent 的工具动作（检索代码/读文件…）。done 事件撤下卡片。
+  const [thinking, setThinking] = useState<Record<string, { agentId: string; agentName: string; actions: string[]; text: string }>>({});
   // 发送回执：刚发出的「我」消息短暂显示「已送达」。
   const [justSentId,     setJustSentId]     = useState('');
   const sentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2320,6 +2364,7 @@ export default function ConversationsPage() {
     setBubbleMenu(null);
     setEditGroup(null);
     setActivity(null);
+    setThinking({});
     setJustSentId('');
     setWsRefs([]);
   }, [active]);
@@ -2341,13 +2386,30 @@ export default function ConversationsPage() {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     listen<unknown>('autoforge://event', e => {
-      const ev = e.payload as { type?: string; conversation_id?: string; status?: string };
+      const ev = e.payload as { type?: string; conversation_id?: string; status?: string; run_id?: string; agent_id?: string; agent_name?: string; kind?: string; text?: string };
+      // 实时活动流：高频思考增量，仅更新本地态、不触发消息重载，且不进 300ms 去抖。
+      if (ev?.type === 'agent_thinking') {
+        if (!activeRef.current || ev.conversation_id !== activeRef.current) return;
+        const rid = ev.run_id || '';
+        if (ev.kind === 'done') {
+          setThinking(t => { if (!(rid in t)) return t; const n = { ...t }; delete n[rid]; return n; });
+          return;
+        }
+        setThinking(t => {
+          const cur = t[rid] || { agentId: ev.agent_id || '', agentName: ev.agent_name || '', actions: [], text: '' };
+          if (ev.kind === 'tool') return { ...t, [rid]: { ...cur, actions: [...cur.actions, ev.text || ''] } };
+          return { ...t, [rid]: { ...cur, text: cur.text + (ev.text || '') } }; // token
+        });
+        // 增量到达时滚到底，让用户看到正在生成的内容。
+        setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 0);
+        return;
+      }
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
       // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。
       if (ev.type === 'conversation_task_updated' && !!activeRef.current && ev.conversation_id === activeRef.current) {
         if (ev.status === 'running') flashActivity('running', 'Agent 正在思考…');
-        else if (ev.status === 'completed') flashActivity('done', '已完成');
-        else if (ev.status === 'failed') flashActivity('error', '处理失败');
+        else if (ev.status === 'completed') { flashActivity('done', '已完成'); setThinking({}); }
+        else if (ev.status === 'failed') { flashActivity('error', '处理失败'); setThinking({}); }
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
@@ -3095,7 +3157,32 @@ export default function ConversationsPage() {
                 receipt={m.id === justSentId}
               />
             ))}
-            {activity?.phase === 'running' && (
+            {/* 实时活动流：每个正在发言的 Agent 一张卡片，显示其工具动作 + 逐字流入的回复正文 */}
+            {Object.entries(thinking).map(([rid, t]) => (
+              <div key={rid} className="msg rise">
+                <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Icon name="bot" size={20} />
+                </div>
+                <div className="msg-body">
+                  <div className="typing-cap">{t.agentName || 'Agent'} 正在工作…</div>
+                  {t.actions.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 3, margin: '2px 0 6px' }}>
+                      {t.actions.map((a, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+                          <span style={{ width: 5, height: 5, borderRadius: 99, background: 'var(--ember)', flexShrink: 0 }} />
+                          {a}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {t.text
+                    ? <div className="bubble"><Markdown md={t.text} /></div>
+                    : <div className="bubble typing-bubble"><div className="typing"><i /><i /><i /></div></div>}
+                </div>
+              </div>
+            ))}
+            {/* 任务已启动但尚无 Agent 开始流式（规划阶段）时，仍显示一个等待气泡 */}
+            {activity?.phase === 'running' && Object.keys(thinking).length === 0 && (
               <div className="msg rise">
                 <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <Icon name="bot" size={20} />

@@ -738,7 +738,16 @@ async fn parse_sse_stream(
     }
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    while let Some(chunk) = stream.next().await {
+    // 空闲超时兜底：即便服务端既不发 [DONE] 也不关连接（异常网关），单次读取超过此时长
+    // 没有任何新字节就停止读取，交回调用方按已累积内容判定（非空即视为正常收尾）。
+    // 取 90s 容纳大 prompt 的首 token 延迟（TTFT），又远短于 reqwest 的 120s 总超时。
+    const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+    loop {
+        let chunk = match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,  // 流正常结束（连接关闭）
+            Err(_) => break,    // 空闲超时：停止读取，调用方按已收内容判定
+        };
         let bytes = chunk.map_err(|e| anyhow!("流式读取失败: {}", e))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // 以换行为界处理完整行，保留最后一段可能不完整的残行。
@@ -884,7 +893,7 @@ pub enum ThinkEvent {
     /// 回复正文的逐字增量。
     Token(String),
     /// Agent 正在执行的一次工具调用（已归一为可读动作描述）。
-    Tool { name: String, summary: String },
+    Tool { summary: String },
 }
 
 /// 由工具名 + 入参生成一句可读的「正在做什么」，用于实时活动流展示（如「检索代码「登录」」）。
@@ -1106,7 +1115,7 @@ async fn run_openai_tool_loop_streaming(
         messages.push(json!({ "role": "assistant", "content": text, "tool_calls": tool_calls_json }));
         for (id, name, args) in &calls {
             let parsed = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
-            on_think(ThinkEvent::Tool { name: name.clone(), summary: tool_action_summary(name, &parsed) });
+            on_think(ThinkEvent::Tool { summary: tool_action_summary(name, &parsed) });
             *emitted = true;
             let outcome = registry.invoke(name, parsed).await;
             if !outcome.ok {
