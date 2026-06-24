@@ -516,23 +516,28 @@ function CodeNowModal({ conversationId, onClose, onError }: {
     return () => clearInterval(t);
   }, [drafting]);
 
-  // 弹窗打开：先订阅流式增量事件（避免竞态丢失开头），再启动梳理
+  // 弹窗打开：先订阅流式增量事件（避免竞态丢失开头），再启动梳理。
+  // ⚠️ 必须用 .then 而非 async/await：React 18 StrictMode（开发模式）会 mount→unmount→mount，
+  // 若在 `await listen` 解析前 cleanup 已跑，旧写法因 unlisten 仍为 null 而漏取消订阅，导致
+  // 两个监听器同时存活、每个 chunk 被累加两次（界面表现为「每个字都重复」）。此处一旦 cleanup
+  // 已执行（disposed）就立刻取消刚解析出的订阅，保证任何时刻只有一个监听器、handleDraft 只触发一次。
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    let cancelled = false;
-    (async () => {
-      unlisten = await listen<{ type: string; conversation_id?: string; chunk?: string }>(
-        'autoforge://event',
-        (e) => {
-          const p = e.payload;
-          if (p?.type === 'coding_brief_chunk' && p.conversation_id === conversationId && p.chunk) {
-            setThinkLog(prev => prev + p.chunk);
-          }
-        },
-      );
-      if (!cancelled) handleDraft();
-    })();
-    return () => { cancelled = true; if (unlisten) unlisten(); };
+    let disposed = false;
+    listen<{ type: string; conversation_id?: string; chunk?: string }>(
+      'autoforge://event',
+      (e) => {
+        const p = e.payload;
+        if (p?.type === 'coding_brief_chunk' && p.conversation_id === conversationId && p.chunk) {
+          setThinkLog(prev => prev + p.chunk);
+        }
+      },
+    ).then(fn => {
+      if (disposed) { fn(); return; }  // cleanup 已先跑：立即退订，杜绝泄漏/重复
+      unlisten = fn;
+      handleDraft();                    // 订阅就绪后再启动，避免丢失开头增量
+    });
+    return () => { disposed = true; if (unlisten) unlisten(); };
   }, [conversationId]);
 
   // AI 梳理：流式调用，实时显示思考过程，完成后组装人性化工单并填表
@@ -2284,6 +2289,30 @@ export default function ConversationsPage() {
   const searchInputRef  = useRef<HTMLInputElement>(null);
   const messageRefs     = useRef<Record<string, HTMLDivElement | null>>({});
 
+  // 实时活动流的 token 节流缓冲：LLM 每秒可吐数十个 token，逐个 setState 会按 token 频率
+  // 重渲整条消息列表 + 重解析思考气泡的 Markdown，长会话下明显卡顿。改为把增量先攒进 ref，
+  // 每 ~60ms 合并一次提交，渲染频率封顶 ~16fps，与流畅可读性兼得。tool/done 事件低频，仍即时处理。
+  const thinkBuf   = useRef<Record<string, { agentId: string; agentName: string; text: string }>>({});
+  const thinkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushThink = useCallback(() => {
+    thinkTimer.current = null;
+    const buf = thinkBuf.current;
+    thinkBuf.current = {};
+    const rids = Object.keys(buf);
+    if (rids.length === 0) return;
+    setThinking(t => {
+      const next = { ...t };
+      for (const rid of rids) {
+        const b = buf[rid];
+        const cur = next[rid] || { agentId: b.agentId, agentName: b.agentName, actions: [], text: '' };
+        next[rid] = { ...cur, agentName: cur.agentName || b.agentName, text: cur.text + b.text };
+      }
+      return next;
+    });
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, []);
+  useEffect(() => () => { if (thinkTimer.current) clearTimeout(thinkTimer.current); }, []);
+
   // Ref keeps the event listener closure up-to-date without re-registering it.
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -2365,6 +2394,8 @@ export default function ConversationsPage() {
     setEditGroup(null);
     setActivity(null);
     setThinking({});
+    thinkBuf.current = {};
+    if (thinkTimer.current) { clearTimeout(thinkTimer.current); thinkTimer.current = null; }
     setJustSentId('');
     setWsRefs([]);
   }, [active]);
@@ -2392,24 +2423,30 @@ export default function ConversationsPage() {
         if (!activeRef.current || ev.conversation_id !== activeRef.current) return;
         const rid = ev.run_id || '';
         if (ev.kind === 'done') {
+          delete thinkBuf.current[rid]; // 丢弃未提交的残余 token（正式消息即将落地）
           setThinking(t => { if (!(rid in t)) return t; const n = { ...t }; delete n[rid]; return n; });
           return;
         }
-        setThinking(t => {
-          const cur = t[rid] || { agentId: ev.agent_id || '', agentName: ev.agent_name || '', actions: [], text: '' };
-          if (ev.kind === 'tool') return { ...t, [rid]: { ...cur, actions: [...cur.actions, ev.text || ''] } };
-          return { ...t, [rid]: { ...cur, text: cur.text + (ev.text || '') } }; // token
-        });
-        // 增量到达时滚到底，让用户看到正在生成的内容。
-        setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 0);
+        if (ev.kind === 'tool') {
+          // 工具动作低频，即时提交（与 token 文本是独立 UI 区，无需保序）。
+          setThinking(t => {
+            const cur = t[rid] || { agentId: ev.agent_id || '', agentName: ev.agent_name || '', actions: [], text: '' };
+            return { ...t, [rid]: { ...cur, agentName: cur.agentName || ev.agent_name || '', actions: [...cur.actions, ev.text || ''] } };
+          });
+          return;
+        }
+        // token：攒进缓冲，按 ~60ms 节流合并提交（见 flushThink）。
+        const b = thinkBuf.current[rid] || { agentId: ev.agent_id || '', agentName: ev.agent_name || '', text: '' };
+        thinkBuf.current[rid] = { ...b, text: b.text + (ev.text || '') };
+        if (!thinkTimer.current) thinkTimer.current = setTimeout(flushThink, 60);
         return;
       }
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
       // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。
       if (ev.type === 'conversation_task_updated' && !!activeRef.current && ev.conversation_id === activeRef.current) {
         if (ev.status === 'running') flashActivity('running', 'Agent 正在思考…');
-        else if (ev.status === 'completed') { flashActivity('done', '已完成'); setThinking({}); }
-        else if (ev.status === 'failed') { flashActivity('error', '处理失败'); setThinking({}); }
+        else if (ev.status === 'completed') { flashActivity('done', '已完成'); thinkBuf.current = {}; setThinking({}); }
+        else if (ev.status === 'failed') { flashActivity('error', '处理失败'); thinkBuf.current = {}; setThinking({}); }
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
@@ -2439,7 +2476,7 @@ export default function ConversationsPage() {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [loadConvs, loadMsgs, flashActivity]); // stable callbacks — this effect runs once
+  }, [loadConvs, loadMsgs, flashActivity, flushThink]); // stable callbacks — this effect runs once
 
   // 6. Close panels when clicking outside the header actions area.
   useEffect(() => {

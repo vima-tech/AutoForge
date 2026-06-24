@@ -738,17 +738,25 @@ async fn parse_sse_stream(
     }
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    // 空闲超时兜底：即便服务端既不发 [DONE] 也不关连接（异常网关），单次读取超过此时长
-    // 没有任何新字节就停止读取，交回调用方按已累积内容判定（非空即视为正常收尾）。
-    // 取 90s 容纳大 prompt 的首 token 延迟（TTFT），又远短于 reqwest 的 120s 总超时。
-    const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+    // 两段式空闲超时兜底：应对「既不发 [DONE]/finish_reason、也不关连接」的非合规网关。
+    //  · 首 token 前（TTFT）：给足 90s 容纳大 prompt 的处理延迟；
+    //  · 已收到内容后：正常 SSE 的 token 间隔 < 1s，故 12s 静默即判定生成结束，立即收尾——
+    //    把这类网关下「文本已出完却仍空等到总超时」的体验从 ~90s 砍到 ~12s。
+    // 两者都远短于 reqwest 的 120s 总超时。合规网关（有终止符）根本走不到这里。
+    const TTFT_TIMEOUT: Duration = Duration::from_secs(90);
+    const POST_DATA_IDLE: Duration = Duration::from_secs(12);
+    let mut got_data = false;
     loop {
-        let chunk = match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+        let idle = if got_data { POST_DATA_IDLE } else { TTFT_TIMEOUT };
+        let chunk = match tokio::time::timeout(idle, stream.next()).await {
             Ok(Some(c)) => c,
             Ok(None) => break,  // 流正常结束（连接关闭）
             Err(_) => break,    // 空闲超时：停止读取，调用方按已收内容判定
         };
         let bytes = chunk.map_err(|e| anyhow!("流式读取失败: {}", e))?;
+        if !bytes.is_empty() {
+            got_data = true;
+        }
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // 以换行为界处理完整行，保留最后一段可能不完整的残行。
         while let Some(nl) = buf.find('\n') {
@@ -1255,7 +1263,7 @@ async fn run_anthropic_tool_loop_streaming(
         let mut results: Vec<Value> = Vec::new();
         for (id, name, args) in &calls {
             let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
-            on_think(ThinkEvent::Tool { name: name.clone(), summary: tool_action_summary(name, &input) });
+            on_think(ThinkEvent::Tool { summary: tool_action_summary(name, &input) });
             *emitted = true;
             let outcome = registry.invoke(name, input).await;
             if !outcome.ok {
