@@ -449,7 +449,7 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   );
 }
 
-// 会议室「立即编码」确认弹窗：AI 起草功能点工单 → 操作者编辑确认 → 自动建需求+CR并开始编码。
+// 会议室「立即编码」确认弹窗：自动梳理讨论 → 展示思考过程 → 操作者可编辑确认 → 创建需求+CR。
 // 跳过需求审核闸（操作者点「立即编码」即需求侧决策），代码审核仍是合并前唯一闸门。
 // 遵守 DESIGN：inset:var(--win-gutter)、不点遮罩关闭、仅 ✕/Esc、每屏 ≤1 个 btn-primary。
 function CodeNowModal({ conversationId, onClose, onError }: {
@@ -463,7 +463,6 @@ function CodeNowModal({ conversationId, onClose, onError }: {
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<string | null>(null);
   const [briefData, setBriefData] = useState<CodingBrief | null>(null);
-  const [showPreview, setShowPreview] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -471,19 +470,21 @@ function CodeNowModal({ conversationId, onClose, onError }: {
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  // AI 起草：调用详细版 API 获取结构化数据，展示预览后自动填充表单。
+  // 弹窗打开时自动梳理讨论内容
+  useEffect(() => {
+    handleDraft();
+  }, [conversationId]);
+
+  // AI 梳理：调用详细版 API 获取结构化数据，自动填充表单供编辑
   const handleDraft = async () => {
     setDrafting(true);
     try {
       const codingBrief = await draftCodingBriefDetailed(conversationId);
       setBriefData(codingBrief);
-      setShowPreview(true);
 
       // 自动填充标题和功能点
-      if (codingBrief.title && !title.trim()) {
-        setTitle(codingBrief.title);
-      }
-      if (codingBrief.functional_points.length > 0 && !brief.trim()) {
+      setTitle(codingBrief.title);
+      if (codingBrief.functional_points.length > 0) {
         setBrief(codingBrief.functional_points.map(p => `- ${p}`).join('\n'));
       }
     } catch (e) {
@@ -531,109 +532,66 @@ function CodeNowModal({ conversationId, onClose, onError }: {
           </div>
         ) : (
           <>
-            <div style={{ padding: '16px 20px' }}>
-              <div className="field" style={{ marginBottom: 14 }}>
-                <label>需求标题</label>
-                <input value={title} onChange={e => setTitle(e.target.value)} placeholder="一句话描述要实现的需求" disabled={submitting} />
-              </div>
-              <div className="field" style={{ marginBottom: 6 }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span>功能点工单</span>
-                  <button
-                    type="button"
-                    className="composer-quick-tag"
-                    style={{ marginLeft: 'auto' }}
-                    disabled={drafting || submitting}
-                    onClick={handleDraft}
-                  >
-                    {drafting ? <Icon name="refresh" size={13} className="spin" /> : <Icon name="brain" size={13} />}
-                    <span>{drafting ? '梳理中…' : 'AI 梳理功能点'}</span>
-                  </button>
-                </label>
-                <textarea
-                  value={brief}
-                  onChange={e => setBrief(e.target.value)}
-                  placeholder="要实现的功能点、涉及模块/文件范围、关键约束、验收要点。可点「AI 梳理功能点」据讨论自动起草后编辑。"
-                  disabled={submitting}
-                  style={{ minHeight: 180, resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-normal)' }}
-                />
-              </div>
-
-              {/* 预览面板：展示 AI 梳理的详细信息 */}
-              {briefData && showPreview && (
-                <div style={{ marginTop: 14, padding: 12, background: 'var(--bg-3)', borderRadius: 'var(--radius)', borderLeft: `3px solid var(--ember)` }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-                    <div style={{ fontSize: 'var(--text-label)', fontWeight: 500, color: 'var(--text)' }}>梳理预览</div>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      style={{ width: 24, height: 24 }}
-                      onClick={() => setShowPreview(false)}
-                      title="关闭预览"
-                    >
-                      <Icon name="chevron-up" size={14} />
-                    </button>
-                  </div>
-
-                  {/* 需求类型和风险等级 */}
-                  <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
-                    {briefData.requirement_type && (
-                      <span className="chip" style={{ fontSize: 'var(--text-caption)' }}>{briefData.requirement_type}</span>
-                    )}
-                    {briefData.risk_level && (
-                      <span className="chip" style={{
-                        fontSize: 'var(--text-caption)',
-                        background: briefData.risk_level === '高' ? 'var(--red-tint)' : briefData.risk_level === '中' ? 'var(--amber-tint)' : 'var(--green-tint)',
-                        color: briefData.risk_level === '高' ? 'var(--red-soft)' : briefData.risk_level === '中' ? 'var(--amber-soft)' : 'var(--green-soft)',
-                      }}>
-                        风险：{briefData.risk_level}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* 涉及的模块 */}
-                  {briefData.involved_modules.length > 0 && (
-                    <div style={{ marginBottom: 10 }}>
-                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginBottom: 4 }}>📁 涉及模块</div>
-                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                        {briefData.involved_modules.slice(0, 4).map((m, i) => (
-                          <span key={i} style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)', fontFamily: 'var(--font-mono)', background: 'rgba(232,119,46,.08)', padding: '2px 6px', borderRadius: 4 }}>
-                            {m}
-                          </span>
-                        ))}
-                        {briefData.involved_modules.length > 4 && (
-                          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>+{briefData.involved_modules.length - 4} more</span>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 关键约束 */}
-                  {briefData.constraints.length > 0 && (
-                    <div style={{ marginBottom: 10 }}>
-                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginBottom: 4 }}>⚡ 关键约束</div>
-                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.5 }}>
-                        {briefData.constraints.slice(0, 2).map((c, i) => <div key={i}>• {c}</div>)}
-                        {briefData.constraints.length > 2 && (
-                          <div style={{ color: 'var(--text-3)' }}>… 等 {briefData.constraints.length - 2} 项约束</div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
-                    ✓ 预览无误后可直接创建，或修改工单内容后再创建
-                  </div>
+            {/* 梳理中：显示思考过程 */}
+            {drafting ? (
+              <div style={{ padding: '60px 40px', textAlign: 'center' }}>
+                <Icon name="brain" size={40} style={{ color: 'var(--ember)', animation: 'pulse 2s ease-in-out infinite' }} />
+                <div style={{ marginTop: 16, fontSize: 'var(--text-body)', color: 'var(--text)' }}>AI 正在梳理讨论内容…</div>
+                <div style={{ marginTop: 8, fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+                  分析需求范围 · 识别关键模块 · 评估复杂度
                 </div>
-              )}
-
-              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
-                <Icon name="layers" size={13} />
-                <span>将自动附带最近会话快照与项目上下文文档作为编码背景</span>
               </div>
-            </div>
+            ) : (
+              <div style={{ padding: '16px 20px' }}>
+                {/* 梳理结果摘要 */}
+                {briefData && (
+                  <div style={{ marginBottom: 14, padding: 12, background: 'var(--bg-3)', borderRadius: 'var(--radius)', borderLeft: `3px solid var(--ember)` }}>
+                    <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+                      {briefData.requirement_type && (
+                        <span className="chip" style={{ fontSize: 'var(--text-caption)' }}>{briefData.requirement_type}</span>
+                      )}
+                      {briefData.risk_level && (
+                        <span className="chip" style={{
+                          fontSize: 'var(--text-caption)',
+                          background: briefData.risk_level === '高' ? 'var(--red-tint)' : briefData.risk_level === '中' ? 'var(--amber-tint)' : 'var(--green-tint)',
+                          color: briefData.risk_level === '高' ? 'var(--red-soft)' : briefData.risk_level === '中' ? 'var(--amber-soft)' : 'var(--green-soft)',
+                        }}>
+                          风险：{briefData.risk_level}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', gap: 4 }}>
+                      <span>📁 涉及 {briefData.involved_modules.length} 个模块</span>
+                      <span>•</span>
+                      <span>⚡ {briefData.constraints.length} 项约束</span>
+                    </div>
+                  </div>
+                )}
+
+                <div className="field" style={{ marginBottom: 14 }}>
+                  <label>需求标题</label>
+                  <input value={title} onChange={e => setTitle(e.target.value)} placeholder="一句话描述要实现的需求" disabled={submitting} />
+                </div>
+                <div className="field" style={{ marginBottom: 6 }}>
+                  <label>功能点工单</label>
+                  <textarea
+                    value={brief}
+                    onChange={e => setBrief(e.target.value)}
+                    placeholder="要实现的功能点、涉及模块/文件范围、关键约束、验收要点。可自由编辑后确认。"
+                    disabled={submitting}
+                    style={{ minHeight: 180, resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-normal)' }}
+                  />
+                </div>
+
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Icon name="layers" size={13} />
+                  <span>将自动附带最近会话快照与项目上下文文档作为编码背景</span>
+                </div>
+              </div>
+            )}
+
             <div style={{ padding: '14px 20px 18px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-              <button className="btn" onClick={onClose} disabled={submitting}>取消</button>
+              <button className="btn" onClick={onClose} disabled={submitting || drafting}>取消</button>
               <button className="btn btn-primary" onClick={handleStart} disabled={submitting || drafting || !title.trim() || !brief.trim()}>
                 {submitting ? <Icon name="refresh" size={15} className="spin" /> : <Icon name="zap" size={15} />}
                 <span>{submitting ? '创建中…' : '创建需求并开始编码'}</span>

@@ -1677,6 +1677,7 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
   animation: asr-pulse 1.1s ease-in-out infinite;
 }
 @keyframes asr-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .6; } }
 @media (prefers-reduced-motion: reduce) { .composer-asr-dot { animation: none; } }
 [data-motion="off"] .composer-asr-dot { animation: none; }
 
