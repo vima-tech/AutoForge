@@ -463,6 +463,7 @@ function CodeNowModal({ conversationId, onClose, onError }: {
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<string | null>(null);
   const [briefData, setBriefData] = useState<CodingBrief | null>(null);
+  const [draftStep, setDraftStep] = useState(0);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -478,7 +479,24 @@ function CodeNowModal({ conversationId, onClose, onError }: {
   // AI 梳理：调用详细版 API 获取结构化数据，自动填充表单供编辑
   const handleDraft = async () => {
     setDrafting(true);
+    setDraftStep(0);
+
+    const draftSteps = [
+      '分析讨论内容…',
+      '提取关键信息…',
+      '识别功能点…',
+      '定位相关模块…',
+      '评估复杂度…',
+      '生成需求…',
+    ];
+
     try {
+      // 模拟逐步思考过程
+      for (let i = 0; i < draftSteps.length; i++) {
+        setDraftStep(i + 1);
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
       const codingBrief = await draftCodingBriefDetailed(conversationId);
       setBriefData(codingBrief);
 
@@ -491,6 +509,7 @@ function CodeNowModal({ conversationId, onClose, onError }: {
       onError(`梳理功能点失败：${String(e)}`);
     } finally {
       setDrafting(false);
+      setDraftStep(0);
     }
   };
 
@@ -536,9 +555,51 @@ function CodeNowModal({ conversationId, onClose, onError }: {
             {drafting ? (
               <div style={{ padding: '60px 40px', textAlign: 'center' }}>
                 <Icon name="brain" size={40} style={{ color: 'var(--ember)', animation: 'pulse 2s ease-in-out infinite' }} />
-                <div style={{ marginTop: 16, fontSize: 'var(--text-body)', color: 'var(--text)' }}>AI 正在梳理讨论内容…</div>
-                <div style={{ marginTop: 8, fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
-                  分析需求范围 · 识别关键模块 · 评估复杂度
+                <div style={{ marginTop: 16, fontSize: 'var(--text-body)', color: 'var(--text)' }}>
+                  Agent 思考中…
+                </div>
+
+                {/* 思考步骤进度 */}
+                <div style={{ marginTop: 20 }}>
+                  {[
+                    '分析讨论内容',
+                    '提取关键信息',
+                    '识别功能点',
+                    '定位相关模块',
+                    '评估复杂度',
+                    '生成需求',
+                  ].map((step, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        fontSize: 'var(--text-caption)',
+                        color: idx < draftStep ? 'var(--green-soft)' : idx === draftStep ? 'var(--ember)' : 'var(--text-3)',
+                        padding: '6px 0',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        justifyContent: 'center',
+                        transition: 'all .2s ease',
+                      }}
+                    >
+                      <span style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        width: 16,
+                        height: 16,
+                        borderRadius: '50%',
+                        fontSize: 'var(--text-caption)',
+                        fontWeight: 600,
+                        background: idx < draftStep ? 'var(--green)' : idx === draftStep ? 'var(--ember)' : 'var(--border)',
+                        color: 'white',
+                      }}>
+                        {idx < draftStep ? '✓' : idx === draftStep ? '→' : idx + 1}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)' }}>{step}</span>
+                      {idx === draftStep && <Icon name="refresh" size={12} style={{ animation: 'spin .8s linear infinite' }} />}
+                    </div>
+                  ))}
                 </div>
               </div>
             ) : (
