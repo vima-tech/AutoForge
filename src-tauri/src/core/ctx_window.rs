@@ -69,12 +69,10 @@ pub fn known_window(model: &str) -> Option<u64> {
 
 /// 把 token 数格式化为人类可读窗口串：1_000_000→"1M"、200_000→"200K"。
 pub fn fmt_window(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
         format!("{}M", tokens / 1_000_000)
     } else if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
-        format!("{}K", tokens / 1_000)
     } else if tokens >= 1_000 {
         format!("{}K", tokens / 1_000)
     } else {
