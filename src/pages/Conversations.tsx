@@ -707,6 +707,9 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const [asrStarting, setAsrStarting] = useState(false);
   // 会议室「立即编码」确认弹窗开关（仅绑定项目的群聊可用）。
   const [codeNowOpen, setCodeNowOpen] = useState(false);
+  // 工作区文件下拉菜单开关
+  const [showWsRefMenu, setShowWsRefMenu] = useState(false);
+  const wsRefMenuRef = useRef<HTMLDivElement>(null);
   const asrRef = useRef<RealtimeAsr | null>(null);
   const asrNodeRef = useRef<Text | null>(null);
   const asrCommittedRef = useRef('');
@@ -762,6 +765,24 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
       document.removeEventListener('keydown', closeOnEscape);
     };
   }, [showAttachmentPicker]);
+
+  useEffect(() => {
+    if (!showWsRefMenu) return;
+    const closeOnOutside = (e: PointerEvent) => {
+      if (!(e.target instanceof Node)) return;
+      if (wsRefMenuRef.current?.contains(e.target)) return;
+      setShowWsRefMenu(false);
+    };
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowWsRefMenu(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [showWsRefMenu]);
 
   const editorText = () => (editorRef.current?.innerText ?? '').replace(/\u00a0/g, ' ');
 
@@ -1392,17 +1413,44 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             </button>
           </div>
         ))}
-        {wsRefs.map(ref => (
-          <div key={ref.path} className="composer-pending-item" title={`.autoforge/${ref.path}`}
-            style={{ borderColor: 'var(--ember)', background: 'var(--ember-tint)' }}>
-            <Icon name="folder" size={15} style={{ color: 'var(--ember)' }} />
-            <span className="pending-name">{ref.name}</span>
-            <span className="pending-size" style={{ fontFamily: 'var(--font-mono)' }}>引用</span>
-            <button className="icon-btn" title="移除引用" disabled={busy} onClick={() => onRemoveWsRef(ref.path)}>
-              <Icon name="x" size={13} />
+        {wsRefs.length > 0 && (
+          <div ref={wsRefMenuRef} style={{ position: 'relative' }}>
+            <button
+              type="button"
+              className="composer-quick-tag"
+              title={`已引用 ${wsRefs.length} 个工作区文件`}
+              disabled={busy}
+              onClick={() => setShowWsRefMenu(!showWsRefMenu)}
+              style={{ borderColor: 'var(--ember)', color: 'var(--ember)' }}
+            >
+              <Icon name="folder" size={13} />
+              <span>引用 {wsRefs.length}</span>
             </button>
+            {showWsRefMenu && (
+              <div className="mention-pop" style={{ right: 0, left: 'auto', bottom: '100%', marginBottom: 4 }}>
+                <div className="mention-pop-label">已引用的工作区文件</div>
+                {wsRefs.map(ref => (
+                  <div key={ref.path} className="mention-row" style={{ cursor: 'auto' }}>
+                    <Icon name="folder" size={12} style={{ color: 'var(--ember)', marginRight: 4 }} />
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div className="nm">{ref.name}</div>
+                      <div className="rl" style={{ fontSize: 'var(--text-caption)' }}>{ref.path}</div>
+                    </div>
+                    <button
+                      className="icon-btn"
+                      style={{ width: 24, height: 24, marginRight: -8 }}
+                      title="移除引用"
+                      disabled={busy}
+                      onClick={() => onRemoveWsRef(ref.path)}
+                    >
+                      <Icon name="x" size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        ))}
+        )}
         <div style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', paddingRight: 4 }}>
           {isG ? '群聊共享上下文' : 'Enter 发送'}
         </div>
