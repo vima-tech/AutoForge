@@ -404,6 +404,7 @@ pub fn run() {
             commands::workspace::write_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::draft_coding_brief,
+            commands::orchestration::draft_coding_brief_detailed,
             commands::orchestration::start_conversation_coding,
             commands::orchestration::list_conversation_tasks,
             commands::orchestration::compress_conversation_context,

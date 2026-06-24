@@ -211,6 +211,16 @@ export interface Message {
   content_json: string; created_at: string;
   excluded_from_context: boolean;
 }
+export interface CodingBrief {
+  title: string;
+  functional_points: string[];
+  involved_modules: string[];
+  constraints: string[];
+  acceptance_criteria: string[];
+  requirement_type: string;
+  risk_level: string;
+  raw_text: string;
+}
 export interface ConversationTask {
   id: string; conversation_id: string; trigger_message_id: string;
   planner_agent_id: string | null; instruction: string; plan_json: string;
@@ -768,6 +778,8 @@ export const listConversationTasks = (conversationId: string) =>
 // 会议室「立即编码」：① AI 起草功能点工单草稿；② 据确认工单直奔编码（建需求→CR→执行，跳过需求审核队列）。
 export const draftCodingBrief = (conversationId: string, windowSize?: number) =>
   ipc<string>('draft_coding_brief', { conversationId, windowSize: windowSize ?? null });
+export const draftCodingBriefDetailed = (conversationId: string, windowSize?: number) =>
+  ipc<CodingBrief>('draft_coding_brief_detailed', { conversationId, windowSize: windowSize ?? null });
 export const startConversationCoding = (payload: {
   conversation_id: string; title: string; brief: string; window_size?: number | null;
 }) => ipc<ChangeRequest>('start_conversation_coding', { payload });

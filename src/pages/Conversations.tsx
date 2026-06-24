@@ -11,7 +11,7 @@ import {
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
-  draftCodingBrief, startConversationCoding,
+  draftCodingBrief, draftCodingBriefDetailed, startConversationCoding,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
@@ -20,6 +20,7 @@ import {
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
   type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
+  type CodingBrief,
 } from '../services';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
@@ -461,6 +462,8 @@ function CodeNowModal({ conversationId, onClose, onError }: {
   const [drafting, setDrafting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<string | null>(null);
+  const [briefData, setBriefData] = useState<CodingBrief | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -468,20 +471,20 @@ function CodeNowModal({ conversationId, onClose, onError }: {
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  // AI 起草：把会议室讨论梳理成「标题：…」+ 功能点要点，填进输入框供编辑。
+  // AI 起草：调用详细版 API 获取结构化数据，展示预览后自动填充表单。
   const handleDraft = async () => {
     setDrafting(true);
     try {
-      const text = await draftCodingBrief(conversationId);
-      // 草稿首行若是「标题：xxx」则拆出来填到标题框，余下作为功能点工单。
-      const lines = text.split('\n');
-      const first = (lines[0] ?? '').trim();
-      const m = first.match(/^标题[：:]\s*(.+)$/);
-      if (m) {
-        if (!title.trim()) setTitle(m[1].trim());
-        setBrief(lines.slice(1).join('\n').trim());
-      } else {
-        setBrief(text.trim());
+      const codingBrief = await draftCodingBriefDetailed(conversationId);
+      setBriefData(codingBrief);
+      setShowPreview(true);
+
+      // 自动填充标题和功能点
+      if (codingBrief.title && !title.trim()) {
+        setTitle(codingBrief.title);
+      }
+      if (codingBrief.functional_points.length > 0 && !brief.trim()) {
+        setBrief(codingBrief.functional_points.map(p => `- ${p}`).join('\n'));
       }
     } catch (e) {
       onError(`梳理功能点失败：${String(e)}`);
@@ -555,7 +558,76 @@ function CodeNowModal({ conversationId, onClose, onError }: {
                   style={{ minHeight: 180, resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-normal)' }}
                 />
               </div>
-              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6 }}>
+
+              {/* 预览面板：展示 AI 梳理的详细信息 */}
+              {briefData && showPreview && (
+                <div style={{ marginTop: 14, padding: 12, background: 'var(--bg-3)', borderRadius: 'var(--radius)', borderLeft: `3px solid var(--ember)` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                    <div style={{ fontSize: 'var(--text-label)', fontWeight: 500, color: 'var(--text)' }}>梳理预览</div>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      style={{ width: 24, height: 24 }}
+                      onClick={() => setShowPreview(false)}
+                      title="关闭预览"
+                    >
+                      <Icon name="chevron-up" size={14} />
+                    </button>
+                  </div>
+
+                  {/* 需求类型和风险等级 */}
+                  <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+                    {briefData.requirement_type && (
+                      <span className="chip" style={{ fontSize: 'var(--text-caption)' }}>{briefData.requirement_type}</span>
+                    )}
+                    {briefData.risk_level && (
+                      <span className="chip" style={{
+                        fontSize: 'var(--text-caption)',
+                        background: briefData.risk_level === '高' ? 'var(--red-tint)' : briefData.risk_level === '中' ? 'var(--amber-tint)' : 'var(--green-tint)',
+                        color: briefData.risk_level === '高' ? 'var(--red-soft)' : briefData.risk_level === '中' ? 'var(--amber-soft)' : 'var(--green-soft)',
+                      }}>
+                        风险：{briefData.risk_level}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* 涉及的模块 */}
+                  {briefData.involved_modules.length > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginBottom: 4 }}>📁 涉及模块</div>
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        {briefData.involved_modules.slice(0, 4).map((m, i) => (
+                          <span key={i} style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)', fontFamily: 'var(--font-mono)', background: 'rgba(232,119,46,.08)', padding: '2px 6px', borderRadius: 4 }}>
+                            {m}
+                          </span>
+                        ))}
+                        {briefData.involved_modules.length > 4 && (
+                          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>+{briefData.involved_modules.length - 4} more</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 关键约束 */}
+                  {briefData.constraints.length > 0 && (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginBottom: 4 }}>⚡ 关键约束</div>
+                      <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 1.5 }}>
+                        {briefData.constraints.slice(0, 2).map((c, i) => <div key={i}>• {c}</div>)}
+                        {briefData.constraints.length > 2 && (
+                          <div style={{ color: 'var(--text-3)' }}>… 等 {briefData.constraints.length - 2} 项约束</div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
+                    ✓ 预览无误后可直接创建，或修改工单内容后再创建
+                  </div>
+                </div>
+              )}
+
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
                 <Icon name="layers" size={13} />
                 <span>将自动附带最近会话快照与项目上下文文档作为编码背景</span>
               </div>
