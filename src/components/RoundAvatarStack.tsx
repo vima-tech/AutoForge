@@ -57,8 +57,11 @@ const ring = (current: boolean, hovered: boolean): string =>
 
 const btnBase: React.CSSProperties = {
   pointerEvents: 'auto', position: 'relative', border: 0, background: 'transparent',
-  cursor: 'pointer', display: 'flex', gap: 8,
+  cursor: 'pointer', display: 'flex', gap: 7,
 };
+
+// 头像统一尺寸（精致小号）。
+const AV = 26;
 
 export default function RoundAvatarStack({
   rounds, currentRoundIndex, agents, currentAgentId, onJump, onJumpAgent,
@@ -87,11 +90,11 @@ export default function RoundAvatarStack({
     return (
       <button
         key={r.id} onMouseEnter={() => enter(r.id)} onMouseLeave={leave} onClick={() => onJump(r.id)}
-        style={{ ...btnBase, alignItems: 'center', padding: '8px 0', zIndex: h ? 60 : 1 }}
+        style={{ ...btnBase, alignItems: 'center', padding: '5px 0', zIndex: h ? 60 : 1 }}
       >
-        <span style={{ display: 'flex', width: 36, justifyContent: 'center' }}>
+        <span style={{ display: 'flex', width: AV, justifyContent: 'center' }}>
           <span style={{
-            width: h ? 28 : 20, height: 3, borderRadius: 2,
+            width: h ? 20 : 14, height: 2, borderRadius: 2,
             background: h ? 'var(--ember)' : 'var(--border-strong)',
             transition: 'width .14s ease, background .14s ease',
           }} />
@@ -104,9 +107,10 @@ export default function RoundAvatarStack({
   return (
     <div style={{
       position: 'absolute',
-      // 垂直居中；窗口够宽时退进左侧留白槽，与气泡拉开间距（窄屏自动收回贴左、不越界）。
-      left: 'max(14px, calc((100% - var(--thread-max)) / 2 - 52px))',
-      top: '50%', transform: 'translateY(-50%)',
+      // 锚定左上角：紧贴 chat-head(60px) 下方一点；窗口够宽时退进左侧留白槽、与气泡拉开间距
+      //（窄屏自动收回贴左、不越界）。不再垂直居中——精致地待在角落，不占据页面中部。
+      left: 'max(12px, calc((100% - var(--thread-max)) / 2 - 42px))',
+      top: 74,
       zIndex: 6, display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
       gap: 0, pointerEvents: 'none',
     }}>
@@ -117,10 +121,10 @@ export default function RoundAvatarStack({
         return (
           <button
             onMouseEnter={() => enter(ME)} onMouseLeave={leave} onClick={() => onJump(currentRound.id)}
-            style={{ ...btnBase, alignItems: 'flex-start', padding: '6px 0', zIndex: h ? 60 : 2 }}
+            style={{ ...btnBase, alignItems: 'flex-start', padding: '4px 0', zIndex: h ? 60 : 2 }}
           >
-            <span style={{ display: 'block', borderRadius: 12, lineHeight: 0, boxShadow: ring(false, h), transition: 'box-shadow .16s ease' }}>
-              <MeAvatar size={36} />
+            <span style={{ display: 'block', borderRadius: 9, lineHeight: 0, boxShadow: ring(false, h), transition: 'box-shadow .16s ease' }}>
+              <MeAvatar size={AV} />
             </span>
             {h && <div className="scroll" style={PANEL}>{currentRound.text || '（无文本内容）'}</div>}
           </button>
@@ -133,10 +137,10 @@ export default function RoundAvatarStack({
         return (
           <button
             key={a.id} onMouseEnter={() => enter(a.id)} onMouseLeave={leave} onClick={() => onJumpAgent(a.id)}
-            style={{ ...btnBase, alignItems: 'center', padding: '6px 0', zIndex: h ? 60 : cur ? 50 : 1 }}
+            style={{ ...btnBase, alignItems: 'center', padding: '4px 0', zIndex: h ? 60 : cur ? 50 : 1 }}
           >
-            <span style={{ display: 'block', borderRadius: 12, lineHeight: 0, boxShadow: ring(cur, h), transition: 'box-shadow .16s ease' }}>
-              <Avatar agent={a} size={36} />
+            <span style={{ display: 'block', borderRadius: 9, lineHeight: 0, boxShadow: ring(cur, h), transition: 'box-shadow .16s ease' }}>
+              <Avatar agent={a} size={AV} />
             </span>
             {h && <span style={{ ...PILL, color: a.color || 'var(--text)' }}>{a.name}</span>}
           </button>
