@@ -15,8 +15,15 @@ use tauri::Manager;
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Quiet the rmcp MCP client: at INFO it dumps the entire server
+                // `peer_info` (incl. codegraph's multi-KB instructions block) on
+                // every connect, plus per-call "task cancelled / serve finished /
+                // child exited" lines. We spawn a fresh MCP client per analysis,
+                // so this floods the log. Keep our own crates at info; override
+                // anytime via RUST_LOG.
+                tracing_subscriber::EnvFilter::new("info,rmcp=warn")
+            }),
         )
         .init();
 

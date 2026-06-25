@@ -50,7 +50,15 @@ impl McpConnection {
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
-                let transport = TokioChildProcess::new(cmd)
+                // Discard the child's stderr. MCP servers (e.g. codegraph prints
+                // "[CodeGraph MCP] Attached to shared daemon …") chatter on stderr,
+                // which otherwise inherits our console and floods the log on every
+                // per-task spawn. Must go through the builder: TokioChildProcess::new
+                // unconditionally resets stderr to inherit(). Protocol I/O is on
+                // stdin/stdout, unaffected.
+                let (transport, _stderr) = TokioChildProcess::builder(cmd)
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
                     .map_err(|e| anyhow!("启动 MCP 子进程失败: {}", e))?;
                 ().serve(transport)
                     .await

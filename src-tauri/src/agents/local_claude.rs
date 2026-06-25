@@ -233,7 +233,19 @@ pub async fn safety_check(db: &crate::db::Db, text: &str) -> bool {
     )
     .await;
     match result {
-        Ok(out) => !out.trim().to_uppercase().contains("UNSAFE"),
+        Ok(out) => {
+            // Strict verdict parse. The model is asked to emit a single token, but
+            // may add explanation or echo the prompt's "SAFE/UNSAFE" option labels —
+            // a naive `contains("UNSAFE")` then false-rejects legitimate input.
+            // Only treat a leading UNSAFE token (the actual verdict position) as a
+            // reject; anything else degrades to allow (the regex fast-reject in
+            // has_obvious_injection remains the always-on guard).
+            let verdict = out
+                .trim()
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .to_uppercase();
+            !verdict.starts_with("UNSAFE")
+        }
         Err(_) => true, // CLI unavailable → don't block the pipeline
     }
 }
