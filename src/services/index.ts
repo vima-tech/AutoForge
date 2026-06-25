@@ -786,6 +786,7 @@ export const draftCodingBriefStream = (conversationId: string, windowSize?: numb
   ipc<CodingBrief>('draft_coding_brief_stream', { conversationId, windowSize: windowSize ?? null });
 export const startConversationCoding = (payload: {
   conversation_id: string; title: string; brief: string; window_size?: number | null;
+  client_request_id?: string | null;
 }) => ipc<ChangeRequest>('start_conversation_coding', { payload });
 // 总结/结论 + 压缩上下文：生成摘要并把当前窗口内历史消息移出后续上下文。
 export const compressConversationContext = (payload: {

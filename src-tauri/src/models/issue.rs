@@ -32,6 +32,9 @@ pub struct Issue {
     /// 该需求是否由「恢复需求」从已撤销态重回队列（1=是）。用于队列里的小 dot 标识。
     #[sqlx(default)]
     pub restored_from_revert: i64,
+    /// 会议室「立即编码」幂等键（前端 UUID），唯一索引防重复创建。
+    #[sqlx(default)]
+    pub client_request_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
