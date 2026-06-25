@@ -166,7 +166,9 @@ fn grep_unfinished(repo_path: &str) -> Vec<Unfinished> {
 
     fn is_comment_line(line: &str) -> bool {
         let t = line.trim_start();
-        t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*')
+        // 排除 /// doc comment（Rust/TS/JS 文档注释），它们描述代码语义而非标记 TODO，
+        // 几乎不用于标记未完成功能，保留 // 普通行注释和 # / /* / * 注释。
+        (t.starts_with("//") && !t.starts_with("///")) || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*')
     }
 
     let mut hits: Vec<Unfinished> = Vec::new();
@@ -951,8 +953,14 @@ mod tests {
             "def h():\n    raise NotImplementedError\n",
         )
         .unwrap();
-        // 字符串里出现“未实现”但不是注释行 → 不应命中（避免误伤关键词数组）。
+        // 字符串里出现"未实现"但不是注释行 → 不应命中（避免误伤关键词数组）。
         std::fs::write(sub.join("c.ts"), "const label = \"未实现的占位\";\n").unwrap();
+        // /// doc comment 描述审查方向，包含「未实现」关键词 → 不应误报。
+        std::fs::write(
+            sub.join("d.rs"),
+            "/// 规格符合性：对照规格找未实现、半成品的功能\npub fn check() {}\n",
+        )
+        .unwrap();
 
         let hits = grep_unfinished(dir.to_str().unwrap());
         std::fs::remove_dir_all(&dir).ok();
@@ -963,6 +971,8 @@ mod tests {
         // 正常函数体与字符串字面量不应命中。
         assert!(!hits.iter().any(|h| h.text.contains("1 + 1")));
         assert!(!hits.iter().any(|h| h.text.contains("const label")));
+        // /// doc comment 中的「未实现」不应误报为待实现标记。
+        assert!(!hits.iter().any(|h| h.text.contains("规格符合性")));
     }
 
     #[test]
