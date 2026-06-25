@@ -1261,18 +1261,26 @@ async fn run_openai_tool_loop_streaming(
         .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，流式收口仍无正文", MAX_TOOL_ITERS))
 }
 
+/// 单轮 Anthropic 流式的请求载荷（messages / system / tools / with_tools），
+/// 将四个"内容参数"收拢成一个借用结构体，使 `anthropic_stream_round` 保持在
+/// clippy::too_many_arguments 上限（7）内。
+struct AnthropicRoundArgs<'a> {
+    messages: &'a [Value],
+    system: &'a str,
+    tools: &'a [Value],
+    with_tools: bool,
+}
+
 /// 单轮 Anthropic 流式（带 tools）：实时回调正文 token，并从 content_block 增量拼装 tool_use。
 /// 返回 (本轮正文, 工具调用列表 [(id, name, input_json_str)])。
 async fn anthropic_stream_round(
     cfg: &LlmConfig,
     client: &reqwest::Client,
-    messages: &[Value],
-    system: &str,
-    tools: &[Value],
-    with_tools: bool,
+    args: &AnthropicRoundArgs<'_>,
     on_think: &mut (dyn FnMut(ThinkEvent) + Send),
     emitted: &mut bool,
 ) -> Result<(String, Vec<(String, String, String)>)> {
+    let AnthropicRoundArgs { messages, system, tools, with_tools } = args;
     let mut body = json!({
         "model": cfg.model,
         "messages": messages,
@@ -1281,7 +1289,7 @@ async fn anthropic_stream_round(
         "stream": true
     });
     body["system"] = anthropic_system_cached(system);
-    if with_tools {
+    if *with_tools {
         body["tools"] = json!(tools);
     }
     let req = client
@@ -1357,7 +1365,9 @@ async fn run_anthropic_tool_loop_streaming(
 
     for iter in 0..MAX_TOOL_ITERS {
         let (text, calls) = anthropic_stream_round(
-            cfg, &client, &messages, &system, &tools, true, on_think, emitted,
+            cfg, &client,
+            &AnthropicRoundArgs { messages: &messages, system: &system, tools: &tools, with_tools: true },
+            on_think, emitted,
         )
         .await?;
         if !text.trim().is_empty() {
@@ -1421,7 +1431,9 @@ async fn run_anthropic_tool_loop_streaming(
     // 轮数耗尽：附收口指令，再走一轮无 tools 的流式请求逼模型直接作答。
     messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
     let (text, _) = anthropic_stream_round(
-        cfg, &client, &messages, &system, &tools, false, on_think, emitted,
+        cfg, &client,
+        &AnthropicRoundArgs { messages: &messages, system: &system, tools: &tools, with_tools: false },
+        on_think, emitted,
     )
     .await?;
     Some(strip_tool_call_residue(&text))

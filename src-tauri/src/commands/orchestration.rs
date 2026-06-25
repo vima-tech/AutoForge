@@ -499,6 +499,8 @@ pub struct StartConversationCoding {
     pub brief: String,
     pub window_size: Option<i64>,
     pub admin_id: Option<String>,
+    /// 前端生成的 UUID，用于幂等去重；重复请求命中时直接返回已有 CR。
+    pub client_request_id: Option<String>,
 }
 
 /// 会议室「立即编码」第二步（直奔编码）：依据操作者确认的功能点工单，**自动创建需求 → 建 CR →
@@ -550,17 +552,76 @@ pub async fn start_conversation_coding(
         _ => None,
     };
 
+    let admin_id = payload.admin_id.as_deref().unwrap_or("admin").to_string();
+
+    // ── 幂等去重 ──────────────────────────────────────────────────────────────
+    // Level 1：client_request_id 精确匹配（前端 UUID，最强保证）。
+    // Level 2：同 project + title + source_type='conversation' + status='pending_execution' 近似兜底。
+    // 命中时直接返回既有 CR；若 Issue 存在但 CR 尚无（前次半途失败），补建 CR 后返回。
+    let maybe_existing: Option<crate::models::issue::Issue> =
+        if let Some(ref req_id) = payload.client_request_id {
+            sqlx::query_as::<_, crate::models::issue::Issue>(
+                "SELECT * FROM issues WHERE client_request_id = ?",
+            )
+            .bind(req_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+    let maybe_existing = if maybe_existing.is_none() {
+        sqlx::query_as::<_, crate::models::issue::Issue>(
+            "SELECT * FROM issues \
+             WHERE project_id = ? AND source_type = 'conversation' AND title = ? \
+             AND status = 'pending_execution' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&project_id)
+        .bind(&title)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        maybe_existing
+    };
+    if let Some(ref ex_issue) = maybe_existing {
+        if let Some(cr) = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
+            "SELECT * FROM change_requests WHERE issue_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&ex_issue.id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            return Ok(cr);
+        }
+        // Issue 存在但 CR 尚无（上次调用中途失败）：补建 CR 后返回。
+        return crate::commands::change_requests::create_cr_for_issue(
+            db,
+            &state.job_tx,
+            ex_issue,
+            &project,
+            Some("会议室「立即编码」：操作者在讨论中确认功能点后直接进入编码"),
+            &admin_id,
+            work_context.as_deref(),
+        )
+        .await;
+    }
+    // ── End 幂等去重 ─────────────────────────────────────────────────────────
+
     // 创建需求：express 路径直接落 pending_execution（不入分析/需求审核队列）。
     let issue_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO issues (id, project_id, source_type, title, description, category, status, source_ref)
-         VALUES (?, ?, 'conversation', ?, ?, 'Feature', 'pending_execution', ?)",
+        "INSERT INTO issues (id, project_id, source_type, title, description, category, status, source_ref, client_request_id)
+         VALUES (?, ?, 'conversation', ?, ?, 'Feature', 'pending_execution', ?, ?)",
     )
     .bind(&issue_id)
     .bind(&project_id)
     .bind(&title)
     .bind(&brief)
     .bind(&payload.conversation_id)
+    .bind(&payload.client_request_id)
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
@@ -570,7 +631,6 @@ pub async fn start_conversation_coding(
         .await
         .map_err(|e| e.to_string())?;
 
-    let admin_id = payload.admin_id.unwrap_or_else(|| "admin".to_string());
     let cr = crate::commands::change_requests::create_cr_for_issue(
         db,
         &state.job_tx,

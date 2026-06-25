@@ -64,7 +64,7 @@ fn parse_csv(project_id: &str, content: &str) -> Result<Vec<IntakePayload>, Stri
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
-        .map(|line| split_csv_line(line))
+        .map(split_csv_line)
         .collect();
     Ok(rows_to_payloads(project_id, rows))
 }

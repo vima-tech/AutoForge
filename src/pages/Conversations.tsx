@@ -579,6 +579,7 @@ function CodeNowModal({ conversationId, onClose, onError }: {
         conversation_id: conversationId,
         title: title.trim(),
         brief: brief.trim(),
+        client_request_id: crypto.randomUUID(),
       });
       setDone(cr.id);
       setTimeout(onClose, 1600);

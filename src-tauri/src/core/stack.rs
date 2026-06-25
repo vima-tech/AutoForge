@@ -894,7 +894,7 @@ pub fn suggest_run_config(dir: &Path) -> RunConfigSuggestion {
     };
 
     // 质量类命令后端优先。
-    let qsrc = backend.or(Some(primary)).unwrap();
+    let qsrc = backend.unwrap_or(primary);
     let build_command = backend
         .and_then(|b| b.build_command.clone())
         .or_else(|| ui.and_then(|u| u.build_command.clone()));
