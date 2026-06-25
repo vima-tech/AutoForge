@@ -197,6 +197,16 @@ pub fn worktrees_base() -> String {
         .unwrap_or_else(|| temp_fallback("autoforge-worktrees"))
 }
 
+/// 共享依赖缓存根目录：与 worktrees 同级的 `dep-cache/`，按 lockfile 指纹分桶存放
+/// 「以 origin/<dev> 为基点」的 node_modules，供所有 worktree 软链公用（见 core::dep_cache）。
+pub fn dep_cache_base() -> String {
+    let wt = worktrees_base();
+    std::path::Path::new(&wt)
+        .parent()
+        .map(|p| p.join("dep-cache").to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}-dep-cache", wt))
+}
+
 pub fn attachments_base() -> String {
     ATTACHMENTS_BASE
         .get()

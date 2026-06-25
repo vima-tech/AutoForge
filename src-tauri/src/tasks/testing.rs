@@ -107,6 +107,19 @@ pub async fn run_and_gate(
     // 测试在 CR 的 worktree 里跑，而 gitignore 的 node_modules/target 不随 worktree 创建。
     // 跑命令前幂等软链依赖缓存，否则 `npx tsc --noEmit` 等命令因缺 node_modules 退化为联网
     // 抓占位假包而失败。覆盖旧 worktree（创建时未软链的）；test_path==repo 时自动跳过。
+    // 与 execution 一致：worktree（≠主仓）优先软链「远程 dev 依赖缓存」，使测试用的依赖与
+    // 编码时一致（同为 origin/dev 那套）；失败回退下方软链主仓。
+    if test_path != project.repo_path {
+        if let Some(shared_nm) =
+            crate::core::dep_cache::ensure_shared_node_modules(std::path::Path::new(&test_path))
+                .await
+        {
+            crate::core::dep_cache::link_into_worktree(
+                &shared_nm,
+                std::path::Path::new(&test_path),
+            );
+        }
+    }
     crate::core::stack::link_dep_caches(
         std::path::Path::new(&project.repo_path),
         std::path::Path::new(&test_path),

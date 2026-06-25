@@ -446,6 +446,13 @@ pub fn build_prompt(
         }
     }
 
+    // 技术栈画像 + 默认约定（与分析阶段 build_project_context 同源，保证两阶段认知一致）。
+    // 放在项目规范之前；其内部已声明「项目 CLAUDE.md/.autoforge/specs 冲突时以后者为准」。
+    let stack_hint = crate::core::stack::stack_hint(std::path::Path::new(repo_path));
+    if !stack_hint.trim().is_empty() {
+        prompt.push_str(&format!("\n## 技术栈画像（自动检测）\n{}\n", stack_hint));
+    }
+
     let specs = read_project_specs(repo_path);
     if !specs.trim().is_empty() {
         prompt.push_str(&format!("\n## 项目规范（.autoforge/specs）\n{}\n", specs));
@@ -928,6 +935,27 @@ mod tests {
         // 端到端：从一段以 build_prompt 模板尾部为蓝本的「agent 输出」里能抠回报告。
         let fake_output = format!("一些思考过程……\n{REPORT_MARKER}\n做了 X");
         assert_eq!(extract_report(&fake_output), format!("{REPORT_MARKER}\n做了 X"));
+    }
+
+    #[test]
+    fn build_prompt_injects_stack_hint() {
+        // 在临时仓库放一个 Taro 工程，build_prompt 应注入技术栈画像段。
+        let dir = std::env::temp_dir().join(format!("af-bp-stack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.config.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"build:weapp":"taro build"},"dependencies":{"@tarojs/taro":"^4"}}"#,
+        )
+        .unwrap();
+        let prompt = build_prompt(
+            "标题", "描述", "摘要", None, None, 1,
+            dir.to_str().unwrap(), None, None, None, None,
+        );
+        assert!(prompt.contains("技术栈画像（自动检测）"), "应注入技术栈画像段");
+        assert!(prompt.contains("微信小程序约定"), "应含小程序默认约定");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

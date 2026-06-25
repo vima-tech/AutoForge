@@ -55,7 +55,9 @@
     submit.disabled = true; msg.textContent = '提交中…';
     var headers = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = 'Bearer ' + token;
-    fetch(endpoint + '/webhook/issues', {
+    // src=widget：标记匿名反馈来源，webhook 端据此强制落入「待整理池」（不自动烧 AI 预算），
+    // 即便此处用的是项目 flow token。query 参数不触发额外 CORS 预检头。
+    fetch(endpoint + '/webhook/issues?src=widget', {
       method: 'POST',
       headers: headers,
       body: JSON.stringify({

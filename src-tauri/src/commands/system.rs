@@ -94,6 +94,8 @@ pub struct UpdateConcurrencyConfig {
     pub build_slots: Option<usize>,
     /// cgroup CPU 预算（占总核数百分比，0 = 关闭；仅 Linux 生效）。
     pub cpu_budget_pct: Option<u64>,
+    /// 出站 LLM 并发上限：同时打到 LLM 服务商的请求数（防 429 限流）。
+    pub llm_max_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +116,8 @@ pub struct ConcurrencyConfig {
     pub build_slots: usize,
     /// cgroup CPU 预算（% × nproc，0 = 关闭）。
     pub cpu_budget_pct: u64,
+    /// 出站 LLM 并发上限（防 429 限流）。
+    pub llm_max_concurrency: usize,
 }
 
 /// 代码 agent 超时默认值（分钟）。墙钟是硬上限兜底，空闲超时是抓卡死的主闸。
@@ -131,6 +135,9 @@ pub const DEFAULT_MAX_LOAD_FACTOR: f64 = 1.5;
 pub const DEFAULT_BUILD_SLOTS: usize = 2;
 /// CPU 预算默认 0=关（cgroup 依环境，显式开启更安全；建议 Linux 上设 70~80）。
 pub const DEFAULT_CPU_BUDGET_PCT: u64 = 0;
+/// 出站 LLM 并发上限默认值：限制同时打到 LLM 服务商的请求数，防批量任务（如一次分析 50 条
+/// 需求）瞬间数十并发触发 429 限流。保守取 4，可在「并发控制」按服务商配额调高。
+pub const DEFAULT_LLM_CONCURRENCY: usize = 4;
 
 /// 读取合并门构建池大小（clamp [1, 32]）。
 pub async fn load_build_slots(db: &crate::db::Db) -> usize {
@@ -156,6 +163,19 @@ pub async fn load_cpu_budget_pct(db: &crate::db::Db) -> u64 {
     v.and_then(|(s,)| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CPU_BUDGET_PCT)
         .min(100)
+}
+
+/// 读取出站 LLM 并发上限（clamp [1, 32]）。供启动初始化与设置热更新用。
+pub async fn load_llm_concurrency(db: &crate::db::Db) -> usize {
+    let v: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key='llm.max_concurrency'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    v.and_then(|(s,)| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LLM_CONCURRENCY)
+        .clamp(1, 32)
 }
 
 /// 读取负载感知入场阈值（factor×nproc）。0 或负 = 关闭。clamp 到 [0, 8]。
@@ -728,11 +748,26 @@ pub async fn update_concurrency_config(
         // 热改 cgroup 预算（仅在已启用时生效；0 → 解除限制 max）。
         crate::core::cpubudget::set_budget(p.min(100));
     }
+    if let Some(c) = payload.llm_max_concurrency {
+        let n = c.clamp(1, 32);
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at)
+             VALUES ('llm.max_concurrency', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(n.to_string())
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        // 热更新出站 LLM 并发闸（无需重启）。
+        crate::agents::llm::set_llm_concurrency(n);
+    }
 
     let (wall_secs, idle_secs) = load_execution_limits(&state.db).await;
     let max_load_factor = load_max_load_factor(&state.db).await;
     let build_slots = load_build_slots(&state.db).await;
     let cpu_budget_pct = load_cpu_budget_pct(&state.db).await;
+    let llm_max_concurrency = load_llm_concurrency(&state.db).await;
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,
         max_slots: status.max_slots,
@@ -745,6 +780,7 @@ pub async fn update_concurrency_config(
         max_load_factor,
         build_slots,
         cpu_budget_pct,
+        llm_max_concurrency,
     })
 }
 
@@ -757,6 +793,7 @@ pub async fn get_concurrency_config(
     let max_load_factor = load_max_load_factor(&state.db).await;
     let build_slots = load_build_slots(&state.db).await;
     let cpu_budget_pct = load_cpu_budget_pct(&state.db).await;
+    let llm_max_concurrency = load_llm_concurrency(&state.db).await;
 
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,
@@ -770,6 +807,7 @@ pub async fn get_concurrency_config(
         max_load_factor,
         build_slots,
         cpu_budget_pct,
+        llm_max_concurrency,
     })
 }
 

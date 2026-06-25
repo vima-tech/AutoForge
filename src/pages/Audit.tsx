@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Toast, { type ToastData } from '../components/Toast';
@@ -15,7 +15,7 @@ import {
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   listMergeCandidates, review1Merge, getChangeRequestIssues, type MergeCandidate, type CrIssueRef,
-  getCrPreview, startCrPreview, stopCrPreview, launchCrApp,
+  getCrPreview, startCrPreview, stopCrPreview, launchCrApp, buildCrMiniapp,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview,
   startPreviewLogTail, stopPreviewLogTail,
   getMergeConflict, retryMerge, aiResolveMergeConflict, revertChangeRequest, restoreChangeRequest, getCustomMergeMessageEnabled, getDefaultMergeMessage,
@@ -29,6 +29,22 @@ import {
 } from '../services';
 
 type Sel = { kind: 'issue' | 'cr'; id: string };
+
+// 模块级「整理中」碎片 id 存储：脱离 React 组件树而存在，使功能审计页卸载（切换页面）后
+// 仍保持，重新挂载时恢复 spinner。triage 后端命令本就跑到完（与前端挂载无关），这里只是
+// 让前端「整理中」标记跨页存活——切走页面整理不会中断，回来仍显示在途。
+// 用 useSyncExternalStore 订阅；getSnapshot 仅在增删时换新引用，未变时引用稳定。
+const refiningStore = (() => {
+  let ids = new Set<string>();
+  const subs = new Set<() => void>();
+  const emit = () => subs.forEach(fn => fn());
+  return {
+    get: () => ids,
+    add(more: string[]) { if (!more.length) return; ids = new Set([...ids, ...more]); emit(); },
+    remove(less: string[]) { if (!less.length) return; const n = new Set(ids); less.forEach(id => n.delete(id)); ids = n; emit(); },
+    subscribe(fn: () => void) { subs.add(fn); return () => { subs.delete(fn); }; },
+  };
+})();
 
 // 复制完整需求编号到剪贴板，附带短暂的成功反馈
 function CopyIdButton({ value, title = '复制编号' }: { value: string; title?: string }) {
@@ -55,6 +71,7 @@ function CopyIdButton({ value, title = '复制编号' }: { value: string; title?
 
 const STATUS_LABEL: Record<string, string> = {
   analysis_failed: '分析失败',
+  pending_analysis: '分析中',
   pending_issue_review: '待需求审核',
   pending_execution: '待执行',
   executing: 'AI 执行中',
@@ -73,6 +90,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 const STATUS_COLOR: Record<string, string> = {
   analysis_failed: 'red',
+  pending_analysis: 'blue',
   pending_issue_review: 'amber',
   pending_execution: 'amber',
   executing: 'blue',
@@ -91,8 +109,8 @@ const STATUS_COLOR: Record<string, string> = {
 };
 // Failed states float to the top so abnormal requirements are easy to find and resolve.
 const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_code_review', 'executing', 'pending_execution', 'pending_merge', 'merge_testing', 'merge_ready', 'pending_issue_review', 'no_change_needed', 'merged', 'rejected'];
-// 需求审核闸口的状态排序：失败需求置顶（需重新分析），待审需求随后。
-const ISSUE_STATUS_ORDER = ['analysis_failed', 'pending_issue_review'];
+// 需求审核闸口的状态排序：失败需求置顶（需重新分析），待审需求随后，分析中（进行态）垫底。
+const ISSUE_STATUS_ORDER = ['analysis_failed', 'pending_issue_review', 'pending_analysis'];
 
 // Stuck/abnormal CR states that the user can recover (retry) or remove (delete).
 const FAILED_STATUSES = ['execution_failed', 'merge_failed', 'merge_conflict'];
@@ -500,8 +518,10 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   // 时间排序方向：true=正序（最早在前，默认——旧需求置前避免积压），false=倒序（最新在前）。
   // 状态分组仍优先，方向只翻组内时间次序。
   const [sortAsc, setSortAsc] = useState(true);
-  // 来源过滤（融进搜索框，不额外占高度）：空集=不过滤；否则只显示命中所选来源的需求。
+  // 来源/状态过滤（融进搜索框，不额外占高度）：空集=不过滤；否则只显示命中所选项的需求。
   const [sourceFilter, setSourceFilter] = useState<Set<string>>(new Set());
+  // 状态过滤：分析失败 / 分析中 / 待需求审核 三态混在一栏，按状态过滤便于聚焦其一。
+  const [statusFilter, setStatusFilter] = useState<Set<string>>(new Set());
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
   const sourceMenuRef = useRef<HTMLDivElement>(null);
   // 点击浮层外部关闭来源过滤菜单（与项目选择菜单一致；非模态，外点即关）。
@@ -520,10 +540,17 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     for (const i of pendingIssues) if (i.source_type) set.add(i.source_type);
     return Array.from(set).sort();
   }, [pendingIssues]);
+  // 状态过滤选项：按 ISSUE_STATUS_ORDER 固定次序，只列当前实际出现过的状态。
+  const availableStatuses = useMemo(() => {
+    const set = new Set<string>();
+    for (const i of pendingIssues) set.add(i.status);
+    return ISSUE_STATUS_ORDER.filter(s => set.has(s));
+  }, [pendingIssues]);
   const filteredIssues = useMemo(() => {
     const q = search.trim().toLowerCase();
     const filtered = pendingIssues.filter(i =>
       (sourceFilter.size === 0 || sourceFilter.has(i.source_type)) &&
+      (statusFilter.size === 0 || statusFilter.has(i.status)) &&
       (!q || i.title.toLowerCase().includes(q) || i.id.toLowerCase().includes(q)));
     // 与 CR 侧 sortedCrs 一致：先按状态分组（失败需关注，置顶），同状态内按更新时间倒序，
     // 避免 pending_issue_review / analysis_failed 仅按 created_at 交错排列显得混乱。
@@ -534,7 +561,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       // 统一用创建时间（updated_at 会随执行/重分析变动，不稳定）：与行内显示一致。方向由 sortAsc 控制。
       return sortAsc ? a.created_at.localeCompare(b.created_at) : b.created_at.localeCompare(a.created_at);
     });
-  }, [pendingIssues, search, sourceFilter, sortAsc]);
+  }, [pendingIssues, search, sourceFilter, statusFilter, sortAsc]);
   const filteredCrs = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return crs;
@@ -544,7 +571,16 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       r.issue_id.toLowerCase().includes(q));
   }, [crs, issueTitles, search]);
   // 切换闸口时清空搜索与来源过滤，避免跨闸口残留筛选条件。
-  useEffect(() => { setSearch(''); setSourceFilter(new Set()); setSourceMenuOpen(false); }, [gate]);
+  useEffect(() => { setSearch(''); setSourceFilter(new Set()); setStatusFilter(new Set()); setSourceMenuOpen(false); }, [gate]);
+  // 列表刷新后剔除已不存在的状态过滤项（如「分析中」分析完成后消失），避免筛选把列表卡成空。
+  useEffect(() => {
+    setStatusFilter(prev => {
+      if (prev.size === 0) return prev;
+      const avail = new Set(availableStatuses);
+      const next = new Set([...prev].filter(s => avail.has(s)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [availableStatuses]);
 
   // 需求闸可批量操作的对象：待需求审核 + 分析失败（后者支持重新分析 / 拒绝 / 直接通过进入编码）。
   // 批量仅作用于当前筛选可见集。
@@ -566,6 +602,25 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   }, [selectableIds]);
   // 切换闸口时清空批量选区，避免跨闸口选区残留与底部操作条错位。
   useEffect(() => { setSelected(new Set()); }, [gate]);
+
+  // 选中需求/变更后，自动把列表滚动到选中项（若不在视口内则居中显示），
+  // 省去用户在长列表里手动翻找。每个选中 id 只滚一次：列表因后台任务高频刷新时不反复抖动。
+  const scrolledForRef = React.useRef<string | null>(null);
+  useEffect(() => {
+    if (!sel) { scrolledForRef.current = null; return; }
+    if (scrolledForRef.current === sel.id) return;
+    const root = listScrollRef.current;
+    if (!root) return;
+    const el = root.querySelector(`[data-item-id="${CSS.escape(sel.id)}"]`) as HTMLElement | null;
+    if (!el) return;  // 该项尚未渲染（列表在途加载）；filteredIssues/filteredCrs 更新后会重试
+    scrolledForRef.current = sel.id;
+    const er = el.getBoundingClientRect();
+    const rr = root.getBoundingClientRect();
+    if (er.top < rr.top || er.bottom > rr.bottom) {
+      // 只动列表自身的 scrollTop（不调 scrollIntoView，避免连带滚动外层内容区）。
+      root.scrollTop += (er.top - rr.top) - (root.clientHeight - el.clientHeight) / 2;
+    }
+  }, [sel, gate, filteredIssues, filteredCrs]);
 
   // 已合并 CR 触底哨兵进入视口即加载下一页（仅代码闸 + 还有更多时；提前 240px 预取）。
   useEffect(() => {
@@ -660,39 +715,68 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           <div style={{ position: 'relative', flex: 1, minWidth: 0 }} ref={sourceMenuRef}>
             <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 需求编号…"
               style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', paddingRight: gate === 'issue' ? 34 : 10, color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
-            {gate === 'issue' && availableSources.length > 0 && (
+            {gate === 'issue' && (availableSources.length > 0 || availableStatuses.length > 1) && (() => {
+              const activeCount = sourceFilter.size + statusFilter.size;
+              return (
               <>
                 <button type="button" onClick={() => setSourceMenuOpen(o => !o)}
-                  title={sourceFilter.size ? `来源过滤：已选 ${sourceFilter.size} 项` : '按来源过滤'}
-                  style={{ position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)', width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', background: sourceFilter.size ? 'var(--ember-tint)' : 'transparent', border: 'none', borderRadius: 6, cursor: 'pointer', color: sourceFilter.size ? 'var(--ember-soft)' : 'var(--text-3)' }}>
+                  title={activeCount ? `过滤：已选 ${activeCount} 项` : '按状态 / 来源过滤'}
+                  style={{ position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)', width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', background: activeCount ? 'var(--ember-tint)' : 'transparent', border: 'none', borderRadius: 6, cursor: 'pointer', color: activeCount ? 'var(--ember-soft)' : 'var(--text-3)' }}>
                   <Icon name="funnel" size={14} />
-                  {sourceFilter.size > 0 && <span style={{ position: 'absolute', top: 2, right: 2, width: 6, height: 6, borderRadius: 99, background: 'var(--ember)' }} />}
+                  {activeCount > 0 && <span style={{ position: 'absolute', top: 2, right: 2, width: 6, height: 6, borderRadius: 99, background: 'var(--ember)' }} />}
                 </button>
                 {sourceMenuOpen && (
                   <div className="mention-pop" style={{ right: 0, left: 'auto', top: 'calc(100% + 6px)', bottom: 'auto', minWidth: 180, marginBottom: 0, zIndex: 40 }}>
-                    <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <span>按来源过滤</span>
-                      {sourceFilter.size > 0 && (
-                        <span onClick={() => setSourceFilter(new Set())} style={{ cursor: 'pointer', color: 'var(--ember-soft)', textTransform: 'none', letterSpacing: 0 }}>清除</span>
-                      )}
-                    </div>
-                    {availableSources.map(src => {
-                      const s = issueSourceMeta(src);
-                      const on = sourceFilter.has(src);
-                      const count = pendingIssues.filter(i => i.source_type === src).length;
-                      return (
-                        <div key={src} className={'mention-row' + (on ? ' mention-active' : '')}
-                          onClick={() => setSourceFilter(prev => { const n = new Set(prev); n.has(src) ? n.delete(src) : n.add(src); return n; })}>
-                          <span style={{ width: 14, flexShrink: 0, color: 'var(--ember)' }}>{on && <Icon name="check" size={13} />}</span>
-                          <span className="nm" style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.label}</span>
-                          <span className="rl" style={{ flexShrink: 0 }}>{count}</span>
+                    {availableStatuses.length > 1 && (
+                      <>
+                        <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <span>按状态过滤</span>
+                          {statusFilter.size > 0 && (
+                            <span onClick={() => setStatusFilter(new Set())} style={{ cursor: 'pointer', color: 'var(--ember-soft)', textTransform: 'none', letterSpacing: 0 }}>清除</span>
+                          )}
                         </div>
-                      );
-                    })}
+                        {availableStatuses.map(st => {
+                          const on = statusFilter.has(st);
+                          const count = pendingIssues.filter(i => i.status === st).length;
+                          return (
+                            <div key={st} className={'mention-row' + (on ? ' mention-active' : '')}
+                              onClick={() => setStatusFilter(prev => { const n = new Set(prev); n.has(st) ? n.delete(st) : n.add(st); return n; })}>
+                              <span style={{ width: 14, flexShrink: 0, color: 'var(--ember)' }}>{on && <Icon name="check" size={13} />}</span>
+                              <span className={'chip ' + (STATUS_COLOR[st] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[st] ?? st}</span>
+                              <span className="rl" style={{ flexShrink: 0, marginLeft: 'auto' }}>{count}</span>
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+                    {availableSources.length > 0 && (
+                      <>
+                        <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <span>按来源过滤</span>
+                          {sourceFilter.size > 0 && (
+                            <span onClick={() => setSourceFilter(new Set())} style={{ cursor: 'pointer', color: 'var(--ember-soft)', textTransform: 'none', letterSpacing: 0 }}>清除</span>
+                          )}
+                        </div>
+                        {availableSources.map(src => {
+                          const s = issueSourceMeta(src);
+                          const on = sourceFilter.has(src);
+                          const count = pendingIssues.filter(i => i.source_type === src).length;
+                          return (
+                            <div key={src} className={'mention-row' + (on ? ' mention-active' : '')}
+                              onClick={() => setSourceFilter(prev => { const n = new Set(prev); n.has(src) ? n.delete(src) : n.add(src); return n; })}>
+                              <span style={{ width: 14, flexShrink: 0, color: 'var(--ember)' }}>{on && <Icon name="check" size={13} />}</span>
+                              <span className="nm" style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.label}</span>
+                              <span className="rl" style={{ flexShrink: 0 }}>{count}</span>
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
                   </div>
                 )}
               </>
-            )}
+              );
+            })()}
           </div>
           <button type="button" className="icon-btn" onClick={() => setSortAsc(v => !v)}
             title={sortAsc ? '创建时间正序（最早在前）· 点击切换为倒序' : '创建时间倒序（最新在前）· 点击切换为正序'}
@@ -712,40 +796,51 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           </button>
         )}
 
-        {/* 搜索/来源过滤无匹配提示：原始列表有内容但筛选后为空 */}
-        {(search.trim() || (gate === 'issue' && sourceFilter.size > 0)) && (gate === 'issue' ? (pendingIssues.length > 0 && filteredIssues.length === 0) : (crs.length > 0 && filteredCrs.length === 0)) && (
+        {/* 搜索/状态/来源过滤无匹配提示：原始列表有内容但筛选后为空 */}
+        {(search.trim() || (gate === 'issue' && (sourceFilter.size > 0 || statusFilter.size > 0))) && (gate === 'issue' ? (pendingIssues.length > 0 && filteredIssues.length === 0) : (crs.length > 0 && filteredCrs.length === 0)) && (
           <div className="empty-compact" style={{ padding: '14px 12px', textAlign: 'center', color: 'var(--text-faint)', fontSize: 'var(--text-caption)' }}>
-            {search.trim() ? <>无匹配「{search.trim()}」的{gate === 'issue' ? '需求' : '变更'}</> : '当前来源筛选下无待审需求'}
+            {search.trim() ? <>无匹配「{search.trim()}」的{gate === 'issue' ? '需求' : '变更'}</> : '当前筛选下无待审需求'}
           </div>
         )}
 
-        {/* 需求审核：待需求审核（Issue，尚未生成 CR） */}
-        {gate === 'issue' && filteredIssues.length > 0 && (
-          <div className="req-group-head">
-            <span>{STATUS_LABEL.pending_issue_review}</span>
-            <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{filteredIssues.length}</span>
-            {/* 批量审核：全选 / 取消全选可批量通过的待审核需求 */}
-            {selectablePending.length > 0 && (
-              <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选可批量操作的需求（待审核 / 分析失败）'}
-                style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
-                <LedgerCheck on={allSelectableSelected} /> 全选
-              </button>
-            )}
-          </div>
-        )}
-        {gate === 'issue' && filteredIssues.map(issue => {
-          const canSelect = issue.status === 'pending_issue_review' || issue.status === 'analysis_failed';
-          const failed = issue.status === 'analysis_failed';
-          return (
-            <div key={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
+        {/* 需求闸口：按状态分组（分析失败 / 待审核 / 分析中），各组独立标题，不再混作一栏 */}
+        {gate === 'issue' && filteredIssues.length > 0 && (() => {
+          const statusCounts = filteredIssues.reduce<Record<string, number>>((acc, i) => {
+            acc[i.status] = (acc[i.status] ?? 0) + 1;
+            return acc;
+          }, {});
+          let lastStatus = '';
+          let shownSelectAll = false;  // 全选只挂在第一个可批量分组的标题上（语义=全选当前可见可批量需求）
+          return filteredIssues.map(issue => {
+            const canSelect = issue.status === 'pending_issue_review' || issue.status === 'analysis_failed';
+            const failed = issue.status === 'analysis_failed';
+            const showLabel = issue.status !== lastStatus;
+            lastStatus = issue.status;
+            const showSelectAll = showLabel && canSelect && !shownSelectAll && selectablePending.length > 0;
+            if (showSelectAll) shownSelectAll = true;
+            return (
+            <React.Fragment key={issue.id}>
+              {showLabel && (
+                <div className="req-group-head">
+                  <span>{STATUS_LABEL[issue.status] ?? issue.status}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{statusCounts[issue.status]}</span>
+                  {showSelectAll && (
+                    <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选可批量操作的需求（待审核 / 分析失败）'}
+                      style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
+                      <LedgerCheck on={allSelectableSelected} /> 全选
+                    </button>
+                  )}
+                </div>
+              )}
+            <div data-item-id={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
               <div className="req-item-top">
                 {canSelect && (
                   <span onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量操作">
                     <LedgerCheck on={selected.has(issue.id)} />
                   </span>
                 )}
-                <span className="req-id">{issue.id.slice(0, 8)}</span>
-                <span className={'chip ' + (failed ? 'red' : 'amber')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{failed ? '分析失败' : '需求审核'}</span>
+                <span className="req-id" onClick={canSelect ? (e => { e.stopPropagation(); toggleSel(issue.id); }) : undefined} style={canSelect ? { cursor: 'pointer' } : undefined} title={canSelect ? '点击选择以批量操作' : undefined}>{issue.id.slice(0, 8)}</span>
+                <span className={'chip ' + (STATUS_COLOR[issue.status] ?? 'amber')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{failed ? '分析失败' : issue.status === 'pending_analysis' ? '分析中' : '需求审核'}</span>
                 <span className="req-time">{fmtShort(issue.created_at)}</span>
               </div>
               <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
@@ -765,8 +860,10 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                 );
               })()}
             </div>
+            </React.Fragment>
           );
-        })}
+          });
+        })()}
 
         {/* 代码审核 及其它 CR 状态 */}
         {gate === 'code' && (() => {
@@ -794,14 +891,14 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                     )}
                   </div>
                 )}
-                <div className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
+                <div data-item-id={r.id} className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
                   <div className="req-item-top">
                     {r.status === 'pending_code_review' && (
                       <span onClick={e => { e.stopPropagation(); toggleSel(r.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
                         <LedgerCheck on={selected.has(r.id)} />
                       </span>
                     )}
-                    <span className="req-id">{r.id.slice(0, 8)}</span>
+                    <span className="req-id" onClick={r.status === 'pending_code_review' ? (e => { e.stopPropagation(); toggleSel(r.id); }) : undefined} style={r.status === 'pending_code_review' ? { cursor: 'pointer' } : undefined} title={r.status === 'pending_code_review' ? '点击选择以批量通过' : undefined}>{r.id.slice(0, 8)}</span>
                     <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
                     <span className="req-time">{fmtShort(r.created_at)}</span>
                   </div>
@@ -1303,10 +1400,12 @@ const LEDGER_PAGE = 50;   // 总账每次滚动加载的条数
 const CR_ACTIVE_CAP = 500;   // 活动集（非合并 CR）单次上限——远超工作流可能的在产数
 const CR_MERGED_PAGE = 50;   // 已合并 CR 每次滚动加载的条数
 
-function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage, onRejectIssues, showMerged, onToggleMerged, mergedCount, initialStatus }: {
+function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage, onRejectIssues, refiningIds, showMerged, onToggleMerged, mergedCount, initialStatus }: {
   projectId: string; refreshKey: number; sel: Sel | null; onSelectIssue: (id: string) => void;
   onRefineTriage: (ids: string[]) => Promise<void> | void;
   onRejectIssues: (ids: string[]) => Promise<void> | void;
+  // 正在整理中的碎片 id：提升到父组件持有，使「整理中」状态在总账弹窗关闭/重开后仍保持。
+  refiningIds: Set<string>;
   // 与功能审计页共享的「显示已合并需求」开关（默认隐藏）。
   showMerged: boolean; onToggleMerged: () => void; mergedCount: number;
   // 流水线节点跳转预置的初始状态筛选（缺省 'all'）。
@@ -1327,9 +1426,6 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   const [loading, setLoading] = useState(false);
   // 待确认的拒绝操作：行内单条 / 批量都先弹二次确认，避免误删（triage 碎片为硬删除不可恢复）。
   const [confirmReject, setConfirmReject] = useState<null | { ids: string[]; clear: boolean }>(null);
-  // 正在整理中的碎片 id：点击「整理」即时置入，用于行/按钮显示 spinner + 「整理中…」，
-  // 消除 triage Agent 调用期间「点了没反应」的感知。
-  const [refiningIds, setRefiningIds] = useState<Set<string>>(new Set());
   // 单调令牌：项目/筛选/刷新变化即自增，丢弃在途的过期分页响应，并区分「重置」与「追加」。
   const reqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1411,14 +1507,13 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
     Promise.resolve(fn()).finally(() => { setBusy(false); if (clear) setSelected(new Set()); });
   };
   // 整理可并发：每条碎片独立跑 triage Agent，互不阻塞（后端按 id 处理且带 status='triage'
-  // 守卫，并发安全）。仅把本批未在途的 id 并入 refiningIds 标记 spinner，跑完只摘除自己这批，
+  // 守卫，并发安全）。refiningIds 由父组件持有（跨弹窗关闭/重开保持），这里只过滤本批未在途
+  // 的 id 交给父组件标记 spinner，跑完父组件摘除；本组件仅在结束后清选区。
   // 因此点一条整理时仍可点另一条同时跑。不占用全局 busy（busy 只留给拒绝等串行操作）。
   const runRefine = (ids: string[], clear: boolean) => {
     const fresh = ids.filter(id => !refiningIds.has(id));
     if (!fresh.length) return;
-    setRefiningIds(prev => new Set([...prev, ...fresh]));
     Promise.resolve(onRefineTriage(fresh)).finally(() => {
-      setRefiningIds(prev => { const n = new Set(prev); fresh.forEach(id => n.delete(id)); return n; });
       if (clear) setSelected(new Set());
     });
   };
@@ -1473,7 +1568,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
             <span onClick={e => { e.stopPropagation(); toggle(i.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择">
               <LedgerCheck on={selected.has(i.id)} />
             </span>
-            <span className="req-id">{i.id.slice(0, 8)}</span>
+            <span className="req-id" onClick={e => { e.stopPropagation(); toggle(i.id); }} style={{ cursor: 'pointer' }} title="点击选择">{i.id.slice(0, 8)}</span>
             <span className="req-title" title={i.title}>{i.title}</span>
             {i.status === 'triage' && (
               <button className="btn btn-sm" style={{ padding: '2px 8px' }} disabled={refiningIds.has(i.id)}
@@ -1908,6 +2003,12 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
         </div>
       )}
 
+      {issue.status === 'pending_analysis' && (
+        <div className="chip blue" style={{ display: 'block', padding: '12px 14px', margin: '12px 0', lineHeight: 'var(--leading-normal)' }}>
+          <strong>分析进行中</strong> · AI 正在分析该需求，完成后会自动进入「待需求审核」。{analysis ? '下方为上一轮分析结果，仅供参考。' : ''}
+        </div>
+      )}
+
       {analysisLoading ? (
         <div className="empty-compact" style={{ padding: '20px 0' }}>加载分析…</div>
       ) : analysis ? (
@@ -2099,6 +2200,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [ledgerStatus, setLedgerStatus] = useState<string | undefined>(undefined);
   // 总账刷新信号：整理/拒绝后自增，触发总账重载首页（背景事件刷新不动它，避免浏览中被重置）。
   const [ledgerRefresh, setLedgerRefresh] = useState(0);
+  // 正在整理中的碎片 id：取自模块级 refiningStore（脱离组件树），使「整理中」spinner 在
+  // 总账弹窗关闭/重开、乃至切换页面后仍保持（后端 triage 命令本就在后台跑到完）。
+  const refiningIds = useSyncExternalStore(refiningStore.subscribe, refiningStore.get);
   // 通知导航请求时自动打开总账弹窗，并立即消费该意图（避免再次进入本页时重复弹出）。
   useEffect(() => {
     if (openLedger) { setShowLedger(true); onLedgerConsumed?.(); }
@@ -2202,6 +2306,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [crAppLaunching, setCrAppLaunching] = useState(false);
   const crAppLaunchingRef = useRef(false);
   crAppLaunchingRef.current = crAppLaunching;
+  // 微信小程序编译中（一次性 build，无持久进程）。crPhase 用 ref 读以保持回调稳定。
+  const [crMiniappBuilding, setCrMiniappBuilding] = useState(false);
+  const crMiniappBuildingRef = useRef(false);
+  crMiniappBuildingRef.current = crMiniappBuilding;
   // 已发起 start_branch_preview 但后端尚未返回（worktree 首次检出可能耗时数秒）的分支。
   // 让阶段灯在这段「无任何输出」的空窗期也显示「启动中」而非误判为已退出。
   const startingBranchesRef = useRef<Set<string>>(new Set());
@@ -2218,6 +2326,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     const p = crPreviewRef.current;
     if (!p) return 'starting';
     if (p.kind === 'tauri') return p.app_running ? 'running' : (crAppLaunchingRef.current ? 'starting' : 'stopped');
+    // 小程序：一次性编译，无持久进程；编译中=running 灯，否则停止。
+    if (p.kind === 'miniapp') return crMiniappBuildingRef.current ? 'running' : 'stopped';
     if (p.status === 'running') return 'running';
     if (p.status === 'starting') return 'starting';
     return 'stopped';
@@ -2272,12 +2382,13 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const loadList = useCallback(async (projectId: string) => {
     // 不再全量加载 issues / CR：左栏只需「活动集 CR（非合并，有界）+ 待审需求（有界子集）」；
     // 已合并 CR 会随项目生命周期无限累积，只取首页、按需滚动追加；总账自带分页滚动加载。
-    // 需求审核 列表同时纳入「分析失败」需求，让用户能看到失败原因并一键重新分析。
+    // 需求审核 列表同时纳入「分析失败」与「分析中」需求：失败可一键重新分析，
+    // 分析中（点了分析/重分析后）也保持可见，不再「点完就从列表消失」。
     const token = ++crReqRef.current;
     const [activePage, mergedPage, pending] = await Promise.all([
       listChangeRequestsPage(projectId, undefined, true, CR_ACTIVE_CAP, 0),
       listChangeRequestsPage(projectId, 'merged', false, CR_MERGED_PAGE, 0),
-      listIssuesByStatuses(projectId, ['pending_issue_review', 'analysis_failed']),
+      listIssuesByStatuses(projectId, ['pending_issue_review', 'analysis_failed', 'pending_analysis']),
     ]);
     if (crReqRef.current !== token) return;  // 期间已切项目/重载，丢弃本次结果
     const allCrs = [...activePage.items, ...mergedPage.items];
@@ -2347,16 +2458,21 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   // 整理待整理池条目：triage Agent 炼成正经需求并转入流水线。
   // triage Agent 炼成正经需求并转入流水线；反馈整理/丢弃/出错数。
   const refineTriageItems = useCallback(async (ids: string[]) => {
-    if (!ids.length) return;
-    showInfo(`正在调用 triage Agent 整理 ${ids.length} 条碎片，请稍候…`);
+    // 只整理本批未在途的 id，避免重复入队；并入模块级 refiningStore 以驱动 spinner
+    // （跨弹窗关闭/重开、跨页面切换均保持，因后端命令在后台跑到完）。
+    const fresh = ids.filter(id => !refiningStore.get().has(id));
+    if (!fresh.length) return;
+    refiningStore.add(fresh);
+    showInfo(`正在调用 triage Agent 整理 ${fresh.length} 条碎片，请稍候…`);
     try {
-      const r = await refineTriage(ids);
+      const r = await refineTriage(fresh);
       if (r.errors && !r.refined && !r.discarded) {
         showError(`整理失败 ${r.errors} 条（请检查 triage 角色的 LLM 配置）`);
       } else {
         showOk(`整理完成：转入流水线 ${r.refined} · 判为噪音丢弃 ${r.discarded}` + (r.errors ? ` · 失败 ${r.errors}` : ''));
       }
     } catch (e) { showError('整理失败：' + String(e)); }
+    finally { refiningStore.remove(fresh); }
     setLedgerRefresh(v => v + 1);
     if (activeProject) await loadList(activeProject.id);
   }, [activeProject, loadList, showError, showOk, showInfo]);
@@ -2997,6 +3113,35 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     setTimeout(() => setCrAppLaunching(false), 12000);
   }, [activeCr, crPhase, showError, showInfo]);
 
+  // 微信小程序：一次性编译（无 dev server / 无端口 / 无浏览器）。编译完提示产物目录，
+  // 用微信开发者工具打开。日志走同一份 cr:{id} 订阅，实时面板可见编译进度。
+  const doBuildMiniapp = useCallback(async () => {
+    if (!activeCr) return;
+    const id = activeCr;
+    setCrMiniappBuilding(true);
+    setLogModal({ title: '编译日志 · 微信小程序', sig: `cr:${id}` });
+    try {
+      const res = await buildCrMiniapp(id);
+      if (res.success) {
+        if (res.launched_devtools) {
+          showInfo(`编译成功 · 已用微信开发者工具打开产物目录：${res.artifact_dir}`);
+        } else {
+          showInfo(
+            res.artifact_dir
+              ? `编译成功 · 产物目录：${res.artifact_dir}（用微信开发者工具打开此目录预览；可在设置中配置 CLI 路径以自动打开）`
+              : '编译成功，但未识别到产物目录，请查看编译日志确认输出位置。'
+          );
+        }
+      } else {
+        showError(`编译失败（退出码 ${res.exit_code}），请查看编译日志。`);
+      }
+    } catch (e) {
+      showError('编译微信小程序失败：' + String(e));
+    } finally {
+      setCrMiniappBuilding(false);
+    }
+  }, [activeCr, showError, showInfo]);
+
   const showCrPreviewLog = useCallback(() => {
     if (!activeCr) return;
     const id = activeCr;
@@ -3031,6 +3176,22 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         <button className="btn btn-sm" disabled>
           <span className="dot amber" style={{ marginRight: 4 }} />启动中…
         </button>
+      );
+    }
+    if (kind === 'miniapp') {
+      // 微信小程序：无 localhost server 可 iframe，预览=一次性编译产物。
+      // 不轮询 reachability、不开浏览器；编译完提示产物目录，用微信开发者工具打开。
+      return (
+        <>
+          <button className="btn btn-sm" disabled={crMiniappBuilding} onClick={doBuildMiniapp}>
+            {crMiniappBuilding
+              ? <><span className="dot amber" style={{ marginRight: 4 }} />编译中…</>
+              : <><Icon name="box" size={14} />编译小程序</>}
+          </button>
+          <button className="btn btn-sm btn-ghost" onClick={showCrPreviewLog} title="查看编译日志">
+            <Icon name="log" size={14} />
+          </button>
+        </>
       );
     }
     if (kind === 'tauri') {
@@ -3752,6 +3913,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                   }
                 }}
                 onRefineTriage={refineTriageItems} onRejectIssues={rejectIssuesItems}
+                refiningIds={refiningIds}
                 showMerged={showMerged} onToggleMerged={() => setShowMerged(v => !v)}
                 mergedCount={mergedTotal}
                 initialStatus={ledgerStatus} />

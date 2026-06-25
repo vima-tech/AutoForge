@@ -102,30 +102,41 @@ struct LlmSensitive {
     detail: String,
 }
 
-/// IPC 命令：为指定 CR 生成 AI 变更摘要。后端自取 diff（单一真源、避免大 diff 在 IPC 往返两次）。
-///
-/// 缓存策略：摘要只随 diff 内容变化。按 `cr_id` 缓存并记录所依据 diff 的 sha256；
-/// 命中且哈希一致则直接返回缓存——切换需求/CR 不重跑 LLM。`force=true`（卡片「重新生成」按钮）
-/// 跳过缓存强制重算。只缓存成功结果（status=ok），degraded/empty 不落库以便下次自动重试。
+/// IPC 命令：为指定 CR 生成 AI 变更摘要（薄包装，逻辑见 [`ensure_change_summary`]）。
+/// 后端自取 diff（单一真源、避免大 diff 在 IPC 往返两次）。
 #[tauri::command]
 pub async fn generate_change_summary(
     cr_id: String,
     force: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ChangeSummary, String> {
-    let diff = crate::commands::change_requests::load_cr_diff(&state.db, &cr_id).await?;
+    ensure_change_summary(&state.db, &cr_id, force.unwrap_or(false)).await
+}
+
+/// 生成（或命中缓存返回）CR 的变更摘要，成功结果落库。供 IPC 命令与执行完成后的
+/// 后台预生成共用——执行结束即预热缓存，用户打开审核页直接命中、无需等待 LLM。
+///
+/// 缓存策略：摘要只随 diff 内容变化，按 `cr_id` 缓存并记录所依据 diff 的 sha256；命中且哈希
+/// 一致则直接返回——切换需求/CR 不重跑 LLM。`force=true`（卡片「重新生成」按钮）跳过缓存强制
+/// 重算。只缓存成功结果（status=ok），degraded/empty 不落库以便下次自动重试。
+pub async fn ensure_change_summary(
+    db: &Db,
+    cr_id: &str,
+    force: bool,
+) -> Result<ChangeSummary, String> {
+    let diff = crate::commands::change_requests::load_cr_diff(db, cr_id).await?;
     let diff_hash = hex::encode(sha2::Sha256::digest(diff.as_bytes()));
 
-    if !force.unwrap_or(false) {
-        if let Some(cached) = load_cached_summary(&state.db, &cr_id, &diff_hash).await {
+    if !force {
+        if let Some(cached) = load_cached_summary(db, cr_id, &diff_hash).await {
             return Ok(cached);
         }
     }
 
-    let summary = build_change_summary(&state.db, &diff).await;
+    let summary = build_change_summary(db, &diff).await;
     // 仅缓存完整成功的摘要；降级 / 空态不落库，下次自动重试。
     if summary.status == "ok" {
-        save_cached_summary(&state.db, &cr_id, &diff_hash, &summary).await;
+        save_cached_summary(db, cr_id, &diff_hash, &summary).await;
     }
     Ok(summary)
 }

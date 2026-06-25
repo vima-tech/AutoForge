@@ -264,7 +264,7 @@ export interface ConcurrencyConfig {
   active_slots: number; max_slots: number; pending_review: number;
   pause_threshold: number; stage: string; queue_strategy: string;
   timeout_min: number; idle_timeout_min: number; max_load_factor: number;
-  build_slots: number; cpu_budget_pct: number;
+  build_slots: number; cpu_budget_pct: number; llm_max_concurrency: number;
 }
 export interface PreviewEnvironment {
   id: string; project_id: string; env_type: string;
@@ -314,7 +314,7 @@ export const getConcurrencyConfig = () => ipc<ConcurrencyConfig>('get_concurrenc
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
   timeout_min: number; idle_timeout_min: number; max_load_factor: number;
-  build_slots: number; cpu_budget_pct: number;
+  build_slots: number; cpu_budget_pct: number; llm_max_concurrency: number;
 }>) => ipc<ConcurrencyConfig>('update_concurrency_config', { payload });
 export const listPreviewEnvironments = (projectId?: string, status?: string) =>
   ipc<PreviewEnvironment[]>('list_preview_environments', {
@@ -467,6 +467,9 @@ export interface RunConfigDraft {
 }
 export const aiGenerateRunConfig = (projectId: string) =>
   ipc<RunConfigDraft>('ai_generate_run_config', { projectId });
+/** 仓库自动检测出的应用品类一句话描述（运行配置只读展示，如「后端服务 · go/gin」） */
+export const detectProjectCategory = (projectId: string) =>
+  ipc<string>('detect_project_category', { projectId });
 
 // ── Issues ───────────────────────────────────────────────────────────────────
 export const listIssues = (projectId?: string) =>
@@ -537,21 +540,50 @@ export const openIssueAttachment = (attachmentId: string) =>
 export const deleteIssueAttachment = (attachmentId: string) =>
   ipc<void>('delete_issue_attachment', { attachmentId });
 
-// ── 项目蓝图向导（大需求 → PRD / 技术规格 / TASKLIST）─────────────────────────
-export interface BlueprintSpec { category: string; title: string; content_markdown: string; }
-export interface BlueprintTask { title: string; description: string; category: string; severity: string; }
-export interface BlueprintResult {
-  prd_markdown: string; specs: BlueprintSpec[]; tasklist: BlueprintTask[]; tasklist_markdown: string;
+// ── 孵化台（每项目多条大需求 → 可多轮对话打磨的 PRD / 规格 / 任务，并一键编码开发）──────
+// 每条大需求 = 一个草稿（单一真源）；点「编码开发」直接落为 issue + CR + 编码执行（仅代码审核）。
+export interface BlueprintSpec { id: string; category: string; title: string; content_markdown: string; }
+export interface BlueprintTask { id: string; title: string; description: string; category: string; severity: string; }
+export interface BlueprintDraft {
+  id: string; project_id: string; title: string; brief: string; prd_markdown: string;
+  specs: BlueprintSpec[]; tasklist: BlueprintTask[]; status: string;
+  issue_id: string; cr_id: string; created_at: string; updated_at: string;
 }
-export const generateProjectBlueprint = (projectId: string, brief: string) =>
-  ipc<BlueprintResult>('generate_project_blueprint', { projectId, brief });
-export const applyProjectBlueprint = (
-  projectId: string, prdMarkdown: string, specs: BlueprintSpec[], tasklistMarkdown?: string | null,
-) => ipc<string>('apply_project_blueprint', {
-  projectId, prdMarkdown, specs, tasklistMarkdown: tasklistMarkdown ?? null,
-});
-export const enqueueBlueprintTasks = (projectId: string, tasks: BlueprintTask[]) =>
-  ipc<number>('enqueue_blueprint_tasks', { projectId, tasks });
+export interface BlueprintMessage {
+  id: string; draft_id: string; role: string; content: string; change_summary: string; created_at: string;
+}
+export interface BlueprintDraftView { draft: BlueprintDraft; messages: BlueprintMessage[]; }
+/** 大需求列表项：display_status ∈ drafting/coding/in_review/implemented/failed/conflict。 */
+export interface BlueprintDraftSummary {
+  id: string; project_id: string; title: string; status: string; display_status: string;
+  spec_count: number; task_count: number; issue_id: string; cr_id: string; updated_at: string;
+}
+
+/** 起草：大需求(+引用的项目文件) → 持久一条新草稿（孵化台支持每项目多条）。 */
+export const startBlueprintDraft = (projectId: string, brief: string, refFiles: string[] = []) =>
+  ipc<BlueprintDraftView>('start_blueprint_draft', { projectId, brief, refFiles });
+/** 多轮修正：自然语言指令 → AI 回传整份更新草稿（保留稳定 id）。 */
+export const refineBlueprintDraft = (draftId: string, instruction: string) =>
+  ipc<BlueprintDraftView>('refine_blueprint_draft', { draftId, instruction });
+/** 人工手改：前端发回编辑后的整份 PRD/规格/任务，落库。 */
+export const patchBlueprintDraft = (
+  draftId: string, prdMarkdown: string, specs: BlueprintSpec[], tasklist: BlueprintTask[],
+) => ipc<BlueprintDraft>('patch_blueprint_draft', { draftId, prdMarkdown, specs, tasklist });
+/** 按 draft_id 恢复一条大需求草稿 + 对话历史（无则 null）。 */
+export const getBlueprintDraft = (draftId: string) =>
+  ipc<BlueprintDraftView | null>('get_blueprint_draft', { draftId });
+/** 列出某项目全部大需求（含派生状态、计数）。 */
+export const listBlueprintDrafts = (projectId: string) =>
+  ipc<BlueprintDraftSummary[]>('list_blueprint_drafts', { projectId });
+/** 删除一条大需求草稿（已编码的不可删）。 */
+export const deleteBlueprintDraft = (draftId: string) =>
+  ipc<void>('delete_blueprint_draft', { draftId });
+/** 留档：PRD 写 docs、规格写 specs+DB（编码开发不依赖此）。 */
+export const applyBlueprintDraft = (draftId: string, writeTasklistDoc: boolean) =>
+  ipc<string>('apply_blueprint_draft', { draftId, writeTasklistDoc });
+/** 编码开发：把该大需求直接落为 issue + CR + 编码执行（仅代码审核）。返回 cr_id。 */
+export const codeBlueprintDraft = (draftId: string) =>
+  ipc<string>('code_blueprint_draft', { draftId });
 
 // CR 级测试遥测记录。
 export interface CrTestRun {
@@ -1067,10 +1099,11 @@ export const listAgentOutputRoles = () => ipc<string[]>('list_agent_output_roles
 export const clearAgentOutputs = (id?: string) => ipc<void>('clear_agent_outputs', { id: id ?? null });
 
 export interface FieldStat { path: string; filled: number; total: number; fill_rate: number; }
+export interface VersionStat { schema_version: string; count: number; }
 export interface FieldHealth {
   role: string; schema_version: string | null; total: number;
   status_ok: number; status_partial: number; status_error: number;
-  fields: FieldStat[];
+  fields: FieldStat[]; versions: VersionStat[];
 }
 export const agentOutputFieldHealth = (role: string, schemaVersion?: string, projectId?: string) =>
   ipc<FieldHealth>('agent_output_field_health', { role, schemaVersion: schemaVersion ?? null, projectId: projectId ?? null });
@@ -1228,7 +1261,7 @@ export const getDevServerLog = (projectId: string) =>
 // ── CR worktree preview (本次改动) ──────────────────────────────────────────────
 export interface CrPreviewStatus {
   cr_id: string;
-  kind: 'web' | 'tauri' | 'none';
+  kind: 'web' | 'tauri' | 'miniapp' | 'none';
   status: 'no_config' | 'no_session' | 'idle' | 'starting' | 'running' | 'stopped';
   url: string | null;
   can_launch_app: boolean;
@@ -1239,12 +1272,31 @@ export interface CrPreviewStatus {
   /** launch_cr_app 启动的桌面应用进程仍存活 —— UI 据此把「启动」切为「停止」 */
   app_running: boolean;
 }
+/** 微信小程序一次性编译结果（区别于 dev server：无端口/无探活/无持久进程） */
+export interface MiniappBuildResult {
+  cr_id: string;
+  success: boolean;
+  exit_code: number;
+  /** 编译产物目录（相对 worktree 根），用微信开发者工具打开；未找到为 null */
+  artifact_dir: string | null;
+  command: string;
+  /** 档位 2：是否已用微信开发者工具 CLI 自动打开产物（未配置/失败为 false） */
+  launched_devtools: boolean;
+}
 export const getCrPreview = (crId: string) =>
   ipc<CrPreviewStatus>('get_cr_preview', { crId });
 export const startCrPreview = (crId: string) =>
   ipc<CrPreviewStatus>('start_cr_preview', { crId });
 export const stopCrPreview = (crId: string) =>
   ipc<void>('stop_cr_preview', { crId });
+/** 编译微信小程序 CR（一次性 build；日志走 get_cr_preview_log / preview_log 订阅） */
+export const buildCrMiniapp = (crId: string) =>
+  ipc<MiniappBuildResult>('build_cr_miniapp', { crId });
+/** 微信开发者工具 CLI 路径（小程序预览档位 2：编译后自动打开产物）。留空=仅手动打开 */
+export const getMiniappDevtoolsPath = () =>
+  ipc<string>('get_miniapp_devtools_path');
+export const setMiniappDevtoolsPath = (path: string) =>
+  ipc<void>('set_miniapp_devtools_path', { path });
 export const launchCrApp = (crId: string) =>
   ipc<void>('launch_cr_app', { crId });
 export const getCrPreviewLog = (crId: string) =>

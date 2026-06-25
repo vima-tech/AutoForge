@@ -85,6 +85,13 @@ pub fn run() {
             state::init_build_pool(build_slots);
             core::cpubudget::init(cpu_budget_pct);
 
+            // 出站 LLM 并发闸：按配置初始化，削平批量任务（如一次分析 50 条需求）打到
+            // 服务商的瞬时并发，防 429 限流。设置变更时由 update_concurrency_config 热更新。
+            let llm_concurrency = tauri::async_runtime::block_on(
+                commands::system::load_llm_concurrency(&db),
+            );
+            agents::llm::set_llm_concurrency(llm_concurrency);
+
             let job_tx = tasks::runner::start(db.clone(), app_handle.clone(), concurrency.clone());
 
             let webhook_handle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
@@ -429,6 +436,8 @@ pub fn run() {
             commands::notifications::mark_all_notifications_read,
             commands::settings::get_asr_settings,
             commands::settings::set_asr_settings,
+            commands::settings::get_miniapp_devtools_path,
+            commands::settings::set_miniapp_devtools_path,
             commands::asr::transcribe_recording_segment,
             commands::asr::transcribe_recording_file,
             commands::asr::asr_realtime_start,
@@ -498,6 +507,7 @@ pub fn run() {
             commands::cr_preview::get_cr_preview,
             commands::cr_preview::start_cr_preview,
             commands::cr_preview::stop_cr_preview,
+            commands::cr_preview::build_cr_miniapp,
             commands::cr_preview::launch_cr_app,
             commands::cr_preview::get_cr_preview_log,
             commands::cr_preview::list_local_branches,
@@ -530,9 +540,14 @@ pub fn run() {
             commands::specs::scan_spec_files,
             commands::specs::get_spec_content,
             commands::specs::set_spec_injection,
-            commands::blueprint::generate_project_blueprint,
-            commands::blueprint::apply_project_blueprint,
-            commands::blueprint::enqueue_blueprint_tasks,
+            commands::blueprint::start_blueprint_draft,
+            commands::blueprint::refine_blueprint_draft,
+            commands::blueprint::patch_blueprint_draft,
+            commands::blueprint::get_blueprint_draft,
+            commands::blueprint::list_blueprint_drafts,
+            commands::blueprint::delete_blueprint_draft,
+            commands::blueprint::apply_blueprint_draft,
+            commands::blueprint::code_blueprint_draft,
             commands::security::list_security_audits,
             commands::deploy::list_deployments,
             commands::deploy::generate_deploy_script,
@@ -556,6 +571,7 @@ pub fn run() {
             commands::artifacts::reveal_delivery_artifact,
             commands::scan::run_proactive_scan,
             commands::run_config::ai_generate_run_config,
+            commands::run_config::detect_project_category,
             commands::grading::get_cr_grade,
             commands::grading::list_auto_pass_policy,
             commands::grading::get_auto_pass_enabled,

@@ -4,7 +4,7 @@ use crate::db::Db;
 use crate::models::widget::WidgetToken;
 use crate::tasks::runner::JobSender;
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,6 +24,15 @@ struct WebhookState {
     app: AppHandle,
     /// 进程内限流器（per-IP / per-project / global 滑窗）。
     limiter: Arc<RateLimiter>,
+}
+
+/// 入站 query 参数。`src=widget` 标记匿名反馈 widget 来源：无论命中的 token 是 flow 还是
+/// triage，一律强制落入待整理池。该标记**只能把模式降级为 triage、不能提权为 flow**，
+/// 因此即便项目 flow token 被公开嵌入 widget HTML，匿名访客也无法借此绕过待整理直进分析队列。
+#[derive(Deserialize, Default)]
+struct IssueQuery {
+    #[serde(default)]
+    src: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +95,7 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
 async fn handle_issue(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(ws): State<WebhookState>,
+    Query(q): Query<IssueQuery>,
     headers: HeaderMap,
     Json(payload): Json<WebhookPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -130,8 +140,14 @@ async fn handle_issue(
         );
     }
 
-    // ── ① token.mode 决定落库模式：flow → 自动分析；triage → 待整理池（不烧 AI）──
-    let (source_type, mode) = if token.mode == "flow" {
+    // ── ① 落库模式决策 ───────────────────────────────────────────────────────────
+    //   * src=widget（匿名反馈 widget）：一律强制 triage —— 仅降级、不可提权，
+    //     故公开嵌入项目 flow token 也不会让访客绕过待整理直进分析队列。
+    //   * 否则按 token.mode：flow → 自动分析；triage → 待整理池（不烧 AI）。
+    let is_widget = q.src.as_deref() == Some("widget");
+    let (source_type, mode) = if is_widget {
+        ("widget", IntakeMode::Triage)
+    } else if token.mode == "flow" {
         ("webhook", IntakeMode::Flow)
     } else {
         ("widget", IntakeMode::Triage)

@@ -1,6 +1,7 @@
 pub mod admin_decision;
 pub mod agent_output;
 pub mod artifact;
+pub mod blueprint;
 pub mod spec;
 pub mod intake;
 pub mod agent;

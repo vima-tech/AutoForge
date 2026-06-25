@@ -6,6 +6,7 @@ import { useOperator } from '../operator';
 import { primeAgents } from '../agents-store';
 import Block from '../components/Block';
 import Markdown from '../components/Markdown';
+import RoundAvatarStack from '../components/RoundAvatarStack';
 import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
@@ -408,6 +409,10 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
         ? <MeAvatar size={36} />
         : isInnate
             ? <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Innate 知识库"><Icon name="brain" size={20} /></div>
+        : isGroup
+            // 群聊里 agent 头像不在每条消息上重复显示——统一由左上角堆叠按发言序展示。
+            // 保留 36px 占位维持消息缩进，让堆叠浮在这条头像列里。
+            ? <div className="av" style={{ width: 36, height: 36, visibility: 'hidden' }} />
         : a ? <Avatar agent={a} size={36} />
             : <div className="av" style={{ width: 36, height: 36, background: '#888', fontSize: 'var(--text-body)' }}>?</div>}
       <div className="msg-body">
@@ -2243,6 +2248,15 @@ export default function ConversationsPage() {
   const [wsRefs,         setWsRefs]         = useState<WorkspaceRef[]>([]);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
+  // 当前正在看的气泡对应的 agent（跨越视口顶边的那条消息的作者）→ 在堆叠里高亮其边框，
+  // 充当「黏性标题」指示当前段落属于谁。
+  const [currentAgentId, setCurrentAgentId] = useState<string | null>(null);
+  // 堆叠作用域：以「我的发言」分段，当前滚动位置所在那一段里发过言的 agent——按**发言先后**排序的有序数组
+  // （非成员名单顺序）。即「只显示到我最近一次发言为止」：最新一轮几个 agent 回复就显示这几个，
+  // 顺序与对话流一致。群聊里消息行不再各自显示头像，统一由此堆叠展示（currentAgentId 高亮当前）。
+  const [segmentAgents, setSegmentAgents] = useState<string[]>([]);
+  // 本段起始处「我的发言」消息 id——堆叠顶部的「我」按钮据此跳转回本轮我的提问。
+  const [segmentStartId, setSegmentStartId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<string | null>(null);
   const [showArchive,    setShowArchive]    = useState(false);
@@ -2316,13 +2330,24 @@ export default function ConversationsPage() {
       }
       return next;
     });
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, []);
   useEffect(() => () => { if (thinkTimer.current) clearTimeout(thinkTimer.current); }, []);
+  // 是否贴在底部附近（用户没有上滚看历史）。仅贴底时才自动跟随，避免上滚阅读 / 点头像跳转时被拽回底部。
+  const atBottomRef = useRef(true);
+  // 思考卡片随流式输出 / 工具调用加载而增高时，自动跟随到底（内容向上顿动），免去手动反复下滚；
+  // 用 useLayoutEffect 在绘制前贴底、无闪动；不贴底（在看历史）则不打扰。
+  useLayoutEffect(() => {
+    if (atBottomRef.current && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [thinking]);
 
   // Ref keeps the event listener closure up-to-date without re-registering it.
   const activeRef = useRef(active);
   activeRef.current = active;
+  // 供滚动可见性计算读取最新 msgs，避免把 msgs 进 useCallback 依赖反复重建监听。
+  const msgsRef = useRef(msgs);
+  msgsRef.current = msgs;
 
   // ── Stable data-fetching callbacks ─────────────────────────────────────────
 
@@ -2379,7 +2404,7 @@ export default function ConversationsPage() {
     // 恢复在途任务指示：切换会话或重新进入会议室页时，若该会话仍有 running 的后台任务，
     // 重新点亮「正在思考」气泡——后台任务本就 detached 持续执行，这里让前端忠实反映它。
     listConversationTasks(active).then(tasks => {
-      if (alive && tasks[0]?.status === 'running') flashActivity('running', 'Agent 正在思考…');
+      if (alive && tasks[0]?.status === 'running') flashActivity('running', '调度器安排任务中…');
     }).catch(() => {});
 
     const readTimer = setTimeout(() => {
@@ -2401,6 +2426,11 @@ export default function ConversationsPage() {
     setEditGroup(null);
     setActivity(null);
     setThinking({});
+    setCurrentAgentId(null);
+    setSegmentAgents([]);
+    setSegmentStartId(null);
+    visKeyRef.current = '';
+    atBottomRef.current = true; // 新会话默认贴底跟随
     thinkBuf.current = {};
     if (thinkTimer.current) { clearTimeout(thinkTimer.current); thinkTimer.current = null; }
     setJustSentId('');
@@ -2451,7 +2481,7 @@ export default function ConversationsPage() {
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
       // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。
       if (ev.type === 'conversation_task_updated' && !!activeRef.current && ev.conversation_id === activeRef.current) {
-        if (ev.status === 'running') flashActivity('running', 'Agent 正在思考…');
+        if (ev.status === 'running') flashActivity('running', '调度器安排任务中…');
         else if (ev.status === 'completed') { flashActivity('done', '已完成'); thinkBuf.current = {}; setThinking({}); }
         else if (ev.status === 'failed') { flashActivity('error', '处理失败'); thinkBuf.current = {}; setThinking({}); }
       }
@@ -2574,6 +2604,90 @@ export default function ConversationsPage() {
     setActiveSearchId(id);
     messageRefs.current[id]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   };
+
+  // 把某条消息对齐到消息区顶端并短暂高亮（堆叠头像 / 「我」按钮点击复用）。
+  const jumpToMsgStart = (tid: string) => {
+    setActiveSearchId(tid);
+    messageRefs.current[tid]?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    setTimeout(() => setActiveSearchId(cur => (cur === tid ? null : cur)), 1800);
+  };
+  // 在「当前堆叠所示那一轮」(从 segmentStartId 起、到下一条我的发言之前) 内找该 agent 的首条发言。
+  // 关键：不是全局最近一条——堆叠显示的是这一轮，点击就应落在这一轮该 agent 的发言，
+  // 而非它在更晚轮次的发言（否则会跳到与堆叠不对应的另一轮）。
+  const agentMsgInRound = (agentId: string): Message | undefined => {
+    const startIdx = segmentStartId ? msgs.findIndex(m => m.id === segmentStartId) : 0;
+    const from = startIdx >= 0 ? startIdx : 0;
+    for (let i = from; i < msgs.length; i++) {
+      if (i > from && !msgs[i].from_agent) break; // 下一条我的发言 = 本轮结束
+      if (msgs[i].from_agent === agentId && !msgs[i].id.startsWith('typing-')) return msgs[i];
+    }
+  };
+  const jumpToAgentInRound = (agentId: string) => { const m = agentMsgInRound(agentId); if (m) jumpToMsgStart(m.id); };
+  // 左侧「轮次标尺 + 头像堆叠」(RoundAvatarStack) 所需数据：所有轮次(我的发言)及其预览文本、
+  // 当前所在轮下标、当前段发言者(解析为 Agent，按发言序)。文本在此算好，组件不感知 msgs/msgText。
+  const roundStarts = msgs.filter(m => !m.from_agent && !m.id.startsWith('typing-'));
+  const stackRounds = roundStarts.map(m => ({ id: m.id, text: msgText(m).trim() }));
+  const curRoundIdx = segmentStartId ? roundStarts.findIndex(r => r.id === segmentStartId) : -1;
+  const stackAgents = segmentAgents.map(id => agentMap[id]).filter((a): a is Agent => !!a);
+
+  // 计算当前视口内可见发言的 agent 集合（供堆叠去重）。按消息 DOM 顺序遍历，越过视口下沿即停。
+  // 用 getBoundingClientRect 对照滚动容器视口，rAF 节流，仅在滚动/消息变化时触发。
+  const visKeyRef = useRef('');
+  const visRafRef = useRef<number | null>(null);
+  const recomputeVisibleAgents = useCallback(() => {
+    visRafRef.current = null;
+    const sc = scrollRef.current;
+    if (!sc) return;
+    // 顺带更新「是否贴底」：滚动回调驱动，供流式自动跟随判定（上滚看历史时不跟随）。
+    atBottomRef.current = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120;
+    const scRect = sc.getBoundingClientRect();
+    const msgs = msgsRef.current;
+    let current: string | null = null;  // 跨越视口顶边的那条消息 = 当前正在看的气泡
+    let currentIdx = -1;
+    let firstVisIdx = -1;
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      const el = messageRefs.current[m.id];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top > scRect.bottom) break;     // 之后的消息都在视口下方
+      if (r.bottom < scRect.top) continue;  // 整行都在视口上方
+      if (firstVisIdx < 0) firstVisIdx = i; // 第一条与视口相交的消息（兜底「当前」）
+      // 跨越视口顶边（行顶在视口顶之上、行底在视口顶之下）= 当前正在阅读的气泡。
+      if (r.top <= scRect.top + 1 && r.bottom > scRect.top) { current = m.from_agent || null; currentIdx = i; }
+    }
+    if (currentIdx < 0 && firstVisIdx >= 0) { currentIdx = firstVisIdx; current = msgs[firstVisIdx].from_agent || null; }
+    // 以「我的发言」(from_agent 为空) 为界，求当前位置所在那一段里发过言的 agent 集合（堆叠作用域）。
+    const seg = new Set<string>();
+    let segStartId: string | null = null;
+    if (currentIdx >= 0) {
+      let start = currentIdx;
+      while (start > 0 && msgs[start].from_agent) start--; // 回退到本段起始的「我的发言」或开头
+      if (msgs[start] && !msgs[start].from_agent) segStartId = msgs[start].id; // 本段起始「我的发言」
+      for (let i = start; i < msgs.length; i++) {
+        if (i > start && !msgs[i].from_agent) break;       // 下一条「我的发言」= 段结束
+        if (msgs[i].from_agent) seg.add(msgs[i].from_agent!);
+      }
+    }
+    const segArr = [...seg]; // Set 保留插入顺序 = 发言先后顺序
+    // key 用有序 join（非排序），以便「成员相同但顺序变化」也能触发更新。
+    const key = segArr.join(',') + '|' + (current ?? '') + '|' + (segStartId ?? '');
+    if (key !== visKeyRef.current) {
+      visKeyRef.current = key;
+      setCurrentAgentId(current);
+      setSegmentAgents(segArr);
+      setSegmentStartId(segStartId);
+    }
+  }, []);
+  const scheduleVisible = useCallback(() => {
+    if (visRafRef.current == null) visRafRef.current = requestAnimationFrame(recomputeVisibleAgents);
+  }, [recomputeVisibleAgents]);
+  // 消息变化（加载/新消息/滚到底）后重算；卸载时取消挂起的 rAF。
+  useEffect(() => {
+    const t = setTimeout(scheduleVisible, 80);
+    return () => clearTimeout(t);
+  }, [msgs, scheduleVisible]);
+  useEffect(() => () => { if (visRafRef.current != null) cancelAnimationFrame(visRafRef.current); }, []);
 
   const openBubbleMenu = (e: React.MouseEvent, message: Message, author: string) => {
     e.preventDefault();
@@ -2745,7 +2859,7 @@ export default function ConversationsPage() {
             }).slice(0, 1)
           : [];
         // 乐观置为「思考中」：让用户立刻知道 Agent 已收到并开始处理，无需等后端 running 事件。
-        flashActivity('running', 'Agent 正在思考…');
+        flashActivity('running', '调度器安排任务中…');
         await startConversationTask({
           conversation_id: conv.id,
           trigger_message_id: m.id,
@@ -2876,7 +2990,20 @@ export default function ConversationsPage() {
       <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} collapsed={listCollapsed} onToggleCollapse={toggleList} />
 
       {conv ? (
-        <div className="content">
+        <div className="content" style={{ position: 'relative' }}>
+          {/* 左侧「对话轮次标尺 + 发言者头像堆叠」(独立组件)：上方刻度=之前轮次、当前轮的「我」+发言者、
+              下方刻度=之后轮次；hover 显示该轮我的发言/agent 名，点击跳到对应轮次/发言。 */}
+          {conv.conv_type === 'group' && (
+            <RoundAvatarStack
+              key={conv.id}
+              rounds={stackRounds}
+              currentRoundIndex={curRoundIdx}
+              agents={stackAgents}
+              currentAgentId={currentAgentId}
+              onJump={jumpToMsgStart}
+              onJumpAgent={jumpToAgentInRound}
+            />
+          )}
           {/* ── Chat header ── */}
           <div className="chat-head">
             {listCollapsed && (
@@ -3186,7 +3313,7 @@ export default function ConversationsPage() {
           </div>
 
           {/* ── Messages ── */}
-          <div className="msgs scroll" ref={scrollRef}>
+          <div className="msgs scroll" ref={scrollRef} onScroll={scheduleVisible}>
             {msgs.map((m, i) => (
               <MessageRow
                 key={m.id ?? i}
@@ -3202,29 +3329,61 @@ export default function ConversationsPage() {
               />
             ))}
             {/* 实时活动流：每个正在发言的 Agent 一张卡片，显示其工具动作 + 逐字流入的回复正文 */}
-            {Object.entries(thinking).map(([rid, t]) => (
+            {Object.entries(thinking).map(([rid, t]) => {
+              const ta = agentMap[t.agentId];
+              const accent = ta?.color || 'var(--ember)';
+              return (
               <div key={rid} className="msg rise">
-                <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <Icon name="bot" size={20} />
+                {/* 工作中头像：bot 图标 + 向外扩散的 ember 脉冲环，传达「正在锻造」的活感 */}
+                <div style={{ position: 'relative', width: 36, height: 36, flex: 'none' }}>
+                  <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Icon name="bot" size={20} />
+                  </div>
+                  <span style={{ position: 'absolute', inset: 0, borderRadius: 13, border: '1.5px solid var(--ember)', animation: 'pulse-ring 1.9s ease-out infinite', pointerEvents: 'none' }} />
                 </div>
                 <div className="msg-body">
-                  <div className="typing-cap">{t.agentName || 'Agent'} 正在工作…</div>
-                  {t.actions.length > 0 && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 3, margin: '2px 0 6px' }}>
-                      {t.actions.map((a, i) => (
-                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>
-                          <span style={{ width: 5, height: 5, borderRadius: 99, background: 'var(--ember)', flexShrink: 0 }} />
-                          {a}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {t.text
-                    ? <div className="bubble"><Markdown md={t.text} /></div>
-                    : <div className="bubble typing-bubble"><div className="typing"><i /><i /><i /></div></div>}
+                  <div className="typing-cap" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: 99, background: 'var(--ember)', animation: 'pulse 1.4s ease-in-out infinite', flex: 'none' }} />
+                    <span style={{ color: accent, fontWeight: 600 }}>{t.agentName || 'Agent'}</span>
+                    <span>正在工作…</span>
+                  </div>
+                  {(() => {
+                    // 工具动作 + 流式正文拍平成行，只取最后三行；包进带 ember 左轴 + 顶部流光的「控制台」面板，
+                    // 最新一行更亮，营造正在处理的活感（最新内容始终在底部可见）。
+                    const lines = [
+                      ...t.actions.map(s => ({ mono: true, s })),
+                      ...(t.text ? t.text.split('\n').map(s => ({ mono: false, s })) : []),
+                    ].filter(l => l.s.trim());
+                    const tail = lines.slice(-3);
+                    if (tail.length === 0) return <div className="bubble typing-bubble"><div className="typing"><i /><i /><i /></div></div>;
+                    return (
+                      <div style={{
+                        position: 'relative', overflow: 'hidden', maxWidth: '90%',
+                        display: 'flex', flexDirection: 'column', gap: 2, lineHeight: 'var(--leading-normal)',
+                        background: 'var(--bg-2)', borderLeft: '2px solid var(--ember)',
+                        borderRadius: '4px 10px 10px 4px', padding: '7px 12px', boxShadow: 'var(--shadow-sm)',
+                      }}>
+                        {/* 顶部 ember 流光：表示正在处理 */}
+                        <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, overflow: 'hidden' }}>
+                          <span style={{ position: 'absolute', inset: 0, background: 'linear-gradient(90deg, transparent, var(--ember), transparent)', transform: 'translateX(-100%)', animation: 'skel-sweep 1.5s ease-in-out infinite' }} />
+                        </span>
+                        {tail.map((l, i) => (
+                          <div key={i} style={{
+                            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                            color: i === tail.length - 1 ? 'var(--text-2)' : 'var(--text-faint)',
+                            fontFamily: l.mono ? 'var(--font-mono)' : 'var(--font-sans)',
+                            fontSize: l.mono ? 'var(--text-caption)' : 'var(--text-control)',
+                          }}>
+                            {l.s}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
-            ))}
+              );
+            })}
             {/* 任务已启动但尚无 Agent 开始流式（规划阶段）时，仍显示一个等待气泡 */}
             {activity?.phase === 'running' && Object.keys(thinking).length === 0 && (
               <div className="msg rise">
@@ -3239,6 +3398,28 @@ export default function ConversationsPage() {
             )}
           </div>
 
+          {/* 右下角滚动控制：回到顶部 / 回到底部。0 高度锚点 + 绝对定位悬浮，自动贴在消息区底部之上 */}
+          <div style={{ position: 'relative', height: 0, pointerEvents: 'none' }}>
+            <div style={{ position: 'absolute', right: 16, bottom: 12, display: 'flex', flexDirection: 'column', gap: 8, pointerEvents: 'auto', zIndex: 7 }}>
+              <button
+                className="icon-btn"
+                title="回到顶部"
+                onClick={() => scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+                style={{ background: 'var(--bg-2)', boxShadow: 'var(--shadow)' }}
+              >
+                <Icon name="arrowUp" size={16} />
+              </button>
+              <button
+                className="icon-btn"
+                title="回到底部"
+                onClick={() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })}
+                style={{ background: 'var(--bg-2)', boxShadow: 'var(--shadow)' }}
+              >
+                <Icon name="arrowDown" size={16} />
+              </button>
+            </div>
+          </div>
+
           {activity && (
             <div className={'chat-activity ' + activity.phase}>
               {activity.phase === 'running'
@@ -3246,7 +3427,8 @@ export default function ConversationsPage() {
                 : activity.phase === 'done'
                   ? <Icon name="check" size={13} />
                   : <Icon name="alert" size={13} />}
-              <span>{activity.label}</span>
+              {/* running 阶段实时反映真实进度：有 Agent 流式中 → 协作中；否则仍是调度安排。 */}
+              <span>{activity.phase === 'running' && Object.keys(thinking).length > 0 ? '智能体协作生成中…' : activity.label}</span>
             </div>
           )}
 

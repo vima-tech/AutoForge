@@ -127,6 +127,20 @@ pub enum AppEvent {
         conversation_id: String,
         chunk: String,
     },
+    /// 会议室 Agent 回复时的「实时思考」增量：让等待中的会议室看到真实进展，消除干等。
+    /// `run_id` 标识本次 Agent 执行（并行步骤里多个 Agent 同时发言时据此分流到各自的实时卡片）。
+    /// `kind`：`token`=回复正文逐字增量 / `tool`=Agent 正在执行的工具动作（如「检索代码」）/
+    /// `done`=该 Agent 已落库最终消息（前端据此撤下实时卡片，换成正式消息气泡）。
+    /// `seq` 为本次执行内的递增序号，保证前端按序拼接。高频 UI-only：不进通知收件箱、不归并 CR 线程。
+    AgentThinking {
+        conversation_id: String,
+        run_id: String,
+        agent_id: String,
+        agent_name: String,
+        kind: String,
+        text: String,
+        seq: u64,
+    },
 }
 
 impl AppEvent {

@@ -3,6 +3,7 @@ pub mod audio_decode;
 pub mod concurrency;
 pub mod cpubudget;
 pub mod ctx_window;
+pub mod dep_cache;
 pub mod event;
 pub mod gate;
 pub mod git;

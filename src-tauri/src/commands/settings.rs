@@ -1262,6 +1262,26 @@ pub async fn set_asr_settings(
     get_asr_settings(state).await
 }
 
+// ---- 微信开发者工具 CLI 路径（小程序预览档位 2：编译后自动用开发者工具打开产物）----
+
+/// 微信开发者工具 CLI 可执行文件路径（如 macOS 的
+/// `/Applications/wechatwebdevtools.app/Contents/MacOS/cli`、Windows 的 `cli.bat`）。
+/// 留空 = 仅档位 1（编译产物 + 手动打开），不自动拉起。存 app_settings 明文（非密钥）。
+#[tauri::command]
+pub async fn get_miniapp_devtools_path(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(read_setting(&state, "miniapp.devtools_cli_path")
+        .await
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn set_miniapp_devtools_path(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    write_setting(&state, "miniapp.devtools_cli_path", path.trim()).await
+}
+
 // ---- 工厂自喂料（autosupply）配置（存 app_settings，供调度器读取）----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

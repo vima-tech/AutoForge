@@ -33,6 +33,7 @@ import {
   getWebSearchSettings, setWebSearchSettings,
   getOpenDesignSettings, setOpenDesignSettings, getOpenDesignLog, type OpenDesignSettings,
   getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
+  getMiniappDevtoolsPath, setMiniappDevtoolsPath,
   getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, autosupplyIsRunning, type AutosupplySettings as AutosupplyT,
   getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
   listBuiltinTools, type BuiltinToolInfo,
@@ -407,6 +408,57 @@ function AsrSettings() {
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存语音配置</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── 微信小程序预览（开发者工具 CLI 路径）─────────────────────────────────────
+// 档位 1（默认）：编译产物 + 手动用微信开发者工具打开；档位 2（本组件配置）：
+// 填 CLI 路径后，审核页编译成功自动 `cli open --project <产物目录>`，缺失/失败自动降级档位 1。
+function MiniappSettings() {
+  const [path, setPath] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getMiniappDevtoolsPath().then(setPath).catch(e => setStatus(String(e))); }, []);
+
+  const save = async () => {
+    setBusy(true); setStatus('');
+    try { await setMiniappDevtoolsPath(path.trim()); setStatus('已保存'); }
+    catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const enabled = path.trim().length > 0;
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">小程序预览</div>
+      <div className="set-desc">微信小程序无法在浏览器内 iframe 预览。审核页对小程序 CR 提供<strong>一键编译</strong>（一次性 build，非 dev server）：编译产物目录可用<strong>微信开发者工具</strong>打开。此处可选填开发者工具 <strong>CLI 路径</strong>，填写后编译成功会自动用它打开产物目录（档位 2）；留空则仅提示产物路径手动打开（档位 1）。</div>
+
+      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-top" style={{ gap: 10 }}>
+          <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="box" size={15} /></div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">微信开发者工具 · CLI</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>PREVIEW</span>
+            </div>
+            <div className="cfg-sub">编译成功后自动打开产物目录（可选）</div>
+          </div>
+          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '自动打开' : '手动打开'}</span>
+        </div>
+
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field full"><label>开发者工具 CLI 路径（可空）</label>
+            <input type="text" className="mono" value={path}
+              placeholder="如 /Applications/wechatwebdevtools.app/Contents/MacOS/cli"
+              onChange={e => setPath(e.target.value)} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存</button>
             {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
           </div>
         </div>
@@ -1741,7 +1793,7 @@ function CodeAgentSkillSettings() {
 }
 
 function ConcurrencySettings() {
-  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, build_slots: 2, cpu_budget_pct: 0 });
+  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, build_slots: 2, cpu_budget_pct: 0, llm_max_concurrency: 4 });
   const [result, setResult] = useState('');
 
   useEffect(() => {
@@ -1749,7 +1801,7 @@ function ConcurrencySettings() {
       ...f,
       max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy,
       timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor,
-      build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct,
+      build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency,
     }))).catch(() => { });
   }, []);
 
@@ -1763,15 +1815,16 @@ function ConcurrencySettings() {
       max_load_factor: form.max_load_factor,
       build_slots: form.build_slots,
       cpu_budget_pct: form.cpu_budget_pct,
+      llm_max_concurrency: form.llm_max_concurrency,
     });
-    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy, timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor, build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct });
+    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy, timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor, build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency });
     setResult(`${cfg.stage} · ${cfg.active_slots}/${cfg.max_slots} · 待审核 ${cfg.pending_review}`);
   };
 
   return (
     <div className="set-inner rise">
       <div className="set-h">并发与流控</div>
-      <div className="set-desc">控制代码 Agent 执行槽位、审核积压背压阈值与代码 agent 超时回收。</div>
+      <div className="set-desc">控制代码 Agent 执行槽位、审核积压背压阈值、代码 agent 超时回收与 LLM 出站并发（防服务商限流）。</div>
       <div className="cfg-card">
         <div className="cfg-fields">
           <div className="field"><label>最大并发槽位</label>
@@ -1803,6 +1856,10 @@ function ConcurrencySettings() {
           <div className="field"><label>CPU 预算（% × 核数）</label>
             <input type="number" min="0" max="100" step="5" value={form.cpu_budget_pct} onChange={e => setForm(f => ({ ...f, cpu_budget_pct: Number(e.target.value) }))} />
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>cgroup 把 agent 自测+门的总 CPU 限到 该%×核数（不禁测试、只限速）；0=关闭。仅 Linux 生效，建议 70~80。</span>
+          </div>
+          <div className="field"><label>LLM 并发上限</label>
+            <input type="number" min="1" max="32" value={form.llm_max_concurrency} onChange={e => setForm(f => ({ ...f, llm_max_concurrency: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>同时打到 LLM 服务商的请求数上限，削平批量任务（如一次分析 50 条需求）的瞬时并发，防 429 限流（另配退避重试）。按服务商配额调整，建议 2~8。</span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
@@ -3026,6 +3083,7 @@ const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string
     items: [
       { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
       { id: 'asr',         name: '语音录入',     ic: 'mic' },
+      { id: 'miniapp',     name: '小程序预览',   ic: 'box' },
       { id: 'notify',      name: '通知通道',     ic: 'bell' },
     ],
   },
@@ -3119,12 +3177,13 @@ export default function SettingsPage({
           {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'asr'         && <AsrSettings />}
+          {sec === 'miniapp'     && <MiniappSettings />}
           {sec === 'autosupply'  && <AutosupplySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','shortcuts','llm','tools','roles','concurrency','codeagent','selfupdate','backup','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','shortcuts','llm','tools','roles','concurrency','codeagent','codeskills','selfupdate','backup','knowledge','security','asr','miniapp','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

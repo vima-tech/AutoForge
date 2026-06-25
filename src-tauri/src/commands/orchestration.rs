@@ -1556,12 +1556,41 @@ async fn run_agent_for_step(
     // 多模态：收集最近上下文窗口内的图片附件，交给绑定多模态 LLM 的 Agent 识别。
     // 非多模态 LLM 会在 llm 层静默忽略这些图片（快照里仍保留「[图片: …]」文字描述）。
     let images = collect_context_images(ctx.db, ctx.conversation_id, 40, 6).await;
+    // 实时活动流：把 Agent 的工具动作与回复正文逐字增量转成 `AgentThinking` 事件推给前端，
+    // 消除会议室「干等」的等待感。闭包只捕获 AppHandle + 标识串，业务层（llm.rs）对 Tauri 无感知。
+    // seq 在本次执行内递增，前端据此按序拼接；run_id 区分并行步骤里同时发言的多个 Agent。
+    let think_app = ctx.app;
+    let think_conv = ctx.conversation_id.to_string();
+    let think_run = run_id.clone();
+    let think_aid = agent_id.to_string();
+    let think_aname = agent.name.clone();
+    let mut think_seq: u64 = 0;
+    let mut on_think = move |ev: crate::agents::llm::ThinkEvent| {
+        let (kind, text) = match ev {
+            crate::agents::llm::ThinkEvent::Token(t) => ("token", t),
+            crate::agents::llm::ThinkEvent::Tool { summary, .. } => ("tool", summary),
+        };
+        event::emit(
+            think_app,
+            event::AppEvent::AgentThinking {
+                conversation_id: think_conv.clone(),
+                run_id: think_run.clone(),
+                agent_id: think_aid.clone(),
+                agent_name: think_aname.clone(),
+                kind: kind.to_string(),
+                text,
+                seq: think_seq,
+            },
+        );
+        think_seq += 1;
+    };
     // 把「LLM 调用 + 解析 <write-file> + 落盘」包进同一个 trace run：写文件以 tool span
     // 挂在与本次 Agent 调用相同的 trace 下，链路追踪里即可审计 Agent 写了哪些工作区文件。
     let (ok, text, text_after_writes, error, write_blocks) =
         crate::core::trace::scope_run(ctx.db, &agent, async {
-            let result = crate::agents::llm::run_agent_text_with_tools(
+            let result = crate::agents::llm::run_agent_text_with_tools_streaming(
                 ctx.db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
+                &mut on_think,
             )
             .await;
             let (ok, text, error) = match result {
@@ -1639,6 +1668,19 @@ async fn run_agent_for_step(
         event::AppEvent::MessageReceived {
             conversation_id: ctx.conversation_id.to_string(),
             message_id,
+        },
+    );
+    // 收尾：通知前端撤下本次执行的实时活动卡片，换成刚落库的正式消息气泡。
+    event::emit(
+        ctx.app,
+        event::AppEvent::AgentThinking {
+            conversation_id: ctx.conversation_id.to_string(),
+            run_id: run_id.clone(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent.name.clone(),
+            kind: "done".to_string(),
+            text: String::new(),
+            seq: u64::MAX,
         },
     );
 

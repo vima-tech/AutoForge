@@ -201,7 +201,8 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
     try { await navigator.clipboard.writeText(pretty); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* ignore */ }
   };
 
-  // 从结构化产出里取一句话结论（兼容不同 schema：test 用 verdict/summary，analysis 用 triage.analysis_summary）。
+  // 从结构化产出里取一句话结论：先认已知 schema 的关键字段，再退化为「首个非空短字符串叶子」兜底，
+  // 让 proposer/doc_writer 等未枚举的环节产出在列表里也有可读摘要。
   const headline = (j: string | null): string => {
     if (!j) return '';
     try {
@@ -209,6 +210,11 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
       if (o.verdict) return `${o.verdict}${o.summary ? ' · ' + o.summary : ''}`;
       if (o.triage?.analysis_summary) return o.triage.analysis_summary;
       if (o.summary) return o.summary;
+      if (typeof o.title === 'string' && o.title.trim()) return o.title.trim();
+      // 兜底：扫顶层字符串字段，取首个长度适中的非空值。
+      for (const v of Object.values(o)) {
+        if (typeof v === 'string' && v.trim().length >= 4 && v.length <= 200) return v.trim();
+      }
       return '';
     } catch { return ''; }
   };
@@ -308,10 +314,12 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
   );
 }
 
-// schema 体检：选 role → 字段填充率 + 状态分布，暴露长期空着的弱字段（优化循环）。
+// schema 体检：选 role（+ 可选 schema 版本）→ 字段填充率 + 状态分布，暴露长期空着的弱字段（优化循环）。
+// 体检锚定单一 schema 版本（默认最新），避免跨版本字段漂移污染填充率。
 function SchemaHealth() {
   const [roles, setRoles] = useState<string[]>([]);
   const [role, setRole] = useState('');
+  const [version, setVersion] = useState('');  // 空 = 后端解析为最新版本
   const [data, setData] = useState<FieldHealth | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -322,11 +330,15 @@ function SchemaHealth() {
     }).catch(() => {});
   }, []);
 
+  // 切换环节时重置版本选择，让后端回到「最新版本」默认。
+  useEffect(() => { setVersion(''); }, [role]);
+
   useEffect(() => {
     if (!role) { setData(null); return; }
     setLoading(true);
-    agentOutputFieldHealth(role).then(setData).catch(() => setData(null)).finally(() => setLoading(false));
-  }, [role]);
+    agentOutputFieldHealth(role, version || undefined)
+      .then(setData).catch(() => setData(null)).finally(() => setLoading(false));
+  }, [role, version]);
 
   const pct = (n: number) => `${Math.round(n * 100)}%`;
   // 填充率 → 语义色：低=红（弱字段）、中=琥珀、高=绿。
@@ -335,10 +347,20 @@ function SchemaHealth() {
   return (
     <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
       <div className="list-col" style={{ width: 220, flex: '0 0 220px', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)' }}>
-          <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">ROLE</span></div>
-          <Select value={role} onChange={setRole} style={{ width: '100%' }}
-            options={roles.map(r => ({ value: r, label: r }))} placeholder="选择环节" />
+        <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">ROLE</span></div>
+            <Select value={role} onChange={setRole} style={{ width: '100%' }}
+              options={roles.map(r => ({ value: r, label: r }))} placeholder="选择环节" />
+          </div>
+          {data && data.versions.length > 0 && (
+            <div>
+              <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">SCHEMA</span></div>
+              <Select value={data.schema_version ?? ''} onChange={setVersion} style={{ width: '100%' }}
+                options={data.versions.map(v => ({ value: v.schema_version, label: `v${v.schema_version} · ${v.count}` }))}
+                placeholder="版本" />
+            </div>
+          )}
         </div>
       </div>
       <div style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 18 }}>

@@ -104,6 +104,27 @@ pub struct RunConfigDraft {
     pub deploy_command: Option<String>,
 }
 
+/// 返回项目仓库自动检测出的**应用品类**一句话描述（运行配置页只读展示）。
+/// 纯文件嗅探，不落库；仓库路径为空或未识别 → "未识别"。
+#[tauri::command]
+pub async fn detect_project_category(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let project = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
+        .bind(&project_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("项目不存在")?;
+    if project.repo_path.trim().is_empty() {
+        return Ok("未识别".to_string());
+    }
+    Ok(crate::core::stack::detected_category(std::path::Path::new(
+        &project.repo_path,
+    )))
+}
+
 /// 根据项目仓库的构建文件，让 AI 推断一份「运行配置」草稿返回给前端填表（不落库，由人工审阅后保存）。
 #[tauri::command]
 pub async fn ai_generate_run_config(
@@ -187,8 +208,8 @@ pub async fn ai_generate_run_config(
 {hints}
 
 字段说明（无法确定的字段置 null，不要编造命令）：
-- dev_kind: "web" 或 "tauri"
-- dev_command: 开发/前端预览启动命令；端口位置用 {{port}} 占位，如 "npm run dev -- --port {{port}}"
+- dev_kind: "web"（网站/后台前端/后端服务/静态站，浏览器预览）、"tauri"（桌面应用）或 "miniapp"（微信小程序）
+- dev_command: 开发/前端预览启动命令；端口位置用 {{port}} 占位，如 "npm run dev -- --port {{port}}"。**miniapp 时填编译命令**（如 "npm run build:weapp"），预览为一次性编译产物
 - app_command: 仅 tauri，桌面应用启动命令，如 "npm run tauri:dev"
 - test_unit / test_integration: 单元 / 集成测试命令
 - test_unit_timeout / test_integration_timeout: 超时秒数（整数）

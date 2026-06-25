@@ -182,7 +182,8 @@ impl NotificationDraft {
             | AppEvent::AutosupplyStatus { .. }
             | AppEvent::CodeAgentLog { .. }
             | AppEvent::PreviewLog { .. }
-            | AppEvent::CodingBriefChunk { .. } => None,
+            | AppEvent::CodingBriefChunk { .. }
+            | AppEvent::AgentThinking { .. } => None,
         }
     }
 }

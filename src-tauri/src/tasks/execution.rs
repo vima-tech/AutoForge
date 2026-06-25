@@ -2,7 +2,7 @@ use crate::core::{event, git::GitProxy};
 use crate::db::Db;
 use crate::state::worktrees_base;
 use anyhow::{anyhow, Result};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// 将 code agent 的 kind（claude / codex / opencode）映射成进度提示里展示的可读名，
@@ -115,41 +115,57 @@ pub async fn run(
 
     let git = GitProxy::new(&project.repo_path);
 
-    // Ensure the base (dev) branch exists. Many repos only have main/master, so
-    // create the dev integration branch from main (or HEAD) when it's missing —
-    // otherwise `worktree add ... dev` fails with "invalid reference: dev".
-    let dev_exists = git
-        .run(&["rev-parse", "--verify", "--quiet", &project.branch_dev])
+    // 方向①：编码开始、建 worktree 之前先抓取远程 dev，让本次 worktree 以最新的
+    // origin/<dev> 为基点 —— 避免本地 dev 落后导致编码基于陈旧代码、合并时冲突激增。
+    // best-effort：离线 / 无远程 / 自管理仓库无 origin 时静默回退本地 dev（零回归）。
+    let _ = git.run(&["fetch", "origin", &project.branch_dev]).await;
+    let remote_dev = format!("origin/{}", project.branch_dev);
+    let remote_dev_exists = git
+        .run(&["rev-parse", "--verify", "--quiet", &remote_dev])
         .await
         .map(|(c, _, _)| c == 0)
         .unwrap_or(false);
-    if !dev_exists {
-        let main_exists = git
-            .run(&["rev-parse", "--verify", "--quiet", &project.branch_main])
+
+    // worktree 基点：优先用刚 fetch 到的 origin/<dev>；无远程 dev 时回退本地 dev。
+    // 本地 dev 也不存在时从 main/HEAD 兜底创建，否则 `worktree add ... dev` 会报
+    // "invalid reference: dev"（许多仓库只有 main/master）。
+    let base_ref = if remote_dev_exists {
+        remote_dev.clone()
+    } else {
+        let dev_exists = git
+            .run(&["rev-parse", "--verify", "--quiet", &project.branch_dev])
             .await
             .map(|(c, _, _)| c == 0)
             .unwrap_or(false);
-        let base = if main_exists {
-            project.branch_main.as_str()
-        } else {
-            "HEAD"
-        };
-        let (bc, _, be) = git
-            .run(&["branch", &project.branch_dev, base])
-            .await
-            .unwrap_or((-1, String::new(), "git not available".to_string()));
-        if bc == 0 {
-            info!(
-                "created base branch '{}' from '{}' for {}",
-                project.branch_dev, base, cr_id
-            );
-        } else {
-            info!(
-                "could not create base branch '{}' from '{}': {}",
-                project.branch_dev, base, be
-            );
+        if !dev_exists {
+            let main_exists = git
+                .run(&["rev-parse", "--verify", "--quiet", &project.branch_main])
+                .await
+                .map(|(c, _, _)| c == 0)
+                .unwrap_or(false);
+            let base = if main_exists {
+                project.branch_main.as_str()
+            } else {
+                "HEAD"
+            };
+            let (bc, _, be) = git
+                .run(&["branch", &project.branch_dev, base])
+                .await
+                .unwrap_or((-1, String::new(), "git not available".to_string()));
+            if bc == 0 {
+                info!(
+                    "created base branch '{}' from '{}' for {}",
+                    project.branch_dev, base, cr_id
+                );
+            } else {
+                info!(
+                    "could not create base branch '{}' from '{}': {}",
+                    project.branch_dev, base, be
+                );
+            }
         }
-    }
+        project.branch_dev.clone()
+    };
 
     // Create worktree
     tokio::fs::create_dir_all(&worktrees_base()).await.ok();
@@ -160,7 +176,7 @@ pub async fn run(
             "-b",
             &branch_name,
             &worktree_path,
-            &project.branch_dev,
+            &base_ref,
         ])
         .await
         .unwrap_or((-1, String::new(), "git not available".to_string()));
@@ -205,8 +221,22 @@ pub async fn run(
         return Err(anyhow!("worktree add failed for {}: {}", cr_id, wt_err));
     }
 
-    // 软链依赖缓存目录（gitignore 的 node_modules[+ target] 不在 worktree 内），让编码 Agent
-    // 与合并前测试门能找到本地 tsc/eslint。run_and_gate 跑测试前还会再幂等软链一次兜底。
+    // 远程 dev 依赖缓存：worktree 取自 origin/<dev>，优先软链一份与该基点 lockfile 匹配的
+    // 共享 node_modules（按指纹分桶、全体 worktree 公用），避免新增依赖 module not found。
+    // best-effort：非 node 项目 / 缺包管理器 / 离线 / 装失败 → 返回 None，下方回退软链主仓。
+    if let Some(shared_nm) =
+        crate::core::dep_cache::ensure_shared_node_modules(std::path::Path::new(&worktree_path))
+            .await
+    {
+        crate::core::dep_cache::link_into_worktree(
+            &shared_nm,
+            std::path::Path::new(&worktree_path),
+        );
+    }
+
+    // 软链其余依赖缓存目录（gitignore 的 node_modules[+ target] 不在 worktree 内），让编码 Agent
+    // 与合并前测试门能找到本地 tsc/eslint。node_modules 上面已软链则此处自动跳过，只补 target 等。
+    // run_and_gate 跑测试前还会再幂等软链一次兜底。
     crate::core::stack::link_dep_caches(
         std::path::Path::new(&project.repo_path),
         std::path::Path::new(&worktree_path),
@@ -749,6 +779,21 @@ pub async fn run(
     .execute(db)
     .await?;
     crate::commands::change_requests::set_cr_issues_status(db, cr_id, "pending_code_review").await?;
+
+    // 预热「AI 变更摘要」缓存：代码实现刚完成、diff 已定型，此刻后台跑一次 LLM 摘要并落库，
+    // 用户打开代码审核页时直接命中缓存、无需现点现等。后台 spawn 不阻塞执行任务收尾 / 释放并发槽位；
+    // 失败仅记日志（审核页仍可懒生成兜底），不影响进入审核流程。
+    {
+        let db = db.clone();
+        let cr_id = cr_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::commands::change_summary::ensure_change_summary(&db, &cr_id, false).await
+            {
+                warn!("change summary prewarm failed for cr {}: {}", cr_id, e);
+            }
+        });
+    }
 
     crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待代码审核").await;
 

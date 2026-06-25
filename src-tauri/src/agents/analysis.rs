@@ -526,6 +526,15 @@ pub async fn build_project_context(repo_path: &str) -> String {
         }
     }
 
+    // 技术栈画像 + 默认约定（与执行阶段 build_prompt 同源）。让分析阶段也认得栈，
+    // 避免对 Taro 等工程给出错误的文件路径/约定（分析产出的 affected_files 会被编码 Agent 直接信任）。
+    {
+        let hint = crate::core::stack::stack_hint(std::path::Path::new(repo_path));
+        if !hint.trim().is_empty() {
+            parts.push(format!("## 技术栈画像（自动检测）\n{}", hint));
+        }
+    }
+
     // Recent git log
     if let Ok(out) = Command::new("git")
         .arg("-C").arg(repo_path)

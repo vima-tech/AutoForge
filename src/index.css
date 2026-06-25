@@ -1982,9 +1982,17 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 /* 分组标题：粘性吸顶——组内滚动时标题钉在列表顶部，滚入下一组时由后一标题顶替。
    背景用 list-col 底色 var(--bg-1)，行从其下方完整穿过；z-index 高于 .req-item(relative)。 */
 .req-group-head { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; padding: 8px 12px 6px; background: var(--bg-1); font-size: var(--text-caption); letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); font-weight: 600; border-bottom: 1px solid var(--border); }
-.req-item { padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s; border: 1px solid transparent; }
+.req-item { padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s, border-color .12s, box-shadow .12s; border: 1px solid transparent; }
 .req-item:hover { background: var(--surface-hover); }
-.req-item.active { background: var(--bg-3); border-color: var(--ember-tint-strong); }
+/* 选中态：ember 余烬高亮——着色底 + ember 实边 + 柔光环 + 左侧指示条（呼应 rail 激活态），
+   让当前选中需求在长列表中一眼可辨。 */
+.req-item.active { background: var(--ember-tint); border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); }
+.req-item.active::before {
+  content: ""; position: absolute; left: 0; top: 9px; bottom: 9px;
+  width: 3px; border-radius: 0 99px 99px 0; background: var(--ember);
+}
+.req-item.active .req-title { color: var(--ember-soft); }
+[data-theme="light"] .req-item.active .req-title { color: var(--ember-deep); }
 .req-item-top { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
 .req-id { font-family: var(--font-mono); font-size: var(--text-caption); color: var(--ember); font-weight: 700; white-space: nowrap; flex: none; }
 .req-time { margin-left: auto; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-3); white-space: nowrap; }

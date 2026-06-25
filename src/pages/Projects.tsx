@@ -4,7 +4,6 @@ import Icon from '../components/Icon';
 import Select from '../components/Select';
 import { ProjectCreateModal, ProjectEditModal, ConfirmProjectDeleteModal, ConfirmModal } from '../components/ProjectDialogs';
 import IntakePanel from '../components/IntakePanel';
-import BlueprintWizard from '../components/BlueprintWizard';
 import { parseTs, fmtFull } from '../utils/datetime';
 import {
   listProjects, updateProject, deleteProject, setDefaultProject, type Project,
@@ -16,7 +15,7 @@ import {
   getMaterialBackupConfig, updateMaterialBackupConfig,
   listProjectSpecs, upsertProjectSpec, deleteProjectSpec, aiGenerateSpecs,
   scanSpecFiles, getSpecContent, setSpecInjection,
-  aiGenerateRunConfig,
+  aiGenerateRunConfig, detectProjectCategory,
   type MaterialFolder, type MaterialFile, type MaterialBackupConfig,
   type MaterialSearchResult,
   type ProjectSpec, type SpecCategory, type SpecInjection, type RunConfigDraft,
@@ -1241,6 +1240,14 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
   const [aiWorking, setAiWorking] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  // 自动检测出的应用品类（只读展示，区别于可选的"预览方式"）。
+  const [category, setCategory] = useState<string>('');
+
+  useEffect(() => {
+    let alive = true;
+    detectProjectCategory(project.id).then(c => { if (alive) setCategory(c); }).catch(() => {});
+    return () => { alive = false; };
+  }, [project.id]);
 
   const set = (patch: Partial<ProjectConfigForm>) => setForm(f => ({ ...f, ...patch }));
   const flash = (m: string) => { setMessage(m); setTimeout(() => setMessage(''), 5000); };
@@ -1251,7 +1258,7 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
     const num = (v: number | null | undefined, cur: string) => (v == null ? cur : String(v));
     setForm(f => ({
       ...f,
-      devKind: d.dev_kind === 'tauri' ? 'tauri' : d.dev_kind === 'web' ? 'web' : f.devKind,
+      devKind: d.dev_kind === 'tauri' ? 'tauri' : d.dev_kind === 'miniapp' ? 'miniapp' : d.dev_kind === 'web' ? 'web' : f.devKind,
       devCommand: pick(d.dev_command, f.devCommand),
       appCommand: pick(d.app_command, f.appCommand),
       testUnit: pick(d.test_unit, f.testUnit),
@@ -1317,13 +1324,31 @@ function ConfigPanel({ project, onSaved }: { project: Project; onSaved: () => vo
         <CfgSection title="审计预览环境" desc="变更审核时拉起预览实例所需。预览固定加载 http://localhost:{port}，命令中的 {port} 会按变更替换为独立端口。">
           <div className="field" style={{ marginBottom: 10 }}>
             <label>应用类型</label>
-            <div className="seg" style={{ alignSelf: 'flex-start' }}>
-              <button type="button" className={form.devKind !== 'tauri' ? 'on' : ''} onClick={() => set({ devKind: 'web' })}>Web 应用</button>
-              <button type="button" className={form.devKind === 'tauri' ? 'on' : ''} onClick={() => set({ devKind: 'tauri' })}>Tauri 桌面</button>
+            {/* 自动检测出的品类，只读；区别于下方可选的"预览方式"。 */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>检测到品类</span>
+              <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{category || '检测中…'}</span>
+              <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)' }}>（自动嗅探仓库，仅供参考）</span>
             </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>预览方式</span>
+              <div className="seg" style={{ alignSelf: 'flex-start' }}>
+                <button type="button" className={form.devKind === 'web' ? 'on' : ''} onClick={() => set({ devKind: 'web' })}>Web（浏览器）</button>
+                <button type="button" className={form.devKind === 'tauri' ? 'on' : ''} onClick={() => set({ devKind: 'tauri' })}>Tauri 桌面</button>
+                <button type="button" className={form.devKind === 'miniapp' ? 'on' : ''} onClick={() => set({ devKind: 'miniapp' })}>微信小程序</button>
+              </div>
+            </div>
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>
+              {form.devKind === 'web' && '浏览器预览：前端 / 后端服务 / 静态站均在 localhost:{port} 起 dev server 后用浏览器打开。'}
+              {form.devKind === 'tauri' && '桌面程序：直接启动原生窗口（可访问完整 IPC），不走 iframe。'}
+              {form.devKind === 'miniapp' && '微信小程序：无本地 server，预览=一次性编译产物，用微信开发者工具打开（可在「设置 → 小程序预览」配 CLI 自动打开）。'}
+            </span>
           </div>
           <div className="cfg-fields" style={{ gridTemplateColumns: '1fr 1fr' }}>
-            <CfgField full label={form.devKind === 'tauri' ? '前端预览启动命令' : '启动命令'} value={form.devCommand} onChange={v => set({ devCommand: v })} placeholder="npm run dev -- --port {port}" />
+            <CfgField full
+              label={form.devKind === 'tauri' ? '前端预览启动命令' : form.devKind === 'miniapp' ? '编译命令' : '启动命令'}
+              value={form.devCommand} onChange={v => set({ devCommand: v })}
+              placeholder={form.devKind === 'miniapp' ? 'npm run build:weapp' : 'npm run dev -- --port {port}'} />
             {form.devKind === 'tauri' && (
               <CfgField full label="桌面应用启动命令（可选，逃生口）" value={form.appCommand} onChange={v => set({ appCommand: v })} placeholder="npm run tauri:dev" />
             )}
@@ -1473,7 +1498,7 @@ function ProjectNavItem({ project, active, onClick }: {
 
 type Tab = 'info' | 'materials' | 'intake' | 'spec' | 'config';
 
-export default function ProjectsPage() {
+export default function ProjectsPage({ onOpenBlueprint }: { onOpenBlueprint?: (projectId: string) => void } = {}) {
   const [projects, setProjects]         = useState<Project[]>([]);
   const [loading, setLoading]           = useState(true);
   const [error, setError]               = useState('');
@@ -1482,7 +1507,6 @@ export default function ProjectsPage() {
   const [showCreate, setShowCreate]     = useState(false);
   const [editProject, setEditProject]   = useState<Project | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
-  const [blueprintProject, setBlueprintProject] = useState<Project | null>(null);
   const [deleting, setDeleting]         = useState(false);
   const [showRecycle, setShowRecycle]   = useState(false);
   const [archived, setArchived]         = useState<Project[]>([]);
@@ -1663,8 +1687,8 @@ export default function ProjectsPage() {
                       <Icon name={selectedProject.status === 'active' ? 'pause' : 'play'} size={13} />
                       {selectedProject.status === 'active' ? '停用' : '启用'}
                     </button>
-                    <button className="btn btn-sm" onClick={() => setBlueprintProject(selectedProject)} title="把一段大需求炼成 PRD / 技术规格 / 任务清单">
-                      <Icon name="layers" size={13} />项目蓝图
+                    <button className="btn btn-sm" onClick={() => onOpenBlueprint?.(selectedProject.id)} title="到「孵化台」：把大需求改动炼成 PRD / 规格 / 任务并一键编码开发">
+                      <Icon name="layers" size={13} />孵化台
                     </button>
                     <button className="btn btn-sm" onClick={() => setEditProject(selectedProject)}>
                       <Icon name="edit" size={13} />编辑
@@ -1734,13 +1758,6 @@ export default function ProjectsPage() {
           project={deleteTarget}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={doDelete}
-        />
-      )}
-      {blueprintProject && (
-        <BlueprintWizard
-          project={blueprintProject}
-          onClose={() => setBlueprintProject(null)}
-          onApplied={() => { void load(); }}
         />
       )}
       {showRecycle && (
