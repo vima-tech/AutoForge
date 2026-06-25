@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AutoForge 分支管理 × 任务角色 · 宣讲海报</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet"/>
+<style>
+  :root{
+    --bg:#0a0e1a; --bg-1:#0d1322; --panel:#111a30; --panel-2:#0c1422;
+    --line:#23365c; --text:#f1f5fb; --text-2:#c9d6e8; --text-3:#8693a8; --faint:#5b6b85;
+    --ember:#f59e0b; --ember-soft:#fbbf24; --ember-deep:#f97316;
+    --blue:#3b82f6; --blue-soft:#60a5fa; --green:#10b981; --green-soft:#34d399;
+    --purple:#8b5cf6; --purple-soft:#a78bfa; --orange:#f97316; --orange-soft:#fb923c; --red:#ef4444;
+    --molten:linear-gradient(135deg,#fde68a,#f59e0b 48%,#f97316);
+    --f-disp:"Archivo","Noto Sans SC",system-ui,sans-serif;
+    --f-sans:"Noto Sans SC",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+    --f-mono:"JetBrains Mono","Noto Sans SC",ui-monospace,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:#05070e; color:var(--text); font-family:var(--f-sans);
+    display:grid; place-items:center; min-height:100vh; padding:28px;
+  }
+
+  /* ===== 海报容器（截图即用 1600×1000） ===== */
+  #poster{
+    position:relative; width:1600px; height:1000px; overflow:hidden;
+    border-radius:26px; padding:46px 50px 40px;
+    background:
+      radial-gradient(680px 540px at 88% 30%, rgba(245,158,11,.16), transparent 70%),
+      radial-gradient(620px 460px at 14% 22%, rgba(59,130,246,.13), transparent 70%),
+      linear-gradient(155deg,var(--bg) 0%, #0d1322 55%, #0b0f1d 100%);
+    box-shadow:0 40px 120px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.04);
+  }
+  #poster::before{ /* 点阵纹理 */
+    content:""; position:absolute; inset:0; pointer-events:none; opacity:.5;
+    background-image:radial-gradient(rgba(120,150,200,.18) 1px, transparent 1.4px);
+    background-size:32px 32px;
+  }
+  #poster>*{position:relative; z-index:1}
+
+  /* ===== 顶部 ===== */
+  .kicker{font-family:var(--f-mono); font-weight:600; font-size:14px; letter-spacing:4px; color:#b08440}
+  h1{
+    font-family:var(--f-disp); font-weight:800; font-size:46px; line-height:1.1; margin:8px 0 8px;
+    letter-spacing:-.01em;
+    background:linear-gradient(95deg,#fef3c7,#fbbf24 46%,#f97316);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .sub{font-size:18px; color:var(--text-3); max-width:1060px; line-height:1.5}
+  #poster .legend{position:absolute; top:50px; right:50px; z-index:3; display:flex; gap:22px; font-family:var(--f-mono); font-size:12.5px; color:var(--text-3)}
+  .legend i{display:inline-block; width:14px; height:14px; border-radius:4px; vertical-align:-2px; margin-right:7px}
+  .legend .k{border:2.5px solid var(--ember); box-shadow:0 0 10px rgba(245,158,11,.6)}
+  .legend .d{border:2px dashed #4b5a72}
+
+  /* ===== 舞台网格 ===== */
+  .stage{
+    margin-top:30px;
+    display:grid; grid-template-columns:168px minmax(0,1fr) 234px;
+    grid-template-rows:auto auto auto; gap:18px 24px; align-items:stretch;
+  }
+  .hub{grid-column:3; grid-row:1 / span 3}
+
+  /* 角色标签 */
+  .role{
+    border-radius:16px; padding:16px 16px 16px 20px; position:relative; align-self:center;
+    background:linear-gradient(180deg,rgba(20,48,85,.55),rgba(11,26,48,.55));
+    border:1px solid rgba(59,130,246,.5); overflow:hidden;
+  }
+  .role::before{content:""; position:absolute; left:0; top:0; bottom:0; width:7px; border-radius:4px; background:linear-gradient(180deg,var(--blue-soft),var(--blue))}
+  .role.af{background:linear-gradient(180deg,rgba(51,32,12,.6),rgba(26,18,6,.6)); border-color:rgba(249,115,22,.5)}
+  .role.af::before{background:linear-gradient(180deg,var(--orange-soft),var(--orange))}
+  .role b{display:block; font-weight:700; font-size:19px}
+  .role span{display:block; font-family:var(--f-mono); font-size:12.5px; color:#8da2bf; margin-top:6px; line-height:1.5}
+
+  /* 泳道行 */
+  .lane{display:flex; align-items:center; gap:0}
+  .lane.dim{opacity:.46}
+
+  /* 通用卡片 */
+  .card{
+    flex:1 1 0; min-width:0; border-radius:16px; padding:16px 18px; position:relative; overflow:hidden;
+    background:linear-gradient(180deg,rgba(20,48,85,.92),rgba(11,26,48,.96));
+    border:2.4px solid var(--blue); box-shadow:0 10px 26px rgba(2,4,12,.5);
+  }
+  .card .cap{position:absolute; left:0; top:0; right:0; height:9px; background:linear-gradient(90deg,var(--blue-soft),var(--blue))}
+  .card h3{font-size:21px; font-weight:700; margin:8px 0 8px}
+  .card p{font-size:14.5px; color:var(--text-2); line-height:1.45}
+  .card .m{font-family:var(--f-mono); font-size:13px; color:#aebdd4}
+  .card.glow{box-shadow:0 10px 26px rgba(2,4,12,.5), 0 0 24px rgba(59,130,246,.35)}
+  .card.green{border-color:var(--green)} .card.green .cap{background:linear-gradient(90deg,var(--green-soft),var(--green))}
+  .card.green.glow{box-shadow:0 10px 26px rgba(2,4,12,.5),0 0 24px rgba(16,185,129,.35)}
+  .card.purple{border-color:var(--purple); background:linear-gradient(180deg,rgba(36,26,82,.92),rgba(19,15,42,.96))}
+  .card.purple .cap{background:linear-gradient(90deg,var(--purple-soft),var(--purple))}
+  .card.purple.glow{box-shadow:0 10px 26px rgba(2,4,12,.5),0 0 24px rgba(139,92,246,.4)}
+  .card.purple .m{color:var(--purple-soft)}
+  .card.orange{border-color:var(--orange); background:linear-gradient(180deg,rgba(51,32,12,.92),rgba(26,18,6,.96))}
+  .card.orange .cap{background:linear-gradient(90deg,var(--orange-soft),var(--orange))}
+  .card.orange.glow{box-shadow:0 10px 26px rgba(2,4,12,.5),0 0 24px rgba(249,115,22,.4)}
+  .card.orange .m{color:var(--orange-soft)}
+
+  /* 多窗口层叠卡 */
+  .windows{flex:1.7 1 0; position:relative; padding-top:14px; padding-right:16px}
+  .windows .stack{position:absolute; inset:14px 16px auto 0; height:104px; border-radius:14px;
+    background:#0b1830; border:1.5px solid #2a4a73}
+  .windows .stack.s2{transform:translate(22px,22px); opacity:.5; border-color:#1e3a5f}
+  .windows .stack.s1{transform:translate(11px,11px); opacity:.82}
+  .windows .win{position:relative; border-radius:15px; padding:0;
+    background:linear-gradient(180deg,rgba(20,48,85,.96),rgba(11,26,48,.98));
+    border:2.5px solid var(--blue); box-shadow:0 0 26px rgba(59,130,246,.4)}
+  .windows .bar{display:flex; align-items:center; gap:7px; padding:11px 14px; border-bottom:1px solid #1e3a5f}
+  .windows .bar i{width:9px;height:9px;border-radius:50%}
+  .windows .bar .t{font-family:var(--f-mono); font-size:13px; color:#8da2bf; margin-left:6px}
+  .windows .body{padding:12px 16px 16px}
+  .windows .body b{font-size:20px; font-weight:700}
+  .windows .body .m{display:block; font-family:var(--f-mono); font-size:13px; color:#93c5fd; margin-top:8px}
+
+  /* 箭头 */
+  .arr{flex:0 0 40px; display:grid; place-items:center; color:var(--blue-soft); font-size:30px; font-weight:800; line-height:1}
+  .arr.green{color:var(--green-soft)} .arr.purple{color:var(--purple-soft)} .arr.orange{color:var(--orange-soft)}
+  .arr.into{flex-basis:30px}
+  .into-hub{flex:0 0 28px; display:grid; place-items:center; color:var(--ember-soft); font-size:30px; font-weight:800}
+
+  /* 同事条 */
+  .colleague{flex:1; border-radius:16px; padding:14px 22px; border:1.8px dashed var(--blue);
+    background:rgba(12,26,48,.7)}
+  .colleague b{font-size:16px; font-weight:500; color:var(--text-2)}
+  .colleague span{display:block; font-family:var(--f-mono); font-size:13px; color:#aebdd4; margin-top:6px}
+
+  /* 关键回路 + 徽标 */
+  .lane1-extra{grid-column:2; grid-row:1; align-self:end; margin-bottom:-8px;
+    display:flex; align-items:center; gap:16px; pointer-events:none}
+  .retry{flex:1; position:relative; height:30px}
+  .retry .track{position:absolute; left:8%; right:6%; top:50%; height:0; border-top:3px dotted var(--red); opacity:.85;
+    background:none; animation:flow 1.1s linear infinite}
+  .retry .lbl{position:absolute; left:50%; top:6px; transform:translateX(-50%); white-space:nowrap;
+    font-size:13px; font-weight:600; color:#fca5a5; background:rgba(10,14,26,.7); padding:0 8px}
+  .badge{flex:0 0 auto; font-family:var(--f-mono); font-size:13px; color:#93c5fd;
+    border:1px solid rgba(59,130,246,.7); border-radius:15px; padding:6px 14px; background:#0c1a30}
+
+  /* 中央枢纽 */
+  .hub-card{height:100%; border-radius:22px; padding:0 22px 24px; text-align:center; position:relative; overflow:hidden;
+    background:linear-gradient(180deg,#3a2509,#241606 55%,#180f05);
+    border:3.5px solid var(--ember); box-shadow:0 0 50px rgba(245,158,11,.5); animation:pulse 3.4s ease-in-out infinite}
+  .hub-card .cap{position:absolute; left:0;right:0;top:0;height:13px; background:var(--molten)}
+  .hub-card .gem{margin:30px auto 4px; width:20px;height:20px; transform:rotate(45deg); border-radius:4px; background:var(--ember-soft); box-shadow:0 0 16px var(--ember)}
+  .hub-card h2{font-family:var(--f-disp); font-weight:800; font-size:30px; color:#fde9c8; margin-top:16px}
+  .hub-card .lead{font-size:15px; color:#f3d8a8; margin-top:8px}
+  .hub-card hr{border:0; border-top:1.4px solid #6b4d18; margin:18px 24px}
+  .hub-card p{color:#f3d8a8; font-size:15px; line-height:1.7}
+  .hub-card .soft{color:#caa970; font-size:13px}
+  .hub-card .hot{color:var(--ember-soft); font-size:16px; font-weight:500; line-height:1.7}
+
+  /* 护栏页脚 */
+  .guards{margin-top:24px; border-radius:16px; padding:14px 26px; opacity:.62;
+    background:rgba(12,19,34,.7); border:1.2px solid #2a3852;
+    display:grid; grid-template-columns:repeat(3,1fr); gap:10px 30px; align-items:center}
+  .guards .cap-row{grid-column:1 / -1; font-family:var(--f-mono); font-size:12px; letter-spacing:3px; color:var(--faint)}
+  .guard{display:flex; align-items:center; gap:14px}
+  .guard .ic{flex:0 0 38px; height:38px; border-radius:10px; display:grid; place-items:center}
+  .guard.g1 .ic{background:#0f1d16; border:1.5px solid var(--green)}
+  .guard.g2 .ic{background:#1c1207; border:1.5px solid var(--orange)}
+  .guard.g3 .ic{background:#1f1012; border:1.5px solid var(--red)}
+  .guard b{display:block; font-size:15px; color:var(--text-2)}
+  .guard small{display:block; font-size:12.5px; color:var(--text-3); margin-top:2px}
+
+  .foot{margin-top:18px; text-align:center; font-family:var(--f-mono); font-size:13.5px; color:#9aa7bd; letter-spacing:.3px}
+  .foot b{color:var(--ember-soft)}
+
+  @keyframes flow{to{background-position:-24px 0}}
+  .retry .track{border-image:none}
+  @keyframes pulse{0%,100%{box-shadow:0 0 40px rgba(245,158,11,.42)} 50%{box-shadow:0 0 64px rgba(245,158,11,.6)}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+
+  /* 适配小屏：缩放整张海报 */
+  @media (max-width:1680px){ body{align-items:flex-start} #poster{transform:scale(.82); transform-origin:top center} }
+  @media (max-width:1380px){ #poster{transform:scale(.66)} }
+  @media (max-width:1120px){ #poster{transform:scale(.5)} }
+</style>
+</head>
+<body>
+  <div id="poster">
+    <div class="legend">
+      <span><i class="k"></i>关键环节</span>
+      <span><i class="d"></i>弱化背景</span>
+    </div>
+    <div class="kicker">AUTOFORGE · 分支托管工作流</div>
+    <h1>AutoForge 分支管理 × 任务角色</h1>
+    <p class="sub">三类写入者各走其道，全部先 rebase 对齐 origin/dev、过 preland，再 land 推回 —— 无锁 · 原子 · 永不双头。</p>
+
+    <div class="stage">
+      <!-- 角色 1 -->
+      <div class="role" style="grid-column:1;grid-row:1">
+        <b>你的 session</b><span>Claude 多窗口 × N<br>人工开发 · 主路径</span>
+      </div>
+      <div class="lane" style="grid-column:2;grid-row:1">
+        <div class="card windows">
+          <div class="stack s2"></div><div class="stack s1"></div>
+          <div class="win">
+            <div class="bar"><i style="background:#ef4444"></i><i style="background:#f59e0b"></i><i style="background:#10b981"></i><span class="t">claude — worktree</span></div>
+            <div class="body"><b>Claude 多窗口会话</b><span class="m">session #1 · #2 · #3 … 并行</span></div>
+          </div>
+        </div>
+        <div class="arr">▸</div>
+        <div class="card glow"><div class="cap"></div><h3>rebase</h3><p>fetch + 对齐</p><p class="m">origin/dev</p></div>
+        <div class="arr green">▸</div>
+        <div class="card green glow"><div class="cap"></div><h3>preland</h3><p>强校验 · 只读</p><p>高冲突把关</p></div>
+        <div class="arr purple">▸</div>
+        <div class="card purple glow"><div class="cap"></div><h3>land</h3><p class="m">push HEAD:dev</p><p>拒绝即重试</p></div>
+        <div class="into-hub">▸</div>
+      </div>
+      <!-- 关键回路覆盖在角色 1 行底部 -->
+      <div class="lane1-extra">
+        <span class="badge">每窗 = 一 worktree = 一 feat 分支 · 物理隔离</span>
+        <div class="retry"><div class="track"></div><div class="lbl">↺ push 被拒 → 自动 rebase 重试（最多 5 次）</div></div>
+      </div>
+
+      <!-- 角色 2 -->
+      <div class="role dim" style="grid-column:1;grid-row:2;opacity:.46">
+        <b>同事</b><span>工程师 · 互为上游</span>
+      </div>
+      <div class="lane dim" style="grid-column:2;grid-row:2">
+        <div class="colleague">
+          <b>同一套流程：worktree → rebase → preland → land</b>
+          <span>与你彼此互为上游，落地前都先对齐 origin/dev</span>
+        </div>
+        <div class="into-hub" style="color:var(--blue-soft)">▸</div>
+      </div>
+
+      <!-- 角色 3 -->
+      <div class="role af" style="grid-column:1;grid-row:3">
+        <b>AutoForge</b><span>自管理合并 · 机器<br>纯 origin/dev 写入</span>
+      </div>
+      <div class="lane" style="grid-column:2;grid-row:3">
+        <div class="card orange"><div class="cap"></div><h3>编码 CR worktree</h3><p>编码阶段 · 一 CR 一棵</p><p class="m">基于 origin/dev</p></div>
+        <div class="arr orange">▸</div>
+        <div class="card orange glow"><div class="cap"></div><h3>隔离合并 worktree</h3><p class="m">dev_is_live=true</p><p>不碰你的主仓工作树</p></div>
+        <div class="arr orange">▸</div>
+        <div class="card orange glow"><div class="cap"></div><h3>rebase → push</h3><p>L0 串行锁 · L1 merge dev</p><p>自动落地，被拒重试</p></div>
+        <div class="into-hub" style="color:var(--orange-soft)">▸</div>
+      </div>
+
+      <!-- 中央枢纽 -->
+      <div class="hub">
+        <div class="hub-card">
+          <div class="cap"></div>
+          <div class="gem"></div>
+          <h2>origin/dev</h2>
+          <div class="lead">唯一权威主干</div>
+          <hr>
+          <p>所有人先对齐<br>再 push 落地</p>
+          <p class="soft">git 原子 ref 更新 · 谁先到谁赢</p>
+          <hr>
+          <p class="hot">无锁串行化<br>永不双头</p>
+          <p class="soft">线性历史</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 护栏页脚（弱化背景） -->
+    <div class="guards">
+      <div class="cap-row">背景护栏 · 自动生效 · 无需记忆</div>
+      <div class="guard g1">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 20 20"><rect x="3" y="1.5" width="11" height="15" rx="1.6" fill="none" stroke="#10b981" stroke-width="1.5"/><line x1="9" y1="1.5" x2="9" y2="16.5" stroke="#10b981" stroke-width="1.1" opacity=".7"/></svg></div>
+        <div><b>主仓 dev 只读镜像</b><small>保持干净，仅 git pull --ff-only 追新</small></div>
+      </div>
+      <div class="guard g2">
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 22 22"><path d="M11 2 L19 5 V11 C19 16 15 19 11 20.6 C7 19 3 16 3 11 V5 Z" fill="none" stroke="#f97316" stroke-width="1.5"/></svg></div>
+        <div><b>hooks / guard 硬拦截</b><small>主仓编辑 · dev 提交 · 裸 pull · merge · force push</small></div>
+      </div>
+      <div class="guard g3">
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 22 22"><path d="M11 3 L20 19 H2 Z" fill="none" stroke="#ef4444" stroke-width="1.5" stroke-linejoin="round"/><line x1="11" y1="9" x2="11" y2="14" stroke="#ef4444" stroke-width="1.5"/><circle cx="11" cy="16.5" r="1" fill="#ef4444"/></svg></div>
+        <div><b>冲突域控制</b><small>migration / lockfile 默认阻断，串行确认</small></div>
+      </div>
+    </div>
+
+    <div class="foot">口诀：<b>origin/dev 唯一主干</b> ｜ 主仓 dev 只读 ｜ 一窗一 worktree ｜ 勤 rebase ｜ preland 先验 ｜ land 推回 ｜ <b>无锁 · 原子 · 永不双头</b></div>
+  </div>
+</body>
+</html>

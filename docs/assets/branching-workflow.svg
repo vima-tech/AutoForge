@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="860" viewBox="0 0 1600 860" role="img" aria-labelledby="title desc">
+  <title id="title">AutoForge 分支管理 × 任务角色</title>
+  <desc id="desc">三类 origin/dev 写入者——你的 Claude 多窗口会话、同事、AutoForge 自管理合并——各走其道，全部先 rebase 对齐 origin/dev、过 preland 强校验，再 land 推回；无锁、原子、永不双头。护栏（主仓只读镜像 / hooks guard / 冲突域控制）为弱化背景。</desc>
+  <defs>
+    <!-- 背景 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0.6" y2="1"><stop offset="0%" stop-color="#0a0e1a"/><stop offset="55%" stop-color="#0d1322"/><stop offset="100%" stop-color="#0b0f1d"/></linearGradient>
+    <radialGradient id="glowR" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#f59e0b" stop-opacity=".16"/><stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/></radialGradient>
+    <radialGradient id="glowL" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#3b82f6" stop-opacity=".12"/><stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/></radialGradient>
+    <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#26344f" opacity=".45"/></pattern>
+    <!-- 文字渐变 -->
+    <linearGradient id="titleg" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#fef3c7"/><stop offset="48%" stop-color="#fbbf24"/><stop offset="100%" stop-color="#f97316"/></linearGradient>
+    <!-- 卡片渐变 -->
+    <linearGradient id="cBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#143055"/><stop offset="100%" stop-color="#0b1a30"/></linearGradient>
+    <linearGradient id="cGreen" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#103a2d"/><stop offset="100%" stop-color="#0a1f18"/></linearGradient>
+    <linearGradient id="cPurple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#241a52"/><stop offset="100%" stop-color="#130f2a"/></linearGradient>
+    <linearGradient id="cOrange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#33200c"/><stop offset="100%" stop-color="#1a1206"/></linearGradient>
+    <linearGradient id="cHub" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3a2509"/><stop offset="55%" stop-color="#241606"/><stop offset="100%" stop-color="#180f05"/></linearGradient>
+    <radialGradient id="hubCore" cx="50%" cy="34%" r="60%"><stop offset="0%" stop-color="#f9a825" stop-opacity=".4"/><stop offset="100%" stop-color="#f9a825" stop-opacity="0"/></radialGradient>
+    <!-- 强调条渐变 -->
+    <linearGradient id="capBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#93c5fd"/><stop offset="100%" stop-color="#3b82f6"/></linearGradient>
+    <linearGradient id="capGreen" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#6ee7b7"/><stop offset="100%" stop-color="#10b981"/></linearGradient>
+    <linearGradient id="capPurple" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#c4b5fd"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient>
+    <linearGradient id="capOrange" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#fdba74"/><stop offset="100%" stop-color="#f97316"/></linearGradient>
+    <linearGradient id="capAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#fde68a"/><stop offset="50%" stop-color="#f59e0b"/><stop offset="100%" stop-color="#d97706"/></linearGradient>
+    <!-- 滤镜 -->
+    <filter id="sh" x="-14%" y="-14%" width="128%" height="150%"><feDropShadow dx="0" dy="6" stdDeviation="9" flood-color="#02030a" flood-opacity="0.55"/></filter>
+    <filter id="gA" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="#f59e0b" flood-opacity="0.5"/></filter>
+    <filter id="gB" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#3b82f6" flood-opacity="0.5"/></filter>
+    <filter id="gG" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#10b981" flood-opacity="0.5"/></filter>
+    <filter id="gP" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#8b5cf6" flood-opacity="0.5"/></filter>
+    <filter id="gO" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#f97316" flood-opacity="0.5"/></filter>
+    <marker id="a-blue" markerWidth="9" markerHeight="9" refX="6.5" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4.5 L0,9 Z" fill="#60a5fa"/></marker>
+    <marker id="a-green" markerWidth="9" markerHeight="9" refX="6.5" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4.5 L0,9 Z" fill="#34d399"/></marker>
+    <marker id="a-purple" markerWidth="9" markerHeight="9" refX="6.5" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4.5 L0,9 Z" fill="#a78bfa"/></marker>
+    <marker id="a-orange" markerWidth="9" markerHeight="9" refX="6.5" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4.5 L0,9 Z" fill="#fb923c"/></marker>
+    <marker id="a-red" markerWidth="9" markerHeight="9" refX="6.5" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4.5 L0,9 Z" fill="#f87171"/></marker>
+    <style>
+      .kicker{fill:#b08440;font:600 14px "JetBrains Mono","Noto Sans CJK SC",monospace;letter-spacing:4px}
+      .title{font:800 42px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .subtitle{fill:#8c99b0;font:400 18px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .role{fill:#f8fafc;font:700 19px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .role-sub{fill:#8da2bf;font:500 12.5px "JetBrains Mono","Noto Sans CJK SC",monospace}
+      .bt{fill:#f8fafc;font:700 21px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .bx{fill:#c9d6e8;font:400 15px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .mono{fill:#aebdd4;font:500 13px "JetBrains Mono","Noto Sans CJK SC",monospace}
+      .edge{font:600 13px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .hubt{fill:#fde9c8;font:800 27px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .hubx{fill:#f3d8a8;font:400 15px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .foot{fill:#d6deea;font:700 15px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .footx{fill:#8693a8;font:400 13px "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+      .hl{stroke:#ffffff;stroke-opacity:.07;stroke-width:1.4;fill:none}
+      .l{fill:none;stroke-width:4;stroke-linecap:round}
+      .l-blue{stroke:#60a5fa;marker-end:url(#a-blue)}
+      .l-green{stroke:#34d399;marker-end:url(#a-green)}
+      .l-purple{stroke:#a78bfa;marker-end:url(#a-purple)}
+      .l-orange{stroke:#fb923c;marker-end:url(#a-orange)}
+      .l-red{stroke:#f87171;stroke-width:3;marker-end:url(#a-red)}
+      .dash{stroke-dasharray:1 11;stroke-linecap:round}
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="860" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1600" height="860" fill="url(#dots)"/>
+  <ellipse cx="1430" cy="330" rx="430" ry="360" fill="url(#glowR)"/>
+  <ellipse cx="280" cy="250" rx="420" ry="320" fill="url(#glowL)"/>
+
+  <!-- 顶部 -->
+  <text class="kicker" x="62" y="40">AUTOFORGE · 分支托管工作流</text>
+  <text class="title" x="60" y="84" fill="url(#titleg)">AutoForge 分支管理 × 任务角色</text>
+  <text class="subtitle" x="62" y="118">三类写入者各走其道，全部先 rebase 对齐 origin/dev、过 preland，再 land 推回 —— 无锁 · 原子 · 永不双头。</text>
+  <!-- 图例 -->
+  <g transform="translate(1208 60)">
+    <rect width="15" height="15" rx="4" fill="none" stroke="#f59e0b" stroke-width="2.5" filter="url(#gA)"/>
+    <text class="footx" x="23" y="13" fill="#c9d6e8">关键环节</text>
+    <rect x="118" y="0" width="15" height="15" rx="4" fill="none" stroke="#4b5a72" stroke-width="2" stroke-dasharray="3 3"/>
+    <text class="footx" x="141" y="13" fill="#8693a8">弱化背景</text>
+  </g>
+
+  <!-- ============ origin/dev 收敛枢纽（关键·强调） ============ -->
+  <g transform="translate(1340 160)" filter="url(#gA)">
+    <rect width="196" height="392" rx="20" fill="url(#cHub)" stroke="#f59e0b" stroke-width="3.5"/>
+    <rect x="3" y="3" width="190" height="160" rx="17" fill="url(#hubCore)"/>
+    <rect width="196" height="13" rx="6.5" fill="url(#capAmber)"/>
+    <rect x="6" y="20" width="184" height="44" rx="13" class="hl"/>
+    <path d="M98 30 l9 9 -9 9 -9 -9 Z" fill="#fbbf24"/>
+    <text class="hubt" x="98" y="92" text-anchor="middle">origin/dev</text>
+    <text class="hubx" x="98" y="122" text-anchor="middle" font-size="14">唯一权威主干</text>
+    <line x1="28" y1="146" x2="168" y2="146" stroke="#6b4d18" stroke-width="1.4"/>
+    <text class="hubx" x="98" y="178" text-anchor="middle">所有人先对齐</text>
+    <text class="hubx" x="98" y="206" text-anchor="middle">再 push 落地</text>
+    <text class="hubx" x="98" y="240" text-anchor="middle" font-size="13" fill="#caa970">git 原子 ref 更新</text>
+    <text class="hubx" x="98" y="266" text-anchor="middle" font-size="13" fill="#caa970">谁先到谁赢</text>
+    <line x1="28" y1="292" x2="168" y2="292" stroke="#6b4d18" stroke-width="1.4"/>
+    <text class="hubx" x="98" y="324" text-anchor="middle" fill="#fbbf24" font-size="16">无锁串行化</text>
+    <text class="hubx" x="98" y="352" text-anchor="middle" fill="#fbbf24" font-size="16">永不双头</text>
+    <text class="hubx" x="98" y="378" text-anchor="middle" font-size="13" fill="#caa970">线性历史</text>
+  </g>
+
+  <!-- =================== 角色 1：你的 Claude 多窗口会话（主路径·关键） =================== -->
+  <rect x="36" y="158" width="1288" height="128" rx="18" fill="#101a30" opacity=".5"/>
+  <rect x="36" y="158" width="1288" height="128" rx="18" fill="none" stroke="#23365c" stroke-width="1"/>
+  <g transform="translate(36 178)" filter="url(#sh)">
+    <rect width="152" height="88" rx="15" fill="url(#cBlue)" stroke="#3b82f6" stroke-width="2"/>
+    <rect width="7" height="88" rx="3.5" fill="url(#capBlue)"/>
+    <text class="role" x="24" y="34">你的 session</text>
+    <text class="role-sub" x="24" y="58">Claude 多窗口 × N</text>
+    <text class="role-sub" x="24" y="76">人工开发 · 主路径</text>
+  </g>
+
+  <!-- 多窗口会话：层叠的 Claude 窗口，每窗一 worktree -->
+  <g transform="translate(210 164)" filter="url(#gB)">
+    <rect x="24" y="20" width="262" height="92" rx="13" fill="#0a1526" stroke="#1e3a5f" stroke-width="1.5" opacity=".5"/>
+    <rect x="12" y="10" width="262" height="92" rx="13" fill="#0b1830" stroke="#2a4a73" stroke-width="1.5" opacity=".82"/>
+    <rect width="262" height="100" rx="15" fill="url(#cBlue)" stroke="#3b82f6" stroke-width="2.5"/>
+    <rect x="4" y="4" width="254" height="30" rx="11" class="hl"/>
+    <circle cx="22" cy="20" r="4.5" fill="#ef4444"/><circle cx="38" cy="20" r="4.5" fill="#f59e0b"/><circle cx="54" cy="20" r="4.5" fill="#10b981"/>
+    <text class="mono" x="72" y="25" fill="#8da2bf">claude — worktree</text>
+    <line x1="14" y1="38" x2="248" y2="38" stroke="#1e3a5f" stroke-width="1.3"/>
+    <text class="bt" x="18" y="65" font-size="20">Claude 多窗口会话</text>
+    <text class="mono" x="18" y="88" fill="#93c5fd">session #1 · #2 · #3 … 并行</text>
+  </g>
+  <g transform="translate(560 164)" filter="url(#gB)"><rect width="180" height="116" rx="16" fill="url(#cBlue)" stroke="#3b82f6" stroke-width="2.5" filter="url(#sh)"/><rect width="180" height="10" rx="5" fill="url(#capBlue)"/><rect x="5" y="5" width="170" height="34" rx="12" class="hl"/><text class="bt" x="18" y="44">rebase</text><text class="bx" x="18" y="74">fetch + 对齐</text><text class="mono" x="18" y="98">origin/dev</text></g>
+  <g transform="translate(800 164)" filter="url(#gG)"><rect width="180" height="116" rx="16" fill="url(#cGreen)" stroke="#10b981" stroke-width="2.5" filter="url(#sh)"/><rect width="180" height="10" rx="5" fill="url(#capGreen)"/><rect x="5" y="5" width="170" height="34" rx="12" class="hl"/><text class="bt" x="18" y="44">preland</text><text class="bx" x="18" y="74">强校验 · 只读</text><text class="bx" x="18" y="98">高冲突把关</text></g>
+  <g transform="translate(1040 164)" filter="url(#gP)"><rect width="180" height="116" rx="16" fill="url(#cPurple)" stroke="#8b5cf6" stroke-width="2.5" filter="url(#sh)"/><rect width="180" height="10" rx="5" fill="url(#capPurple)"/><rect x="5" y="5" width="170" height="34" rx="12" class="hl"/><text class="bt" x="18" y="44">land</text><text class="mono" x="18" y="72" fill="#c4b5fd">push HEAD:dev</text><text class="bx" x="18" y="98">拒绝即重试</text></g>
+
+  <path class="l l-blue" d="M496 222H556"/>
+  <path class="l l-blue" d="M740 222H796"/>
+  <path class="l l-green" d="M980 222H1036"/>
+  <path class="l l-purple" d="M1220 222H1336"/>
+  <!-- 关键回路：push 被拒 → 自动 rebase 重试 -->
+  <path class="l-red dash" style="fill:none;stroke-width:3.2" d="M1130 280 C 1130 320, 680 322, 650 282"/>
+  <path class="l l-red" d="M666 290 L648 280 L662 270" transform="translate(-12 -2)"/>
+  <text class="edge" x="724" y="322" fill="#fca5a5">push 被拒 → 自动 rebase 重试（最多 5 次）</text>
+  <rect x="210" y="298" width="332" height="30" rx="15" fill="#0c1a30" stroke="#3b82f6" stroke-opacity=".7"/>
+  <text class="mono" x="226" y="318" fill="#93c5fd">每窗 = 一 worktree = 一 feat 分支 · 物理隔离</text>
+
+  <!-- =================== 角色 2：同事（同一套流程·弱化） =================== -->
+  <g opacity=".46">
+    <g transform="translate(36 366)">
+      <rect width="152" height="80" rx="15" fill="#0c1a30" stroke="#3b82f6" stroke-width="1.6"/>
+      <rect width="7" height="80" rx="3.5" fill="#3b82f6"/>
+      <text class="role" x="24" y="34">同事</text>
+      <text class="role-sub" x="24" y="58">工程师 · 互为上游</text>
+    </g>
+    <g transform="translate(210 372)">
+      <rect width="1044" height="68" rx="16" fill="#0c1a30" stroke="#3b82f6" stroke-width="1.6" stroke-dasharray="9 7"/>
+      <text class="bx" x="28" y="32" font-size="16">同一套流程：worktree → rebase → preland → land</text>
+      <text class="mono" x="28" y="54">与你彼此互为上游，落地前都先对齐 origin/dev</text>
+    </g>
+    <path class="l l-blue" d="M1254 406H1336"/>
+  </g>
+
+  <!-- =================== 角色 3：AutoForge 自管理合并（机器·关键） =================== -->
+  <rect x="36" y="484" width="1288" height="128" rx="18" fill="#1f1405" opacity=".5"/>
+  <rect x="36" y="484" width="1288" height="128" rx="18" fill="none" stroke="#4a3013" stroke-width="1"/>
+  <g transform="translate(36 504)" filter="url(#sh)">
+    <rect width="152" height="88" rx="15" fill="url(#cOrange)" stroke="#f97316" stroke-width="2"/>
+    <rect width="7" height="88" rx="3.5" fill="url(#capOrange)"/>
+    <text class="role" x="24" y="34">AutoForge</text>
+    <text class="role-sub" x="24" y="58">自管理合并 · 机器</text>
+    <text class="role-sub" x="24" y="76">纯 origin/dev 写入</text>
+  </g>
+
+  <g transform="translate(210 494)" filter="url(#sh)"><rect width="300" height="116" rx="16" fill="url(#cOrange)" stroke="#f97316" stroke-width="2.2"/><rect width="300" height="10" rx="5" fill="url(#capOrange)"/><rect x="5" y="5" width="290" height="34" rx="12" class="hl"/><text class="bt" x="18" y="44">编码 CR worktree</text><text class="bx" x="18" y="74">编码阶段 · 一 CR 一棵</text><text class="mono" x="18" y="98" fill="#fdba74">基于 origin/dev</text></g>
+  <g transform="translate(582 494)" filter="url(#gO)"><rect width="300" height="116" rx="16" fill="url(#cOrange)" stroke="#f97316" stroke-width="2.5" filter="url(#sh)"/><rect width="300" height="10" rx="5" fill="url(#capOrange)"/><rect x="5" y="5" width="290" height="34" rx="12" class="hl"/><text class="bt" x="18" y="44">隔离合并 worktree</text><text class="mono" x="18" y="73" fill="#fdba74">dev_is_live=true</text><text class="bx" x="18" y="98">不碰你的主仓工作树</text></g>
+  <g transform="translate(954 494)" filter="url(#gO)"><rect width="300" height="116" rx="16" fill="url(#cOrange)" stroke="#f97316" stroke-width="2.5" filter="url(#sh)"/><rect width="300" height="10" rx="5" fill="url(#capOrange)"/><rect x="5" y="5" width="290" height="34" rx="12" class="hl"/><text class="bt" x="18" y="44">rebase → push</text><text class="bx" x="18" y="74">L0 串行锁 · L1 merge dev</text><text class="bx" x="18" y="98">自动落地，被拒重试</text></g>
+
+  <path class="l l-orange" d="M510 552H578"/>
+  <path class="l l-orange" d="M882 552H950"/>
+  <path class="l l-orange" d="M1254 552H1336"/>
+
+  <!-- =================== 护栏与镜像（背景·非关键·弱化） =================== -->
+  <g opacity=".5">
+    <rect x="36" y="648" width="1500" height="104" rx="16" fill="#0c1322" stroke="#2a3852" stroke-width="1.3"/>
+    <text class="footx" x="58" y="675" font-size="12" letter-spacing="3" fill="#5b6b85">背景护栏 · 自动生效 · 无需记忆</text>
+    <line x1="520" y1="668" x2="520" y2="734" stroke="#2a3852" stroke-width="1"/>
+    <line x1="1050" y1="668" x2="1050" y2="734" stroke="#2a3852" stroke-width="1"/>
+    <g transform="translate(58 690)">
+      <rect width="38" height="38" rx="10" fill="#0f1d16" stroke="#10b981" stroke-width="1.5"/>
+      <rect x="12" y="10" width="14" height="18" rx="2" fill="none" stroke="#10b981" stroke-width="1.6"/><line x1="19" y1="10" x2="19" y2="28" stroke="#10b981" stroke-width="1.2" opacity=".7"/>
+      <text class="foot" x="52" y="18">主仓 dev 只读镜像</text>
+      <text class="footx" x="52" y="40">保持干净，仅 git pull --ff-only 追新</text>
+    </g>
+    <g transform="translate(560 690)">
+      <rect width="38" height="38" rx="10" fill="#1c1207" stroke="#f97316" stroke-width="1.5"/>
+      <path d="M19 9 L29 12.5 V19 C29 24.5 24.6 28 19 29.8 C13.4 28 9 24.5 9 19 V12.5 Z" fill="none" stroke="#f97316" stroke-width="1.6"/>
+      <text class="foot" x="52" y="18">hooks / guard 硬拦截</text>
+      <text class="footx" x="52" y="40">主仓编辑 · dev 提交 · 裸 pull · merge · force push</text>
+    </g>
+    <g transform="translate(1090 690)">
+      <rect width="38" height="38" rx="10" fill="#1f1012" stroke="#ef4444" stroke-width="1.5"/>
+      <path d="M19 10 L30 29 H8 Z" fill="none" stroke="#ef4444" stroke-width="1.6" stroke-linejoin="round"/><line x1="19" y1="17" x2="19" y2="23" stroke="#ef4444" stroke-width="1.6"/><circle cx="19" cy="26" r="1.1" fill="#ef4444"/>
+      <text class="foot" x="52" y="18">冲突域控制</text>
+      <text class="footx" x="52" y="40">migration / lockfile 默认阻断，串行确认</text>
+    </g>
+  </g>
+</svg>
