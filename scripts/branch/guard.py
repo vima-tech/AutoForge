@@ -33,6 +33,18 @@ def deny(reason):
     sys.exit(0)
 
 
+def nearest_existing_dir(path):
+    """向上找最近存在的父目录:目标文件可能在主仓 dev 下一个尚不存在的新目录里,
+    直接对不存在的目录跑 git 会失败从而绕过 repo 检测。"""
+    d = os.path.abspath(path or ".")
+    while d and not os.path.isdir(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return d
+
+
 def repo_info(d):
     """返回 (is_inside, is_main_worktree, current_branch) for dir d。"""
     code, _, _ = git(d, "rev-parse", "--is-inside-work-tree")
@@ -65,10 +77,11 @@ def main():
     ti = data.get("tool_input", {}) or {}
     cwd = data.get("cwd") or os.getcwd()
 
-    # ---- Write / Edit / NotebookEdit:保护主仓 <dev> 只读镜像 ----
-    if tool in ("Write", "Edit", "NotebookEdit"):
+    # ---- Write / Edit / MultiEdit / NotebookEdit:保护主仓 <dev> 只读镜像 ----
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         fp = ti.get("file_path") or ti.get("notebook_path") or ""
-        target_dir = os.path.dirname(fp) if os.path.isabs(fp) else cwd
+        base = os.path.dirname(fp) if os.path.isabs(fp) else os.path.join(cwd, os.path.dirname(fp))
+        target_dir = nearest_existing_dir(base or cwd)
         inside, is_main, branch = repo_info(target_dir or cwd)
         if inside and is_main and branch == DEV:
             deny(f"主仓 {DEV} 是只读镜像,禁止在此编辑(BRANCHING.md §1)。请先 "
@@ -80,10 +93,8 @@ def main():
         sys.exit(0)
 
     cmd = ti.get("command", "") or ""
-    # 放行我们自己的脚本(其内部已遵守规范)
-    if re.search(r"scripts/branch/(land|wt-new|wt-clean)", cmd):
-        sys.exit(0)
-
+    # 注:不再"整条放行含 scripts/branch/* 的命令"——脚本调用段本身不含 git 动词,
+    # 天然不触发任何规则;按段扫描可让 `bash …/land.sh && git push --force` 的后段仍被拦。
     _, is_main, branch = repo_info(cwd)
     dev_re = rf"\b(origin/)?{re.escape(DEV)}\b"
 
@@ -96,6 +107,10 @@ def main():
         if re.search(dev_re, seg):
             deny(f"不要直接 push 到 {DEV}。请用 `bash scripts/branch/land.sh`"
                  f"(rebase→push,被拒自动重试,保证无双头)。")
+    # 在 dev 分支上的任何 push(裸 push 命令文本不含 dev,但当前就在 dev → 也会动 origin/dev)
+    if branch == DEV and git_segments(cmd, r"\bpush\b"):
+        deny(f"当前在 {DEV} 分支,禁止任何 push(裸 push 也会推 origin/{DEV})。"
+             f"开发请用 feature worktree,落地走 `bash scripts/branch/land.sh`。")
     # 裸 pull(既非 --ff-only 也非 --rebase)
     for seg in git_segments(cmd, r"\bpull\b"):
         if not re.search(r"--ff-only|--rebase", seg):

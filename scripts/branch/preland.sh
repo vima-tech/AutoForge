@@ -25,25 +25,39 @@ if git grep -nI -e '^<<<<<<<' -e '^>>>>>>>' -- . >/dev/null 2>&1; then
   bad "检测到冲突标记 <<<<<<< / >>>>>>>:"; git grep -nI -e '^<<<<<<<' -e '^>>>>>>>' -- . | sed 's/^/    /'
 else ok "无冲突标记"; fi
 
-# 4) 无空白/标记错误
-if git diff --check HEAD >/dev/null 2>&1; then ok "git diff --check 通过"
-else note "  ⚠️ git diff --check 报告问题(空白/标记):"; git diff --check HEAD | sed 's/^/    /' || true; fi
-
-# 5) 已基于最新 origin/dev
+# 5) 已基于最新 origin/dev(先算,供下面 diff/范围用)
 git fetch origin "$DEV" >/dev/null 2>&1 || true
+BASE=""
 if git rev-parse --verify -q "origin/$DEV" >/dev/null; then
   if git merge-base --is-ancestor "origin/$DEV" HEAD; then ok "已基于最新 origin/$DEV"
   else bad "落后 origin/$DEV,请先 git rebase origin/$DEV(land 会自动 rebase)"; fi
+  BASE=$(git merge-base "origin/$DEV" HEAD 2>/dev/null || echo "")
 fi
 
-# 6) 高冲突文件预警(相对 origin/dev 的改动范围)——见 BRANCHING.md「冲突域控制规则」
-BASE=$(git merge-base "origin/$DEV" HEAD 2>/dev/null || echo "")
+# 4) 无空白/标记错误——检查本分支相对 origin/dev 的【已提交差异】(工作树干净时 HEAD 对比查不到)
+RANGE_OK=1
 if [ -n "$BASE" ]; then
-  HOT=$(git diff --name-only "$BASE"..HEAD 2>/dev/null | grep -E \
-    'migrations/|(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock)$|src/services/index\.ts|src/App\.tsx|src-tauri/src/lib\.rs|src-tauri/src/state\.rs|(^|/)mod\.rs$|src/index\.css' || true)
-  if [ -n "$HOT" ]; then
-    note "  ⚠️ 触及【高冲突文件】,确认无其它 session 并行修改同一文件(否则串行/先协调):"
-    printf '%s\n' "$HOT" | sed 's/^/      - /'
+  if git diff --check "$BASE" HEAD >/dev/null 2>&1; then ok "git diff --check(相对 origin/$DEV)通过"
+  else RANGE_OK=0; note "  ⚠️ git diff --check 报告问题(空白/标记):"; git diff --check "$BASE" HEAD | sed 's/^/    /' || true; fi
+fi
+
+# 6) 冲突域:migration/lockfile 默认【阻断】(需 AUTOFORGE_ALLOW_HOT=1 显式放行),其余高冲突文件【预警】
+if [ -n "$BASE" ]; then
+  CHANGED=$(git diff --name-only "$BASE"..HEAD 2>/dev/null)
+  HOTBLOCK=$(printf '%s\n' "$CHANGED" | grep -E 'migrations/|(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock)$' || true)
+  HOTWARN=$(printf '%s\n' "$CHANGED" | grep -E 'src/services/index\.ts|src/App\.tsx|src-tauri/src/lib\.rs|src-tauri/src/state\.rs|(^|/)mod\.rs$|src/index\.css' || true)
+  if [ -n "$HOTBLOCK" ]; then
+    if [ "${AUTOFORGE_ALLOW_HOT:-}" = "1" ]; then
+      note "  ⚠️ 触及 migration/lockfile(AUTOFORGE_ALLOW_HOT=1 已放行),务必确认仅你一人在改:"
+      printf '%s\n' "$HOTBLOCK" | sed 's/^/      - /'
+    else
+      bad "触及 migration/lockfile,默认阻断 land(避免并行序号/依赖冲突)。确认无其它 session 并行修改后,以 AUTOFORGE_ALLOW_HOT=1 land:"
+      printf '%s\n' "$HOTBLOCK" | sed 's/^/      - /'
+    fi
+  fi
+  if [ -n "$HOTWARN" ]; then
+    note "  ⚠️ 触及高冲突文件(预警),确认无其它 session 并行修改同一文件:"
+    printf '%s\n' "$HOTWARN" | sed 's/^/      - /'
   fi
 fi
 

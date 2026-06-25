@@ -27,15 +27,14 @@ AI 全自动处理需求分析→代码实现→测试；人类只在两个审�
 
 ---
 
-## 🌿 分支工作流（自动托管 — 必读）
+## 🌿 分支工作流（必读·详见 [`BRANCHING.md`](./BRANCHING.md)）
 
-完整契约见根目录 **[`BRANCHING.md`](./BRANCHING.md)**。本仓 `dev` 由多方写入（AutoForge 自管理合并推 `origin/dev`、同事、你的多个 Claude session），靠 worktree 物理隔离 + rebase-then-push 协议避免冲突/双头。`.claude/settings.json` 的 hooks 会**硬拦截**违规操作，agent 必须主动遵守：
+`origin/dev` 是唯一主干，多方写入；hooks 会**硬拦截**违规。铁律：
 
-- **主仓 `dev` 是只读镜像**：禁止在主仓工作树编辑/提交（guard 会 deny）。SessionStart 钩子检测到你在主仓 dev 时会提示——**本次若要改代码，第一步执行 `bash scripts/branch/wt-new.sh <任务名>`，再 `EnterWorktree(path=<打印的路径>)` 切入**，之后所有编辑都在该 worktree。纯问答可留在主仓但不要写文件。
-- **隔离 worktree 内开发**：开工/中途勤同步 `git fetch origin && git rebase origin/dev`（**不要 `git merge dev`、不要裸 `git pull`**，guard 会拦）。
-- **落地只走 `land`**：完工执行 `bash scripts/branch/land.sh`（rebase→push origin/dev，被拒自动重试）。**禁止直接 `git push` 到 dev**；禁止 push main/master、force push。
-- **追新只用 ff-only**：`git pull --ff-only`。完工后可 `bash scripts/branch/wt-clean.sh` 清理已落地的 worktree。
-- 维护本机制本身（改 guard/脚本/本节）需在主仓编辑时，以 `AUTOFORGE_GUARD_OFF=1` 启动 Claude 临时放行。
+- **主仓 `dev` 只读**：要改代码先 `bash scripts/branch/wt-new.sh <名>` 建 worktree 并 `EnterWorktree` 切入；禁止在主仓编辑/提交。
+- **worktree 内**：勤 `git fetch && git rebase origin/dev`（不 merge dev、不裸 pull）。
+- **落地**：`bash scripts/branch/land.sh`（含 preland 校验，rebase→push，被拒重试）；禁止直推 dev / push main / force push。
+- 追新 `git pull --ff-only`；维护本机制以 `AUTOFORGE_GUARD_OFF=1` 启动放行。
 
 ---
 

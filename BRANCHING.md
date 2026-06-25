@@ -55,6 +55,56 @@ AutoForge 是自托管的——它会改自己这个仓库。其**自管理合�
 
 ## 2. 拓扑总览
 
+### 2.0 一图读懂
+
+```mermaid
+flowchart LR
+  O[("origin/dev<br/>唯一集成主干")]
+
+  M["主仓 dev<br/>只读镜像 / 保持干净<br/>只 pull --ff-only"]
+  W["任务 worktree<br/>feat/&lt;slug&gt;<br/>一任务一棵"]
+  C["Claude / 人工开发<br/>只在 worktree 修改"]
+  R["同步最新<br/>git fetch<br/>git rebase origin/dev"]
+  P["preland 强校验<br/>干净 / 无冲突标记 / 已基于最新 dev<br/>migration + lockfile 默认阻断"]
+  L["land<br/>git push origin HEAD:dev"]
+  Q{"push 被拒？"}
+
+  A["AutoForge CR<br/>基于 origin/dev 创建 worktree"]
+  G["隔离合并 worktree<br/>不碰主仓工作树"]
+
+  H["hooks / guard<br/>拦主仓编辑、dev 提交、裸 pull、merge dev、直推 dev、force push"]
+  HC["高冲突文件<br/>migration / lockfile / 全局入口 / 路由<br/>串行或先协调"]
+
+  O -->|ff-only 追新| M
+  O -->|wt-new.sh| W
+  W --> C --> R --> P --> L --> Q
+  Q -->|否：落地成功| O
+  Q -->|是：fetch + rebase + 重跑 preland| R
+
+  O --> A --> G -->|push HEAD:dev| O
+
+  H -.硬拦截.-> M
+  H -.规范 git 操作.-> W
+  HC -.触发阻断 / 预警.-> P
+
+  classDef trunk fill:#1f2937,stroke:#f59e0b,color:#fff,stroke-width:2px;
+  classDef safe fill:#ecfdf5,stroke:#10b981,color:#064e3b;
+  classDef work fill:#eff6ff,stroke:#3b82f6,color:#1e3a8a;
+  classDef guard fill:#fff7ed,stroke:#f97316,color:#7c2d12;
+  class O trunk;
+  class M,P safe;
+  class W,C,R,L,A,G work;
+  class H,HC guard;
+```
+
+读图规则:
+
+- `origin/dev` 是唯一权威;主仓 `dev` 只是干净只读镜像。
+- 所有人工改动都先进独立 `worktree`，先 `rebase origin/dev`，再 `preland`，最后用 `land` 推回 `origin/dev`。
+- 如果 push 被别人抢先，自动回到 `fetch + rebase + preland` 再试;不会产生双头。
+- AutoForge 自管理合并也只写 `origin/dev`，并在隔离 worktree 内完成，不碰主仓工作树。
+- migration / lockfile 等高冲突文件默认阻断或预警，必须串行确认。
+
 | 角色 | 位置 / 分支 | 谁写 | 写法 |
 |------|------|------|------|
 | 集成主干 | `origin/dev` | AutoForge / 同事 / 你的每个 session | 各自 rebase 后 push |
@@ -157,9 +207,10 @@ AutoForge 的 L0 串行合并锁 + L1 合并前 merge dev 是同一套"先对齐
 | 当前分支不是 `dev`、非 detached | 阻断 |
 | 工作树干净、改动全部已提交 | 阻断(rebase 会失败/丢改动) |
 | 无冲突标记 `<<<<<<<` / `>>>>>>>` | 阻断 |
-| `git diff --check`(空白/标记错误) | 警告 |
 | HEAD 已基于最新 `origin/dev`(`merge-base --is-ancestor`) | 阻断(让 land 去 rebase) |
-| **高冲突文件预警**:列出本次相对 `origin/dev` 改动里命中 migration/lockfile/全局类型/app shell/路由/`index.css` 的文件 | 警告(提醒确认无并行修改,见 §7) |
+| `git diff --check`:检查本分支**相对 `origin/dev` 的已提交差异**(`merge-base..HEAD`,而非工作树对 HEAD——后者在工作树干净时查不到) | 警告 |
+| **migration / lockfile 改动 → 默认阻断**:`migrations/*`、`*-lock.*` / `Cargo.lock` 命中即阻断 land,需 `AUTOFORGE_ALLOW_HOT=1` 显式放行 | 阻断(可 override) |
+| **其它高冲突文件预警**:`services/index.ts`、`App.tsx`、`lib.rs`、`state.rs`、`**/mod.rs`、`index.css` | 警告(确认无并行修改,见 §7) |
 | 可选测试/lint(设 `AUTOFORGE_PRELAND_CMD`,如 `"npm run lint && cargo check"`) | 阻断 |
 
 > 建议在 shell profile 里设 `export AUTOFORGE_PRELAND_CMD="npm run lint && cargo check"`(或本项目对应的快速检查),
@@ -190,6 +241,7 @@ AutoForge 的 L0 串行合并锁 + L1 合并前 merge dev 是同一套"先对齐
 
 6. **环境变量**:`AUTOFORGE_DEV_BRANCH`(默认 `dev`)、`AUTOFORGE_WT_DIR`(worktree 落点,默认
    `<主仓父目录>/<主仓名>-wt`)、`AUTOFORGE_PRELAND_CMD`(preland 测试命令)、
+   `AUTOFORGE_ALLOW_HOT=1`(放行 migration/lockfile 改动 land,见 §5/§7)、
    `AUTOFORGE_GUARD_OFF=1`(临时关闭硬拦截,仅用于维护本机制本身,见 §8)。
 
 ---
@@ -207,13 +259,15 @@ AutoForge 的 L0 串行合并锁 + L1 合并前 merge dev 是同一套"先对齐
    - **app shell / 注册入口** `src/App.tsx`、`src-tauri/src/lib.rs`、`src-tauri/src/state.rs`;
    - **IPC 封装层** `src/services/index.ts`、**设计系统** `src/index.css`、路由表。
 3. **schema / migration 类任务串行**:同一时间只让一个 session 动 migration;它落地后其它 session 先
-   `rebase origin/dev` 再继续,避免迁移序号冲突。
+   `rebase origin/dev` 再继续,避免迁移序号冲突。**preland 对 migration/lockfile 改动默认阻断 land**,
+   确认仅你一人在改后以 `AUTOFORGE_ALLOW_HOT=1 bash scripts/branch/land.sh` 放行——这一步强制你
+   做一次"是否串行"的确认。
 4. **长跑分支设时限**:半天到一天内必须 rebase;越久越容易和高冲突文件撞。
-5. **preland 会自动预警**:落地前若改动触及上述高冲突文件,会列出来提示你确认无并行修改——
-   看到预警就主动核对其它 session/同事,必要时改为串行。
+5. **preland 自动把关**:落地前对 migration/lockfile **阻断**(需 override)、对其它高冲突文件**预警**——
+   看到就主动核对其它 session/同事,必要时改为串行。
 
 > 说明:真正的"跨 session 硬锁"(把占用 claim 推到一条共享分支)成本高、收益有限,本规范**不强制**,
-> 留作后续可选增强。当前以"约定 + preland 自动预警 + 高冲突文件串行"覆盖绝大多数编辑冲突。
+> 留作后续可选增强。当前以"migration/lockfile 默认阻断 + 其它高冲突文件预警 + 串行约定"覆盖绝大多数编辑冲突。
 
 ---
 
@@ -224,14 +278,14 @@ AutoForge 的 L0 串行合并锁 + L1 合并前 merge dev 是同一套"先对齐
 - **SessionStart → `session_start.py`**:刷新 `origin/dev`,并按你所在位置注入指引:
   - 在**主仓 dev** → 提示"本次要改代码就先 `wt-new` + `EnterWorktree`,纯问答可留下但别写文件";
   - 在**隔离 worktree** → 提示 rebase 节奏、`land`、`preland`、高冲突文件注意。
-- **PreToolUse(Bash / Write / Edit / NotebookEdit)→ `guard.py`**:**硬拦截(deny)**以下违规:
+- **PreToolUse(Bash / Write / Edit / MultiEdit / NotebookEdit)→ `guard.py`**:**硬拦截(deny)**以下违规:
   - 在主仓 `dev` 只读镜像上编辑文件;
   - 在 `dev` 分支上 `git commit`;
   - 裸 `git pull`(非 `--ff-only` / `--rebase`);
   - `git merge dev`(应 rebase);
-  - force push / push 到 `main|master` / 直接 push 到 `dev`(应走 `land`);
+  - force push / push 到 `main|master` / 直接 push 到 `dev`(应走 `land`);**在 `dev` 分支上的任何 push(含裸 `git push`)一律拦**;
   - 在主仓把 `dev` 切走(破坏 `dev_is_live` 安全路径)。
-  - 放行 `scripts/branch/{land,wt-new,wt-clean}`(内部自管);采用"同段 `git`+动词"匹配,避免误拦 echo/heredoc。
+  - 对 `scripts/branch/*` 的调用**天然放行**(其命令段不含 git 动词),但**复合命令按段扫描**——`bash …/land.sh && git push --force` 的后段仍会被拦;采用"同段 `git`+动词"匹配,避免误拦 echo/heredoc。
 
 **逃生阀**:维护本机制本身(改 guard / 脚本 / 本文档,需在主仓编辑)时,以
 `AUTOFORGE_GUARD_OFF=1 claude` 启动,临时放行。
@@ -252,6 +306,27 @@ AUTOFORGE_GUARD_OFF=1 claude     # 或手工:
 
 落地后 `git -C ~/projects/AutoForge switch dev && git pull --ff-only`,主仓即回到干净只读镜像态。
 此后一切开发都走 §3 的 worktree 流程。
+
+### 8.2 更强的边界:GitHub 侧防护(覆盖 hooks 的盲区)
+
+**hooks 只能约束 Claude session**;手工终端、其它 agent、CI 机器人仍可绕过。要在服务端兜住,
+对 `dev`(及 `main`)开启 **branch protection**——这是唯一对所有写入者都生效的强制层:
+
+```bash
+# 需要仓库 admin 权限;按实际 owner/repo 替换。要求 PR + 状态检查、禁止 force push/删除
+gh api -X PUT repos/<owner>/<repo>/branches/dev/protection \
+  -F required_status_checks.strict=true \
+  -F 'required_status_checks.contexts[]=ci' \
+  -F enforce_admins=true \
+  -F required_pull_request_reviews.required_approving_review_count=0 \
+  -F restrictions= \
+  -F allow_force_pushes=false -F allow_deletions=false
+```
+
+要点:**禁止 force push / 删除**、**required status checks(strict=必须基于最新 dev)**。
+注意:若 AutoForge 自管理流程是直接 `push origin HEAD:dev`(非 PR),开启"必须 PR"会挡住它——
+那就只保留 **禁止 force push + required checks**,不要求 PR,或把 AutoForge 的机器人账号加入
+push 白名单(`restrictions`)。本地 `land` 与服务端 required checks 形成"双保险"。
 
 ---
 
@@ -291,15 +366,20 @@ CUR=$(git branch --show-current)
 { [ -z "$CUR" ] && bad "detached HEAD"; } || { [ "$CUR" = "$DEV" ] && bad "当前在 $DEV" || ok "分支 $CUR"; }
 [ -n "$(git status --porcelain)" ] && bad "工作树有未提交改动" || ok "工作树干净"
 git grep -nI -e '^<<<<<<<' -e '^>>>>>>>' -- . >/dev/null 2>&1 && bad "检测到冲突标记" || ok "无冲突标记"
-git diff --check HEAD >/dev/null 2>&1 || note "  ⚠️ git diff --check 报告空白/标记问题"
-git fetch origin "$DEV" >/dev/null 2>&1 || true
+git fetch origin "$DEV" >/dev/null 2>&1 || true; BASE=""
 git rev-parse -q --verify "origin/$DEV" >/dev/null && {
-  git merge-base --is-ancestor "origin/$DEV" HEAD && ok "已基于最新 origin/$DEV" || bad "落后 origin/$DEV,请先 rebase"; }
-# 高冲突文件预警
-BASE=$(git merge-base "origin/$DEV" HEAD 2>/dev/null || echo "")
-[ -n "$BASE" ] && { HOT=$(git diff --name-only "$BASE"..HEAD | grep -E \
-  'migrations/|(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock)$|services/index\.ts|App\.tsx|lib\.rs|state\.rs|mod\.rs$|index\.css' || true)
-  [ -n "$HOT" ] && { note "  ⚠️ 触及高冲突文件,确认无并行修改:"; printf '%s\n' "$HOT" | sed 's/^/      - /'; }; }
+  git merge-base --is-ancestor "origin/$DEV" HEAD && ok "已基于最新 origin/$DEV" || bad "落后 origin/$DEV,请先 rebase"
+  BASE=$(git merge-base "origin/$DEV" HEAD 2>/dev/null || echo ""); }
+# diff --check 查【相对 origin/dev 的已提交差异】(非工作树对 HEAD)
+[ -n "$BASE" ] && { git diff --check "$BASE" HEAD >/dev/null 2>&1 && ok "diff --check 通过" \
+  || { note "  ⚠️ diff --check 报告空白/标记问题"; git diff --check "$BASE" HEAD | sed 's/^/    /'; }; }
+# 冲突域:migration/lockfile 默认阻断(AUTOFORGE_ALLOW_HOT=1 放行),其余高冲突文件预警
+[ -n "$BASE" ] && { CH=$(git diff --name-only "$BASE"..HEAD)
+  HB=$(printf '%s\n' "$CH" | grep -E 'migrations/|(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock)$' || true)
+  HW=$(printf '%s\n' "$CH" | grep -E 'services/index\.ts|App\.tsx|lib\.rs|state\.rs|mod\.rs$|index\.css' || true)
+  [ -n "$HB" ] && { [ "${AUTOFORGE_ALLOW_HOT:-}" = "1" ] && note "  ⚠️ migration/lockfile(已放行):$HB" \
+    || bad "触及 migration/lockfile,默认阻断;确认串行后以 AUTOFORGE_ALLOW_HOT=1 land:$HB"; }
+  [ -n "$HW" ] && note "  ⚠️ 高冲突文件(预警),确认无并行修改:$HW"; }
 # 可选测试/lint
 [ -n "${AUTOFORGE_PRELAND_CMD:-}" ] && { note "  → $AUTOFORGE_PRELAND_CMD"; bash -c "$AUTOFORGE_PRELAND_CMD" && ok "测试/lint 通过" || bad "测试/lint 失败"; } \
   || note "  ℹ️ 未设 AUTOFORGE_PRELAND_CMD,跳过测试/lint"
