@@ -482,12 +482,14 @@ export const listIssuesPage = (
   excludeMerged?: boolean,   // 与功能审计页「显示已合并需求」开关共享：true 时隐藏已合并需求
   sortAsc?: boolean,         // 按创建时间排序方向：true=正序（最早在前，默认），false=倒序
 ) => ipc<IssuePage>('list_issues_page', {
-  projectId: projectId || null,
-  status: status && status !== 'all' ? status : null,
-  search: search?.trim() || null,
-  excludeMerged: excludeMerged ?? false,
-  limit, offset,
-  sortAsc: sortAsc ?? true,
+  query: {
+    projectId: projectId || null,
+    status: status && status !== 'all' ? status : null,
+    search: search?.trim() || null,
+    excludeMerged: excludeMerged ?? false,
+    limit, offset,
+    sortAsc: sortAsc ?? true,
+  },
 });
 // 某项目出现过的全部需求状态（去重），用于总账筛选 chip。
 export const listIssueStatuses = (projectId: string) =>

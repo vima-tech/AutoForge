@@ -50,22 +50,31 @@ pub struct IssuePage {
     pub total: i64,
 }
 
+/// 分页查询需求的过滤参数聚合体，收拢 list_issues_page 的多个筛选字段，
+/// 使 Tauri command 签名保持在 clippy::too_many_arguments 上限（7）内。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListIssuesQuery {
+    pub project_id: Option<String>,
+    pub status: Option<String>,
+    pub search: Option<String>,
+    pub exclude_merged: Option<bool>,
+    pub limit: i64,
+    pub offset: i64,
+    pub sort_asc: Option<bool>,
+}
+
 /// 分页查询需求：按项目 + 状态 + 关键字（标题/编号）过滤，按 updated_at 倒序。
 /// status 为空或 "all" 表示不过滤状态；search 为空表示不过滤关键字。
 /// exclude_merged 为 true 时排除「已合并」需求（与功能审计页「显示已合并需求」开关共享，默认隐藏）；
 /// 当显式按 merged 状态筛选时该排除自然失效（status 优先）。
 #[tauri::command]
 pub async fn list_issues_page(
-    project_id: Option<String>,
-    status: Option<String>,
-    search: Option<String>,
-    exclude_merged: Option<bool>,
-    limit: i64,
-    offset: i64,
-    sort_asc: Option<bool>,
+    query: ListIssuesQuery,
     state: State<'_, AppState>,
 ) -> Result<IssuePage, String> {
     use sqlx::{QueryBuilder, Sqlite};
+    let ListIssuesQuery { project_id, status, search, exclude_merged, limit, offset, sort_asc } = query;
     let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
     let status = status.filter(|s| !s.is_empty() && s != "all");
