@@ -1733,7 +1733,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
         </div>
       </div>
       <div className="list-body scroll" ref={scrollRef} style={{ paddingTop: 0, flex: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 14px 6px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 14px 6px', position: 'sticky', top: 0, zIndex: 2, background: 'var(--bg-1)', borderBottom: '1px solid var(--border)' }}>
           <button onClick={toggleAll} disabled={!items.length} title="全选已加载的需求"
             style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'none', border: 'none', cursor: items.length ? 'pointer' : 'default', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)' }}>
             <LedgerCheck on={allLoadedSelected} /> 全选
