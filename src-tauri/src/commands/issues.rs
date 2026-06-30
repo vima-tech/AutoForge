@@ -414,16 +414,25 @@ pub async fn export_issues(
 
     let count = issues.len() as i64;
 
-    // 文件名：项目无关，带类型与时间戳避免覆盖。
+    // 文件名前缀用项目 slug（文件名安全）；查不到则回退 autoforge。
+    let prefix: String = sqlx::query_scalar::<_, String>("SELECT slug FROM projects WHERE id = ?")
+        .bind(&project_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "autoforge".to_string());
+
+    // 文件名：项目名 + 类型 + 时间戳避免覆盖。
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let (file_name, bytes) = if fmt == "csv" {
         (
-            format!("autoforge-需求总账-{}.csv", stamp),
+            format!("{}-需求总账-{}.csv", prefix, stamp),
             issues_export_csv(&issues),
         )
     } else {
         (
-            format!("autoforge-需求总账-{}.xlsx", stamp),
+            format!("{}-需求总账-{}.xlsx", prefix, stamp),
             issues_export_xlsx(&issues, split_by_type)?,
         )
     };
