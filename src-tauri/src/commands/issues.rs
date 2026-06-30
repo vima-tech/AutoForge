@@ -250,15 +250,16 @@ fn issue_status_label(status: &str) -> &str {
 }
 
 /// 导出列头（与导出行字段顺序一致）。
-const EXPORT_HEADERS: [&str; 8] = [
-    "编号", "标题", "状态", "分类", "严重度", "来源", "创建时间", "更新时间",
+const EXPORT_HEADERS: [&str; 9] = [
+    "编号", "标题", "描述", "状态", "分类", "严重度", "来源", "创建时间", "更新时间",
 ];
 
 /// 取一条需求的导出行（与 EXPORT_HEADERS 顺序对应）。
-fn issue_export_row(i: &Issue) -> [String; 8] {
+fn issue_export_row(i: &Issue) -> [String; 9] {
     [
         i.id.clone(),
         i.title.clone(),
+        i.description.clone(),
         issue_status_label(&i.status).to_string(),
         i.category.clone(),
         i.severity.clone(),
@@ -327,11 +328,12 @@ fn issues_export_xlsx(issues: &[Issue], split_by_type: bool) -> Result<Vec<u8>, 
                     .map_err(|e| e.to_string())?;
             }
         }
-        sheet.set_column_width(0, 22).ok();
-        sheet.set_column_width(1, 40).ok();
-        sheet.set_column_width(2, 12).ok();
-        sheet.set_column_width(6, 20).ok();
-        sheet.set_column_width(7, 20).ok();
+        sheet.set_column_width(0, 22).ok();   // 编号
+        sheet.set_column_width(1, 40).ok();   // 标题
+        sheet.set_column_width(2, 60).ok();   // 描述
+        sheet.set_column_width(3, 12).ok();   // 状态
+        sheet.set_column_width(7, 20).ok();   // 创建时间
+        sheet.set_column_width(8, 20).ok();   // 更新时间
         Ok(())
     };
 
