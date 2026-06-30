@@ -15,7 +15,8 @@ import type { Agent } from '../services';
  * - 数据解耦：父级把每一轮的预览文本与该轮回复(`rounds[].replies`)算好传入，
  *   本组件不感知 `msgs`/`msgText`，只负责呈现与交互。
  * - 零位移/零缩放：hover 不做位移或放大特效，靠颜色/投影/展开切换，鼠标稳定、选中精准不抖。
- * - 离开留 120ms 意图缓冲：从刻度尺移到面板、或在面板内移动都不闪。
+ * - 刻度尺与面板包在同一 pointer-events 热区内（含中间 gap），横移不经过死区；
+ *   再叠 320ms 离开意图缓冲，从刻度尺移到面板、或在面板内移动都不闪、来得及进入。
  */
 
 /** 一轮里某个 agent 的回复（子列表项）。 */
@@ -86,7 +87,7 @@ export default function RoundAvatarStack({ rounds, currentRoundIndex, onJump }: 
   const enter = () => { if (timer.current) { clearTimeout(timer.current); timer.current = null; } setOpen(true); };
   const leave = () => {
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => { setOpen(false); setHoverRound(null); timer.current = null; }, 120);
+    timer.current = setTimeout(() => { setOpen(false); setHoverRound(null); timer.current = null; }, 320);
   };
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
 
@@ -99,27 +100,38 @@ export default function RoundAvatarStack({ rounds, currentRoundIndex, onJump }: 
         // 锚定左上角：紧贴 chat-head 下方一点；窗口够宽时退进左侧留白槽、与气泡拉开间距。
         left: 'max(12px, calc((100% - var(--thread-max)) / 2 - 42px))',
         top: 74, zIndex: 6,
-        display: 'flex', alignItems: 'flex-start', gap: 10,
+        display: 'flex', alignItems: 'flex-start',
         pointerEvents: 'none',
       }}
     >
-      {/* 刻度尺：默认唯一可见物。每轮一根刻度，当前轮 ember 高亮。 */}
+      {/* 刻度尺 + 面板包在同一悬浮区：gap 也算热区，鼠标从刻度尺横移到面板不经过死区、不闪。 */}
       <div
         onMouseEnter={enter} onMouseLeave={leave}
         style={{
-          pointerEvents: 'auto', display: 'flex', flexDirection: 'column',
-          gap: 6, padding: '4px 6px', cursor: 'pointer',
+          pointerEvents: 'auto', display: 'flex', alignItems: 'flex-start', gap: 10,
+        }}
+      >
+      {/* 刻度尺：默认唯一可见物。每轮一根刻度，当前轮 ember 高亮。 */}
+      <div
+        style={{
+          display: 'flex', flexDirection: 'column',
+          gap: 7, padding: '5px 7px', cursor: 'pointer',
+          borderRadius: 10,
+          background: open ? 'var(--bg-2)' : 'transparent',
+          boxShadow: open ? 'var(--shadow-sm)' : 'none',
+          transition: 'background .16s ease, box-shadow .16s ease',
         }}
       >
         {rounds.map((r, i) => {
           const cur = i === currentRoundIndex;
           const hot = open && (hoverRound === r.id || (hoverRound === null && cur));
           return (
-            <span key={r.id} style={{ display: 'flex', width: 18, justifyContent: 'center' }}>
+            <span key={r.id} style={{ display: 'flex', width: 20, justifyContent: 'center' }}>
               <span style={{
-                width: cur ? 18 : 14, height: 2, borderRadius: 2,
-                background: cur || hot ? 'var(--ember)' : 'var(--border-strong)',
-                transition: 'background .14s ease, width .14s ease',
+                width: cur ? 20 : 14, height: 3, borderRadius: 3,
+                background: cur || hot ? 'var(--ember)' : 'var(--text-faint)',
+                opacity: cur || hot ? 1 : (open ? 0.9 : 0.7),
+                transition: 'background .14s ease, width .14s ease, opacity .14s ease',
               }} />
             </span>
           );
@@ -128,7 +140,7 @@ export default function RoundAvatarStack({ rounds, currentRoundIndex, onJump }: 
 
       {/* hover 目录面板：标题=我的发言，子列表=该轮所有 agent 回复（默认收起，hover 标题展开）。 */}
       {open && (
-        <div className="scroll" style={PANEL} onMouseEnter={enter} onMouseLeave={leave}>
+        <div className="scroll" style={PANEL}>
           <div style={KICKER}>对话目录 · {rounds.length} 轮</div>
           {rounds.map((r, i) => {
             const cur = i === currentRoundIndex;
@@ -196,6 +208,7 @@ export default function RoundAvatarStack({ rounds, currentRoundIndex, onJump }: 
           })}
         </div>
       )}
+      </div>
     </div>
   );
 }
