@@ -530,6 +530,7 @@ fn synth_role_agent(system_kind: &str, llm_id: String) -> Option<Agent> {
         enabled: true,
         prompt_mode: "builtin".to_string(),
         memory_enabled: true,
+        code_agent_id: None,
         created_at: String::new(),
     })
 }

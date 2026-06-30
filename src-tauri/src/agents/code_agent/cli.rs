@@ -86,6 +86,213 @@ impl CliCodeAgent {
         cmd
     }
 
+    /// `run`（执行）与 `answer`（只读问答）共享的执行骨架：spawn 子进程 → 进程组隔离/降优/
+    /// CPU 预算 → 流式 drain（claude 解析 NDJSON 成可读转写、codex/opencode 原样）→ 墙钟+空闲
+    /// 双超时真杀进程组并回收僵尸。返回 `(exit_code, stdout 转写, stderr, answer)`；
+    /// `collect_answer=true` 时额外从 claude 的 assistant 文本里抽取**末轮答案**填入第 4 元
+    /// （answer 仅 claude 流有意义，codex/opencode 的答案由调用方取 stdout）。
+    #[allow(clippy::too_many_arguments)]
+    async fn supervise(
+        &self,
+        mut cmd: Command,
+        prompt: &str,
+        worktree: &str,
+        feed_stdin: bool,
+        claude_stream: bool,
+        limits: RunLimits,
+        log: Option<&super::LogSink>,
+        collect_answer: bool,
+    ) -> Result<(i32, String, String, String)> {
+        let mut child = cmd.spawn()?;
+
+        // The child was spawned with setpgid(0,0), so its pgid == its pid. Track
+        // it so timeout / app-exit can SIGKILL the whole group (agent + ripgrep /
+        // build / test descendants). `_guard` clears the registry entry when this
+        // run ends, however it ends.
+        let pgid = child.id().unwrap_or(0);
+        crate::core::reaper::register(pgid);
+        let _guard = GroupGuard(pgid);
+        // 降低整个进程组的调度优先级（nice +10），让批量 agent 的构建/搜索子进程给
+        // 前台/UI 让路——总 CPU 不变但机器不卡。子进程 fork 后继承该 nice 值。
+        crate::core::reaper::lower_priority(pgid);
+        // 纳入 cgroup CPU 预算（Linux，且已启用时）：agent 及其子孙（含自测的 rustc/tsc）
+        // 的总 CPU 被内核限到预算内——测试照跑，只是被限速。未启用/非 Linux 时空操作。
+        crate::core::cpubudget::attach(pgid);
+
+        if feed_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(prompt.as_bytes()).await?;
+                stdin.shutdown().await?; // 关闭 stdin，否则 agent 一直等输入
+            }
+        } else {
+            // 关闭 stdin，避免 agent 误等管道输入。
+            drop(child.stdin.take());
+        }
+
+        // Drain stdout/stderr incrementally so we can enforce an IDLE timeout (no
+        // output for `idle_secs`) on top of the WALL ceiling. `.wait_with_output()`
+        // buffers to the end and would hide a hung-but-not-exited agent.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamMsg>(64);
+        let mut open_streams = 0u8;
+        if let Some(mut out) = child.stdout.take() {
+            open_streams += 1;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match out.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send(StreamMsg::Eof).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(StreamMsg::Out(buf[..n].to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(mut err) = child.stderr.take() {
+            open_streams += 1;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match err.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send(StreamMsg::Eof).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(StreamMsg::Err(buf[..n].to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx); // only the reader tasks hold senders now
+
+        // stdout_buf：codex/opencode 存原始 stdout；claude 存解析后的**可读转写**
+        // （供 extract_report 抽报告 + 落库展示）。line_acc 仅 claude 用，跨读块拼完整 NDJSON 行。
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let mut line_acc: Vec<u8> = Vec::new();
+        // 只读问答抽取的末轮助手答案（仅 claude 流填充；collect_answer=false 时恒空）。
+        let mut answer = String::new();
+        // tool_use_id → 工具名：claude 的 tool_result 只带 id，借此回查工具名定制结果摘要
+        // （Edit→✓已写入 / Read→读取 N 行 / Bash→输出尾），见 render_claude_line。
+        let mut tool_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // 往实时 sink 发一段（已是最终形态的）文本；通道关闭（前端没在看）时静默忽略。
+        let emit = |stream: &'static str, text: String| {
+            if !text.is_empty() {
+                if let Some(s) = log {
+                    let _ = s.send(super::LogChunk { stream, text });
+                }
+            }
+        };
+        let run_start = tokio::time::Instant::now();
+        let wall_deadline = run_start + Duration::from_secs(limits.wall_secs.max(1));
+        let idle_dur = Duration::from_secs(limits.idle_secs);
+        let mut last_activity = tokio::time::Instant::now();
+        // CPU 基准：空闲告警时用它判断"安静但在干活"（CPU 仍在涨）还是"真卡死"。
+        // ~0.5s CPU 时间（_SC_CLK_TCK 通常 100/s）即算活动，足以区分 hung 与 busy。
+        let mut last_cpu = crate::core::reaper::group_cpu_ticks(pgid).unwrap_or(0);
+        const CPU_ACTIVE_TICKS: u64 = 50;
+        let mut timeout_kind: Option<&'static str> = None;
+
+        while open_streams > 0 {
+            let idle_deadline = last_activity + idle_dur;
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(StreamMsg::Out(b)) => {
+                        if claude_stream {
+                            // 按行拼接 NDJSON，逐条解析（成可读行入转写 + 推前端；增量 token 仅推前端）。
+                            line_acc.extend_from_slice(&b);
+                            while let Some(nl) = line_acc.iter().position(|&c| c == b'\n') {
+                                let line: Vec<u8> = line_acc.drain(..=nl).collect();
+                                let raw = String::from_utf8_lossy(&line);
+                                handle_claude_line(
+                                    raw.trim_end(), worktree, run_start,
+                                    &mut tool_names, &mut stdout_buf, log,
+                                );
+                                if collect_answer {
+                                    collect_answer_from_line(raw.trim_end(), &mut answer);
+                                }
+                            }
+                        } else {
+                            stdout_buf.extend_from_slice(&b);
+                            emit("stdout", String::from_utf8_lossy(&b).to_string());
+                        }
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Some(StreamMsg::Err(b)) => {
+                        stderr_buf.extend_from_slice(&b);
+                        emit("stderr", String::from_utf8_lossy(&b).to_string());
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Some(StreamMsg::Eof) => open_streams -= 1,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(idle_deadline), if limits.idle_secs > 0 => {
+                    // 无输出达 idle_secs：再看进程组是否仍在烧 CPU。仍在涨 = 安静地跑长
+                    // 构建/测试（claude --print 不流式时尤甚），不杀，重置窗口继续等；
+                    // CPU 也不动 = 真卡死，才判 idle 超时。这样杜绝误杀合法长任务。
+                    match crate::core::reaper::group_cpu_ticks(pgid) {
+                        Some(cur) if cur > last_cpu + CPU_ACTIVE_TICKS => {
+                            last_cpu = cur;
+                            last_activity = tokio::time::Instant::now();
+                        }
+                        _ => {
+                            timeout_kind = Some("idle");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(wall_deadline) => {
+                    timeout_kind = Some("wall");
+                    break;
+                }
+            }
+        }
+        // 末行无换行符时的残留 NDJSON：补解析一次，避免漏掉最后一个事件（常是 result）。
+        if claude_stream && !line_acc.is_empty() {
+            let raw = String::from_utf8_lossy(&line_acc);
+            handle_claude_line(
+                raw.trim_end(), worktree, run_start,
+                &mut tool_names, &mut stdout_buf, log,
+            );
+            if collect_answer {
+                collect_answer_from_line(raw.trim_end(), &mut answer);
+            }
+        }
+
+        if let Some(kind) = timeout_kind {
+            // 真杀：SIGKILL 整个进程组（agent + ripgrep/构建子进程），再回收僵尸。
+            crate::core::reaper::kill_group(pgid);
+            let _ = child.wait().await;
+            // 不丢弃已捕获的输出：超时/卡死前的 stdout/stderr 正是调试线索，原样返回
+            // （退出码用 124 表超时，调用方按非 0 视为失败），并在 stderr 末尾附说明。
+            let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+            let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+            stderr.push_str(&format!(
+                "\n\n⛔ {} code agent {} timeout（墙钟 {}s / 空闲 {}s）— 已杀进程组回收\n",
+                self.profile.kind, kind, limits.wall_secs, limits.idle_secs
+            ));
+            return Ok((124, stdout, stderr, answer));
+        }
+
+        let status = child.wait().await?;
+        let code = status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+        Ok((code, stdout, stderr, answer))
+    }
+
     /// 用配置的模型发一个极小 prompt，确认该模型确实被该 CLI 接受——
     /// 区别于 `check_auth()` 只验证「工具已装/已登录」。失败时多半是模型名写错、
     /// 该 provider 未授权或额度问题。返回 `(ok, detail)`，detail 为失败时 stdout/stderr 的首行摘要。
@@ -291,186 +498,105 @@ impl CodeAgent for CliCodeAgent {
         // codex/opencode 是纯文本，stdout 原样透传。
         let claude_stream = !matches!(self.profile.kind.as_str(), "codex" | "opencode");
 
-        let mut child = cmd.spawn()?;
+        // spawn + 流式 drain + 双超时 + 进程组回收：与只读 answer() 共用同一骨架（见 supervise）。
+        let (code, stdout, stderr, _answer) = self
+            .supervise(cmd, prompt, worktree, feed_stdin, claude_stream, limits, log, false)
+            .await?;
+        Ok((code, stdout, stderr))
+    }
 
-        // The child was spawned with setpgid(0,0), so its pgid == its pid. Track
-        // it so timeout / app-exit can SIGKILL the whole group (agent + ripgrep /
-        // build / test descendants). `_guard` clears the registry entry when this
-        // run ends, however it ends.
-        let pgid = child.id().unwrap_or(0);
-        crate::core::reaper::register(pgid);
-        let _guard = GroupGuard(pgid);
-        // 降低整个进程组的调度优先级（nice +10），让批量 agent 的构建/搜索子进程给
-        // 前台/UI 让路——总 CPU 不变但机器不卡。子进程 fork 后继承该 nice 值。
-        crate::core::reaper::lower_priority(pgid);
-        // 纳入 cgroup CPU 预算（Linux，且已启用时）：agent 及其子孙（含自测的 rustc/tsc）
-        // 的总 CPU 被内核限到预算内——测试照跑，只是被限速。未启用/非 Linux 时空操作。
-        crate::core::cpubudget::attach(pgid);
-
-        if feed_stdin {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(prompt.as_bytes()).await?;
-                stdin.shutdown().await?; // 关闭 stdin，否则 agent 一直等输入
+    async fn answer(
+        &self,
+        repo: &str,
+        prompt: &str,
+        limits: RunLimits,
+        mcp: &[McpInject],
+        log: Option<&super::LogSink>,
+    ) -> Result<String> {
+        let mut cmd = self.base_cmd(repo);
+        // pull：把「适用于编码 Agent」的只读 MCP（如 codegraph 代码情报）注入本 kind 的 CLI。
+        // 无 server 时为空，命令与未注入一致。
+        let mcp_cfg = super::mcp_inject::build(&self.profile.kind, mcp);
+        for (k, v) in &mcp_cfg.envs {
+            cmd.env(k, v);
+        }
+        // 临时文件（claude 的 mcp-config json）须活到子进程退出，绑定到本作用域。
+        let _mcp_temp = mcp_cfg.temp_files;
+        // claude 走 stream-json（按行解析抽答案）；codex 纯文本（答案=stdout）。
+        let claude_stream = !matches!(self.profile.kind.as_str(), "codex" | "opencode");
+        let feed_stdin = match self.profile.kind.as_str() {
+            "codex" => {
+                // read-only sandbox：只读问答不写盘（remote git 亦被禁）；
+                // --skip-git-repo-check 容忍在仓库顶层/非仓库目录运行。
+                cmd.arg("exec")
+                    .arg("-C")
+                    .arg(repo)
+                    .arg("-s")
+                    .arg("read-only")
+                    .arg("--skip-git-repo-check");
+                if let Some(m) = self.model() {
+                    cmd.arg("-m").arg(m);
+                }
+                for a in &self.profile.extra_args {
+                    cmd.arg(a);
+                }
+                for a in &mcp_cfg.args {
+                    cmd.arg(a);
+                }
+                cmd.arg("-"); // 从 stdin 读问题，避免超长 prompt 撞命令行上限
+                true
             }
-        } else {
-            // 关闭 stdin，避免 agent 误等管道输入。
-            drop(child.stdin.take());
-        }
-
-        // Drain stdout/stderr incrementally so we can enforce an IDLE timeout (no
-        // output for `idle_secs`) on top of the WALL ceiling. `.wait_with_output()`
-        // buffers to the end and would hide a hung-but-not-exited agent.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamMsg>(64);
-        let mut open_streams = 0u8;
-        if let Some(mut out) = child.stdout.take() {
-            open_streams += 1;
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match out.read(&mut buf).await {
-                        Ok(0) | Err(_) => {
-                            let _ = tx.send(StreamMsg::Eof).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            if tx.send(StreamMsg::Out(buf[..n].to_vec())).await.is_err() {
-                                break;
-                            }
-                        }
+            "opencode" => {
+                // opencode run 无只读保证、无逐次 MCP 注入入口 → 不支持只读问答，交调用方降级。
+                return Err(anyhow::anyhow!(
+                    "opencode 暂不支持只读问答（请改用 claude / codex 作为该成员/分析后端）"
+                ));
+            }
+            // 默认 = claude：plan 模式天然只读（不落盘编辑、不跑变更命令），可读/搜全仓回答；
+            // 最终答案抽自助手文本（含 plan 模式下的 ExitPlanMode 兜底），见 collect_answer_from_line。
+            _ => {
+                cmd.arg("--print")
+                    .arg("--output-format")
+                    .arg("stream-json")
+                    .arg("--verbose")
+                    .arg("--include-partial-messages")
+                    .arg("--permission-mode")
+                    .arg("plan");
+                if let Some(m) = self.model() {
+                    cmd.arg("--model").arg(m);
+                }
+                for a in &self.profile.extra_args {
+                    cmd.arg(a);
+                }
+                for a in &mcp_cfg.args {
+                    cmd.arg(a);
+                }
+                // `--print` 下 MCP 工具须显式放行；plan 模式已保证只读，无需再禁写工具。
+                // --allowedTools 是变参，放最后段；prompt 走 stdin 不占位置参数，安全。
+                if !mcp_cfg.allowed_tools.is_empty() {
+                    cmd.arg("--allowedTools");
+                    for t in &mcp_cfg.allowed_tools {
+                        cmd.arg(t);
                     }
                 }
-            });
-        }
-        if let Some(mut err) = child.stderr.take() {
-            open_streams += 1;
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match err.read(&mut buf).await {
-                        Ok(0) | Err(_) => {
-                            let _ = tx.send(StreamMsg::Eof).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            if tx.send(StreamMsg::Err(buf[..n].to_vec())).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        drop(tx); // only the reader tasks hold senders now
-
-        // stdout_buf：codex/opencode 存原始 stdout；claude 存解析后的**可读转写**
-        // （供 extract_report 抽报告 + 落库展示）。line_acc 仅 claude 用，跨读块拼完整 NDJSON 行。
-        let mut stdout_buf: Vec<u8> = Vec::new();
-        let mut stderr_buf: Vec<u8> = Vec::new();
-        let mut line_acc: Vec<u8> = Vec::new();
-        // tool_use_id → 工具名：claude 的 tool_result 只带 id，借此回查工具名定制结果摘要
-        // （Edit→✓已写入 / Read→读取 N 行 / Bash→输出尾），见 render_claude_line。
-        let mut tool_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        // 往实时 sink 发一段（已是最终形态的）文本；通道关闭（前端没在看）时静默忽略。
-        let emit = |stream: &'static str, text: String| {
-            if !text.is_empty() {
-                if let Some(s) = log {
-                    let _ = s.send(super::LogChunk { stream, text });
-                }
+                true
             }
         };
-        let run_start = tokio::time::Instant::now();
-        let wall_deadline = run_start + Duration::from_secs(limits.wall_secs.max(1));
-        let idle_dur = Duration::from_secs(limits.idle_secs);
-        let mut last_activity = tokio::time::Instant::now();
-        // CPU 基准：空闲告警时用它判断"安静但在干活"（CPU 仍在涨）还是"真卡死"。
-        // ~0.5s CPU 时间（_SC_CLK_TCK 通常 100/s）即算活动，足以区分 hung 与 busy。
-        let mut last_cpu = crate::core::reaper::group_cpu_ticks(pgid).unwrap_or(0);
-        const CPU_ACTIVE_TICKS: u64 = 50;
-        let mut timeout_kind: Option<&'static str> = None;
-
-        while open_streams > 0 {
-            let idle_deadline = last_activity + idle_dur;
-            tokio::select! {
-                msg = rx.recv() => match msg {
-                    Some(StreamMsg::Out(b)) => {
-                        if claude_stream {
-                            // 按行拼接 NDJSON，逐条解析（成可读行入转写 + 推前端；增量 token 仅推前端）。
-                            line_acc.extend_from_slice(&b);
-                            while let Some(nl) = line_acc.iter().position(|&c| c == b'\n') {
-                                let line: Vec<u8> = line_acc.drain(..=nl).collect();
-                                let raw = String::from_utf8_lossy(&line);
-                                handle_claude_line(
-                                    raw.trim_end(), worktree, run_start,
-                                    &mut tool_names, &mut stdout_buf, log,
-                                );
-                            }
-                        } else {
-                            stdout_buf.extend_from_slice(&b);
-                            emit("stdout", String::from_utf8_lossy(&b).to_string());
-                        }
-                        last_activity = tokio::time::Instant::now();
-                    }
-                    Some(StreamMsg::Err(b)) => {
-                        stderr_buf.extend_from_slice(&b);
-                        emit("stderr", String::from_utf8_lossy(&b).to_string());
-                        last_activity = tokio::time::Instant::now();
-                    }
-                    Some(StreamMsg::Eof) => open_streams -= 1,
-                    None => break,
-                },
-                _ = tokio::time::sleep_until(idle_deadline), if limits.idle_secs > 0 => {
-                    // 无输出达 idle_secs：再看进程组是否仍在烧 CPU。仍在涨 = 安静地跑长
-                    // 构建/测试（claude --print 不流式时尤甚），不杀，重置窗口继续等；
-                    // CPU 也不动 = 真卡死，才判 idle 超时。这样杜绝误杀合法长任务。
-                    match crate::core::reaper::group_cpu_ticks(pgid) {
-                        Some(cur) if cur > last_cpu + CPU_ACTIVE_TICKS => {
-                            last_cpu = cur;
-                            last_activity = tokio::time::Instant::now();
-                        }
-                        _ => {
-                            timeout_kind = Some("idle");
-                            break;
-                        }
-                    }
-                }
-                _ = tokio::time::sleep_until(wall_deadline) => {
-                    timeout_kind = Some("wall");
-                    break;
-                }
-            }
-        }
-        // 末行无换行符时的残留 NDJSON：补解析一次，避免漏掉最后一个事件（常是 result）。
-        if claude_stream && !line_acc.is_empty() {
-            let raw = String::from_utf8_lossy(&line_acc);
-            handle_claude_line(
-                raw.trim_end(), worktree, run_start,
-                &mut tool_names, &mut stdout_buf, log,
-            );
-        }
-
-        if let Some(kind) = timeout_kind {
-            // 真杀：SIGKILL 整个进程组（agent + ripgrep/构建子进程），再回收僵尸。
-            crate::core::reaper::kill_group(pgid);
-            let _ = child.wait().await;
-            // 不丢弃已捕获的输出：超时/卡死前的 stdout/stderr 正是调试线索，原样返回
-            // （退出码用 124 表超时，调用方按非 0 视为失败），并在 stderr 末尾附说明。
-            let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
-            let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
-            stderr.push_str(&format!(
-                "\n\n⛔ {} code agent {} timeout（墙钟 {}s / 空闲 {}s）— 已杀进程组回收\n",
-                self.profile.kind, kind, limits.wall_secs, limits.idle_secs
+        let (code, stdout, stderr, answer) = self
+            .supervise(cmd, prompt, repo, feed_stdin, claude_stream, limits, log, true)
+            .await?;
+        // claude → 抽到的末轮助手答案；codex → 纯 stdout。
+        let text = if claude_stream { answer } else { stdout };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} 只读问答无有效输出（退出码 {}）：{}",
+                self.profile.kind,
+                code,
+                first_line_clip(stderr.trim(), 200)
             ));
-            return Ok((124, stdout, stderr));
         }
-
-        let status = child.wait().await?;
-        let code = status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
-        let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
-        Ok((code, stdout, stderr))
+        Ok(text)
     }
 
     async fn check_auth(&self) -> bool {
@@ -796,6 +922,59 @@ fn render_claude_line(
     }
 }
 
+/// 从 claude `--output-format stream-json` 的一行里抽取**最终助手答案**，供只读问答（answer）用。
+/// 规则：遇到带 `text` 块的 assistant 消息，用其纯文本**覆盖**累计——claude 在所有工具调用后
+/// 给的最后一条文本即答案（无 💬/时间戳前缀）。plan 模式下结论可能落在 `ExitPlanMode` 工具调用
+/// 的 `plan` 入参里，故一并抽取作兜底。非 assistant / 无可用文本的行忽略，故工具结果、思考块、
+/// 增量 token（type=stream_event）都不会污染答案。
+fn collect_answer_from_line(raw: &str, answer: &mut String) {
+    let line = raw.trim();
+    if line.is_empty() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return;
+    }
+    let Some(content) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return;
+    };
+    let mut txt = String::new();
+    for block in content {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    txt.push_str(t);
+                }
+            }
+            // plan 模式：最终方案/答案可能作为 ExitPlanMode 的入参 plan 返回。
+            Some("tool_use")
+                if block.get("name").and_then(|n| n.as_str()) == Some("ExitPlanMode") =>
+            {
+                if let Some(p) = block
+                    .get("input")
+                    .and_then(|i| i.get("plan"))
+                    .and_then(|p| p.as_str())
+                {
+                    txt.push_str(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let txt = txt.trim();
+    if !txt.is_empty() {
+        // 覆盖 → 只保留最后一条带可用文本的 assistant 消息（即末轮答案）。
+        *answer = txt.to_string();
+    }
+}
+
 /// 处理一行 claude NDJSON：完整行（newline）前缀相对时间戳 `[mm:ss]` 并入落库转写 + 推前端；
 /// 增量 token（无 newline）仅推前端，拼成连续打字。落档/实时各取所需，互不重复。
 fn handle_claude_line(
@@ -825,5 +1004,75 @@ fn handle_claude_line(
                 let _ = s.send(super::LogChunk { stream: "stdout", text: chunk });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_answer_from_line;
+
+    /// 一条带 text 块的 assistant 消息 → 抽出其纯文本（无前缀）。
+    #[test]
+    fn collects_assistant_text() {
+        let mut ans = String::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"最终答案在这里"}]}}"#;
+        collect_answer_from_line(line, &mut ans);
+        assert_eq!(ans, "最终答案在这里");
+    }
+
+    /// 多条 assistant 消息 → 覆盖式保留**最后一条**带文本的（即末轮答案）。
+    #[test]
+    fn keeps_last_assistant_text() {
+        let mut ans = String::new();
+        collect_answer_from_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"先看看代码"}]}}"#,
+            &mut ans,
+        );
+        // 中间一条只有工具调用，不应覆盖已有答案。
+        collect_answer_from_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","id":"t1","input":{}}]}}"#,
+            &mut ans,
+        );
+        collect_answer_from_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"结论：在 foo.rs:42"}]}}"#,
+            &mut ans,
+        );
+        assert_eq!(ans, "结论：在 foo.rs:42");
+    }
+
+    /// 非 assistant 行（stream_event 增量 / result / user 工具结果）一律忽略，不污染答案。
+    #[test]
+    fn ignores_non_assistant_lines() {
+        let mut ans = "已有答案".to_string();
+        for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"增"}}}"#,
+            r#"{"type":"result","duration_ms":1200,"num_turns":3,"is_error":false}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"读取 10 行"}]}}"#,
+            "not json at all",
+            "",
+        ] {
+            collect_answer_from_line(line, &mut ans);
+        }
+        assert_eq!(ans, "已有答案");
+    }
+
+    /// plan 模式：结论落在 ExitPlanMode 工具的 plan 入参 → 兜底抽取。
+    #[test]
+    fn captures_exit_plan_mode_plan() {
+        let mut ans = String::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","id":"p1","input":{"plan":"方案：读 a.rs 改 b"}}]}}"#;
+        collect_answer_from_line(line, &mut ans);
+        assert_eq!(ans, "方案：读 a.rs 改 b");
+    }
+
+    /// 空白 / 纯思考块不产生答案（thinking 不算最终答案）。
+    #[test]
+    fn thinking_only_yields_nothing() {
+        let mut ans = String::new();
+        collect_answer_from_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"我在想"}]}}"#,
+            &mut ans,
+        );
+        assert_eq!(ans, "");
     }
 }

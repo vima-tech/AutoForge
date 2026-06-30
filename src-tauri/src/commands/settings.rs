@@ -524,9 +524,10 @@ pub async fn create_agent(
         "INSERT INTO agents (
             id, name, name_en, role, color, initial, llm_id, system_prompt,
             role_type, system_kind, capabilities_json, max_concurrency,
-            visible_in_chat, mentionable, enabled, prompt_mode, memory_enabled
+            visible_in_chat, mentionable, enabled, prompt_mode, memory_enabled,
+            code_agent_id
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&payload.name)
@@ -545,6 +546,7 @@ pub async fn create_agent(
     .bind(enabled)
     .bind(prompt_mode)
     .bind(memory_enabled)
+    .bind(payload.code_agent_id.as_deref().filter(|s| !s.is_empty()))
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -649,6 +651,16 @@ pub async fn update_agent(
     if let Some(v) = payload.memory_enabled {
         sets.push("memory_enabled=?");
         values.push(AgentUpdateValue::Bool(v));
+    }
+    // code_agent_id is Option<Option<String>>: Some(None) / Some("") clears it (back to LLM backend).
+    if let Some(ref ca) = payload.code_agent_id {
+        match ca.as_deref().filter(|s| !s.is_empty()) {
+            Some(v) => {
+                sets.push("code_agent_id=?");
+                values.push(AgentUpdateValue::Text(v.to_string()));
+            }
+            None => sets.push("code_agent_id=NULL"),
+        }
     }
 
     if sets.is_empty() {

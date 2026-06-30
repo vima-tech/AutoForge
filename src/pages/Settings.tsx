@@ -109,7 +109,15 @@ function llmBindingState(llmId: string | null | undefined, llms: LlmRef[]): 'non
 // 下拉项标签：已停用的 LLM 追加标记，避免误选到不可用配置。
 const llmOptionLabel = (l: LlmRef) => l.enabled ? l.name : `${l.name}（已停用）`;
 
-function formatAgentSub(agent: Agent, llms: LlmRef[]) {
+function formatAgentSub(agent: Agent, llms: LlmRef[], codeAgents: CodeAgentT[] = []) {
+  // 编码 Agent 后端：成员由 CLI 只读跑仓库作答，副标题显示其后端而非 LLM。
+  const caId = agent.code_agent_id?.trim();
+  if (caId) {
+    const ca = codeAgents.find(c => c.id === caId);
+    return ca
+      ? `编码 Agent: ${ca.label}（${ca.kind}）${ca.enabled ? '' : ' · 已停用'}`
+      : `编码 Agent: ${caId}（配置缺失）`;
+  }
   if (!agent.llm_id) return 'LLM: 未指定 LLM';
   const m = llms.find(l => l.id === agent.llm_id);
   if (!m) return `LLM: ${agent.llm_id}（配置缺失）`;
@@ -1008,6 +1016,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hideIds, setHideIds] = useState<Set<string>>(new Set());
   const [llmNames, setLlmNames] = useState<LlmRef[]>([]);
+  const [codeAgents, setCodeAgents] = useState<CodeAgentT[]>([]);
   const [exp, setExp] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Partial<Agent>>>({});
   const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
@@ -1015,12 +1024,14 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [loading, setLoading] = useState(true);
 
   const reload = () =>
-    Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog()]).then(([ags, llms, cat]) => {
-      setAgents(ags);
-      setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
-      setLlmNames(llms.map(l => ({ id: l.id, name: l.name, enabled: l.enabled })));
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog(), listCodeAgents()])
+      .then(([ags, llms, cat, cas]) => {
+        setAgents(ags);
+        setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
+        setLlmNames(llms.map(l => ({ id: l.id, name: l.name, enabled: l.enabled })));
+        setCodeAgents(cas);
+        setLoading(false);
+      }).catch(() => setLoading(false));
 
   useEffect(() => { reload(); }, []);
 
@@ -1077,9 +1088,11 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
               <Avatar agent={a} size={32} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{v('name')}</span></div>
-                <div className="cfg-sub">{formatAgentSub(a, llmNames)}</div>
+                <div className="cfg-sub">{formatAgentSub(a, llmNames, codeAgents)}</div>
               </div>
               {(() => {
+                // 编码 Agent 后端成员不绑 LLM，不显示 LLM 缺失/停用告警。
+                if (a.code_agent_id?.trim()) return null;
                 const st = llmBindingState(a.llm_id, llmNames);
                 if (!a.enabled || st === 'ok' || st === 'none') return null;
                 return <span className="chip red" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }}
@@ -1094,12 +1107,44 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                   <div className="field"><label>名称</label>
                     <input value={v('name')} onChange={e => setDraft(a.id, 'name', e.target.value)} />
                   </div>
-                  <div className="field"><label>使用的 LLM</label>
-                    <Select
-                      value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
-                      onChange={val => setDraft(a.id, 'llm_id', val || null)}
-                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]} />
-                  </div>
+                  {(() => {
+                    const curCa = d.code_agent_id !== undefined ? (d.code_agent_id ?? '') : (a.code_agent_id ?? '');
+                    const backend = curCa ? 'code_agent' : 'llm';
+                    return <>
+                      <div className="field"><label>后端</label>
+                        <div className="seg">
+                          {/* 清空发空串 ''（→ Some(Some(""))）才能触发后端 NULL 分支；发 null 会被 serde 当「不改」。 */}
+                          <button className={backend === 'llm' ? 'on' : ''}
+                            onClick={() => setDraft(a.id, 'code_agent_id', '')}>LLM 配置</button>
+                          <button className={backend === 'code_agent' ? 'on' : ''} disabled={!codeAgents.length}
+                            title={!codeAgents.length ? '请先在「编码 Agent」标签页新增并启用一个编码 Agent' : '该成员改由编码 Agent(CLI) 只读跑项目仓库作答（仅绑定项目的群聊中生效）'}
+                            onClick={() => setDraft(a.id, 'code_agent_id', curCa || codeAgents[0]?.id || '')}>编码 Agent (CLI)</button>
+                        </div>
+                      </div>
+                      {backend === 'llm' ? (
+                        <div className="field"><label>使用的 LLM</label>
+                          <Select
+                            value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
+                            onChange={val => setDraft(a.id, 'llm_id', val || null)}
+                            options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]} />
+                        </div>
+                      ) : (
+                        <div className="field"><label>编码 Agent</label>
+                          <Select
+                            value={curCa}
+                            onChange={val => setDraft(a.id, 'code_agent_id', val || codeAgents[0]?.id || '')}
+                            options={codeAgents.map(c => ({ value: c.id, label: `${c.label}（${c.kind}）${c.enabled ? '' : ' · 已停用'}` }))} />
+                        </div>
+                      )}
+                      {backend === 'code_agent' && (
+                        <div className="field full">
+                          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                            编码 Agent 成员只在**绑定项目**的群聊中、被 @ 点名时作答：只读读取该项目仓库的真实代码来回答（不改任何文件、不参与自动选人）。
+                          </span>
+                        </div>
+                      )}
+                    </>;
+                  })()}
                   <div className="field full"><label>职责标签</label>
                     <input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} />
                   </div>

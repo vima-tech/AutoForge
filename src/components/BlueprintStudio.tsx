@@ -7,6 +7,7 @@ import {
   startBlueprintDraft, refineBlueprintDraft, patchBlueprintDraft,
   getBlueprintDraft, applyBlueprintDraft, codeBlueprintDraft, listProjectFiles,
   type Project, type BlueprintDraftView, type BlueprintSpec, type BlueprintTask, type ProjectContextFile,
+  type BlueprintBackend,
 } from '../services';
 
 /**
@@ -78,6 +79,8 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
   const [prdDraft, setPrdDraft] = useState('');
   const [inputFocused, setInputFocused] = useState(false);
   const [genPhase, setGenPhase] = useState(0);
+  // 分析后端：需求分析专家(LLM) 或 编码 Agent(CLI 读真实仓库)。无仓库时强制走 LLM。
+  const [backend, setBackend] = useState<BlueprintBackend>('analysis');
   // 起草 composer：引用项目文件 + 本地附件 + 语音录入
   const [refFiles, setRefFiles] = useState<string[]>([]);
   const [attachFiles, setAttachFiles] = useState<File[]>([]);
@@ -208,7 +211,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
         composed += `\n\n【附件：${f.name}（非文本，未内联）】`;
       }
     }
-    const p = startBlueprintDraft(project.id, composed, refFiles);
+    const p = startBlueprintDraft(project.id, composed, refFiles, backend);
     trackInflight(flowKey, p);
     try {
       const v = await p;
@@ -223,7 +226,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
     const ins = chatInput.trim();
     setChatInput(''); setBusy(true); setErr('');
     const prev = view;
-    const p = refineBlueprintDraft(draft.id, ins);
+    const p = refineBlueprintDraft(draft.id, ins, backend);
     trackInflight(draft.id, p);
     try { const v = await p; flash(diffIds(prev, v)); setView(v); onChanged(); }
     catch (e) { setErr(String(e)); setChatInput(ins); }
@@ -491,6 +494,13 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                   <span style={{ fontSize: 'var(--text-micro)', color: 'var(--ember)', fontFamily: 'var(--font-mono)' }}>{voiceConnecting ? '连接中…' : '录音中'}</span>
                 )}
                 <div style={{ flex: 1 }} />
+                {/* 分析后端：需求分析专家(LLM) / 编码 Agent(读真实仓库)。无仓库时仅 LLM。 */}
+                <div className="seg" title="选择由谁来分析并起草这条需求">
+                  <button className={backend === 'analysis' ? 'on' : ''} onClick={() => setBackend('analysis')}>需求分析专家</button>
+                  <button className={backend === 'code_agent' ? 'on' : ''} disabled={!project.repo_path?.trim()}
+                    title={!project.repo_path?.trim() ? '该项目未配置仓库路径，无法用编码 Agent 读代码起草' : '用项目配置的编码 Agent 只读跑真实仓库起草（更贴实际代码）'}
+                    onClick={() => setBackend('code_agent')}>编码 Agent</button>
+                </div>
                 <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>⌘/Ctrl+Enter</span>
                 <button className="btn btn-primary btn-sm" onClick={doStart} disabled={busy || !briefInput.trim()}>
                   <Icon name="zap" size={14} />{busy ? '起草中…' : 'AI 起草'}

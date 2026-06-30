@@ -239,13 +239,54 @@ fn build_ref_files_block(repo_path: &str, ref_files: &[String]) -> String {
     buf
 }
 
+/// 跑「分析后端」产出蓝图 JSON 原文。`backend = Some("code_agent")` 且项目有仓库路径时，用项目
+/// 已配置的编码 Agent（execution 同款 `resolve`）**只读跑真实仓库**起草——产出的 PRD/规格/任务
+/// 更贴实际代码；否则（默认 / `"analysis"`）走需求分析专家 LLM（`BLUEPRINT_SYSTEM_KIND`）。
+/// 编码 Agent 不可用 / 空输出 / 失败时**回落 LLM**，绝不让起草整体失败。
+async fn run_blueprint_backend(
+    db: &crate::db::Db,
+    project: &crate::models::project::Project,
+    backend: Option<&str>,
+    prompt: &str,
+    system: &str,
+    recall_key: &str,
+) -> Result<String, String> {
+    let want_code_agent =
+        matches!(backend, Some("code_agent")) && !project.repo_path.trim().is_empty();
+    if want_code_agent {
+        let agent = crate::agents::code_agent::resolve(db, project).await;
+        let (wall_secs, idle_secs) = crate::commands::system::load_execution_limits(db).await;
+        let limits = crate::agents::code_agent::RunLimits { wall_secs, idle_secs };
+        let mcp = crate::agents::code_agent::load_code_agent_mcp(db).await;
+        match agent.answer(&project.repo_path, prompt, limits, &mcp, None).await {
+            Ok(t) if !t.trim().is_empty() => return Ok(t),
+            Ok(_) => tracing::warn!("[blueprint] 编码 Agent 输出为空，回落需求分析专家"),
+            Err(e) => {
+                tracing::warn!("[blueprint] 编码 Agent 起草失败，回落需求分析专家: {}", e)
+            }
+        }
+    }
+    crate::agents::llm::run_system_role_text(
+        db,
+        BLUEPRINT_SYSTEM_KIND,
+        prompt,
+        Some(system),
+        Some(&project.id),
+        Some(recall_key),
+    )
+    .await
+    .map_err(|e| format!("AI 生成失败: {}", e))
+}
+
 /// 步骤1：根据大需求起草一条**新的**蓝图草稿并持久（孵化台支持每项目多条大需求，不再清旧草稿）。
 /// `ref_files`：用户勾选引用的项目文件（相对仓库根），读出后作为重点上下文注入。
+/// `backend`：分析后端——`"analysis"`（默认，需求分析专家 LLM）或 `"code_agent"`（编码 Agent 读仓库）。
 #[tauri::command]
 pub async fn start_blueprint_draft(
     project_id: String,
     brief: String,
     ref_files: Vec<String>,
+    backend: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<BlueprintDraftView, String> {
     let brief = brief.trim().to_string();
@@ -319,16 +360,15 @@ pub async fn start_blueprint_draft(
         brief = brief,
     );
 
-    let raw = crate::agents::llm::run_system_role_text(
+    let raw = run_blueprint_backend(
         &state.db,
-        BLUEPRINT_SYSTEM_KIND,
+        &project,
+        backend.as_deref(),
         &prompt,
-        Some("你是 AutoForge 的项目蓝图生成 Agent，把一段大需求拆解为 PRD、技术规格与可执行任务清单。只输出调用方要求的 JSON。"),
-        Some(&project_id),
-        Some(&brief),
+        "你是 AutoForge 的项目蓝图生成 Agent，把一段大需求拆解为 PRD、技术规格与可执行任务清单。只输出调用方要求的 JSON。",
+        &brief,
     )
-    .await
-    .map_err(|e| format!("AI 生成失败: {}", e))?;
+    .await?;
 
     let mut parsed = parse_raw(&raw)?;
     if parsed.prd_markdown.trim().is_empty()
@@ -379,6 +419,7 @@ pub async fn start_blueprint_draft(
 pub async fn refine_blueprint_draft(
     draft_id: String,
     instruction: String,
+    backend: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<BlueprintDraftView, String> {
     let instruction = instruction.trim().to_string();
@@ -393,6 +434,15 @@ pub async fn refine_blueprint_draft(
     if draft.status == "coding" {
         return Err("该需求已进入编码开发，如需调整请在「变更审核」处理或新建一条需求改动".into());
     }
+    // 加载项目（编码 Agent 后端起草需要仓库路径；LLM 后端只用其 id 走召回）。
+    let project = sqlx::query_as::<_, crate::models::project::Project>(
+        "SELECT * FROM projects WHERE id=?",
+    )
+    .bind(&draft.project_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("项目不存在")?;
 
     // 当前草稿序列化为 JSON（带 id），供模型在其上做最小改动。
     let current = serde_json::json!({
@@ -446,16 +496,15 @@ pub async fn refine_blueprint_draft(
         instruction = instruction,
     );
 
-    let raw = crate::agents::llm::run_system_role_text(
+    let raw = run_blueprint_backend(
         &state.db,
-        BLUEPRINT_SYSTEM_KIND,
+        &project,
+        backend.as_deref(),
         &prompt,
-        Some("你是 AutoForge 的项目蓝图修正 Agent，在既有蓝图上做最小必要改动并回传整份更新结果。只输出调用方要求的 JSON。"),
-        Some(&draft.project_id),
-        Some(&instruction),
+        "你是 AutoForge 的项目蓝图修正 Agent，在既有蓝图上做最小必要改动并回传整份更新结果。只输出调用方要求的 JSON。",
+        &instruction,
     )
-    .await
-    .map_err(|e| format!("AI 修正失败: {}", e))?;
+    .await?;
 
     let mut parsed = parse_raw(&raw)?;
     if parsed.prd_markdown.trim().is_empty()

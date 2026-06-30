@@ -51,6 +51,8 @@ export interface Agent {
   visible_in_chat: boolean; mentionable: boolean; enabled: boolean;
   prompt_mode: 'builtin' | 'append' | 'custom';
   memory_enabled: boolean;
+  /** 非空 ⇒ 该成员由编码 Agent(CLI) 后端驱动，只读跑项目仓库作答；空 = LLM 后端。 */
+  code_agent_id: string | null;
   created_at: string;
 }
 export interface RoleSlot {
@@ -584,12 +586,17 @@ export interface BlueprintDraftSummary {
   spec_count: number; task_count: number; issue_id: string; cr_id: string; updated_at: string;
 }
 
-/** 起草：大需求(+引用的项目文件) → 持久一条新草稿（孵化台支持每项目多条）。 */
-export const startBlueprintDraft = (projectId: string, brief: string, refFiles: string[] = []) =>
-  ipc<BlueprintDraftView>('start_blueprint_draft', { projectId, brief, refFiles });
-/** 多轮修正：自然语言指令 → AI 回传整份更新草稿（保留稳定 id）。 */
-export const refineBlueprintDraft = (draftId: string, instruction: string) =>
-  ipc<BlueprintDraftView>('refine_blueprint_draft', { draftId, instruction });
+/** 分析后端：需求分析专家(LLM) 或 编码 Agent(CLI 读真实仓库)。 */
+export type BlueprintBackend = 'analysis' | 'code_agent';
+/** 起草：大需求(+引用的项目文件) → 持久一条新草稿（孵化台支持每项目多条）。
+ *  `backend` 选用分析后端（默认走需求分析专家 LLM）。 */
+export const startBlueprintDraft = (
+  projectId: string, brief: string, refFiles: string[] = [], backend: BlueprintBackend = 'analysis',
+) => ipc<BlueprintDraftView>('start_blueprint_draft', { projectId, brief, refFiles, backend });
+/** 多轮修正：自然语言指令 → AI 回传整份更新草稿（保留稳定 id）。`backend` 同起草。 */
+export const refineBlueprintDraft = (
+  draftId: string, instruction: string, backend: BlueprintBackend = 'analysis',
+) => ipc<BlueprintDraftView>('refine_blueprint_draft', { draftId, instruction, backend });
 /** 人工手改：前端发回编辑后的整份 PRD/规格/任务，落库。 */
 export const patchBlueprintDraft = (
   draftId: string, prdMarkdown: string, specs: BlueprintSpec[], tasklist: BlueprintTask[],
@@ -1087,6 +1094,7 @@ export const createAgent = (payload: {
   capabilities_json?: string; max_concurrency?: number;
   visible_in_chat?: boolean; mentionable?: boolean; enabled?: boolean;
   prompt_mode?: 'builtin' | 'append' | 'custom'; memory_enabled?: boolean;
+  code_agent_id?: string | null;
 }) => ipc<Agent>('create_agent', { payload });
 export const updateAgent = (id: string, payload: Partial<{
   name: string; name_en: string; role: string; color: string;
@@ -1095,6 +1103,7 @@ export const updateAgent = (id: string, payload: Partial<{
   capabilities_json: string; max_concurrency: number;
   visible_in_chat: boolean; mentionable: boolean; enabled: boolean;
   prompt_mode: 'builtin' | 'append' | 'custom'; memory_enabled: boolean;
+  code_agent_id: string | null;
 }>) => ipc<Agent>('update_agent', { id, payload });
 export const deleteAgent = (id: string) => ipc<void>('delete_agent', { id });
 export const setAgentForgeRole = (agentId: string, role: string) =>

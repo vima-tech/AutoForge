@@ -1604,6 +1604,11 @@ async fn run_agent_for_step(
     .map_err(|e| e.to_string())?;
 
     let agent = load_agent(ctx.db, agent_id).await?;
+    // 编码 Agent 后端成员：改走 CLI 只读跑项目仓库作答的路径（不经 LLM tool-loop）。
+    // 复用已插入的 run_id 这条 conversation_task_runs 行。
+    if let Some(code_agent_id) = agent.code_agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        return run_code_agent_reply(ctx, &run_id, &agent, code_agent_id, instruction).await;
+    }
     let roster_section = if ctx.roster.trim().is_empty() {
         String::new()
     } else {
@@ -1718,7 +1723,151 @@ async fn run_agent_for_step(
     for wb in write_blocks {
         blocks.push(wb);
     }
-    let content_json = serde_json::to_string(&blocks).unwrap_or_default();
+    finalize_chat_reply(ctx, &run_id, agent_id, &agent.name, &blocks, ok, text, error).await
+}
+
+/// 编码 Agent 后端成员的群聊回复：在项目仓库内**只读**跑 CLI（claude/codex）回答问题，把实时
+/// 活动转成「思考」流推前端，最终落库末轮答案。需群聊**绑定带仓库的项目**（要有真实代码可读）；
+/// 未绑定 / 解析失败 / 该 kind 不支持只读问答（opencode）时，落一条说明性消息优雅降级，
+/// 不抛错卡住整个任务。复用调用方已插入的 `run_id` 运行行。
+async fn run_code_agent_reply(
+    ctx: &ChatTaskCtx<'_>,
+    run_id: &str,
+    agent: &Agent,
+    code_agent_id: &str,
+    instruction: &str,
+) -> Result<AgentOutcome, String> {
+    // 1) 需要项目仓库（只读读取真实代码）。
+    let repo_path = match ctx.project_id {
+        Some(pid) => sqlx::query_as::<_, crate::models::project::Project>(
+            "SELECT * FROM projects WHERE id=?",
+        )
+        .bind(pid)
+        .fetch_optional(ctx.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|p| p.repo_path)
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    if repo_path.trim().is_empty() {
+        let msg = format!(
+            "我是编码 Agent 成员「{}」，需要本群聊**绑定一个带仓库路径的项目**才能读取真实代码作答。\
+             请在群聊设置里绑定项目后再 @ 我。",
+            agent.name
+        );
+        let blocks = vec![serde_json::json!({ "t": "md", "md": msg.clone() })];
+        return finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, true, msg, None)
+            .await;
+    }
+
+    // 2) 解析该成员绑定的编码 Agent（查不到/停用即降级，不静默兜底 claude）。
+    let Some(code_agent) =
+        crate::agents::code_agent::resolve_by_id(ctx.db, code_agent_id).await
+    else {
+        let msg = format!(
+            "我绑定的编码 Agent 不可用（可能已被删除或停用）。请在「设置 → Agent」里为成员「{}」\
+             重新指定编码 Agent 后端。",
+            agent.name
+        );
+        let blocks = vec![serde_json::json!({ "t": "md", "md": msg.clone() })];
+        return finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, true, msg, None)
+            .await;
+    };
+
+    // 3) prompt：群聊上下文 + 只读读真实代码的措辞（不输出写文件指令）。
+    let roster_section = if ctx.roster.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "群聊成员名单（话题相关时可 @名字 协作）：\n{}\n\n",
+            ctx.roster
+        )
+    };
+    let prompt = format!(
+        "{roster}以下是群聊对话快照：\n{snap}\n\n前置 Agent 发言：\n{acc}\n\n当前任务：\n{ins}\n\n\
+         你是群聊成员「{name}」，可直接读取并检索本项目仓库的**真实代码**来回答。请基于真实代码\
+         作答（点明涉及的文件/符号与关键流程），结论先行、观点明确，用简洁中文 Markdown。\
+         你处于**只读**模式：可读代码、检索、分析，但不会改动任何文件，也不要输出文件写入指令。\
+         若某部分确实更适合其他成员，可自然地用 @对方名字 点名（仅 @ 名单中相关成员），\
+         不要为凑协作而 @ 无关成员。",
+        roster = roster_section,
+        snap = ctx.snapshot,
+        acc = if ctx.accumulated.trim().is_empty() { "无" } else { ctx.accumulated },
+        ins = instruction,
+        name = agent.name,
+    );
+
+    // 4) 限额复用「执行」配置；MCP 复用「适用于编码 Agent」的只读情报（如 codegraph）。
+    let (wall_secs, idle_secs) = crate::commands::system::load_execution_limits(ctx.db).await;
+    let limits = crate::agents::code_agent::RunLimits { wall_secs, idle_secs };
+    let code_mcp = crate::agents::code_agent::load_code_agent_mcp(ctx.db).await;
+
+    // 5) 实时活动 → 「思考」流：把 CLI 边跑边吐的可读增量转成 AgentThinking(token) 推前端，
+    //    消除会议室干等。业务层对 Tauri 仅经 event::emit 感知。
+    let (log_tx, mut log_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agents::code_agent::LogChunk>();
+    let forward = {
+        let app = ctx.app.clone();
+        let conv = ctx.conversation_id.to_string();
+        let rid = run_id.to_string();
+        let aid = agent.id.clone();
+        let aname = agent.name.clone();
+        tokio::spawn(async move {
+            let mut seq: u64 = 0;
+            while let Some(c) = log_rx.recv().await {
+                event::emit(
+                    &app,
+                    event::AppEvent::AgentThinking {
+                        conversation_id: conv.clone(),
+                        run_id: rid.clone(),
+                        agent_id: aid.clone(),
+                        agent_name: aname.clone(),
+                        kind: "token".to_string(),
+                        text: c.text,
+                        seq,
+                    },
+                );
+                seq += 1;
+            }
+        })
+    };
+
+    // 6) 只读跑仓库取末轮答案。
+    let result = code_agent
+        .answer(&repo_path, &prompt, limits, &code_mcp, Some(&log_tx))
+        .await;
+    drop(log_tx); // 关闭 sink，让转发任务收尾
+    let _ = forward.await;
+
+    let (ok, text, error) = match result {
+        Ok(t) => (true, t, None),
+        Err(e) => (
+            false,
+            format!("[编码 Agent「{}」执行失败] {}", agent.name, e),
+            Some(e.to_string()),
+        ),
+    };
+    let blocks = vec![serde_json::json!({ "t": "md", "md": text.clone() })];
+    finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, ok, text, error).await
+}
+
+/// 落库一条 Agent 群聊回复（LLM 后端与编码 Agent 后端两路共用）：写 `messages`、更新本次
+/// `conversation_task_runs`（状态/output_text/error）、广播 `MessageReceived` 并撤下实时活动
+/// 卡片，返回 `AgentOutcome`（其 `text` 供后续轮次 / 链式 @ 累计）。`blocks` 为已构建好的消息
+/// 块数组（md / artifact / file_written…），`run_id` 为调用方已插入的运行行 id。
+#[allow(clippy::too_many_arguments)]
+async fn finalize_chat_reply(
+    ctx: &ChatTaskCtx<'_>,
+    run_id: &str,
+    agent_id: &str,
+    agent_name: &str,
+    blocks: &[serde_json::Value],
+    ok: bool,
+    text: String,
+    error: Option<String>,
+) -> Result<AgentOutcome, String> {
+    let content_json = serde_json::to_string(blocks).unwrap_or_default();
 
     let message_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -1742,7 +1891,7 @@ async fn run_agent_for_step(
     .bind(&message_id)
     .bind(&text)
     .bind(&error)
-    .bind(&run_id)
+    .bind(run_id)
     .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -1759,9 +1908,9 @@ async fn run_agent_for_step(
         ctx.app,
         event::AppEvent::AgentThinking {
             conversation_id: ctx.conversation_id.to_string(),
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             agent_id: agent_id.to_string(),
-            agent_name: agent.name.clone(),
+            agent_name: agent_name.to_string(),
             kind: "done".to_string(),
             text: String::new(),
             seq: u64::MAX,
@@ -1770,7 +1919,7 @@ async fn run_agent_for_step(
 
     Ok(AgentOutcome {
         agent_id: agent_id.to_string(),
-        agent_name: agent.name,
+        agent_name: agent_name.to_string(),
         ok,
         text,
     })
@@ -2612,6 +2761,11 @@ fn route_by_relevance(instruction: &str, members: &[Agent]) -> Option<String> {
     let hay = instruction.to_lowercase();
     let mut best: Option<(usize, &str)> = None;
     for m in members {
+        // 编码 Agent 成员（CLI 重型、只读跑仓库）只在被**显式 @** 时触发，绝不参与零成本
+        // 关键词自动选人——避免日常闲聊误把昂贵 CLI 拉起来。见 [[迁移 0079]]。
+        if is_code_agent_member(m) {
+            continue;
+        }
         let mut score = 0usize;
         for kw in [
             m.name.as_str(),
@@ -2651,7 +2805,22 @@ async fn last_speaking_member(
     .ok()
     .flatten();
     let last = last.map(|(a,)| a)?;
-    members.iter().find(|m| m.id == last).map(|m| m.id.clone())
+    // 同理：编码 Agent 成员不作为"对话连续性默认接话人"自动续接，只在被显式 @ 时回复。
+    members
+        .iter()
+        .find(|m| m.id == last && !is_code_agent_member(m))
+        .map(|m| m.id.clone())
+}
+
+/// 该成员是否由编码 Agent（CLI）后端驱动（`agents.code_agent_id` 非空）。这类成员只读跑项目
+/// 仓库作答、进程重，故只在被**显式 @mention** 或单点指定时触发，不参与自动选人/连续性接话。
+fn is_code_agent_member(agent: &Agent) -> bool {
+    agent
+        .code_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
 }
 
 fn infer_artifact_kind(text: &str) -> &'static str {

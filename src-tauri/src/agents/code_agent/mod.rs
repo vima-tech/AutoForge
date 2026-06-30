@@ -230,6 +230,19 @@ pub trait CodeAgent: Send + Sync {
         skills: &[SkillInject],
         log: Option<&LogSink>,
     ) -> Result<(i32, String, String)>;
+    /// 只读问答：在 `repo`（项目仓库根，**不开 worktree**）内回答问题，返回**末轮助手答案
+    /// 文本**（而非执行转写）。供会议室「编码 Agent 成员」答疑、孵化台用编码 Agent 起草蓝图。
+    /// 各 kind 用只读模式（claude `--permission-mode plan`、codex `-s read-only`），**不得改文件**；
+    /// 不支持只读问答的 kind（opencode）返回 Err，由调用方降级。`mcp` 同 run（pull 实时 MCP）；
+    /// `log` 为可选实时增量 sink（供上层转「思考」流），None = 不需要实时。
+    async fn answer(
+        &self,
+        repo: &str,
+        prompt: &str,
+        limits: RunLimits,
+        mcp: &[McpInject],
+        log: Option<&LogSink>,
+    ) -> Result<String>;
     /// 该 agent 是否已安装并（在可探测时）登录。
     async fn check_auth(&self) -> bool;
     /// kind 标识（claude / codex / opencode）。
@@ -323,6 +336,25 @@ pub async fn resolve(
         })),
         None => Box::new(CliCodeAgent::claude()),
     }
+}
+
+/// 按 `code_agents.id` 直接解析一个具体的 code agent（会议室「编码 Agent 成员」用其绑定的
+/// `agents.code_agent_id`）。**不走项目覆盖、不分级、查不到/禁用即 None** —— 成员是用户显式
+/// 绑定的，静默兜底 claude 会误导，故让调用方据 None 显式降级。
+pub async fn resolve_by_id(db: &crate::db::Db, id: &str) -> Option<Box<dyn CodeAgent>> {
+    use crate::models::code_agent::CodeAgentRow;
+    let r = sqlx::query_as::<_, CodeAgentRow>("SELECT * FROM code_agents WHERE id=? AND enabled=1")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()?;
+    Some(Box::new(CliCodeAgent::new(CliProfile {
+        kind: r.kind,
+        program: r.program,
+        model: r.model,
+        extra_args: parse_extra_args(&r.extra_args_json),
+    })))
 }
 
 /// 解析 code agent，并按风险档位挑模型：Low → fast_model、High → strong_model；
