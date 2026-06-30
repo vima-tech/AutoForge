@@ -327,6 +327,7 @@ pub fn run() {
             commands::issues::list_issues_page,
             commands::issues::list_issue_statuses,
             commands::issues::list_issues_by_statuses,
+            commands::issues::export_issues,
             commands::issues::list_issue_titles,
             commands::issues::get_issue,
             commands::issues::get_issue_analysis,

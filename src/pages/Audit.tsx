@@ -12,7 +12,7 @@ import { fmtShort, fmtFull } from '../utils/datetime';
 import {
   listActiveProjects, listChangeRequests, listChangeRequestsPage, getChangeRequestByIssue, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
-  openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles,
+  openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles, exportIssues,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   listMergeCandidates, review1Merge, getChangeRequestIssues, type MergeCandidate, type CrIssueRef,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, buildCrMiniapp,
@@ -1500,6 +1500,14 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   const [loading, setLoading] = useState(false);
   // 待确认的拒绝操作：行内单条 / 批量都先弹二次确认，避免误删（triage 碎片为硬删除不可恢复）。
   const [confirmReject, setConfirmReject] = useState<null | { ids: string[]; clear: boolean }>(null);
+  // 导出面板：全量 / 按状态类型多选导出（CSV / Excel）。
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportFmt, setExportFmt] = useState<'xlsx' | 'csv'>('xlsx');
+  // 选中的导出状态类型（空集 = 全量导出，不按状态过滤）。
+  const [exportSel, setExportSel] = useState<Set<string>>(new Set());
+  const [exportSplit, setExportSplit] = useState(true);   // xlsx 按类型分表
+  const [exporting, setExporting] = useState(false);
+  const [exportMsg, setExportMsg] = useState<{ ok: boolean; text: string } | null>(null);
   // 单调令牌：项目/筛选/刷新变化即自增，丢弃在途的过期分页响应，并区分「重置」与「追加」。
   const reqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1595,6 +1603,20 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
   // 拒绝确认里区分 triage（硬删除）与其余（软归档），让用户清楚不可恢复的部分。
   const rejTriageCount = confirmReject ? confirmReject.ids.filter(id => items.find(i => i.id === id)?.status === 'triage').length : 0;
 
+  // 导出：勾选的状态类型（空集 = 全量）。「显示已合并需求」关闭时不展示 merged 类型。
+  const exportTypes = statuses.filter(s => showMerged || s !== 'merged');
+  const toggleExportType = (s: string) => setExportSel(prev => { const n = new Set(prev); n.has(s) ? n.delete(s) : n.add(s); return n; });
+  const doExport = () => {
+    if (exporting) return;
+    setExporting(true);
+    setExportMsg(null);
+    const sel = [...exportSel].filter(s => exportTypes.includes(s));   // 仅导可见类型
+    exportIssues(projectId, sel, exportFmt, exportFmt === 'xlsx' && exportSplit)
+      .then(r => setExportMsg({ ok: true, text: `已导出 ${r.count} 条 → ${r.path}` }))
+      .catch(e => setExportMsg({ ok: false, text: `导出失败：${String(e)}` }))
+      .finally(() => setExporting(false));
+  };
+
   return (
     <>
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
@@ -1615,7 +1637,63 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
             title={showMerged ? `隐藏已合并需求（${mergedCount}）` : `显示已合并需求（${mergedCount}）`}>
             <Icon name={showMerged ? 'eye' : 'eye-off'} size={16} />
           </button>
+          {/* 导出：全量 / 按状态类型多选导出（CSV / Excel）。 */}
+          <button className={'icon-btn' + (exportOpen ? ' on' : '')} style={{ flexShrink: 0 }}
+            onClick={() => { setExportOpen(v => !v); setExportMsg(null); }}
+            title="导出需求（全量或按类型多选）">
+            <Icon name="download" size={16} />
+          </button>
         </div>
+        {exportOpen && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10 }}>
+            {/* 格式选择 */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', minWidth: 44 }}>格式</span>
+              <div className="seg" style={{ flexShrink: 0 }}>
+                <button className={exportFmt === 'xlsx' ? 'on' : ''} onClick={() => setExportFmt('xlsx')}>Excel</button>
+                <button className={exportFmt === 'csv' ? 'on' : ''} onClick={() => setExportFmt('csv')}>CSV</button>
+              </div>
+            </div>
+            {/* 状态类型多选：空选=全量 */}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', minWidth: 44, paddingTop: 3 }}>类型</span>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  <button onClick={() => setExportSel(new Set())}
+                    className={'filter-chip' + (exportSel.size === 0 ? ' on' : '')}
+                    style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>全部</button>
+                  {exportTypes.map(s => (
+                    <button key={s} onClick={() => toggleExportType(s)}
+                      className={'filter-chip' + (exportSel.has(s) ? ' on' : '')}
+                      style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>
+                      {LEDGER_STATUS_LABEL[s] ?? s}
+                    </button>
+                  ))}
+                </div>
+                <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
+                  {exportSel.size === 0 ? '不选=全量导出' : `已选 ${exportSel.size} 类`}
+                </span>
+              </div>
+            </div>
+            {/* xlsx 按类型分表 */}
+            {exportFmt === 'xlsx' && (
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setExportSplit(v => !v)}>
+                <LedgerCheck on={exportSplit} />
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)' }}>按类型分表（每个状态一个工作表）</span>
+              </label>
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button className="btn btn-sm btn-primary" disabled={exporting} onClick={doExport} title="导出到系统下载目录">
+                {exporting ? <><Icon name="brain" size={13} className="spin" />导出中…</> : <><Icon name="download" size={13} />导出</>}
+              </button>
+              {exportMsg && (
+                <span style={{ flex: 1, minWidth: 0, fontSize: 'var(--text-micro)', color: exportMsg.ok ? 'var(--green)' : 'var(--red)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={exportMsg.text}>
+                  {exportMsg.text}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
         <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
           {['all', ...statuses.filter(s => showMerged || s !== 'merged')].map(s => (
             <button key={s} onClick={() => setStatusFilter(s)}

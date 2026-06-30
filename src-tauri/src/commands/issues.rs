@@ -188,6 +188,240 @@ pub async fn list_issues_by_statuses(
         .map_err(|e| e.to_string())
 }
 
+// ── 总账导出（全量 / 按状态类型多选）────────────────────────────────────────
+// 「全量需求总账」页的导出：可全量导出，或多选状态类型只导其中几类；
+// 支持 CSV / Excel(xlsx)，xlsx 可「按类型分表」（每个状态一个工作表）。
+// 写入系统下载目录并在文件管理器中定位，沿用 export_bulk_template 的落盘模式。
+
+/// 状态码 → 中文标签（与前端 LEDGER_STATUS_LABEL 对齐；缺省回落原始状态码）。
+fn issue_status_label(status: &str) -> &str {
+    match status {
+        "triage" => "待整理",
+        "pending_analysis" => "分析中",
+        "analysis_failed" => "分析失败",
+        "pending_issue_review" => "需求审核",
+        "pending_execution" => "待编码",
+        "executing" => "编码中",
+        "pending_code_review" => "代码审核",
+        "pending_merge" => "待合并",
+        "merge_testing" => "合并中",
+        "merge_ready" => "待落地",
+        "merged" => "已合并",
+        "reverting" => "撤销中",
+        "reverted" => "已撤销",
+        "rejected" => "已拒绝",
+        "merge_failed" => "合并失败",
+        "merge_conflict" => "合并冲突",
+        "execution_failed" => "执行失败",
+        "no_change_needed" => "无需改动",
+        other => other,
+    }
+}
+
+/// 导出列头（与导出行字段顺序一致）。
+const EXPORT_HEADERS: [&str; 8] = [
+    "编号", "标题", "状态", "分类", "严重度", "来源", "创建时间", "更新时间",
+];
+
+/// 取一条需求的导出行（与 EXPORT_HEADERS 顺序对应）。
+fn issue_export_row(i: &Issue) -> [String; 8] {
+    [
+        i.id.clone(),
+        i.title.clone(),
+        issue_status_label(&i.status).to_string(),
+        i.category.clone(),
+        i.severity.clone(),
+        i.source_type.clone(),
+        i.created_at.clone(),
+        i.updated_at.clone(),
+    ]
+}
+
+/// CSV 单元格转义：含逗号/引号/换行的值用双引号包裹并转义内部引号。
+fn csv_escape(v: &str) -> String {
+    if v.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
+    }
+}
+
+/// 构建 CSV 字节（带 UTF-8 BOM，Excel 打开不乱码）。
+fn issues_export_csv(issues: &[Issue]) -> Vec<u8> {
+    let mut s = String::new();
+    s.push_str(&EXPORT_HEADERS.join(","));
+    s.push('\n');
+    for i in issues {
+        let row = issue_export_row(i);
+        let line: Vec<String> = row.iter().map(|c| csv_escape(c)).collect();
+        s.push_str(&line.join(","));
+        s.push('\n');
+    }
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(s.as_bytes());
+    bytes
+}
+
+/// 构建 xlsx 字节。split_by_type=true 时按状态分表（每个状态一个工作表），
+/// 否则全部写入单个「需求」工作表（含状态列）。
+fn issues_export_xlsx(issues: &[Issue], split_by_type: bool) -> Result<Vec<u8>, String> {
+    use rust_xlsxwriter::{Format, Workbook};
+    let mut workbook = Workbook::new();
+    let header_fmt = Format::new().set_bold().set_background_color(0xE8772E);
+
+    // 把若干行写进一个工作表（含表头）。
+    let write_sheet = |workbook: &mut Workbook, name: &str, rows: &[&Issue]| -> Result<(), String> {
+        // 工作表名 ≤31 字符且禁含 []:*?/\\，做一次净化。
+        let mut safe: String = name.chars().filter(|c| !"[]:*?/\\".contains(*c)).collect();
+        if safe.chars().count() > 31 {
+            safe = safe.chars().take(31).collect();
+        }
+        if safe.is_empty() {
+            safe = "需求".to_string();
+        }
+        let sheet = workbook
+            .add_worksheet()
+            .set_name(&safe)
+            .map_err(|e| e.to_string())?;
+        for (col, h) in EXPORT_HEADERS.iter().enumerate() {
+            sheet
+                .write_string_with_format(0, col as u16, *h, &header_fmt)
+                .map_err(|e| e.to_string())?;
+        }
+        for (r, issue) in rows.iter().enumerate() {
+            let row = issue_export_row(issue);
+            for (col, v) in row.iter().enumerate() {
+                sheet
+                    .write_string(r as u32 + 1, col as u16, v)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        sheet.set_column_width(0, 22).ok();
+        sheet.set_column_width(1, 40).ok();
+        sheet.set_column_width(2, 12).ok();
+        sheet.set_column_width(6, 20).ok();
+        sheet.set_column_width(7, 20).ok();
+        Ok(())
+    };
+
+    if split_by_type {
+        // 按状态分组，保持稳定顺序（首次出现的先后）。
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<&Issue>> =
+            std::collections::HashMap::new();
+        for i in issues {
+            if !groups.contains_key(&i.status) {
+                order.push(i.status.clone());
+            }
+            groups.entry(i.status.clone()).or_default().push(i);
+        }
+        if order.is_empty() {
+            // 无数据也产一张空表，避免无工作表导致 xlsx 非法。
+            write_sheet(&mut workbook, "需求", &[])?;
+        }
+        for st in &order {
+            let rows = groups.get(st).map(|v| v.as_slice()).unwrap_or(&[]);
+            write_sheet(&mut workbook, issue_status_label(st), rows)?;
+        }
+    } else {
+        let rows: Vec<&Issue> = issues.iter().collect();
+        write_sheet(&mut workbook, "需求", &rows)?;
+    }
+
+    workbook.save_to_buffer().map_err(|e| e.to_string())
+}
+
+/// 导出参数：项目 + 状态类型多选（空=全量）+ 格式 + 是否按类型分表。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportIssuesQuery {
+    pub project_id: String,
+    /// 选中的状态类型；为空表示全量导出（不按状态过滤）。
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// "csv" | "xlsx"
+    pub format: String,
+    /// 仅 xlsx 生效：每个状态类型导出为独立工作表。
+    #[serde(default)]
+    pub split_by_type: bool,
+}
+
+/// 导出结果：落盘路径 + 导出条数。
+#[derive(serde::Serialize)]
+pub struct IssueExportResult {
+    pub path: String,
+    pub count: i64,
+}
+
+/// 导出总账需求到系统下载目录（CSV / xlsx），返回文件路径与条数。
+#[tauri::command]
+pub async fn export_issues(
+    query: ExportIssuesQuery,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<IssueExportResult, String> {
+    use sqlx::{QueryBuilder, Sqlite};
+    use tauri::Manager;
+    use tauri_plugin_opener::OpenerExt;
+
+    let ExportIssuesQuery { project_id, statuses, format, split_by_type } = query;
+    let fmt = format.to_lowercase();
+    if fmt != "csv" && fmt != "xlsx" {
+        return Err(format!("不支持的导出格式: {}，请使用 csv / xlsx", format));
+    }
+
+    // 拉取需求（按创建时间正序，与总账一致的稳定排序）。
+    let issues: Vec<Issue> = {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT * FROM issues WHERE project_id = ");
+        qb.push_bind(&project_id);
+        if !statuses.is_empty() {
+            qb.push(" AND status IN (");
+            let mut sep = qb.separated(", ");
+            for s in &statuses {
+                sep.push_bind(s);
+            }
+            qb.push(")");
+        }
+        qb.push(" ORDER BY created_at ASC");
+        qb.build_query_as::<Issue>()
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let count = issues.len() as i64;
+
+    // 文件名：项目无关，带类型与时间戳避免覆盖。
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let (file_name, bytes) = if fmt == "csv" {
+        (
+            format!("autoforge-需求总账-{}.csv", stamp),
+            issues_export_csv(&issues),
+        )
+    } else {
+        (
+            format!("autoforge-需求总账-{}.xlsx", stamp),
+            issues_export_xlsx(&issues, split_by_type)?,
+        )
+    };
+
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().temp_dir())
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dest = dir.join(&file_name);
+    tokio::fs::write(&dest, &bytes)
+        .await
+        .map_err(|e| format!("写入导出文件失败: {}", e))?;
+
+    let dest_str = dest.to_string_lossy().to_string();
+    let _ = app.opener().reveal_item_in_dir(&dest_str);
+
+    Ok(IssueExportResult { path: dest_str, count })
+}
+
 /// 需求标题（轻量），按 id 批量取，用于变更请求列表解析标题，
 /// 无需把全部需求载入内存。
 #[derive(serde::Serialize, sqlx::FromRow)]

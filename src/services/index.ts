@@ -497,6 +497,17 @@ export const listIssuesPage = (
 // 某项目出现过的全部需求状态（去重），用于总账筛选 chip。
 export const listIssueStatuses = (projectId: string) =>
   ipc<string[]>('list_issue_statuses', { projectId });
+// 总账导出：全量或按状态类型多选导出为 CSV / Excel；空 statuses=全量，
+// splitByType 仅 xlsx 生效（每个状态一个工作表）。写入下载目录并定位，返回路径 + 条数。
+export interface IssueExportResult { path: string; count: number }
+export const exportIssues = (
+  projectId: string,
+  statuses: string[],
+  format: 'csv' | 'xlsx',
+  splitByType: boolean,
+) => ipc<IssueExportResult>('export_issues', {
+  query: { projectId, statuses, format, splitByType },
+});
 // 按状态集合取需求（有界子集，如需求审核 队列），替代全量加载。
 export const listIssuesByStatuses = (projectId: string, statuses: string[]) =>
   ipc<Issue[]>('list_issues_by_statuses', { projectId, statuses });
