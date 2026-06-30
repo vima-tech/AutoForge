@@ -36,6 +36,34 @@ pub struct MergeCandidate {
     pub conflict_hint: Option<String>,
 }
 
+/// 人工批量绑定（工单组）的相关度预览（preview_batch_bind 返回）。
+/// 把「这些需求是否真相关」摊到人眼前，并暴露上限/风险/确认门信号，
+/// 取代用 Result 错误通道夹带控制信号的脆弱做法（设计评审 D5）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchBindPreview {
+    /// "strong"（实质重叠，鼓励）| "weak"（有重叠但占比低/有冲突）|
+    /// "unrelated"（无共享实质文件，真无关）| "insufficient"（含未分析需求，无法判定）。
+    pub signal: String,
+    /// 共享实质文件占最小成员文件集的比例（0~1）；insufficient 时为 0。
+    pub relatedness: f64,
+    /// 全员共享的实质文件（已剔除 lib.rs/index.ts 等登记类枢纽）。
+    pub shared_files: Vec<String>,
+    /// 合并后去重的目标文件总数（blast radius）。
+    pub total_files: usize,
+    /// 删改冲突提示；无则 None。
+    pub conflict_hint: Option<String>,
+    /// 缺文件画像（分析失败/无 spec）的成员标题——触发 insufficient 的原因。
+    pub missing_analysis: Vec<String>,
+    /// 选中数是否超过 MAX_GROUP 上限（超限前端禁用提交）。
+    pub over_cap: bool,
+    /// 工单组成员数硬上限（= MAX_GROUP），供前端展示。
+    pub max_group: usize,
+    /// 批次最高风险等级 "low"|"high"（含未分析需求按 high 保守计）；用于提示「将走强模型」。
+    pub est_risk: String,
+    /// signal ∈ {unrelated, insufficient} → 人工绑定需显式 force 二次确认。
+    pub requires_confirm: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review1Decision {
     pub decision: String,

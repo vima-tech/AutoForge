@@ -17,7 +17,8 @@ import {
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback, deferIssue, reactivateIssue,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles, exportIssues,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
-  listMergeCandidates, review1Merge, getChangeRequestIssues, type MergeCandidate, type CrIssueRef,
+  listMergeCandidates, review1Merge, previewBatchBind, detachAndRequeue, getChangeRequestIssues,
+  type MergeCandidate, type CrIssueRef, type BatchBindPreview,
   getCrPreview, startCrPreview, stopCrPreview, launchCrApp, buildCrMiniapp,
   listLocalBranches, startBranchPreview, listBranchPreviews, stopBranchPreview,
   startPreviewLogTail, stopPreviewLogTail,
@@ -468,7 +469,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   // 批量拒绝：拒绝/归档选中的需求（待审核 / 分析失败）。
   onBatchReject: (ids: string[]) => Promise<void> | void;
   // 合并需求：把多条需求合并成一个 CR + 一次执行（同文件多需求合并）。
-  onMerge: (issueIds: string[], primaryId?: string) => Promise<void> | void;
+  onMerge: (issueIds: string[], primaryId?: string, bindSource?: 'auto' | 'manual', forceUnrelated?: boolean) => Promise<void> | void;
   // 当前审核闸口：'issue' 只显示待需求审核，'code' 只显示变更请求各态。
   gate: 'issue' | 'code';
   width: number;
@@ -515,10 +516,12 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     const key = [...ids].sort().join(',');
     return candidates.find(c => [...c.issue_ids].sort().join(',') === key);
   };
-  const runMerge = (primaryId: string) => {
+  const runMerge = (primaryId: string, forceUnrelated?: boolean) => {
     if (merging || !mergePanel || mergePanel.ids.length < 2) return;
     setMerging(true);
-    Promise.resolve(onMerge(mergePanel.ids, primaryId))
+    // bindSource：选区恰为系统探测候选 → 'auto'；否则人工圈选 → 'manual'（受相关度门约束）。
+    const bindSource = mergePanel.candidate ? 'auto' : 'manual';
+    Promise.resolve(onMerge(mergePanel.ids, primaryId, bindSource, forceUnrelated))
       .finally(() => { setMerging(false); setMergePanel(null); setSelected(new Set()); });
   };
   // 需求闸批量动作下拉：按钮过多会折行，收进单个「批量操作」下拉菜单（mention-pop 模式）。
@@ -1065,7 +1068,6 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     {mergePanel && (
       <MergeConfirm
         members={mergePanel.ids.map(id => ({ id, title: pendingIssues.find(i => i.id === id)?.title || id.slice(0, 8) }))}
-        candidate={mergePanel.candidate}
         busy={merging}
         onConfirm={runMerge}
         onCancel={() => { if (!merging) setMergePanel(null); }}
@@ -1077,15 +1079,30 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
 
 // ── 合并确认面板：把多条需求合并成一个变更、一次编码 ────────────────────────────
 // 遵守 DESIGN：遮罩 inset:var(--win-gutter) + 圆角；不点遮罩关闭，仅 ✕ / Esc；每屏 ≤1 主操作。
-function MergeConfirm({ members, candidate, busy, onConfirm, onCancel }: {
+function MergeConfirm({ members, busy, onConfirm, onCancel }: {
   members: { id: string; title: string }[];
-  candidate?: MergeCandidate;
   busy: boolean;
-  onConfirm: (primaryId: string) => void;
+  onConfirm: (primaryId: string, forceUnrelated?: boolean) => void;
   onCancel: () => void;
 }) {
   // 主需求默认取第一条（驱动 CR 标题 / Innate 召回）。
   const [primary, setPrimary] = useState(members[0]?.id ?? '');
+  // 相关度预览（previewBatchBind，只读）：把「是否真相关」摊到人眼前，驱动信号/上限/确认门。
+  const [preview, setPreview] = useState<BatchBindPreview | null>(null);
+  const [loadingPreview, setLoadingPreview] = useState(true);
+  // 真无关 / 数据不足时需勾选此项才放行（force_unrelated 二次确认，设计评审 D4/D5）。
+  const [confirmed, setConfirmed] = useState(false);
+  const idsKey = members.map(m => m.id).join(',');
+  useEffect(() => {
+    let alive = true;
+    setLoadingPreview(true);
+    setConfirmed(false);
+    previewBatchBind(members.map(m => m.id))
+      .then(p => { if (alive) { setPreview(p); setLoadingPreview(false); } })
+      .catch(() => { if (alive) { setPreview(null); setLoadingPreview(false); } });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onCancel(); };
     document.addEventListener('keydown', onKey);
@@ -1101,32 +1118,55 @@ function MergeConfirm({ members, candidate, busy, onConfirm, onCancel }: {
           <button className="icon-btn" onClick={onCancel} disabled={busy} title="关闭（Esc）"><Icon name="x" size={16} /></button>
         </div>
 
-        {/* 共享文件（探测出的候选才有；手动合并则提示无预查信息） */}
-        {candidate && candidate.shared_files.length > 0 ? (
-          <div style={{ marginBottom: 12 }}>
-            <div className="field-label" style={{ marginBottom: 6 }}>共享文件</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {candidate.shared_files.map(f => (
-                <span key={f} className="chip ember" style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>{f}</span>
-              ))}
+        {/* 相关度信号（previewBatchBind 驱动；四态区分「真无关」与「数据不足」，设计评审 D4）。 */}
+        {loadingPreview || !preview ? (
+          <div style={{ marginBottom: 12, fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Icon name="brain" size={13} className="spin" />评估相关度…
+          </div>
+        ) : (() => {
+          const SIG: Record<string, { chip: string; icon: string; label: string }> = {
+            strong: { chip: 'green', icon: 'check', label: '强相关 · 共享实质文件' },
+            weak: { chip: 'amber', icon: 'alert', label: '弱相关 · 文件重叠较少' },
+            unrelated: { chip: 'red', icon: 'alert', label: '未见共享文件 · 请确认相关性' },
+            insufficient: { chip: 'amber', icon: 'alert', label: '含未分析需求 · 暂无法判定' },
+          };
+          const s = SIG[preview.signal] ?? SIG.weak;
+          return (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: preview.shared_files.length || preview.missing_analysis.length || preview.conflict_hint || preview.over_cap ? 8 : 0 }}>
+                <span className={'chip ' + s.chip}><Icon name={s.icon} size={12} />{s.label}</span>
+                {preview.est_risk === 'high' && (
+                  <span className="chip amber" title="批次含高风险需求，编码将走强模型"><Icon name="zap" size={12} />将走强模型</span>
+                )}
+                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>预计改动 {preview.total_files} 个文件</span>
+              </div>
+              {preview.shared_files.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                  {preview.shared_files.slice(0, 8).map(f => (
+                    <span key={f} className="chip ember" style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>{f}</span>
+                  ))}
+                </div>
+              )}
+              {preview.missing_analysis.length > 0 && (
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)', marginBottom: 6 }}>
+                  尚无分析结果：{preview.missing_analysis.join('、')}
+                </div>
+              )}
+              {preview.conflict_hint && (
+                <div style={{ padding: '8px 10px', borderRadius: 9, background: 'var(--amber-tint, rgba(220,160,40,.14))', border: '1px solid var(--border)', fontSize: 'var(--text-caption)', color: 'var(--amber)', display: 'flex', gap: 6, alignItems: 'flex-start', marginBottom: preview.over_cap ? 6 : 0 }}>
+                  <Icon name="alert" size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span>{preview.conflict_hint}</span>
+                </div>
+              )}
+              {preview.over_cap && (
+                <div style={{ padding: '8px 10px', borderRadius: 9, background: 'var(--red-tint, rgba(220,70,70,.14))', border: '1px solid var(--border)', fontSize: 'var(--text-caption)', color: 'var(--red)', display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                  <Icon name="alert" size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span>工单组最多 {preview.max_group} 条需求，当前 {members.length} 条，请减少选择。</span>
+                </div>
+              )}
             </div>
-            <div style={{ marginTop: 6, fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
-              合并后预计改动 {candidate.total_files} 个文件
-            </div>
-          </div>
-        ) : (
-          <div style={{ marginBottom: 12, fontSize: 'var(--text-caption)', color: 'var(--text-3)', lineHeight: 'var(--leading-relaxed)' }}>
-            手动合并（非系统建议组）：将把这些需求作为同一变更一次性实现，请确认它们确属相关改动。
-          </div>
-        )}
-
-        {/* 冲突提示 */}
-        {candidate?.conflict_hint && (
-          <div style={{ marginBottom: 12, padding: '8px 10px', borderRadius: 9, background: 'var(--amber-tint, rgba(220,160,40,.14))', border: '1px solid var(--border)', fontSize: 'var(--text-caption)', color: 'var(--amber)', display: 'flex', gap: 6, alignItems: 'flex-start' }}>
-            <Icon name="alert" size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-            <span>{candidate.conflict_hint}</span>
-          </div>
-        )}
+          );
+        })()}
 
         {/* 成员需求 + 选主需求（主需求驱动 CR 标题与召回） */}
         <div className="field-label" style={{ marginBottom: 6 }}>选择主需求（驱动变更标题）</div>
@@ -1144,9 +1184,19 @@ function MergeConfirm({ members, candidate, busy, onConfirm, onCancel }: {
           ))}
         </div>
 
+        {/* 真无关 / 数据不足 → 必须显式二次确认才放行（force_unrelated；前端门，后端亦兜底）。 */}
+        {preview?.requires_confirm && !preview.over_cap && (
+          <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 14, cursor: 'pointer', fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 'var(--leading-relaxed)' }}>
+            <input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} style={{ marginTop: 2, flexShrink: 0 }} />
+            <span>我已确认这些需求确属相关改动，仍要绑定为一个工单组（一并实现、一并审核、一并合并）。</span>
+          </label>
+        )}
+
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onCancel} disabled={busy}>取消</button>
-          <button className="btn btn-primary" onClick={() => onConfirm(primary)} disabled={busy || !primary}>
+          <button className="btn btn-primary"
+            onClick={() => onConfirm(primary, preview?.requires_confirm ? true : undefined)}
+            disabled={busy || !primary || !!preview?.over_cap || (!!preview?.requires_confirm && !confirmed)}>
             <Icon name={busy ? 'brain' : 'merge'} size={15} className={busy ? 'spin' : undefined} />
             {busy ? '合并中…' : '合并并进入编码'}
           </button>
@@ -2578,6 +2628,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [grade, setGrade] = useState<CrGrade | null>(null);
   // 该 CR 覆盖的全部需求（合并 CR 含多条）——用于头部「覆盖 N 个需求」展示。
   const [crIssues, setCrIssues] = useState<CrIssueRef[]>([]);
+  // 工单组成员浮层开合 + 摘出中（review_2 阶段从合并 CR 摘出某成员需求重审）。
+  const [crIssuesOpen, setCrIssuesOpen] = useState(false);
+  const [detaching, setDetaching] = useState<string | null>(null);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [tab, setTab] = useState<'report' | 'diff' | 'logs'>('report');
   const [compareOpen, setCompareOpen] = useState(false);
@@ -3368,10 +3421,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   };
 
   // 合并需求（同文件多需求合并）：把多条需求合并成一个 CR + 一次编码执行。
-  const doMergeReview1 = async (ids: string[], primaryId?: string) => {
+  const doMergeReview1 = async (ids: string[], primaryId?: string, bindSource?: 'auto' | 'manual', forceUnrelated?: boolean) => {
     if (ids.length < 2) return;
     try {
-      await review1Merge(ids, primaryId);
+      await review1Merge(ids, primaryId, undefined, bindSource, forceUnrelated);
       showOk(`已合并 ${ids.length} 条需求为一次变更，进入编码`);
     } catch (e) {
       showError('合并失败：' + String(e));
@@ -3379,6 +3432,27 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       if (activeProject) await loadList(activeProject.id);
       await loadProjectReviewCounts();
       window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    }
+  };
+
+  // 代码审核阶段：从合并工单组摘出某成员需求 → 该需求退回独立审核，剩余组收窄后重新执行。
+  // 解决 squash 下「一个错全组陪葬」：摘掉做错的那条，好的重跑（detach_and_requeue）。
+  const doDetachIssue = async (issueId: string) => {
+    if (!cr || detaching) return;
+    setDetaching(issueId);
+    try {
+      await detachAndRequeue(cr.id, issueId);
+      showOk('已摘出该需求重审，剩余组重新执行');
+      setCrIssuesOpen(false);
+      // 摘出后该 CR 离开代码审核态（回执行），刷新列表 + 覆盖需求；详情随事件自动更新。
+      getChangeRequestIssues(cr.id).then(setCrIssues).catch(() => {});
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      showError('摘出失败：' + String(e));
+    } finally {
+      setDetaching(null);
     }
   };
 
@@ -4056,8 +4130,40 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                     {session && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)' }}>迭代 {session.iteration_count} 轮</span>}
                     {grade && <span className={'chip ' + (grade.tier === 'T3' ? 'red' : grade.tier === 'T2' ? 'amber' : grade.tier === 'T1' ? 'blue' : 'green')} title={grade.rationale}>风险 {grade.tier} · {grade.change_class}</span>}
                     {crIssues.length > 1 && (
-                      <span className="chip ember" title={crIssues.map(c => `${c.role === 'primary' ? '主 · ' : ''}${c.title}`).join('\n')}>
-                        <Icon name="merge" size={12} />覆盖 {crIssues.length} 个需求
+                      <span style={{ position: 'relative', display: 'inline-flex' }}>
+                        <button className="chip ember" onClick={() => setCrIssuesOpen(o => !o)}
+                          style={{ cursor: 'pointer', border: 'none', gap: 4 }}
+                          title="查看工单组成员（代码审核阶段可摘出某条退回重审）">
+                          <Icon name="merge" size={12} />覆盖 {crIssues.length} 个需求
+                          <Icon name="chevDown" size={11} style={{ transition: 'transform .15s', transform: crIssuesOpen ? 'rotate(180deg)' : 'none' }} />
+                        </button>
+                        {crIssuesOpen && (
+                          <div className="mention-pop" style={{ left: 0, right: 'auto', top: 'calc(100% + 6px)', minWidth: 300, maxWidth: 400, padding: 4 }}>
+                            {crIssues.map(ci => (
+                              <div key={ci.issue_id} className="mention-row" style={{ cursor: 'default', alignItems: 'center', gap: 8 }}>
+                                <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  {ci.role === 'primary' && (
+                                    <span className="chip" style={{ fontSize: 'var(--text-micro)', padding: '1px 6px', flexShrink: 0 }}>主</span>
+                                  )}
+                                  <span className="nm" style={{ whiteSpace: 'normal', minWidth: 0 }}>{ci.title}</span>
+                                </div>
+                                {ci.role !== 'primary' && cr.status === 'pending_code_review' && (
+                                  <button className="btn btn-sm btn-ghost" disabled={!!detaching} style={{ flexShrink: 0 }}
+                                    onClick={() => doDetachIssue(ci.issue_id)}
+                                    title="把这条需求摘出退回独立审核，其余需求作废当前改动重新执行">
+                                    <Icon name={detaching === ci.issue_id ? 'brain' : 'moveFile'} size={12} className={detaching === ci.issue_id ? 'spin' : undefined} />
+                                    摘出重审
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                            {cr.status === 'pending_code_review' && crIssues.some(c => c.role !== 'primary') && (
+                              <div style={{ padding: '6px 10px 4px', fontSize: 'var(--text-micro)', color: 'var(--text-3)', borderTop: '1px solid var(--border)', lineHeight: 'var(--leading-normal)' }}>
+                                摘出后该需求退回独立审核（保留分析结果），剩余组收窄后重新执行。
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </span>
                     )}
                   </div>

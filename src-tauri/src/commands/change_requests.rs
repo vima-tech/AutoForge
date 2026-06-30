@@ -571,7 +571,7 @@ pub(crate) async fn create_cr_for_issue(
     .map_err(|e| e.to_string())?;
 
     // 关联表 primary 行：单需求 CR 也写，保证「CR 的全部需求」恒等于 change_request_issues 查询。
-    add_cr_issue(db, &cr_id, issue_id, "primary", 0).await?;
+    add_cr_issue(db, &cr_id, issue_id, "primary", 0, "auto").await?;
 
     record_admin_decision(
         db,
@@ -708,16 +708,21 @@ pub async fn get_change_request_issues(
     Ok(out)
 }
 
-/// 合并需求审核：把多条**待需求审核**的需求合并成**一个** CR + 一次执行（同文件多需求合并）。
-/// primary 需求驱动 CR 标题/分支/Innate 召回，其余为 member。全部成员翻 `pending_execution`
-/// 并各记一条 review_1 审计，最后入队**一个** Execution job（执行层会拼多需求工单）。
-/// 校验：≥2 条、同项目、均为 `pending_issue_review`（或分析失败，可直接进编码）。
+/// 合并需求审核：把多条**待需求审核**的需求合并成**一个** CR + 一次执行（同文件多需求合并，
+/// 亦即人工批量绑定的工单组）。primary 需求驱动 CR 标题/分支/Innate 召回，其余为 member。
+/// 全部成员翻 `pending_execution` 并各记一条 review_1 审计，最后入队**一个** Execution job
+/// （执行层会拼多需求工单）。
+/// 校验：≥2 条、同项目、均为 `pending_issue_review`（或分析失败，可直接进编码）、
+/// 不超过 `MAX_GROUP` 上限；人工绑定（bind_source="manual"）相关性不足时需 `force_unrelated`
+/// 二次确认（前端先调 `preview_batch_bind` 渲染信号，此处为服务端安全网）。
 #[tauri::command]
 pub async fn review_1_merge(
     issue_ids: Vec<String>,
     suggestions: Option<String>,
     primary_id: Option<String>,
     admin_id: Option<String>,
+    bind_source: Option<String>,
+    force_unrelated: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ChangeRequest, String> {
     let admin_id = admin_id.unwrap_or_else(|| "admin".to_string());
@@ -753,6 +758,29 @@ pub async fn review_1_merge(
         return Err("只能合并同一项目下的需求".to_string());
     }
 
+    // 工单组成员上限护栏（设计评审 D3：MAX_GROUP=5），控制爆炸半径与风险连坐。
+    if ordered.len() > crate::commands::requirement_merge::MAX_GROUP {
+        return Err(format!(
+            "工单组最多 {} 条需求，当前选了 {} 条",
+            crate::commands::requirement_merge::MAX_GROUP,
+            ordered.len()
+        ));
+    }
+
+    // 相关度服务端安全网：人工绑定（manual）且相关性「真无关 / 数据不足」时，必须显式
+    // force_unrelated 才放行。前端已先调 preview_batch_bind 渲染信号 + 二次确认（D5），
+    // 此处仅防绕过预览。'auto'（规则探测推荐采纳）天然相关，不设此门。
+    let bind_source = bind_source
+        .filter(|s| s == "manual")
+        .unwrap_or_else(|| "auto".to_string());
+    if bind_source == "manual" && force_unrelated != Some(true) {
+        let files = crate::commands::requirement_merge::load_issue_files(db, &ordered).await?;
+        let rel = crate::commands::requirement_merge::group_relatedness(&files);
+        if matches!(rel.signal, "unrelated" | "insufficient") {
+            return Err("所选需求相关性不足，请在预览确认后再绑定".to_string());
+        }
+    }
+
     // 选 primary：用传入的（且在选区内）否则取第一条。
     let primary = primary_id
         .filter(|p| ordered.iter().any(|id| id == p))
@@ -785,9 +813,9 @@ pub async fn review_1_merge(
     let mut order = 1i64;
     for id in &ordered {
         if *id == primary {
-            add_cr_issue(db, &cr_id, id, "primary", 0).await?;
+            add_cr_issue(db, &cr_id, id, "primary", 0, &bind_source).await?;
         } else {
-            add_cr_issue(db, &cr_id, id, "member", order).await?;
+            add_cr_issue(db, &cr_id, id, "member", order, &bind_source).await?;
             order += 1;
         }
     }
@@ -877,6 +905,121 @@ pub async fn split_change_request(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 从一个**已进入代码审核**（pending_code_review）的合并 CR 中摘出某成员需求：该需求退回
+/// 独立审核（pending_issue_review，保留分析结果），剩余成员作废当前 diff、**重新入队执行**
+/// 用收窄后的需求集重跑。解决 squash 下「一个错全组陪葬」——把全有或全无的代价降到最小。
+///
+/// 设计评审修正（务必照此实现，勿自创机制）：
+///  - **D1**：仅允许 `pending_code_review` 态摘出（唯一持有 pending_review 槽的态）→ 必
+///    `release_pending_review()` 一次，单一来源无双重释放风险；merge_conflict/execution_failed
+///    走既有 closure 路径，不在此处。
+///  - **D2**：重执行用 `execution:{cr}:retry:{uuid}` 唯一键（enqueue 既去重行也去重执行，
+///    普通键会撞已 completed 行致**静默不重跑**）——与 review_2 revision 路径完全一致。
+///  - 不可摘 primary（驱动 CR 身份）；摘到只剩 primary 一条 → 退化为单需求 CR 正常重跑。
+///  - 剩余组自动收窄：execution.rs 每次**实时**读 change_request_issues，DELETE 后被摘需求
+///    自然不在 member 集，`merged_requirements` 随之收窄（这正是 detach 能 work 的支点）。
+#[tauri::command]
+pub async fn detach_and_requeue(
+    cr_id: String,
+    issue_id: String,
+    reason: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ChangeRequest, String> {
+    let db = &state.db;
+    let cr = sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("变更请求不存在：{}", cr_id))?;
+    // D1：仅代码审核阶段（唯一持有 pending_review 槽的态）可摘出。
+    if cr.status != "pending_code_review" {
+        return Err(format!(
+            "变更请求当前状态为 {}，仅可在代码审核阶段摘出需求",
+            cr.status
+        ));
+    }
+    if cr.issue_id == issue_id {
+        return Err("不可摘出主需求（primary）".to_string());
+    }
+    let members = cr_issue_ids(db, &cr_id).await;
+    if !members.contains(&issue_id) {
+        return Err("该需求不属于此变更请求".to_string());
+    }
+
+    // 1) 摘成员关联 + 需求退回独立审核（issue_analyses 保留，可直接重新合并/独立编码）。
+    sqlx::query("DELETE FROM change_request_issues WHERE change_request_id=? AND issue_id=?")
+        .bind(&cr_id)
+        .bind(&issue_id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE issues SET status='pending_issue_review', updated_at=datetime('now') WHERE id=?",
+    )
+    .bind(&issue_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    // 审计：被摘需求记一条 review_2 'detached'（reason 入 suggestions）。
+    record_admin_decision(
+        db,
+        AdminDecisionRecord {
+            project_id: &cr.project_id,
+            issue_id: &issue_id,
+            change_request_id: Some(&cr_id),
+            stage: "review_2",
+            decision: "detached",
+            admin_id: cr.admin_id.as_deref().unwrap_or("admin"),
+            suggestions: reason.as_deref(),
+        },
+    )
+    .await?;
+
+    // 2) 收尾完全照抄 review_2 revision 路径（释放审核槽 → 退回执行 → 唯一键重入队 → emit）。
+    state.concurrency.release_pending_review(); // D1：单一来源，释放一次
+    sqlx::query(
+        "UPDATE change_requests SET status='pending_execution', updated_at=datetime('now') WHERE id=?",
+    )
+    .bind(&cr_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    // 剩余成员需求一并回 pending_execution（被摘需求已不在关联表，不受影响）。
+    set_cr_issues_status(db, &cr_id, "pending_execution")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let idem_key = format!("execution:{}:retry:{}", cr_id, Uuid::new_v4()); // D2
+    let _ = enqueue(
+        db,
+        &state.job_tx,
+        "execution",
+        &idem_key,
+        JobPayload::Execution {
+            change_request_id: cr_id.clone(),
+            project_id: cr.project_id.clone(),
+        },
+    )
+    .await;
+
+    crate::core::event::emit(
+        &app,
+        crate::core::event::AppEvent::WorktreeUpdate {
+            cr_id: cr_id.clone(),
+            status: "re-executing".to_string(),
+            message: Some("已摘出需求，剩余组重新执行".to_string()),
+        },
+    );
+
+    sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
+        .bind(&cr_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Feed a review-2 human outcome into the change class trust state machine
@@ -1553,15 +1696,17 @@ pub(crate) async fn add_cr_issue(
     issue_id: &str,
     role: &str,
     sort_order: i64,
+    bind_source: &str,
 ) -> Result<(), String> {
     sqlx::query(
-        "INSERT OR IGNORE INTO change_request_issues (change_request_id, issue_id, role, sort_order)
-         VALUES (?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO change_request_issues (change_request_id, issue_id, role, sort_order, bind_source)
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(cr_id)
     .bind(issue_id)
     .bind(role)
     .bind(sort_order)
+    .bind(bind_source)
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;

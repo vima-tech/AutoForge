@@ -761,20 +761,48 @@ export interface MergeCandidate {
 /** 列出某项目需求审核队列里的合并候选组（按共享实质文件聚类，已剔除枢纽文件）。 */
 export const listMergeCandidates = (projectId: string) =>
   ipc<MergeCandidate[]>('list_merge_candidates', { projectId });
-/** 合并需求审核：把多条需求合并成一个 CR + 一次执行；primaryId 缺省取第一条。 */
+/** 合并需求审核：把多条需求合并成一个 CR + 一次执行；primaryId 缺省取第一条。
+ *  bindSource='manual' 为人工批量绑定（相关性不足时需 forceUnrelated 二次确认）。 */
 export const review1Merge = (
   issueIds: string[],
   primaryId?: string,
   suggestions?: string,
+  bindSource?: 'auto' | 'manual',
+  forceUnrelated?: boolean,
 ) =>
   ipc<ChangeRequest>('review_1_merge', {
     issueIds,
     primaryId: primaryId || undefined,
     suggestions: suggestions || undefined,
+    bindSource: bindSource || undefined,
+    forceUnrelated: forceUnrelated || undefined,
   });
+
+// ── 人工批量绑定（工单组）相关度预览 ───────────────────────────────────────────
+// 把「这些需求是否真相关」摊到人眼前；前端据此渲染信号条 + 决定是否需二次确认。
+export interface BatchBindPreview {
+  /** strong=实质重叠鼓励 | weak=有重叠但弱 | unrelated=真无关 | insufficient=含未分析无法判定 */
+  signal: 'strong' | 'weak' | 'unrelated' | 'insufficient';
+  relatedness: number;        // 共享实质文件占最小成员文件集比例（0~1）
+  shared_files: string[];
+  total_files: number;        // blast radius
+  conflict_hint: string | null;
+  missing_analysis: string[]; // 缺文件画像（未分析）的成员标题
+  over_cap: boolean;          // 选中数超 max_group
+  max_group: number;
+  est_risk: 'low' | 'high';   // 批次最高风险（含未分析按 high）；提示「将走强模型」
+  requires_confirm: boolean;  // signal∈{unrelated,insufficient} → 需 forceUnrelated 确认
+}
+/** 预览一组任意圈选需求的相关度（只读、零 LLM 成本）。 */
+export const previewBatchBind = (issueIds: string[]) =>
+  ipc<BatchBindPreview>('preview_batch_bind', { issueIds });
+
 /** 从尚未进入执行的合并 CR 中拆出某成员需求，退回独立审核。 */
 export const splitChangeRequest = (crId: string, issueId: string) =>
   ipc<void>('split_change_request', { crId, issueId });
+/** 代码审核阶段从合并 CR 摘出某成员需求：该需求退回独立审核，剩余组收窄后重新执行。 */
+export const detachAndRequeue = (crId: string, issueId: string, reason?: string) =>
+  ipc<ChangeRequest>('detach_and_requeue', { crId, issueId, reason: reason || undefined });
 // 一个 CR 覆盖的需求引用（合并 CR 含多条；普通 CR 一条）。
 export interface CrIssueRef { issue_id: string; title: string; role: string; status: string; }
 /** 列出某 CR 覆盖的全部需求（primary 在前），供「覆盖 N 个需求」展示。 */

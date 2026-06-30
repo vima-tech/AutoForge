@@ -10,13 +10,14 @@
 //! 探测纯规则、零 LLM 成本。核心逻辑放在纯函数 `compute_candidates` 便于单测；命令层只做
 //! 「取 state → 查库取 spec → 调纯函数」。
 
-use crate::models::change_request::MergeCandidate;
+use crate::models::change_request::{BatchBindPreview, MergeCandidate};
 use crate::state::AppState;
 use std::collections::{BTreeSet, HashMap};
 use tauri::State;
 
 /// 组内需求数上限：超过视为枢纽未滤净，跳过该组（防滚雪球）。
-const MAX_GROUP: usize = 5;
+/// 人工批量绑定共用此上限（设计评审 D3：真值为 5）。
+pub const MAX_GROUP: usize = 5;
 /// 合并后去重总文件数上限：超过仍返回但标记 weak（blast radius 过大，收益存疑）。
 const MAX_BLAST: usize = 15;
 /// 频率枢纽阈值：某文件被 ≥ 该条数的需求命中，且占比 ≥ 50%，视为枢纽。
@@ -180,6 +181,126 @@ pub fn compute_candidates(issues: &[IssueFiles]) -> Vec<MergeCandidate> {
     out
 }
 
+/// 一组「人工圈选的全部需求」的相关度评估（纯函数产出，无 IO、无 Tauri，便于单测）。
+/// 与 `compute_candidates` 的单组强弱判定同构、共用阈值，区别是它对**整组**给一个信号，
+/// 且显式区分「真无关」（unrelated，无共享实质文件）与「数据不足」（insufficient，含未分析
+/// 需求）——设计评审 D4：二者绝不可混为一谈。
+#[derive(Debug, Clone)]
+pub struct GroupRelatedness {
+    /// 全员共享的实质文件（已剔除枢纽）。
+    pub shared_files: Vec<String>,
+    /// 并集文件总数（blast radius；insufficient 时仍按已知文件计）。
+    pub total_files: usize,
+    /// 共享实质文件 / 最小成员文件集 的占比；insufficient 时为 0。
+    pub overlap_ratio: f64,
+    /// "strong" | "weak" | "unrelated" | "insufficient"。
+    pub signal: &'static str,
+    /// 删改冲突提示；无则 None。
+    pub conflict_hint: Option<String>,
+    /// 缺文件画像（无 spec / 分析失败）的成员标题，非空即触发 insufficient。
+    pub missing_analysis: Vec<String>,
+}
+
+/// 评估一组需求的相关度。issues 为人工圈选的**全部**成员（含 primary）。
+pub fn group_relatedness(issues: &[IssueFiles]) -> GroupRelatedness {
+    let total = issues.len();
+
+    // 并集（即便 insufficient 也给 UI 展示 blast）。
+    let mut union: BTreeSet<&String> = BTreeSet::new();
+    for it in issues {
+        for f in &it.files {
+            union.insert(f);
+        }
+    }
+    let total_files = union.len();
+
+    // 数据不足：成员 < 2，或任一成员无文件画像（analysis_failed / 无 spec）→ 无法判定相关性。
+    let missing: Vec<String> = issues
+        .iter()
+        .filter(|i| i.files.is_empty())
+        .map(|i| i.title.clone())
+        .collect();
+    if total < 2 || !missing.is_empty() {
+        return GroupRelatedness {
+            shared_files: Vec::new(),
+            total_files,
+            overlap_ratio: 0.0,
+            signal: "insufficient",
+            conflict_hint: None,
+            missing_analysis: missing,
+        };
+    }
+
+    // 频率枢纽（与 compute_candidates 同规则）。
+    let mut freq: HashMap<&str, usize> = HashMap::new();
+    for it in issues {
+        for f in &it.files {
+            *freq.entry(f.as_str()).or_insert(0) += 1;
+        }
+    }
+    let is_hub = |f: &str| -> bool {
+        if is_builtin_hub(f) {
+            return true;
+        }
+        let c = *freq.get(f).unwrap_or(&0);
+        c >= HUB_MIN_COUNT && c * 2 >= total
+    };
+
+    // 全员文件交集 → 剔枢纽 = 实质共享。
+    let mut shared: BTreeSet<String> = issues[0].files.clone();
+    for it in &issues[1..] {
+        shared = shared.intersection(&it.files).cloned().collect();
+    }
+    let shared_substantive: Vec<String> = shared.iter().filter(|f| !is_hub(f)).cloned().collect();
+
+    // 冲突：某共享文件在一成员删除/重命名、在另一成员修改。
+    let mut conflict_files: Vec<String> = Vec::new();
+    for f in &shared_substantive {
+        let del = issues.iter().any(|i| i.deletes.contains(f));
+        let modi = issues
+            .iter()
+            .any(|i| i.files.contains(f) && !i.deletes.contains(f));
+        if del && modi {
+            conflict_files.push(f.clone());
+        }
+    }
+    let conflict_hint = (!conflict_files.is_empty()).then(|| {
+        format!(
+            "潜在冲突：{} 在不同需求中既被删除/重命名又被修改",
+            conflict_files.join("、")
+        )
+    });
+
+    // 重叠占比：分母取最小成员文件集（对「小并大」友好；与 compute_candidates 一致）。
+    let min_member = issues
+        .iter()
+        .map(|i| i.files.len())
+        .min()
+        .unwrap_or(0)
+        .max(1);
+    let overlap_ratio = shared_substantive.len() as f64 / min_member as f64;
+
+    let signal = if shared_substantive.is_empty() {
+        "unrelated" // 无任何共享实质文件 → 真无关（需人工二次确认）
+    } else if total_files <= MAX_BLAST
+        && conflict_hint.is_none()
+        && overlap_ratio >= LOW_OVERLAP_RATIO
+    {
+        "strong"
+    } else {
+        "weak"
+    };
+
+    GroupRelatedness {
+        shared_files: shared_substantive,
+        total_files,
+        overlap_ratio,
+        signal,
+        conflict_hint,
+        missing_analysis: Vec::new(),
+    }
+}
+
 /// 从一条需求的分析 spec 抽取文件画像。无 spec / 解析失败 → 文件集为空（不参与成组）。
 fn issue_files_from_spec(
     id: String,
@@ -213,6 +334,34 @@ fn issue_files_from_spec(
     }
 }
 
+/// 按 id 批量取需求文件画像（保序、**不滤空**——空画像用于判 insufficient）。
+/// 供 `preview_batch_bind` 与 `review_1_merge` 服务端护栏共用，保证两处相关度判定同源。
+pub(crate) async fn load_issue_files(
+    db: &crate::db::Db,
+    ids: &[String],
+) -> Result<Vec<IssueFiles>, String> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT i.title, a.analysis_json
+             FROM issues i
+             LEFT JOIN issue_analyses a ON a.issue_id = i.id
+             WHERE i.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some((title, json)) = row {
+            let spec = json
+                .as_deref()
+                .and_then(crate::agents::analysis::parse_spec);
+            out.push(issue_files_from_spec(id.clone(), title, spec.as_ref()));
+        }
+    }
+    Ok(out)
+}
+
 /// 列出某项目「需求审核」队列里的合并候选组。
 #[tauri::command]
 pub async fn list_merge_candidates(
@@ -244,6 +393,66 @@ pub async fn list_merge_candidates(
         .collect();
 
     Ok(compute_candidates(&issues))
+}
+
+/// 人工批量绑定预览：给定一组**任意圈选**的需求 id，返回相关度信号 + 上限/风险/确认门。
+/// 前端在「确认绑定」前调它渲染信号条，再据 `requires_confirm` 决定是否需 force 二次确认。
+/// 只读、零副作用、零 LLM 成本（设计评审 D5：取代 Err 字符串协议）。
+#[tauri::command]
+pub async fn preview_batch_bind(
+    issue_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<BatchBindPreview, String> {
+    // 去重保序。
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<String> = issue_ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+
+    // 一次循环：取每条的标题 + spec → 同时构建文件画像与批次风险（避免双查）。
+    let mut files_list: Vec<IssueFiles> = Vec::with_capacity(ids.len());
+    let mut est_high = false;
+    for id in &ids {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT i.title, a.analysis_json
+             FROM issues i
+             LEFT JOIN issue_analyses a ON a.issue_id = i.id
+             WHERE i.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        let Some((title, json)) = row else { continue };
+        let spec = json
+            .as_deref()
+            .and_then(crate::agents::analysis::parse_spec);
+        // est_risk：批次内任一成员高风险（含无 spec → risk_from_spec(None)=High）即 high。
+        // 保守提示；执行实际按 primary spec 选模型（execution.rs），此处仅给「将走强模型」预警。
+        if matches!(
+            crate::agents::code_agent::risk_from_spec(spec.as_ref()),
+            crate::agents::code_agent::CodeRisk::High
+        ) {
+            est_high = true;
+        }
+        files_list.push(issue_files_from_spec(id.clone(), title, spec.as_ref()));
+    }
+
+    let rel = group_relatedness(&files_list);
+    let requires_confirm = matches!(rel.signal, "unrelated" | "insufficient");
+    Ok(BatchBindPreview {
+        signal: rel.signal.to_string(),
+        relatedness: rel.overlap_ratio,
+        shared_files: rel.shared_files,
+        total_files: rel.total_files,
+        conflict_hint: rel.conflict_hint,
+        missing_analysis: rel.missing_analysis,
+        over_cap: ids.len() > MAX_GROUP,
+        max_group: MAX_GROUP,
+        est_risk: if est_high { "high" } else { "low" }.to_string(),
+        requires_confirm,
+    })
 }
 
 #[cfg(test)]
@@ -351,5 +560,64 @@ mod tests {
             .collect();
         // hot.rs 被 6/6 命中 → 也会被频率枢纽规则滤掉，双重保证不成巨簇。
         assert!(compute_candidates(&issues).is_empty());
+    }
+
+    // ── group_relatedness（人工批量绑定相关度，设计评审 D4 四态）──────────────────
+
+    #[test]
+    fn relatedness_strong_when_substantive_overlap() {
+        let issues = vec![
+            mk("a", &["src/foo.rs", "src/a.rs"]),
+            mk("b", &["src/foo.rs", "src/b.rs"]),
+        ];
+        let r = group_relatedness(&issues);
+        assert_eq!(r.signal, "strong");
+        assert_eq!(r.shared_files, vec!["src/foo.rs".to_string()]);
+        assert!(r.missing_analysis.is_empty());
+    }
+
+    #[test]
+    fn relatedness_unrelated_distinct_from_insufficient() {
+        // 都有文件数据、但零共享 → unrelated（不是 insufficient）。
+        let issues = vec![mk("a", &["src/x.rs"]), mk("b", &["src/y.rs"])];
+        let r = group_relatedness(&issues);
+        assert_eq!(r.signal, "unrelated");
+        assert!(r.shared_files.is_empty());
+        assert!(r.missing_analysis.is_empty());
+    }
+
+    #[test]
+    fn relatedness_insufficient_when_member_has_no_files() {
+        // b 无文件画像（分析失败/无 spec）→ insufficient，且 missing_analysis 含其标题。
+        let issues = vec![mk("a", &["src/x.rs"]), mk("b", &[])];
+        let r = group_relatedness(&issues);
+        assert_eq!(r.signal, "insufficient");
+        assert_eq!(r.missing_analysis, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn relatedness_weak_on_low_overlap() {
+        let issues = vec![
+            mk("a", &["src/foo.rs", "src/a1.rs", "src/a2.rs", "src/a3.rs"]),
+            mk("b", &["src/foo.rs", "src/b1.rs", "src/b2.rs", "src/b3.rs"]),
+        ];
+        let r = group_relatedness(&issues);
+        assert_eq!(r.signal, "weak");
+        assert_eq!(r.shared_files, vec!["src/foo.rs".to_string()]);
+    }
+
+    #[test]
+    fn relatedness_hub_only_share_is_unrelated() {
+        // 仅共享 lib.rs（登记类枢纽）→ 实质共享为空 → unrelated。
+        let issues = vec![
+            mk("a", &["src/lib.rs", "src/x.rs"]),
+            mk("b", &["src/lib.rs", "src/y.rs"]),
+        ];
+        assert_eq!(group_relatedness(&issues).signal, "unrelated");
+    }
+
+    #[test]
+    fn relatedness_single_issue_is_insufficient() {
+        assert_eq!(group_relatedness(&[mk("a", &["x.rs"])]).signal, "insufficient");
     }
 }
