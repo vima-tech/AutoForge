@@ -12,7 +12,7 @@ import type { Agent } from '../services';
  * - 数据解耦：父级把每一轮的预览文本(`rounds[].text`)与当前段发言者(`agents`)算好传入，
  *   本组件不感知 `msgs`/`msgText`，只负责呈现与交互。
  * - 命中区连续：项间距由各按钮内边距提供、容器 `gap:0`，鼠标在整列内移动 hover 不丢。
- * - 零位移：hover 不做位移特效（只改不影响布局的描边/刻度宽度），鼠标稳定不抖。
+ * - 零位移/零缩放：hover 不做位移或放大特效（只切换刻度/头像描边颜色与投影），鼠标稳定、选中精准不抖。
  * - hover 内容/名称气泡为实底面板，自带描边+阴影，无需虚化背景；离开留 100ms 意图缓冲防闪。
  */
 
@@ -94,9 +94,9 @@ export default function RoundAvatarStack({
       >
         <span style={{ display: 'flex', width: AV, justifyContent: 'center' }}>
           <span style={{
-            width: h ? 20 : 14, height: 2, borderRadius: 2,
+            width: 16, height: 2, borderRadius: 2,
             background: h ? 'var(--ember)' : 'var(--border-strong)',
-            transition: 'width .14s ease, background .14s ease',
+            transition: 'background .14s ease',
           }} />
         </span>
         {h && <div className="scroll" style={PANEL}>{r.text || '（无文本内容）'}</div>}
