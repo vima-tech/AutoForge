@@ -1982,8 +1982,15 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 /* 分组标题：粘性吸顶——组内滚动时标题钉在列表顶部，滚入下一组时由后一标题顶替。
    背景用 list-col 底色 var(--bg-1)，行从其下方完整穿过；z-index 高于 .req-item(relative)。 */
 .req-group-head { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; padding: 8px 12px 6px; background: var(--bg-1); font-size: var(--text-caption); letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); font-weight: 600; border-bottom: 1px solid var(--border); }
-.req-item { padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s, border-color .12s, box-shadow .12s; border: 1px solid transparent; }
+/* 可折叠分组标题：整行可点；hover 时轻微提示可交互（chevron/勾选框各自 stopPropagation） */
+.req-group-head.clickable:hover { color: var(--text-3); background: var(--surface-hover); }
+/* 列表行：左侧批量勾选框独占一列（gutter），右侧主内容纵向排布——把勾选与内容解耦，命中区更大、对齐更稳。 */
+.req-item { display: flex; align-items: flex-start; gap: 9px; padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s, border-color .12s, box-shadow .12s; border: 1px solid transparent; }
 .req-item:hover { background: var(--surface-hover); }
+.req-item-main { flex: 1 1 auto; min-width: 0; }
+.req-check { display: flex; flex-shrink: 0; align-items: center; cursor: pointer; padding-top: 1px; }
+/* 勾选框 hover/选中放大命中区并给 ember 光环，呼应 focus 态 */
+.req-check:hover > span { border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); }
 /* 选中态：ember 余烬高亮——着色底 + ember 实边 + 柔光环 + 左侧指示条（呼应 rail 激活态），
    让当前选中需求在长列表中一眼可辨。 */
 .req-item.active { background: var(--ember-tint); border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); }

@@ -470,6 +470,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   // 合并确认面板：待合并需求 id 集 + 可选预填候选（含共享文件/冲突提示）。null=未打开。
   const [mergePanel, setMergePanel] = useState<{ ids: string[]; candidate?: MergeCandidate } | null>(null);
   const [merging, setMerging] = useState(false);
+  // 分组折叠：键为 `${gate}:${status}`，存在=该组已折叠（仅收起组内行，标题与计数仍在，可重新展开）。
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   useEffect(() => {
     if (gate !== 'issue' || !activeProject) { setCandidates([]); return; }
     let alive = true;
@@ -600,8 +602,8 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
       return next.size === prev.size ? prev : next;
     });
   }, [selectableIds]);
-  // 切换闸口时清空批量选区，避免跨闸口选区残留与底部操作条错位。
-  useEffect(() => { setSelected(new Set()); }, [gate]);
+  // 切换闸口时清空批量选区与分组折叠态，避免跨闸口选区残留与底部操作条错位。
+  useEffect(() => { setSelected(new Set()); setCollapsedGroups(new Set()); }, [gate]);
 
   // 选中需求/变更后，自动把列表滚动到选中项（若不在视口内则居中显示），
   // 省去用户在长列表里手动翻找。每个选中 id 只滚一次：列表因后台任务高频刷新时不反复抖动。
@@ -638,6 +640,24 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
     const n = new Set(prev);
     if (allSelectableSelected) selectableIds.forEach(id => n.delete(id));
     else selectableIds.forEach(id => n.add(id));
+    return n;
+  });
+  // 分组折叠开关（按当前闸口 + 状态键，切闸口下方 effect 会清空）。
+  const isGroupCollapsed = (status: string) => collapsedGroups.has(gate + ':' + status);
+  const toggleGroupCollapse = (status: string) => setCollapsedGroups(prev => {
+    const n = new Set(prev); const k = gate + ':' + status;
+    n.has(k) ? n.delete(k) : n.add(k); return n;
+  });
+  // 「选择当前分组」：组内可批量 id 的三态（全选 / 半选 / 未选）与切换。
+  const groupSelState = (ids: string[]): 'all' | 'some' | 'none' => {
+    if (ids.length === 0) return 'none';
+    const c = ids.reduce((acc, id) => acc + (selected.has(id) ? 1 : 0), 0);
+    return c === 0 ? 'none' : c === ids.length ? 'all' : 'some';
+  };
+  const toggleGroupSel = (ids: string[]) => setSelected(prev => {
+    const n = new Set(prev);
+    const allOn = ids.length > 0 && ids.every(id => n.has(id));
+    if (allOn) ids.forEach(id => n.delete(id)); else ids.forEach(id => n.add(id));
     return n;
   });
   const runBatch = () => {
@@ -803,107 +823,120 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
           </div>
         )}
 
-        {/* 需求闸口：按状态分组（分析失败 / 待审核 / 分析中），各组独立标题，不再混作一栏 */}
+        {/* 需求闸口：按状态分组（分析失败 / 待审核 / 分析中），各组可折叠；
+            可批量分组标题左侧带「选择当前分组」三态框，多组并存时右侧再给「全选」（跨组）。 */}
         {gate === 'issue' && filteredIssues.length > 0 && (() => {
           const statusCounts = filteredIssues.reduce<Record<string, number>>((acc, i) => {
             acc[i.status] = (acc[i.status] ?? 0) + 1;
             return acc;
           }, {});
+          // 各状态分组的 id 集（「选择当前分组」按组取 id；同组状态一致故可批量性一致）。
+          const idsByStatus = filteredIssues.reduce<Record<string, string[]>>((acc, i) => {
+            (acc[i.status] ??= []).push(i.id);
+            return acc;
+          }, {});
+          // 可批量分组数 ≥2 时才显示跨组「全选」，与单组的「选择当前分组」区分开。
+          const selectableGroupCount = new Set(selectablePending.map(i => i.status)).size;
           let lastStatus = '';
-          let shownSelectAll = false;  // 全选只挂在第一个可批量分组的标题上（语义=全选当前可见可批量需求）
           return filteredIssues.map(issue => {
             const canSelect = issue.status === 'pending_issue_review' || issue.status === 'analysis_failed';
             const failed = issue.status === 'analysis_failed';
             const showLabel = issue.status !== lastStatus;
             lastStatus = issue.status;
-            const showSelectAll = showLabel && canSelect && !shownSelectAll && selectablePending.length > 0;
-            if (showSelectAll) shownSelectAll = true;
+            const collapsed = isGroupCollapsed(issue.status);
+            const groupIds = idsByStatus[issue.status] ?? [];
             return (
             <React.Fragment key={issue.id}>
               {showLabel && (
-                <div className="req-group-head">
-                  <span>{STATUS_LABEL[issue.status] ?? issue.status}</span>
-                  <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{statusCounts[issue.status]}</span>
-                  {showSelectAll && (
-                    <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选可批量操作的需求（待审核 / 分析失败）'}
-                      style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
-                      <LedgerCheck on={allSelectableSelected} /> 全选
-                    </button>
-                  )}
-                </div>
+                <GroupHead
+                  label={STATUS_LABEL[issue.status] ?? issue.status}
+                  count={statusCounts[issue.status]}
+                  collapsed={collapsed}
+                  onToggleCollapse={() => toggleGroupCollapse(issue.status)}
+                  group={canSelect ? { state: groupSelState(groupIds), onToggle: () => toggleGroupSel(groupIds) } : undefined}
+                  all={canSelect && selectableGroupCount >= 2 ? { selected: allSelectableSelected, onToggle: toggleAllSelectable } : undefined}
+                />
               )}
+            {!collapsed && (
             <div data-item-id={issue.id} className={'req-item' + (sel?.kind === 'issue' && sel.id === issue.id ? ' active' : '')} onClick={() => onSelectIssue(issue.id)}>
-              <div className="req-item-top">
-                {canSelect && (
-                  <span onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量操作">
-                    <LedgerCheck on={selected.has(issue.id)} />
-                  </span>
-                )}
-                <span className="req-id" onClick={canSelect ? (e => { e.stopPropagation(); toggleSel(issue.id); }) : undefined} style={canSelect ? { cursor: 'pointer' } : undefined} title={canSelect ? '点击选择以批量操作' : undefined}>{issue.id.slice(0, 8)}</span>
-                <span className={'chip ' + (STATUS_COLOR[issue.status] ?? 'amber')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{failed ? '分析失败' : issue.status === 'pending_analysis' ? '分析中' : '需求审核'}</span>
-                <span className="req-time">{fmtShort(issue.created_at)}</span>
+              {canSelect && (
+                <span className="req-check" onClick={e => { e.stopPropagation(); toggleSel(issue.id); }} title="选择以批量操作">
+                  <LedgerCheck on={selected.has(issue.id)} />
+                </span>
+              )}
+              <div className="req-item-main">
+                <div className="req-item-top">
+                  <span className="req-id">{issue.id.slice(0, 8)}</span>
+                  <span className={'chip ' + (STATUS_COLOR[issue.status] ?? 'amber')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{failed ? '分析失败' : issue.status === 'pending_analysis' ? '分析中' : '需求审核'}</span>
+                  <span className="req-time">{fmtShort(issue.created_at)}</span>
+                </div>
+                <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
+                {(() => {
+                  const cand = issueStrongCandidate.get(issue.id);
+                  if (!cand) return null;
+                  return (
+                    <div
+                      onClick={e => { e.stopPropagation(); setSelected(new Set(cand.issue_ids)); setMergePanel({ ids: cand.issue_ids, candidate: cand }); }}
+                      title={`与另外 ${cand.issue_ids.length - 1} 条需求共享 ${cand.shared_files.join('、')}，点击合并为一次变更`}
+                      style={{ marginTop: 4, display: 'inline-flex', alignItems: 'center', gap: 5, cursor: 'pointer', maxWidth: '100%' }}>
+                      <span className="chip ember" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>
+                        <Icon name="merge" size={11} /> 可合并 {cand.issue_ids.length}
+                      </span>
+                      <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{cand.shared_files[0]}</span>
+                    </div>
+                  );
+                })()}
               </div>
-              <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issue.title}>{issue.title}</div>
-              {(() => {
-                const cand = issueStrongCandidate.get(issue.id);
-                if (!cand) return null;
-                return (
-                  <div
-                    onClick={e => { e.stopPropagation(); setSelected(new Set(cand.issue_ids)); setMergePanel({ ids: cand.issue_ids, candidate: cand }); }}
-                    title={`与另外 ${cand.issue_ids.length - 1} 条需求共享 ${cand.shared_files.join('、')}，点击合并为一次变更`}
-                    style={{ marginTop: 4, display: 'inline-flex', alignItems: 'center', gap: 5, cursor: 'pointer', maxWidth: '100%' }}>
-                    <span className="chip ember" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>
-                      <Icon name="merge" size={11} /> 可合并 {cand.issue_ids.length}
-                    </span>
-                    <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{cand.shared_files[0]}</span>
-                  </div>
-                );
-              })()}
             </div>
+            )}
             </React.Fragment>
           );
           });
         })()}
 
-        {/* 代码审核 及其它 CR 状态 */}
+        {/* 代码审核 及其它 CR 状态：各组可折叠；待审核代码组带「选择当前分组」三态框 */}
         {gate === 'code' && (() => {
           const sorted = sortedCrs(filteredCrs, sortAsc);
           const statusCounts = sorted.reduce<Record<string, number>>((acc, r) => {
             acc[r.status] = (acc[r.status] ?? 0) + 1;
             return acc;
           }, {});
+          // 待审核代码组 id 集（「选择当前分组」用；代码闸只有此组可批量，故无需跨组「全选」）。
+          const pendingIds = sorted.filter(r => r.status === 'pending_code_review').map(r => r.id);
           let lastStatus = '';
           return sorted.map(r => {
             const showLabel = r.status !== lastStatus;
             lastStatus = r.status;
+            const canSelect = r.status === 'pending_code_review';
+            const collapsed = isGroupCollapsed(r.status);
             return (
               <React.Fragment key={r.id}>
                 {showLabel && (
-                  <div className="req-group-head">
-                    <span>{STATUS_LABEL[r.status] ?? r.status}</span>
-                    <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{statusCounts[r.status]}</span>
-                    {/* 批量代码审核：仅 pending_code_review 分组显示全选，可批量通过进入合并 */}
-                    {r.status === 'pending_code_review' && selectableCrs.length > 0 && (
-                      <button onClick={toggleAllSelectable} title={allSelectableSelected ? '取消全选' : '全选待审核代码'}
-                        style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
-                        <LedgerCheck on={allSelectableSelected} /> 全选
-                      </button>
-                    )}
-                  </div>
+                  <GroupHead
+                    label={STATUS_LABEL[r.status] ?? r.status}
+                    count={statusCounts[r.status]}
+                    collapsed={collapsed}
+                    onToggleCollapse={() => toggleGroupCollapse(r.status)}
+                    group={canSelect && selectableCrs.length > 0 ? { state: groupSelState(pendingIds), onToggle: () => toggleGroupSel(pendingIds) } : undefined}
+                  />
                 )}
+                {!collapsed && (
                 <div data-item-id={r.id} className={'req-item' + (sel?.kind === 'cr' && sel.id === r.id ? ' active' : '')} onClick={() => onSelectCr(r.id)}>
-                  <div className="req-item-top">
-                    {r.status === 'pending_code_review' && (
-                      <span onClick={e => { e.stopPropagation(); toggleSel(r.id); }} style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }} title="选择以批量通过">
-                        <LedgerCheck on={selected.has(r.id)} />
-                      </span>
-                    )}
-                    <span className="req-id" onClick={r.status === 'pending_code_review' ? (e => { e.stopPropagation(); toggleSel(r.id); }) : undefined} style={r.status === 'pending_code_review' ? { cursor: 'pointer' } : undefined} title={r.status === 'pending_code_review' ? '点击选择以批量通过' : undefined}>{r.id.slice(0, 8)}</span>
-                    <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
-                    <span className="req-time">{fmtShort(r.created_at)}</span>
+                  {canSelect && (
+                    <span className="req-check" onClick={e => { e.stopPropagation(); toggleSel(r.id); }} title="选择以批量通过">
+                      <LedgerCheck on={selected.has(r.id)} />
+                    </span>
+                  )}
+                  <div className="req-item-main">
+                    <div className="req-item-top">
+                      <span className="req-id">{r.id.slice(0, 8)}</span>
+                      <span className={'chip ' + (STATUS_COLOR[r.status] ?? '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{STATUS_LABEL[r.status] ?? r.status}</span>
+                      <span className="req-time">{fmtShort(r.created_at)}</span>
+                    </div>
+                    <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}>{issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}</div>
                   </div>
-                  <div className="req-title" style={{ fontSize: 'var(--text-control)' }} title={issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}>{issueTitles[r.issue_id] || r.issue_id.slice(0, 8)}</div>
                 </div>
+                )}
               </React.Fragment>
             );
           });
@@ -1376,9 +1409,50 @@ const canReject = (s: string) => !REJECT_SKIP.includes(s);
 
 function LedgerCheck({ on }: { on: boolean }) {
   return (
-    <span style={{ width: 16, height: 16, borderRadius: 5, border: '1px solid var(--border-strong)', background: on ? 'var(--ember)' : 'var(--bg-3)', display: 'grid', placeItems: 'center' }}>
+    <span style={{ width: 16, height: 16, borderRadius: 5, border: '1px solid ' + (on ? 'var(--ember)' : 'var(--border-strong)'), background: on ? 'var(--ember)' : 'var(--bg-3)', display: 'grid', placeItems: 'center' }}>
       {on && <Icon name="check" size={11} style={{ color: 'var(--bg)' }} />}
     </span>
+  );
+}
+
+// 分组级三态勾选框：all=整组已选（实心勾）/ some=部分已选（横杠）/ none=未选（空框）。
+function GroupCheck({ state }: { state: 'all' | 'some' | 'none' }) {
+  const lit = state !== 'none';
+  return (
+    <span style={{ width: 16, height: 16, borderRadius: 5, border: '1px solid ' + (lit ? 'var(--ember)' : 'var(--border-strong)'), background: state === 'all' ? 'var(--ember)' : 'var(--bg-3)', display: 'grid', placeItems: 'center' }}>
+      {state === 'all' && <Icon name="check" size={11} style={{ color: 'var(--bg)' }} />}
+      {state === 'some' && <span style={{ width: 8, height: 2, borderRadius: 1, background: 'var(--ember)' }} />}
+    </span>
+  );
+}
+
+// 列表分组标题：整行点击折叠/展开（chevron 指示）；可批量分组左侧带「选择当前分组」三态框，
+// 多个可批量分组并存时右侧再给一个「全选」按钮（跨组），二者语义区分。
+function GroupHead({ label, count, collapsed, onToggleCollapse, group, all }: {
+  label: string; count: number; collapsed: boolean; onToggleCollapse: () => void;
+  group?: { state: 'all' | 'some' | 'none'; onToggle: () => void };
+  all?: { selected: boolean; onToggle: () => void };
+}) {
+  return (
+    <div className="req-group-head clickable" onClick={onToggleCollapse} style={{ cursor: 'pointer', userSelect: 'none' }}>
+      <Icon name="chevRight" size={12} style={{ color: 'var(--text-faint)', transition: 'transform .15s', transform: collapsed ? 'none' : 'rotate(90deg)', flexShrink: 0 }} />
+      {group && (
+        <span onClick={e => { e.stopPropagation(); group.onToggle(); }}
+          title={group.state === 'all' ? '取消选择当前分组' : '选择当前分组'}
+          style={{ display: 'flex', flexShrink: 0, cursor: 'pointer' }}>
+          <GroupCheck state={group.state} />
+        </span>
+      )}
+      <span>{label}</span>
+      <span style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0, color: 'var(--text-3)' }}>{count}</span>
+      {all && (
+        <button onClick={e => { e.stopPropagation(); all.onToggle(); }}
+          title={all.selected ? '取消全选（所有可批量分组）' : '全选所有可批量分组'}
+          style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px', borderRadius: 6, color: all.selected ? 'var(--ember-soft)' : 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', letterSpacing: 0, textTransform: 'none' }}>
+          <Icon name="layers" size={12} /> {all.selected ? '取消全选' : '全选'}
+        </button>
+      )}
+    </div>
   );
 }
 
