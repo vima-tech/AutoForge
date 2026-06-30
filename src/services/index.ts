@@ -511,6 +511,9 @@ export const exportIssues = (
 // 按状态集合取需求（有界子集，如需求审核 队列），替代全量加载。
 export const listIssuesByStatuses = (projectId: string, statuses: string[]) =>
   ipc<Issue[]>('list_issues_by_statuses', { projectId, statuses });
+// 跨项目「待审核需求」计数（GROUP BY，只取计数）：喂功能审计页项目列表的需求待审徽标。
+export const countPendingIssueReviews = () =>
+  ipc<{ project_id: string; count: number }[]>('count_pending_issue_reviews', {});
 // 批量取需求标题（轻量），用于变更请求列表解析标题。
 export const listIssueTitles = (ids: string[]) =>
   ipc<{ id: string; title: string }[]>('list_issue_titles', { ids });

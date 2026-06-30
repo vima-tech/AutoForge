@@ -10,7 +10,7 @@ import { ReaderToc } from '../components/ReaderToc';
 import { toggleMaximizeOnDoubleClick } from '../lib/window';
 import { fmtShort, fmtFull } from '../utils/datetime';
 import {
-  listActiveProjects, listChangeRequests, listChangeRequestsPage, getChangeRequestByIssue, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
+  listActiveProjects, listChangeRequests, listChangeRequestsPage, countPendingIssueReviews, getChangeRequestByIssue, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
   retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles, exportIssues,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
@@ -435,7 +435,7 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
   onSelectCr, onSelectIssue, onOpenLedger, onBatchApprove, onBatchApproveCrs, onBatchReanalyze, onBatchReject, onMerge, gate,
   width, hasMoreMerged, mergedLoading, onLoadMoreMerged }: {
   projects: Project[]; activeProject: Project | null; setActiveProject: (p: Project) => void;
-  projectReviewCounts: Record<string, number>; crs: ChangeRequest[]; pendingIssues: Issue[];
+  projectReviewCounts: Record<string, { issue: number; code: number }>; crs: ChangeRequest[]; pendingIssues: Issue[];
   issueTitles: Record<string, string>; sel: Sel | null;
   onSelectCr: (id: string) => void; onSelectIssue: (id: string) => void; onOpenLedger: () => void;
   // 批量需求审核：通过选中的待审核需求，返回 Promise 供调用方等待刷新。
@@ -717,11 +717,18 @@ function AuditList({ projects, activeProject, setActiveProject, projectReviewCou
                   </div>
                   <div className="rl">{p.description || p.slug}</div>
                 </div>
-                {(projectReviewCounts[p.id] ?? 0) > 0 && (
-                  <span className="chip amber" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)', flexShrink: 0 }}>
-                    {projectReviewCounts[p.id]}
-                  </span>
-                )}
+                <span style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                  {(projectReviewCounts[p.id]?.issue ?? 0) > 0 && (
+                    <span className="chip amber" title="待审核需求" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)' }}>
+                      需 {projectReviewCounts[p.id].issue}
+                    </span>
+                  )}
+                  {(projectReviewCounts[p.id]?.code ?? 0) > 0 && (
+                    <span className="chip amber" title="待审核代码" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)' }}>
+                      码 {projectReviewCounts[p.id].code}
+                    </span>
+                  )}
+                </span>
               </div>
             ))}
           </div>
@@ -2453,7 +2460,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [crLoading, setCrLoading] = useState(false);
   // 任务进度心跳：cr_id → 最近一次阶段说明，用于在编码/合并期间显示「活着」的进度。
   const [crProgress, setCrProgress] = useState<Record<string, { phase: string; note?: string }>>({});
-  const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, number>>({});
+  // 每项目两闸口待审计数：issue=待审核需求(pending_issue_review)，code=待审核代码(pending_code_review)。
+  const [projectReviewCounts, setProjectReviewCounts] = useState<Record<string, { issue: number; code: number }>>({});
   const [intakeOpen, setIntakeOpen] = useState(false);
   // 日志内容经事件驱动累积（见 LiveLogModal）；phase 在渲染处按 sig 实时计算，故此处只存 sig。
   const [logModal, setLogModal] = useState<{ title: string; sig: string } | null>(null);
@@ -2513,11 +2521,18 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const activeCrUpdatedAt = sel?.kind === 'cr' ? crs.find(c => c.id === sel.id)?.updated_at : undefined;
 
   const loadProjectReviewCounts = useCallback(async () => {
-    const pending = await listChangeRequests(undefined, 'pending_code_review');
-    setProjectReviewCounts(pending.reduce<Record<string, number>>((acc, cr) => {
-      acc[cr.project_id] = (acc[cr.project_id] ?? 0) + 1;
-      return acc;
-    }, {}));
+    const [pendingCrs, pendingIssueCounts] = await Promise.all([
+      listChangeRequests(undefined, 'pending_code_review'),
+      countPendingIssueReviews(),
+    ]);
+    const counts: Record<string, { issue: number; code: number }> = {};
+    for (const c of pendingIssueCounts) {
+      (counts[c.project_id] ??= { issue: 0, code: 0 }).issue = c.count;
+    }
+    for (const cr of pendingCrs) {
+      (counts[cr.project_id] ??= { issue: 0, code: 0 }).code += 1;
+    }
+    setProjectReviewCounts(counts);
   }, []);
 
   const loadProjects = useCallback(async () => {

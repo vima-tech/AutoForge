@@ -188,6 +188,27 @@ pub async fn list_issues_by_statuses(
         .map_err(|e| e.to_string())
 }
 
+/// 跨项目「待审核需求」计数：按 project_id 分组统计 pending_issue_review 数量。
+/// 用于功能审计页项目列表的需求待审徽标——只取计数，避免全量加载 issues 行。
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct ProjectIssueReviewCount {
+    pub project_id: String,
+    pub count: i64,
+}
+
+#[tauri::command]
+pub async fn count_pending_issue_reviews(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectIssueReviewCount>, String> {
+    sqlx::query_as::<_, ProjectIssueReviewCount>(
+        "SELECT project_id, COUNT(*) AS count FROM issues \
+         WHERE status = 'pending_issue_review' GROUP BY project_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // ── 总账导出（全量 / 按状态类型多选）────────────────────────────────────────
 // 「全量需求总账」页的导出：可全量导出，或多选状态类型只导其中几类；
 // 支持 CSV / Excel(xlsx)，xlsx 可「按类型分表」（每个状态一个工作表）。
