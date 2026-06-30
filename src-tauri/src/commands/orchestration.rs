@@ -917,7 +917,18 @@ async fn execute_conversation_task(
         &project_prefix,
     )
     .await?;
-    let members = load_schedulable_members(&db, &payload.conversation_id).await?;
+    let mut members = load_schedulable_members(&db, &payload.conversation_id).await?;
+    // 内置「编码 Agent」：在绑定了项目的群聊里，作为一个可 @ 的虚拟成员自动出现（不入库）。
+    // 被显式 @ 时用当前系统默认编码 Agent 只读跑仓库作答。详见 [`BUILTIN_CODE_AGENT_ID`]。
+    if conversation.conv_type == "group"
+        && conversation
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    {
+        members.push(builtin_code_agent_member());
+    }
     // Roster of who else is in the room (name + specialty), injected into every
     // agent prompt so agents know whom they can @ to bring in the right expert.
     let roster = build_member_roster(&members);
@@ -1203,7 +1214,12 @@ async fn build_plan(
     if !needs_planner {
         // `@所有人`：被点名的恰好覆盖全部可调度成员（且不止一人）。让全员并发就同一话题
         // 表态，并显式要求互相分析、@ 彼此尽快收敛到一致意见（后续链式 @ 跟进阶段接力）。
-        let is_everyone = mentioned.len() > 1 && mentioned.len() == members.len();
+        // 计数排除内置「编码 Agent」——它不随 `@所有人` 广播（重型 CLI），不应影响"全员"判定。
+        let real_member_count = members
+            .iter()
+            .filter(|m| m.id != BUILTIN_CODE_AGENT_ID)
+            .count();
+        let is_everyone = mentioned.len() > 1 && mentioned.len() == real_member_count;
         let step_instruction = if is_everyone {
             consensus_instruction(instruction)
         } else {
@@ -1603,7 +1619,12 @@ async fn run_agent_for_step(
     .await
     .map_err(|e| e.to_string())?;
 
-    let agent = load_agent(ctx.db, agent_id).await?;
+    // 内置「编码 Agent」虚拟成员不入库，合成其 Agent；其余成员照常查库。
+    let agent = if agent_id == BUILTIN_CODE_AGENT_ID {
+        builtin_code_agent_member()
+    } else {
+        load_agent(ctx.db, agent_id).await?
+    };
     // 编码 Agent 后端成员：改走 CLI 只读跑项目仓库作答的路径（不经 LLM tool-loop）。
     // 复用已插入的 run_id 这条 conversation_task_runs 行。
     if let Some(code_agent_id) = agent.code_agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -1737,19 +1758,22 @@ async fn run_code_agent_reply(
     code_agent_id: &str,
     instruction: &str,
 ) -> Result<AgentOutcome, String> {
-    // 1) 需要项目仓库（只读读取真实代码）。
-    let repo_path = match ctx.project_id {
+    // 1) 需要项目仓库（只读读取真实代码）。完整加载项目行：repo_path 与（内置成员的）
+    //    resolve 都要用它。
+    let project = match ctx.project_id {
         Some(pid) => sqlx::query_as::<_, crate::models::project::Project>(
             "SELECT * FROM projects WHERE id=?",
         )
         .bind(pid)
         .fetch_optional(ctx.db)
         .await
-        .map_err(|e| e.to_string())?
-        .map(|p| p.repo_path)
-        .unwrap_or_default(),
-        None => String::new(),
+        .map_err(|e| e.to_string())?,
+        None => None,
     };
+    let repo_path = project
+        .as_ref()
+        .map(|p| p.repo_path.clone())
+        .unwrap_or_default();
     if repo_path.trim().is_empty() {
         let msg = format!(
             "我是编码 Agent 成员「{}」，需要本群聊**绑定一个带仓库路径的项目**才能读取真实代码作答。\
@@ -1760,11 +1784,19 @@ async fn run_code_agent_reply(
         return finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, true, msg, None)
             .await;
     }
+    // repo_path 非空蕴含 project 必为 Some。
+    let project = project.expect("repo_path non-empty implies project loaded");
 
-    // 2) 解析该成员绑定的编码 Agent（查不到/停用即降级，不静默兜底 claude）。
-    let Some(code_agent) =
+    // 2) 解析编码 Agent 后端：
+    //    - 内置「编码 Agent」虚拟成员（哨兵 BUILTIN_CODE_AGENT_ID）→ resolve（当前系统默认，
+    //      含项目覆盖、硬兜底 claude），随设置里选的默认而变；
+    //    - 显式绑定某 code_agents.id 的成员 → resolve_by_id（查不到/停用即降级，不静默兜底）。
+    let code_agent = if code_agent_id == BUILTIN_CODE_AGENT_ID {
+        Some(crate::agents::code_agent::resolve(ctx.db, &project).await)
+    } else {
         crate::agents::code_agent::resolve_by_id(ctx.db, code_agent_id).await
-    else {
+    };
+    let Some(code_agent) = code_agent else {
         let msg = format!(
             "我绑定的编码 Agent 不可用（可能已被删除或停用）。请在「设置 → Agent」里为成员「{}」\
              重新指定编码 Agent 后端。",
@@ -2810,6 +2842,41 @@ async fn last_speaking_member(
         .iter()
         .find(|m| m.id == last && !is_code_agent_member(m))
         .map(|m| m.id.clone())
+}
+
+/// 内置「编码 Agent」虚拟成员的稳定 id。它**不入库**（不在 `agents` / `conversation_members`
+/// 表），仅在运行时注入到「绑定了项目的群聊」的成员集中：被显式 @ 时用**当前系统默认编码
+/// Agent**（`code_agent::resolve`，含项目覆盖、硬兜底 claude）只读跑仓库作答——随设置里选的
+/// 默认而变，无需把群成员逐个切成编码 Agent。前端 `Conversations.tsx` 用同名常量在 @ 候选 /
+/// 作者渲染里镜像它，改这个值需两端同步。
+pub const BUILTIN_CODE_AGENT_ID: &str = "__builtin_code_agent__";
+
+/// 构造内置「编码 Agent」虚拟成员。`code_agent_id` 置为 [`BUILTIN_CODE_AGENT_ID`] 作哨兵：据此
+/// `is_code_agent_member` 为真（只在显式 @ 时触发、不参与自动选人/连续性接话），且
+/// `run_code_agent_reply` 走 `resolve`（当前默认）而非 `resolve_by_id`。
+fn builtin_code_agent_member() -> Agent {
+    Agent {
+        id: BUILTIN_CODE_AGENT_ID.to_string(),
+        name: "编码 Agent".to_string(),
+        name_en: "CodeAgent".to_string(),
+        role: "只读读项目真实代码答疑".to_string(),
+        color: "#e8772e".to_string(),
+        initial: "码".to_string(),
+        llm_id: None,
+        system_prompt: String::new(),
+        forge_role: None,
+        role_type: "system".to_string(),
+        system_kind: None,
+        capabilities_json: "[]".to_string(),
+        max_concurrency: 1,
+        visible_in_chat: true,
+        mentionable: true,
+        enabled: true,
+        prompt_mode: "builtin".to_string(),
+        memory_enabled: false,
+        code_agent_id: Some(BUILTIN_CODE_AGENT_ID.to_string()),
+        created_at: String::new(),
+    }
 }
 
 /// 该成员是否由编码 Agent（CLI）后端驱动（`agents.code_agent_id` 非空）。这类成员只读跑项目

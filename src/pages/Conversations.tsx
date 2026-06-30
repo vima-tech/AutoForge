@@ -97,6 +97,28 @@ function clearComposerDraft(convId: string) {
 const ALL_MENTION_ID = '__all__';
 type MentionItem = { kind: 'all' } | { kind: 'agent'; agent: Agent };
 
+// 内置「编码 Agent」虚拟成员：与后端 orchestration.rs 的 BUILTIN_CODE_AGENT_ID 同值。
+// 它不入库，仅在「绑定了项目的群聊」里作为可 @ 成员出现，被 @ 时由后端用当前系统默认
+// 编码 Agent（设置→编码 Agent 里选的默认）只读跑仓库作答。改这个值需两端同步。
+const BUILTIN_CODE_AGENT_ID = '__builtin_code_agent__';
+// 合成其前端 Agent 对象，供 @ 候选列表与消息作者/头像查表渲染。mentionable/visible_in_chat
+// 置 false 使其**不混入**成员选择器/快速添加等通用 `agents.filter(...)` 列表（它不是可手动
+// 增删的成员）；@ 候选由 members memo 显式追加，不受这两个开关影响。
+function builtinCodeAgent(): Agent {
+  return {
+    id: BUILTIN_CODE_AGENT_ID,
+    name: '编码 Agent', name_en: 'CodeAgent',
+    role: '只读读项目真实代码答疑',
+    color: 'var(--ember)', initial: '码', llm_id: null,
+    system_prompt: '', forge_role: null,
+    role_type: 'system', system_kind: null,
+    capabilities_json: '[]', max_concurrency: 1,
+    visible_in_chat: false, mentionable: false, enabled: true,
+    prompt_mode: 'builtin', memory_enabled: false,
+    code_agent_id: BUILTIN_CODE_AGENT_ID, created_at: '',
+  };
+}
+
 // Innate 知识库斜杠命令：在私聊/群聊里手动触发记忆存储、召回、进化与状态查看。
 interface SlashCommand { name: ConvCommandName; usage: string; desc: string; icon: string; }
 const SLASH_COMMANDS: SlashCommand[] = [
@@ -858,10 +880,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const isG = conv.conv_type === 'group';
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const members  = useMemo(
-    () => isG
-      ? conv.members.map(id => agentMap[id]).filter((a): a is Agent => !!a && a.mentionable && a.enabled)
-      : [],
-    [isG, conv.members, agentMap],
+    () => {
+      if (!isG) return [];
+      const list = conv.members.map(id => agentMap[id]).filter((a): a is Agent => !!a && a.mentionable && a.enabled);
+      // 绑定了项目的群聊：把内置「编码 Agent」显式追加为可 @ 成员（不受其 mentionable=false 影响）。
+      if (conv.project_id) list.push(builtinCodeAgent());
+      return list;
+    },
+    [isG, conv.members, conv.project_id, agentMap],
   );
   // 下拉候选：成员超过 1 人时，置顶一个「@所有人」选项。
   const mentionItems = useMemo<MentionItem[]>(() => {
@@ -1301,8 +1327,13 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const ids = Array.from(editor.querySelectorAll<HTMLElement>('.mention-tag'))
       .map(node => node.dataset.agentId)
       .filter((id): id is string => !!id);
-    // `@所有人` 展开为当前全部可点名成员。
-    const expanded = ids.flatMap(id => (id === ALL_MENTION_ID ? members.map(m => m.id) : [id]));
+    // `@所有人` 展开为当前全部可点名成员，但**排除内置「编码 Agent」**——它是重型 CLI，
+    // 只应被显式单独 @，不随广播一起触发，避免误烧 token。
+    const expanded = ids.flatMap(id =>
+      id === ALL_MENTION_ID
+        ? members.map(m => m.id).filter(mid => mid !== BUILTIN_CODE_AGENT_ID)
+        : [id],
+    );
     return Array.from(new Set(expanded));
   };
 
@@ -2355,8 +2386,11 @@ export default function ConversationsPage() {
   const loadConvs = useCallback(async () => {
     const [cs, as, ps] = await Promise.all([listConversations(), listAgents(), listProjects()]);
     setConvs(cs);
-    setAgents(as);
-    primeAgents(as);  // 同步全局 Agent store（Markdown @提及 / Avatar 查表的真源）
+    // 把内置「编码 Agent」并入列表：让所有由页面 `agents` 派生的 agentMap（消息作者名/头像、
+    // @提及解析）都能查到它；其 mentionable/visible_in_chat=false 故不会混入成员选择器。
+    const withBuiltin = [...as, builtinCodeAgent()];
+    setAgents(withBuiltin);
+    primeAgents(withBuiltin);  // 同步全局 Agent store（Markdown @提及 / Avatar 查表的真源）
     setProjects(ps);
     // Keep the current/persisted conversation if it still exists; otherwise fall back
     // to the first group conversation (groups listed before directs in the UI).
