@@ -2792,7 +2792,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     finally { refiningStore.remove(fresh); }
     setLedgerRefresh(v => v + 1);
     if (activeProject) await loadList(activeProject.id);
-  }, [activeProject, loadList, showError, showOk, showInfo]);
+    // 整理会把 triage 碎片转为 pending_issue_review 等态，改变项目列表待审计数——刷新徽标与全局徽章。
+    await loadProjectReviewCounts();
+    window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+  }, [activeProject, loadList, loadProjectReviewCounts, showError, showOk, showInfo]);
 
   // 批量拒绝：triage 碎片硬删除，其余软归档为 rejected，运行中/已合并跳过。
   const rejectIssuesItems = useCallback(async (ids: string[]) => {
@@ -2807,7 +2810,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } catch (e) { showError('拒绝失败：' + String(e)); }
     setLedgerRefresh(v => v + 1);
     if (activeProject) await loadList(activeProject.id);
-  }, [activeProject, loadList, showError, showOk]);
+    // 拒绝/归档会从待审队列移除需求，改变项目列表待审计数——刷新徽标与全局徽章（其余审核动作均如此）。
+    await loadProjectReviewCounts();
+    window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+  }, [activeProject, loadList, loadProjectReviewCounts, showError, showOk]);
 
   useEffect(() => { if (activeProject) loadList(activeProject.id); }, [activeProject, loadList]);
 
