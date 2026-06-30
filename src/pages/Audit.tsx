@@ -36,15 +36,31 @@ type Sel = { kind: 'issue' | 'cr'; id: string };
 // 模块级「整理中」碎片 id 存储：脱离 React 组件树而存在，使功能审计页卸载（切换页面）后
 // 仍保持，重新挂载时恢复 spinner。triage 后端命令本就跑到完（与前端挂载无关），这里只是
 // 让前端「整理中」标记跨页存活——切走页面整理不会中断，回来仍显示在途。
-// 用 useSyncExternalStore 订阅；getSnapshot 仅在增删时换新引用，未变时引用稳定。
+// 按项目隔离：每个项目持有独立的在途集合，切换项目时各看各的，绝不串台（项目1整理中不影响项目2）。
+// 用 useSyncExternalStore 订阅；getSnapshot 仅在该项目集合增删时换新引用，未变时引用稳定。
+const REFINING_EMPTY: ReadonlySet<string> = new Set();
 const refiningStore = (() => {
-  let ids = new Set<string>();
+  const byProject = new Map<string, Set<string>>();
   const subs = new Set<() => void>();
   const emit = () => subs.forEach(fn => fn());
   return {
-    get: () => ids,
-    add(more: string[]) { if (!more.length) return; ids = new Set([...ids, ...more]); emit(); },
-    remove(less: string[]) { if (!less.length) return; const n = new Set(ids); less.forEach(id => n.delete(id)); ids = n; emit(); },
+    // 缺省项目（或集合为空）统一返回同一冻结空集，保证 getSnapshot 引用稳定。
+    get: (projectId: string): Set<string> => byProject.get(projectId) ?? (REFINING_EMPTY as Set<string>),
+    add(projectId: string, more: string[]) {
+      if (!projectId || !more.length) return;
+      const cur = byProject.get(projectId) ?? new Set<string>();
+      byProject.set(projectId, new Set([...cur, ...more]));
+      emit();
+    },
+    remove(projectId: string, less: string[]) {
+      if (!projectId || !less.length) return;
+      const cur = byProject.get(projectId);
+      if (!cur) return;
+      const n = new Set(cur);
+      less.forEach(id => n.delete(id));
+      if (n.size) byProject.set(projectId, n); else byProject.delete(projectId);
+      emit();
+    },
     subscribe(fn: () => void) { subs.add(fn); return () => { subs.delete(fn); }; },
   };
 })();
@@ -2514,7 +2530,10 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [ledgerRefresh, setLedgerRefresh] = useState(0);
   // 正在整理中的碎片 id：取自模块级 refiningStore（脱离组件树），使「整理中」spinner 在
   // 总账弹窗关闭/重开、乃至切换页面后仍保持（后端 triage 命令本就在后台跑到完）。
-  const refiningIds = useSyncExternalStore(refiningStore.subscribe, refiningStore.get);
+  // 仅取当前项目的在途集合，做到项目间隔离——切到别的项目不再误显「整理中」。
+  const refiningProjectId = activeProject?.id ?? '';
+  const refiningSnapshot = useCallback(() => refiningStore.get(refiningProjectId), [refiningProjectId]);
+  const refiningIds = useSyncExternalStore(refiningStore.subscribe, refiningSnapshot);
   // 通知导航请求时自动打开总账弹窗，并立即消费该意图（避免再次进入本页时重复弹出）。
   useEffect(() => {
     if (openLedger) { setShowLedger(true); onLedgerConsumed?.(); }
@@ -2779,11 +2798,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   // 整理待整理池条目：triage Agent 炼成正经需求并转入流水线。
   // triage Agent 炼成正经需求并转入流水线；反馈整理/丢弃/出错数。
   const refineTriageItems = useCallback(async (ids: string[]) => {
+    // 整理归属当前项目；按项目隔离记录在途，切到别的项目不会误显「整理中」。
+    const pid = activeProject?.id ?? '';
+    if (!pid) return;
     // 只整理本批未在途的 id，避免重复入队；并入模块级 refiningStore 以驱动 spinner
     // （跨弹窗关闭/重开、跨页面切换均保持，因后端命令在后台跑到完）。
-    const fresh = ids.filter(id => !refiningStore.get().has(id));
+    const fresh = ids.filter(id => !refiningStore.get(pid).has(id));
     if (!fresh.length) return;
-    refiningStore.add(fresh);
+    refiningStore.add(pid, fresh);
     showInfo(`正在调用 triage Agent 整理 ${fresh.length} 条碎片，请稍候…`);
     try {
       const r = await refineTriage(fresh);
@@ -2793,7 +2815,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
         showOk(`整理完成：转入流水线 ${r.refined} · 判为噪音丢弃 ${r.discarded}` + (r.errors ? ` · 失败 ${r.errors}` : ''));
       }
     } catch (e) { showError('整理失败：' + String(e)); }
-    finally { refiningStore.remove(fresh); }
+    finally { refiningStore.remove(pid, fresh); }
     setLedgerRefresh(v => v + 1);
     if (activeProject) await loadList(activeProject.id);
     // 整理会把 triage 碎片转为 pending_issue_review 等态，改变项目列表待审计数——刷新徽标与全局徽章。
