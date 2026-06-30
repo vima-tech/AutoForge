@@ -1605,6 +1605,8 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
 
   // 导出：勾选的状态类型（空集 = 全量）。「显示已合并需求」关闭时不展示 merged 类型。
   const exportTypes = statuses.filter(s => showMerged || s !== 'merged');
+  // 字段小标题样式（对齐 .field label：mono 大写小字）。
+  const exportLabel: React.CSSProperties = { fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', letterSpacing: '.04em', textTransform: 'uppercase' };
   const toggleExportType = (s: string) => setExportSel(prev => { const n = new Set(prev); n.has(s) ? n.delete(s) : n.add(s); return n; });
   const doExport = () => {
     if (exporting) return;
@@ -1622,7 +1624,7 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
       {/* 搜索栏 + 筛选 tag：固定在顶部，不随列表滚动。 */}
       <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 12px' }}>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', position: 'relative' }}>
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题 / 编号…"
             style={{ flex: 1, minWidth: 0, boxSizing: 'border-box', background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '6px 10px', color: 'var(--text)', fontSize: 'var(--text-control)', outline: 'none' }} />
           {/* 创建时间正/倒序切换：默认正序（旧需求在前），避免问题积压。 */}
@@ -1643,57 +1645,74 @@ function LedgerView({ projectId, refreshKey, sel, onSelectIssue, onRefineTriage,
             title="导出需求（全量或按类型多选）">
             <Icon name="download" size={16} />
           </button>
-        </div>
         {exportOpen && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10 }}>
-            {/* 格式选择 */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', minWidth: 44 }}>格式</span>
-              <div className="seg" style={{ flexShrink: 0 }}>
-                <button className={exportFmt === 'xlsx' ? 'on' : ''} onClick={() => setExportFmt('xlsx')}>Excel</button>
-                <button className={exportFmt === 'csv' ? 'on' : ''} onClick={() => setExportFmt('csv')}>CSV</button>
-              </div>
+          <div role="dialog" aria-label="导出需求"
+            style={{ position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 30, width: 320,
+              display: 'flex', flexDirection: 'column',
+              background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-lg)', overflow: 'hidden' }}>
+            {/* 头部 */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '11px 14px', borderBottom: '1px solid var(--border)' }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 7, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-label)', letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--text-2)' }}>
+                <Icon name="download" size={14} style={{ color: 'var(--ember)' }} />导出需求
+              </span>
+              <button className="icon-btn btn-sm" onClick={() => setExportOpen(false)} title="关闭"><Icon name="x" size={15} /></button>
             </div>
-            {/* 状态类型多选：空选=全量 */}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', minWidth: 44, paddingTop: 3 }}>类型</span>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 0 }}>
-                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: '14px' }}>
+              {/* 格式 */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                <span style={exportLabel}>格式</span>
+                <div className="seg" style={{ alignSelf: 'flex-start' }}>
+                  <button className={exportFmt === 'xlsx' ? 'on' : ''} onClick={() => setExportFmt('xlsx')}>Excel</button>
+                  <button className={exportFmt === 'csv' ? 'on' : ''} onClick={() => setExportFmt('csv')}>CSV</button>
+                </div>
+              </div>
+
+              {/* 类型多选（空选=全量） */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+                  <span style={exportLabel}>类型</span>
+                  <span style={{ fontSize: 'var(--text-micro)', color: exportSel.size ? 'var(--ember-soft)' : 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
+                    {exportSel.size === 0 ? '不选 = 全量' : `已选 ${exportSel.size} 类`}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
                   <button onClick={() => setExportSel(new Set())}
                     className={'filter-chip' + (exportSel.size === 0 ? ' on' : '')}
-                    style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>全部</button>
+                    style={{ fontSize: 'var(--text-micro)', padding: '3px 9px' }}>全部</button>
                   {exportTypes.map(s => (
                     <button key={s} onClick={() => toggleExportType(s)}
                       className={'filter-chip' + (exportSel.has(s) ? ' on' : '')}
-                      style={{ fontSize: 'var(--text-micro)', padding: '2px 8px' }}>
+                      style={{ fontSize: 'var(--text-micro)', padding: '3px 9px' }}>
                       {LEDGER_STATUS_LABEL[s] ?? s}
                     </button>
                   ))}
                 </div>
-                <span style={{ fontSize: 'var(--text-micro)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
-                  {exportSel.size === 0 ? '不选=全量导出' : `已选 ${exportSel.size} 类`}
-                </span>
               </div>
+
+              {/* xlsx 按类型分表 */}
+              {exportFmt === 'xlsx' && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: 9, cursor: 'pointer' }} onClick={() => setExportSplit(v => !v)}>
+                  <LedgerCheck on={exportSplit} />
+                  <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)', lineHeight: 'var(--leading-snug)' }}>按类型分表<span style={{ color: 'var(--text-faint)' }}>（每个状态一个工作表）</span></span>
+                </label>
+              )}
             </div>
-            {/* xlsx 按类型分表 */}
-            {exportFmt === 'xlsx' && (
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setExportSplit(v => !v)}>
-                <LedgerCheck on={exportSplit} />
-                <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-2)' }}>按类型分表（每个状态一个工作表）</span>
-              </label>
-            )}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <button className="btn btn-sm btn-primary" disabled={exporting} onClick={doExport} title="导出到系统下载目录">
-                {exporting ? <><Icon name="brain" size={13} className="spin" />导出中…</> : <><Icon name="download" size={13} />导出</>}
+
+            {/* 底部操作 */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '12px 14px', borderTop: '1px solid var(--border)', background: 'var(--bg-1)' }}>
+              <button className="btn btn-sm btn-primary" disabled={exporting} onClick={doExport} title="导出到系统下载目录" style={{ width: '100%', justifyContent: 'center' }}>
+                {exporting ? <><Icon name="brain" size={13} className="spin" />导出中…</> : <><Icon name="download" size={13} />导出{exportSel.size ? ` ${exportSel.size} 类` : '全量'}</>}
               </button>
               {exportMsg && (
-                <span style={{ flex: 1, minWidth: 0, fontSize: 'var(--text-micro)', color: exportMsg.ok ? 'var(--green)' : 'var(--red)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={exportMsg.text}>
+                <span style={{ fontSize: 'var(--text-micro)', color: exportMsg.ok ? 'var(--green)' : 'var(--red)', fontFamily: 'var(--font-mono)', lineHeight: 'var(--leading-snug)', wordBreak: 'break-all' }} title={exportMsg.text}>
                   {exportMsg.text}
                 </span>
               )}
             </div>
           </div>
         )}
+        </div>
         <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
           {['all', ...statuses.filter(s => showMerged || s !== 'merged')].map(s => (
             <button key={s} onClick={() => setStatusFilter(s)}
