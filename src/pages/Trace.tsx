@@ -4,9 +4,10 @@ import Select from '../components/Select';
 import {
   listLlmTraces, getLlmTrace, listTraceAgentNames, clearLlmTraces,
   listAgentOutputs, getAgentOutput, listAgentOutputRoles, clearAgentOutputs,
-  agentOutputFieldHealth,
+  agentOutputFieldHealth, llmUsageStats,
   type LlmTraceSummary, type LlmTrace, type TraceFilter,
   type AgentOutputSummary, type AgentOutput, type FieldHealth,
+  type LlmUsageStats,
 } from '../services';
 
 // span 类型 → chip 语义色（仅语义状态色，遵循设计系统）。
@@ -402,8 +403,97 @@ function SchemaHealth() {
   );
 }
 
+// 用量 Tab：按模型聚合的 token 消耗与调用次数 + 合计。时间范围可切「近 7 天 / 30 天 / 全部」。
+const USAGE_RANGES: { label: string; days: number }[] = [
+  { label: '近 7 天', days: 7 },
+  { label: '近 30 天', days: 30 },
+  { label: '全部', days: 0 },
+];
+function UsageTab() {
+  const [days, setDays] = useState(7);
+  const [stats, setStats] = useState<LlmUsageStats | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    const since = days > 0
+      ? new Date(Date.now() - days * 86400000).toISOString().slice(0, 19).replace('T', ' ')
+      : undefined;
+    llmUsageStats(since)
+      .then(s => { if (alive) setStats(s); })
+      .catch(() => { if (alive) setStats(null); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [days]);
+
+  const fmt = (n: number) => n.toLocaleString();
+  return (
+    <div className="scroll" style={{ flex: 1, padding: 'clamp(12px, 1.6vw, 24px)' }}>
+      <div className="seg" style={{ marginBottom: 16, width: 'fit-content' }}>
+        {USAGE_RANGES.map(r => (
+          <button key={r.days} className={days === r.days ? 'on' : ''} onClick={() => setDays(r.days)}>{r.label}</button>
+        ))}
+      </div>
+
+      {/* 合计卡 */}
+      <div className="stat-grid" style={{ marginBottom: 16 }}>
+        {[
+          { label: '调用次数', val: stats ? fmt(stats.total_calls) : '—', color: 'var(--blue)' },
+          { label: '输入 tokens', val: stats ? fmt(stats.total_prompt_tokens) : '—', color: 'var(--violet)' },
+          { label: '输出 tokens', val: stats ? fmt(stats.total_completion_tokens) : '—', color: 'var(--amber)' },
+          { label: '总 tokens', val: stats ? fmt(stats.total_tokens) : '—', color: 'var(--ember)' },
+        ].map((c, i) => (
+          <div className="stat" key={i}>
+            <div className="stat-main">
+              <div className="stat-label">{c.label}</div>
+              <div className="stat-val" style={{ color: c.color }}>{c.val}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 按模型明细表 */}
+      <div className="panel">
+        <div className="panel-head"><span style={{ fontWeight: 700 }}>按模型用量</span></div>
+        <div style={{ padding: '8px 0' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-control)' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', textTransform: 'uppercase' }}>
+                <th style={{ textAlign: 'left', padding: '6px 14px' }}>模型</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>调用</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>输入</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>输出</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>总计</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats?.rows.map((r, i) => (
+                <tr key={i} style={{ borderTop: '1px solid var(--border)' }}>
+                  <td style={{ padding: '8px 14px' }}>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{r.model || '—'}</span>
+                    {r.provider && <span className="chip" style={{ marginLeft: 6, fontSize: 'var(--text-micro)' }}>{r.provider}</span>}
+                  </td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px' }}>{fmt(r.calls)}</td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px', color: 'var(--text-3)' }}>{fmt(r.prompt_tokens)}</td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px', color: 'var(--text-3)' }}>{fmt(r.completion_tokens)}</td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px', fontWeight: 600 }}>{fmt(r.total_tokens)}</td>
+                </tr>
+              ))}
+              {!loading && (!stats || stats.rows.length === 0) && (
+                <tr><td colSpan={5} style={{ padding: '20px 14px', textAlign: 'center', color: 'var(--text-faint)' }}>暂无用量数据</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TracePage() {
-  const [tab, setTab] = useState<'trace' | 'outputs' | 'health'>('trace');
+  const [tab, setTab] = useState<'trace' | 'outputs' | 'usage' | 'health'>('trace');
+  const [usageKey, setUsageKey] = useState(0);
   const [outputsKey, setOutputsKey] = useState(0);
   const [healthKey, setHealthKey] = useState(0);
   const [issueId, setIssueId] = useState('');
@@ -464,6 +554,7 @@ export default function TracePage() {
         <div className="seg" style={{ marginLeft: 16 }}>
           <button className={tab === 'trace' ? 'on' : ''} onClick={() => setTab('trace')}>调用链路</button>
           <button className={tab === 'outputs' ? 'on' : ''} onClick={() => setTab('outputs')}>环节产出</button>
+          <button className={tab === 'usage' ? 'on' : ''} onClick={() => setTab('usage')}>用量</button>
           <button className={tab === 'health' ? 'on' : ''} onClick={() => setTab('health')}>schema 体检</button>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
@@ -481,6 +572,8 @@ export default function TracePage() {
                 <Icon name="trash" size={14} />清空
               </button>
             </>
+          ) : tab === 'usage' ? (
+            <button className="btn btn-sm" onClick={() => setUsageKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
           ) : (
             <button className="btn btn-sm" onClick={() => setHealthKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
           )}
@@ -490,6 +583,8 @@ export default function TracePage() {
       {tab === 'outputs' && (
         <AgentOutputsExplorer key={outputsKey} onDrill={(tid) => { setTab('trace'); openTrace(tid); }} />
       )}
+
+      {tab === 'usage' && <UsageTab key={usageKey} />}
 
       {tab === 'health' && <SchemaHealth key={healthKey} />}
 

@@ -374,6 +374,18 @@ async fn build_lens_seed(
         }
     }
 
+    // 所有 lens 共享：**当前仍在队列中**的活跃需求（待整理/待审/在产）。这是抑制
+    // 「频繁重复」的关键负面样例——proposer 历史上只看 merged+rejected，对队列里尚未
+    // 落地的同一问题一无所知，于是每轮换个措辞重复提（gateway 精确指纹又抓不住措辞变体）。
+    // 把活跃队列喂回来，明确禁止重复提同一问题。
+    let open = open_titles(db, project_id).await;
+    if !open.is_empty() {
+        blocks.push(format!(
+            "### ⚠️ 已在需求队列中（待整理/待审核/在产，**严禁重复提出**——哪怕换措辞也算重复）\n{}",
+            bullet(&open)
+        ));
+    }
+
     // 所有 lens 共享：被人工否决的方向（负面样例，反馈闭环——别再重复提）。
     let rejected = rejected_titles(db, project_id).await;
     if !rejected.is_empty() {
@@ -425,6 +437,22 @@ async fn spec_titles(db: &Db, project_id: &str) -> Vec<String> {
 async fn merged_titles(db: &Db, project_id: &str) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT title FROM issues WHERE project_id=? AND status='merged' ORDER BY updated_at DESC LIMIT 20",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
+
+/// 当前仍在队列中的**活跃**需求标题（非终态）：待整理、待审、在产中的全部条目。
+/// 终态（merged/rejected/reverted/deferred/no_change_needed）已分别由 merged/rejected
+/// 上下文覆盖或无需再提，这里只取「还没落地、还占着队列」的，喂回去防重复提。
+async fn open_titles(db: &Db, project_id: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT title FROM issues
+         WHERE project_id=?
+           AND status NOT IN ('merged','rejected','reverted','deferred','no_change_needed')
+         ORDER BY updated_at DESC LIMIT 60",
     )
     .bind(project_id)
     .fetch_all(db)

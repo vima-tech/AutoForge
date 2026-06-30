@@ -17,19 +17,24 @@ pub async fn list_issues(
     project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Issue>, String> {
+    // 严重度优先排序（修复优先级倒挂），同级按时间倒序。
     if let Some(pid) = project_id {
-        sqlx::query_as::<_, Issue>(
-            "SELECT * FROM issues WHERE project_id=? ORDER BY created_at DESC",
-        )
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues WHERE project_id=?{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
         .bind(&pid)
         .fetch_all(&state.db)
         .await
         .map_err(|e| e.to_string())
     } else {
-        sqlx::query_as::<_, Issue>("SELECT * FROM issues ORDER BY created_at DESC")
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| e.to_string())
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -130,16 +135,18 @@ pub async fn list_issues_page(
                 .push_bind(l)
                 .push(")");
         }
-        // 统一按创建时间排序（updated_at 会随执行/重分析变动，跨页不稳定）。
-        // 默认正序：旧需求置前，避免问题积压长期无人处理。
-        qb.push(if sort_asc.unwrap_or(true) {
-            " ORDER BY created_at ASC LIMIT "
-        } else {
-            " ORDER BY created_at DESC LIMIT "
-        })
-        .push_bind(limit)
-        .push(" OFFSET ")
-        .push_bind(offset);
+        // 「严重度优先」排序：critical/high 永远浮在最前（修复优先级倒挂），同级再按
+        // 创建时间（updated_at 会随执行/重分析变动，跨页不稳定）。
+        // 默认正序：同严重度下旧需求置前，避免问题积压长期无人处理。
+        qb.push(crate::models::issue::SEVERITY_ORDER_PREFIX)
+            .push(if sort_asc.unwrap_or(true) {
+                "created_at ASC LIMIT "
+            } else {
+                "created_at DESC LIMIT "
+            })
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
         qb.build_query_as::<Issue>()
             .fetch_all(&state.db)
             .await
@@ -181,7 +188,9 @@ pub async fn list_issues_by_statuses(
     for s in &statuses {
         sep.push_bind(s);
     }
-    qb.push(") ORDER BY created_at DESC");
+    qb.push(")")
+        .push(crate::models::issue::SEVERITY_ORDER_PREFIX)
+        .push("created_at DESC");
     qb.build_query_as::<Issue>()
         .fetch_all(&state.db)
         .await
@@ -918,4 +927,148 @@ pub async fn delete_issue_attachment(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ── 需求全链路生命周期追溯（#101/#108/#131）────────────────────────────────────
+// 把一条需求从录入→分析→需求审核→编码→代码审核→合并/撤销散落在多张表里的关键节点
+// 聚合成一条按时间排序的时间线，供审核页「溯源时间线 / 生命线」面板下钻展示。
+
+/// 生命周期时间线上的一个事件。
+#[derive(serde::Serialize)]
+pub struct LifecycleEvent {
+    /// ISO 时间戳（datetime('now') 文本，可直接字典序排序）。
+    pub at: String,
+    /// 事件类别：created / analyzed / decision / cr_created / cr_approved / worktree / merged。
+    pub kind: String,
+    /// 一句话标签（中文，给人看）。
+    pub label: String,
+    /// 补充明细（可空）。
+    pub detail: String,
+}
+
+/// 聚合某需求的全链路生命周期事件（按时间升序）。纯只读、跨表 UNION 后在 Rust 里排序。
+#[tauri::command]
+pub async fn get_issue_lifecycle(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<LifecycleEvent>, String> {
+    let db = &state.db;
+    let mut events: Vec<LifecycleEvent> = Vec::new();
+
+    // 1) 需求录入。
+    if let Some((title, status, created)) =
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT title, status, created_at FROM issues WHERE id=?",
+        )
+        .bind(&issue_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "created".into(),
+            label: "需求录入".into(),
+            detail: format!("{}（当前状态：{}）", title, status),
+        });
+    }
+
+    // 2) 需求分析（每次分析一行）。
+    for (created, auth) in sqlx::query_as::<_, (String, f64)>(
+        "SELECT created_at, authenticity_score FROM issue_analyses WHERE issue_id=? ORDER BY created_at",
+    )
+    .bind(&issue_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    {
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "analyzed".into(),
+            label: "需求分析完成".into(),
+            detail: format!("真实性评分 {:.2}", auth),
+        });
+    }
+
+    // 3) 人工审核决策（review_1 / review_2）。
+    for (created, stage, decision, sugg) in sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT created_at, stage, decision, suggestions FROM admin_decisions WHERE issue_id=? ORDER BY created_at",
+    )
+    .bind(&issue_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    {
+        let stage_label = match stage.as_str() {
+            "review_1" => "需求审核",
+            "review_2" => "代码审核",
+            other => other,
+        };
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "decision".into(),
+            label: format!("{}：{}", stage_label, decision),
+            detail: sugg.unwrap_or_default(),
+        });
+    }
+
+    // 4) 变更请求创建 / 通过。
+    for (cr_id, status, created, approved) in
+        sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT id, status, created_at, approved_at FROM change_requests WHERE issue_id=? ORDER BY created_at",
+        )
+        .bind(&issue_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+    {
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "cr_created".into(),
+            label: "创建变更请求".into(),
+            detail: format!("CR {}（{}）", &cr_id[..cr_id.len().min(8)], status),
+        });
+        if let Some(a) = approved.filter(|s| !s.trim().is_empty()) {
+            events.push(LifecycleEvent {
+                at: a,
+                kind: "cr_approved".into(),
+                label: "代码审核通过".into(),
+                detail: format!("CR {}", &cr_id[..cr_id.len().min(8)]),
+            });
+        }
+        // 5) worktree 执行 / 合并提交。
+        for (created_w, merge_commit, wstatus) in
+            sqlx::query_as::<_, (String, Option<String>, String)>(
+                "SELECT created_at, merge_commit, status FROM worktree_sessions WHERE change_request_id=? ORDER BY created_at",
+            )
+            .bind(&cr_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default()
+        {
+            events.push(LifecycleEvent {
+                at: created_w,
+                kind: "worktree".into(),
+                label: "编码执行".into(),
+                detail: format!("worktree {}", wstatus),
+            });
+            if let Some(c) = merge_commit.filter(|s| !s.trim().is_empty()) {
+                events.push(LifecycleEvent {
+                    at: String::new(), // 合并时间用 CR 的 updated 不易取，置空排末尾
+                    kind: "merged".into(),
+                    label: "已合并到主干".into(),
+                    detail: format!("提交 {}", &c[..c.len().min(10)]),
+                });
+            }
+        }
+    }
+
+    // 时间升序；空时间戳（合并提交）排到最后。
+    events.sort_by(|a, b| match (a.at.is_empty(), b.at.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.at.cmp(&b.at),
+    });
+    Ok(events)
 }

@@ -231,6 +231,45 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
           ))}
         </div>
 
+        {/* 运营洞察 / 产线健康：从实时 pipeline_stats 派生的几个关键经营指标，
+            让操作者一眼看出「在产多少、卡在哪、产出与拒绝、是否被背压暂停」。 */}
+        {stats && (() => {
+          const wip = stats.pending_analysis + stats.pending_review_1 + stats.executing + stats.pending_review_2;
+          const stages: { name: string; cnt: number }[] = [
+            { name: '需求分析', cnt: stats.pending_analysis },
+            { name: '需求审核', cnt: stats.pending_review_1 },
+            { name: '代码 Agent', cnt: stats.executing },
+            { name: '代码审核', cnt: stats.pending_review_2 },
+          ];
+          const bottleneck = stages.reduce((a, b) => (b.cnt > a.cnt ? b : a), stages[0]);
+          const decided = stats.merged + stats.rejected;
+          const rejectRate = decided > 0 ? Math.round((stats.rejected / decided) * 100) : 0;
+          const cards = [
+            { label: '在产 WIP', val: String(wip), hint: '分析+审核+编码中', color: 'var(--blue)' },
+            { label: '瓶颈环节', val: bottleneck.cnt > 0 ? bottleneck.name : '无积压', hint: bottleneck.cnt > 0 ? `积压 ${bottleneck.cnt} 条` : '流转顺畅', color: bottleneck.cnt > 3 ? 'var(--red)' : bottleneck.cnt > 0 ? 'var(--amber)' : 'var(--green)' },
+            { label: '已交付', val: String(stats.merged), hint: `拒绝率 ${rejectRate}%`, color: 'var(--green)' },
+            { label: '背压状态', val: stageLabel, hint: `待审 ${stats.pending_review_slots}/${stats.pause_threshold}`, color: stageBar },
+          ];
+          return (
+            <div className="panel" style={{ marginBottom: 16, padding: '14px 18px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                <Icon name="sliders" size={15} style={{ color: 'var(--ember)' }} />
+                <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>运营洞察</span>
+                <span className="chip" style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)' }}>实时</span>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+                {cards.map((c, i) => (
+                  <div key={i} style={{ background: 'var(--bg-3)', borderRadius: 'var(--radius)', padding: '12px 14px' }}>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-3)' }}>{c.label}</div>
+                    <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 'var(--text-metric)', lineHeight: 1, margin: '6px 0 4px', color: c.color }}>{c.val}</div>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{c.hint}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* pipeline — 逐项目完整流水线，自动轮播，主页的「看」中枢 */}
         <div className="panel" style={{ marginBottom: 16 }}>
           <div className="panel-head">

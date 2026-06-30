@@ -62,6 +62,35 @@ pub fn cr_lock(cr_id: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// 按 conversation_id 的「会话串行锁」。同一会话内会读-改消息流的写操作——
+/// 上下文压缩/结论（`compress_context_now`）与会话任务编排（`execute_conversation_task`
+/// 的创建/状态流转）——持此锁，避免同一会话并发交织导致：摘要重复插入、原消息被
+/// 重复排除、同一会话并发跑多个 running 任务。跨会话仍并行（粒度=会话）。
+/// 走进程内全局 OnceLock，保持纯 Rust、零 Tauri 依赖（与 merge_lock/cr_lock 同构）。
+static CONVERSATION_LOCKS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::OnceLock::new();
+
+/// 取（或惰性创建）某会话的串行锁。
+pub fn conversation_lock(conversation_id: &str) -> Arc<Mutex<()>> {
+    let map = CONVERSATION_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    guard
+        .entry(conversation_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// 全局「agents 写锁」：`agents` 是规模很小的全局配置表，角色分配/新增/删除都是
+/// 「先读快照 → 在 Rust 里算新值 → 写回」的读-改-写。并发调用会基于同一过期快照各自计算，
+/// 导致角色被覆盖丢失、重复插入。用一把全局互斥串行化所有 agents 写操作即可彻底消除
+/// 这些 stale-read / 重复插入竞态（写频率极低，串行无性能损失）。
+static AGENTS_WRITE_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+/// 取全局 agents 写锁。
+pub fn agents_write_lock() -> &'static Mutex<()> {
+    AGENTS_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// 全局「构建/测试池」信号量：所有合并门测试（`tasks/testing.rs::run_and_gate`）
 /// 占一个许可，跨项目/CR 共享，限制任意时刻并发编译/测试数（默认 2），避免批量合并
 /// 时多个 rustc/tsc 同时跑把 CPU 和内存打满。纯进程内、零 Tauri，全平台有效。

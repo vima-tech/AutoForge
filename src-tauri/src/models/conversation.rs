@@ -22,6 +22,9 @@ pub struct Message {
     pub created_at: String,
     #[sqlx(default)]
     pub excluded_from_context: bool,
+    /// 被引用/回复的消息 id（可空）。支持会议室「回复某条消息」的引用线索（迁移 0078）。
+    #[sqlx(default)]
+    pub parent_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +46,9 @@ pub struct ConversationDetail {
 pub struct SendMessage {
     pub conversation_id: String,
     pub content_json: String,
+    /// 可选：本条消息引用/回复的目标消息 id（迁移 0078）。
+    #[serde(default)]
+    pub parent_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

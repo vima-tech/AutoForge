@@ -6,6 +6,7 @@ pub mod backup;
 pub mod blueprint;
 pub mod change_requests;
 pub mod change_summary;
+pub mod review_assist;
 pub mod code_agents;
 pub mod code_agent_skills;
 pub mod conflicts;

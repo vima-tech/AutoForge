@@ -210,6 +210,7 @@ export interface Message {
   id: string; conversation_id: string; from_agent: string | null;
   content_json: string; created_at: string;
   excluded_from_context: boolean;
+  parent_message_id?: string | null;
 }
 export interface CodingBrief {
   title: string;
@@ -671,6 +672,36 @@ export interface ChangeSummary {
 }
 export const generateChangeSummary = (crId: string, force = false) =>
   ipc<ChangeSummary>('generate_change_summary', { crId, force });
+
+// LLM 用量与成本视图：按模型聚合 token 消耗与调用次数（Trace 页「用量」Tab）。
+export interface LlmUsageRow {
+  provider: string | null; model: string | null; calls: number;
+  prompt_tokens: number; completion_tokens: number; total_tokens: number;
+}
+export interface LlmUsageStats {
+  rows: LlmUsageRow[]; total_calls: number;
+  total_prompt_tokens: number; total_completion_tokens: number; total_tokens: number;
+}
+export const llmUsageStats = (since?: string) =>
+  ipc<LlmUsageStats>('llm_usage_stats', { since: since ?? null });
+
+// 需求全链路生命周期时间线（录入→分析→审核→编码→合并/撤销），审核页溯源用。
+export interface LifecycleEvent { at: string; kind: string; label: string; detail: string }
+export const getIssueLifecycle = (issueId: string) =>
+  ipc<LifecycleEvent[]>('get_issue_lifecycle', { issueId });
+
+// AI 代码预审摘要（code_reviewer 角色）：进入代码审核前对 diff 生成 Markdown 摘要，减负人审。
+// get* 读最新已生成（无则空串）；generate* 主动触发重算。
+export const getCodeReviewSummary = (crId: string) =>
+  ipc<string>('get_code_review_summary', { crId });
+export const generateCodeReviewSummary = (crId: string) =>
+  ipc<string>('generate_code_review_summary', { crId });
+
+// 发布说明（release_notes 角色）：依据需求+diff 生成面向用户的变更说明（JSON 字符串：kind/headline/body）。
+export const getReleaseNotes = (crId: string) =>
+  ipc<string>('get_release_notes', { crId });
+export const generateReleaseNotes = (crId: string) =>
+  ipc<string>('generate_release_notes', { crId });
 export type MergeConflictView = { files: string[]; diff: string };
 export const getMergeConflict = (crId: string) =>
   ipc<MergeConflictView>('get_merge_conflict', { crId });
@@ -760,7 +791,7 @@ export const deleteChangeRequest = (crId: string) =>
 export const listConversations = () => ipc<Conversation[]>('list_conversations');
 export const listMessages = (conversationId: string) =>
   ipc<Message[]>('list_messages', { conversationId });
-export const sendMessage = (payload: { conversation_id: string; content_json: string }) =>
+export const sendMessage = (payload: { conversation_id: string; content_json: string; parent_message_id?: string }) =>
   ipc<Message>('send_message', { payload });
 export const importAttachment = (payload: {
   conversation_id: string; file_name: string; mime_hint: string; data_base64: string;
@@ -892,6 +923,9 @@ export const readWorkspaceFile = (projectId: string, relPath: string) =>
   ipc<string>('read_workspace_file', { projectId, relPath });
 export const writeWorkspaceFile = (projectId: string, relPath: string, content: string) =>
   ipc<WorkspaceFile>('write_workspace_file', { projectId, relPath, content });
+// 撤销 AI 写入的工作区文件（删除 .autoforge/ 下该文件）。
+export const undoWorkspaceFile = (projectId: string, relPath: string) =>
+  ipc<void>('undo_workspace_file', { projectId, relPath });
 
 // ── Settings — LLM ──────────────────────────────────────────────────────────
 export const listLlmConfigs = () => ipc<LlmConfig[]>('list_llm_configs');

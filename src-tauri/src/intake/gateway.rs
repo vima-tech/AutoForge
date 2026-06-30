@@ -132,6 +132,36 @@ pub async fn receive_with_status(
         return Ok((issue, false));
     }
 
+    // 近似去重（仅机器生成的 Triage 来源，绝不作用于用户的 Flow 提交——用户的明确需求
+    // 不能被模糊匹配静默吞掉）：精确指纹未命中时，proposer/scanner 常换个措辞重提同一问题，
+    // 精确哈希抓不住。这里对同项目内**活跃**（非终态）需求的标题做字符 bigram Jaccard 相似度，
+    // 超过保守阈值即判为重复，返回既有条目（created=false → 不计预算、不淹没队列）。
+    if mode == IntakeMode::Triage {
+        const SIM_THRESHOLD: f64 = 0.72;
+        let incoming = security::title_shingles(&title);
+        if !incoming.is_empty() {
+            let candidates: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, title FROM issues
+                 WHERE project_id=?
+                   AND status NOT IN ('merged','rejected','reverted','deferred','no_change_needed')",
+            )
+            .bind(&payload.project_id)
+            .fetch_all(db)
+            .await
+            .map_err(|e| e.to_string())?;
+            for (cid, ctitle) in candidates {
+                if security::jaccard(&incoming, &security::title_shingles(&ctitle)) >= SIM_THRESHOLD {
+                    let issue = sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
+                        .bind(&cid)
+                        .fetch_one(db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok((issue, false));
+                }
+            }
+        }
+    }
+
     let id = Uuid::new_v4().to_string();
 
     sqlx::query(

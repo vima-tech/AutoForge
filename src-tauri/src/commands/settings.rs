@@ -964,18 +964,26 @@ async fn ensure_llm_usable(db: &crate::db::Db, id: &str) -> Result<(), String> {
 #[tauri::command]
 pub async fn set_default_llm(id: String, state: State<'_, AppState>) -> Result<Vec<LlmConfig>, String> {
     let id = id.trim().to_string();
+    // 先校验目标可用，再动数据库：否则「清旧默认」已生效而「置新默认」因 id 不可用而失败，
+    // 会让系统落到**零默认**配置（原子性/一致性缺陷）。
+    if !id.is_empty() {
+        ensure_llm_usable(&state.db, &id).await?;
+    }
+    // 单事务内「清旧默认 + 置新默认」，保证任一时刻恰有一个默认（或显式传空时零个），
+    // 不会出现中途失败遗留的双默认/零默认。
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE llm_configs SET is_default=0 WHERE is_default=1")
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
     if !id.is_empty() {
-        ensure_llm_usable(&state.db, &id).await?;
         sqlx::query("UPDATE llm_configs SET is_default=1 WHERE id=?")
             .bind(&id)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
     }
+    tx.commit().await.map_err(|e| e.to_string())?;
     list_llm_configs(state).await
 }
 
@@ -1068,6 +1076,9 @@ pub async fn bulk_bind_roles(
     ensure_llm_usable(&state.db, llm).await?;
     let overwrite = overwrite.unwrap_or(false);
 
+    // 与 set_agent_forge_role / apply_role_preset 共用全局 agents 写锁，串行化角色绑定，
+    // 避免并发铺角色基于过期快照重复插入/互相覆盖。
+    let _wlock = crate::state::agents_write_lock().lock().await;
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
     for def in crate::agents::roles::registry() {
         bind_role_in_tx(&mut tx, def, llm, overwrite).await?;
@@ -1096,6 +1107,8 @@ pub async fn apply_role_preset(
     ensure_llm_usable(&state.db, strong).await?;
     let overwrite = overwrite.unwrap_or(false);
 
+    // 与 set_agent_forge_role / bulk_bind_roles 共用全局 agents 写锁（见各自说明）。
+    let _wlock = crate::state::agents_write_lock().lock().await;
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
     for def in crate::agents::roles::registry() {
         let llm = if crate::agents::roles::is_heavy(def.kind) { strong } else { fast };
@@ -1109,8 +1122,24 @@ pub async fn apply_role_preset(
 
 #[tauri::command]
 pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    // 与角色分配共用全局 agents 写锁：避免删除与并发的角色读-改-写交织（删到一半被
+    // 另一调用基于含该 agent 的旧快照写回）。
+    let _wlock = crate::state::agents_write_lock().lock().await;
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM conversation_members WHERE agent_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 清理引用该 agent 的编排记录，否则（foreign_keys=ON）删 agents 会因外键约束直接失败：
+    // - conversation_task_runs.agent_id 是 NOT NULL 外键 → 该 agent 的执行记录必须先删；
+    // - conversation_tasks.planner_agent_id 是可空外键 → 置空，保留任务本身（属于会话，非单 agent）。
+    sqlx::query("DELETE FROM conversation_task_runs WHERE agent_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE conversation_tasks SET planner_agent_id=NULL WHERE planner_agent_id=?")
         .bind(&id)
         .execute(&mut *tx)
         .await
@@ -1132,6 +1161,10 @@ pub async fn set_agent_forge_role(
     role: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Agent>, String> {
+    // 全局 agents 写锁：序列化「读快照→算新角色串→写回」，避免并发分配基于过期快照
+    // 互相覆盖（丢角色）。锁跨 await 持有到事务提交。
+    let _wlock = crate::state::agents_write_lock().lock().await;
+
     // Load current state to compute new comma-separated role lists in Rust.
     let holders = sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE forge_role IS NOT NULL")
         .fetch_all(&state.db)

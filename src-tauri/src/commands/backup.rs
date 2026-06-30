@@ -275,16 +275,17 @@ async fn apply_backup(db: &Db, backup: &ConfigBackup) -> Result<BackupSummary, S
         let api_key = secrets::encrypt_field(&c.api_key)?;
         sqlx::query(
             "INSERT INTO llm_configs
-                (id,name,model,endpoint,api_key,ctx_window,temperature,enabled,api_spec,supports_vision,created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                (id,name,model,endpoint,api_key,ctx_window,temperature,enabled,api_spec,supports_vision,is_default,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, model=excluded.model, endpoint=excluded.endpoint,
                 api_key=excluded.api_key, ctx_window=excluded.ctx_window, temperature=excluded.temperature,
-                enabled=excluded.enabled, api_spec=excluded.api_spec, supports_vision=excluded.supports_vision",
+                enabled=excluded.enabled, api_spec=excluded.api_spec, supports_vision=excluded.supports_vision,
+                is_default=excluded.is_default",
         )
         .bind(&c.id).bind(&c.name).bind(&c.model).bind(&c.endpoint).bind(&api_key)
         .bind(&c.ctx_window).bind(c.temperature).bind(c.enabled).bind(&c.api_spec)
-        .bind(c.supports_vision).bind(&c.created_at)
+        .bind(c.supports_vision).bind(c.is_default).bind(&c.created_at)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;

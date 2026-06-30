@@ -92,6 +92,23 @@ pub async fn start_conversation_task(
         return Err("触发消息不存在或不属于当前对话".to_string());
     }
 
+    // 会话串行锁：把「检查是否已有运行中任务 + 插入新任务」做成对并发调用原子的临界区。
+    // 否则两条几乎同时到达的消息（或前端重试）会各自插入一条 running 任务，同一会话并发跑多个
+    // 任务、互相覆盖消息流。锁内拒绝重复，保证同一会话任一时刻至多一个 running 任务。
+    let lock = crate::state::conversation_lock(&payload.conversation_id);
+    let _guard = lock.lock().await;
+
+    let already_running: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM conversation_tasks WHERE conversation_id=? AND status='running' LIMIT 1",
+    )
+    .bind(&payload.conversation_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if already_running.is_some() {
+        return Err("当前会话已有正在运行的任务，请等待其完成后再试".to_string());
+    }
+
     let task_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO conversation_tasks
@@ -554,6 +571,13 @@ pub async fn start_conversation_coding(
 
     let admin_id = payload.admin_id.as_deref().unwrap_or("admin").to_string();
 
+    // 会话串行锁：把「幂等查重 → 建 Issue → 建 CR」整段做成对并发原子的临界区。
+    // 否则操作者双击/前端重试会让两次调用都越过下面的查重（彼此都还没插入），各建一条
+    // Issue+CR（重复编码同一需求）。Level-2（未传 client_request_id）尤其只有 check-then-insert
+    // 保护，无 DB 唯一约束兜底，必须靠此锁关闭 TOCTOU 窗口。
+    let lock = crate::state::conversation_lock(&payload.conversation_id);
+    let _guard = lock.lock().await;
+
     // ── 幂等去重 ──────────────────────────────────────────────────────────────
     // Level 1：client_request_id 精确匹配（前端 UUID，最强保证）。
     // Level 2：同 project + title + source_type='conversation' + status='pending_execution' 近似兜底。
@@ -763,6 +787,11 @@ async fn compress_context_now(
     conversation_id: &str,
     mode: &str,
 ) -> Result<(), String> {
+    // 会话串行锁：同一会话的压缩/结论与任务编排互斥，避免并发交织重复插摘要、重复排除原消息。
+    // 持锁跨越「读消息→调 LLM→原子写回」全过程，后到的并发请求会在此排队、再读时已是压缩后状态。
+    let lock = crate::state::conversation_lock(conversation_id);
+    let _guard = lock.lock().await;
+
     let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
         .bind(conversation_id)
         .fetch_optional(db)
@@ -849,15 +878,10 @@ async fn compress_context_now(
         summary.trim(),
         messages.len()
     );
+    // 原子写回：摘要插入 + 原消息排除同生共死（见 commit_compression）。
+    let excluded_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let message_id =
-        insert_agent_markdown_message(db, conversation_id, &agent.id, &markdown).await?;
-    for msg in &messages {
-        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
-            .bind(&msg.id)
-            .execute(db)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+        commit_compression(db, conversation_id, &agent.id, &markdown, &excluded_ids).await?;
     event::emit(
         app,
         event::AppEvent::MessageReceived {
@@ -1987,15 +2011,10 @@ async fn maybe_compress_context(
         summary.trim(),
         to_compress.len()
     );
+    // 原子写回：摘要插入 + 原消息排除同生共死（见 commit_compression）。
+    let excluded_ids: Vec<String> = to_compress.iter().map(|m| m.id.clone()).collect();
     let message_id =
-        insert_agent_markdown_message(db, conversation_id, &compressor.id, &markdown).await?;
-    for msg in to_compress {
-        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
-            .bind(&msg.id)
-            .execute(db)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+        commit_compression(db, conversation_id, &compressor.id, &markdown, &excluded_ids).await?;
     event::emit(
         app,
         event::AppEvent::MessageReceived {
@@ -2112,6 +2131,40 @@ async fn messages_to_context_text(
         }
     }
     Ok(parts.join("\n\n"))
+}
+
+/// 原子提交一次压缩/结论：在**单事务**内插入摘要消息 + 把被压缩的原消息标记为
+/// `excluded_from_context=1`。要么全成功要么全回滚——杜绝「摘要已插入但原消息未排除
+/// （下轮重复压缩、摘要叠摘要）」或「原消息已排除但摘要插入失败（内容凭空丢失）」的半完成态。
+async fn commit_compression(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    agent_id: &str,
+    markdown: &str,
+    excluded_ids: &[String],
+) -> Result<String, String> {
+    let content_json = serde_json::json!([{ "t": "md", "md": markdown }]).to_string();
+    let message_id = Uuid::new_v4().to_string();
+    let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, from_agent, content_json) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&message_id)
+    .bind(conversation_id)
+    .bind(agent_id)
+    .bind(&content_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    for id in excluded_ids {
+        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(message_id)
 }
 
 async fn insert_agent_markdown_message(

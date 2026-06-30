@@ -204,11 +204,12 @@ pub async fn send_message(
     let id = Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, from_agent, content_json) VALUES (?, ?, NULL, ?)"
+        "INSERT INTO messages (id, conversation_id, from_agent, content_json, parent_message_id) VALUES (?, ?, NULL, ?, ?)"
     )
     .bind(&id)
     .bind(&payload.conversation_id)
     .bind(&payload.content_json)
+    .bind(&payload.parent_message_id)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;

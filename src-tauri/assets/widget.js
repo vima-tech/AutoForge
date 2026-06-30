@@ -70,8 +70,19 @@
       })
     }).then(function (r) {
       submit.disabled = false;
-      if (r.ok) { msg.textContent = '已提交，谢谢！'; title.value = ''; desc.value = ''; setTimeout(close, 900); }
-      else { msg.textContent = '提交失败（' + r.status + '）'; }
+      if (!r.ok) { msg.textContent = '提交失败（' + r.status + '）'; return; }
+      title.value = ''; desc.value = '';
+      // 反馈闭环：拿回 issue id，给出「查看进度」回执链接（/feedback?id=…），可随时回查处理状态。
+      r.json().then(function (issue) {
+        var id = issue && issue.id;
+        if (id) {
+          msg.innerHTML = '已提交，谢谢！<a href="' + endpoint + '/feedback?id=' +
+            encodeURIComponent(id) + '" target="_blank" rel="noopener" style="margin-left:6px;color:#e8772e;text-decoration:underline;">查看进度</a>';
+        } else {
+          msg.textContent = '已提交，谢谢！';
+          setTimeout(close, 900);
+        }
+      }).catch(function () { msg.textContent = '已提交，谢谢！'; setTimeout(close, 900); });
     }).catch(function () { submit.disabled = false; msg.textContent = '网络错误'; });
   });
 })();

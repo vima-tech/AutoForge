@@ -259,6 +259,24 @@ pub async fn read_workspace_file(
         .map_err(|e| e.to_string())
 }
 
+/// 撤销 AI 触发的工作区文件写入（#2）：删除 `.autoforge/` 下由 Agent 写入的文件。
+/// 路径强校验在 `.autoforge/docs|specs|deliverables` 内（delete_workspace_path 内部已校），
+/// 供会议室 file_written 块的「撤销」按钮调用。文件不存在视为已撤销（幂等）。
+#[tauri::command]
+pub async fn undo_workspace_file(
+    project_id: String,
+    rel_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT repo_path FROM projects WHERE id=?")
+        .bind(&project_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (repo_path,) = row.ok_or("项目不存在")?;
+    delete_workspace_path(&repo_path, &rel_path).await
+}
+
 #[tauri::command]
 pub async fn write_workspace_file(
     project_id: String,

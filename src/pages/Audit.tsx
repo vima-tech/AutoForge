@@ -5,6 +5,9 @@ import Toast, { type ToastData } from '../components/Toast';
 import IntakePanel from '../components/IntakePanel';
 import AttachmentBar from '../components/AttachmentBar';
 import ChangeSummaryCard from '../components/ChangeSummaryCard';
+import ReviewAssistCard from '../components/ReviewAssistCard';
+import LifecyclePanel from '../components/LifecyclePanel';
+import CompareCrModal from '../components/CompareCrModal';
 import { ConfirmModal } from '../components/ProjectDialogs';
 import { ReaderToc } from '../components/ReaderToc';
 import { toggleMaximizeOnDoubleClick } from '../lib/window';
@@ -2555,6 +2558,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [crIssues, setCrIssues] = useState<CrIssueRef[]>([]);
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [tab, setTab] = useState<'report' | 'diff' | 'logs'>('report');
+  const [compareOpen, setCompareOpen] = useState(false);
   // 代码 Agent 执行日志：列表 meta + 当前展开的完整日志。
   const [runs, setRuns] = useState<CodeAgentRunMeta[]>([]);
   const [activeRun, setActiveRun] = useState<CodeAgentRunLog | null>(null);
@@ -4100,6 +4104,11 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                           </button>
                         </div>
                       )}
+                      {tab === 'diff' && (
+                        <button className="btn btn-sm" title="与另一个 CR 并排对比 diff" onClick={() => setCompareOpen(true)}>
+                          <Icon name="columns" size={13} />对比
+                        </button>
+                      )}
                       {tab !== 'logs' && (
                         <button className="icon-btn" title="全屏阅读（报告 + Diff 分栏）" onClick={() => setFsReader(true)}>
                           <Icon name="maximize" size={15} />
@@ -4111,6 +4120,14 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                     {/* AI 变更摘要卡片：报告 tab 顶部，基于 diff 实时生成（仅有实际改动的 CR）。 */}
                     {tab === 'report' && !NO_CHANGE_STATUSES.includes(cr.status) && !FAILED_STATUSES.includes(cr.status) && (
                       <ChangeSummaryCard crId={cr.id} enabled={!crLoading} />
+                    )}
+                    {/* 审核辅助：AI 代码预审摘要 + 发布说明（按需生成，仅有实际改动的 CR）。 */}
+                    {tab === 'report' && !NO_CHANGE_STATUSES.includes(cr.status) && !FAILED_STATUSES.includes(cr.status) && (
+                      <ReviewAssistCard crId={cr.id} enabled={!crLoading} />
+                    )}
+                    {/* 需求溯源时间线：录入→分析→审核→编码→合并 全链路追溯（折叠，按需加载）。 */}
+                    {tab === 'report' && cr.issue_id && (
+                      <LifecyclePanel issueId={cr.issue_id} />
                     )}
                     {tab === 'report' ? renderReportBody() : tab === 'diff' ? renderDiffBody() : renderLogsBody()}
                   </div>
@@ -4177,6 +4194,17 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
       </div>
 
       {/* 全屏阅读模式：报告 + 代码 Diff 双栏并排，铺满整窗，可调字号（风格对齐会议室阅读模式） */}
+      {compareOpen && cr && (
+        <CompareCrModal
+          currentCrId={cr.id}
+          currentLabel={issueTitles[cr.issue_id] || cr.id.slice(0, 8)}
+          candidates={crs
+            .filter(c => c.id !== cr.id)
+            .map(c => ({ value: c.id, label: issueTitles[c.issue_id] || c.id.slice(0, 8) }))}
+          onClose={() => setCompareOpen(false)}
+        />
+      )}
+
       {fsReader && cr && (
         <div className="reader-overlay diff-reader" style={{ ['--rs' as string]: String(diffScale) }}>
           <div className="reader-bar" onDoubleClick={toggleMaximizeOnDoubleClick}>

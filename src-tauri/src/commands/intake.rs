@@ -463,17 +463,20 @@ pub async fn list_triage_issues(
     project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Issue>, String> {
+    // 严重度优先排序（修复优先级倒挂）：待整理池里 critical/high 浮在最前。
     let res = if let Some(pid) = project_id {
-        sqlx::query_as::<_, Issue>(
-            "SELECT * FROM issues WHERE status='triage' AND project_id=? ORDER BY created_at DESC",
-        )
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues WHERE status='triage' AND project_id=?{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
         .bind(pid)
         .fetch_all(&state.db)
         .await
     } else {
-        sqlx::query_as::<_, Issue>(
-            "SELECT * FROM issues WHERE status='triage' ORDER BY created_at DESC",
-        )
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues WHERE status='triage'{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
         .fetch_all(&state.db)
         .await
     };

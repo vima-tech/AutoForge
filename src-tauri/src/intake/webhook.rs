@@ -61,6 +61,9 @@ pub async fn start(port: u16, db: Db, job_tx: JobSender, app: AppHandle) -> anyh
     let router = Router::new()
         .route("/webhook/issues", post(handle_issue).options(preflight))
         .route("/widget.js", get(serve_widget))
+        // 反馈状态回执（#77/#113/#126/#150/#157）：提交者凭返回的 issue id 公开查询处理进度。
+        .route("/feedback/status", get(feedback_status))
+        .route("/feedback", get(serve_feedback_page))
         .layer(middleware::from_fn(add_cors))
         .with_state(state);
 
@@ -215,6 +218,90 @@ async fn authenticate(
         }
     }
     Some(wt)
+}
+
+// ── 反馈状态回执（公开只读）────────────────────────────────────────────────────
+// 提交反馈后，widget 拿到返回的 issue id；提交者凭此 id 公开查询「业务语言」处理进度。
+// 安全：id 是不可猜的 UUID；只回业务状态标签 + 标题 + 时间，绝不泄露内部分析/代码细节；
+// 同样过限流。这是「反馈闭环」的回执侧，与提交侧（handle_issue）对称。
+
+#[derive(Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    id: String,
+}
+
+/// 内部状态码 → 面向提交者的业务语言进度标签（不暴露流水线内部术语）。
+fn business_status_label(status: &str) -> &'static str {
+    match status {
+        "triage" => "已收到，待整理",
+        "pending_analysis" | "analysis_failed" => "评估中",
+        "pending_issue_review" => "评估中，待确认",
+        "pending_execution" | "executing" => "处理中",
+        "pending_code_review" | "pending_merge" | "merge_testing" | "merge_ready" | "merge_conflict"
+        | "merge_failed" => "即将完成，收尾中",
+        "merged" => "已完成",
+        "reverting" | "reverted" => "已回退",
+        "rejected" => "经评估未采纳",
+        "deferred" => "已收到，暂缓处理",
+        "no_change_needed" => "已确认，无需改动",
+        _ => "处理中",
+    }
+}
+
+async fn feedback_status(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(ws): State<WebhookState>,
+    Query(q): Query<StatusQuery>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ip = client_ip(&headers, peer);
+    if !ws.limiter.check(&format!("status:{ip}"), ratelimit::IP_MAX)
+        || !ws.limiter.check("global", ratelimit::GLOBAL_MAX)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "请求过于频繁，请稍后再试"})),
+        );
+    }
+    let id = q.id.trim();
+    if id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "缺少 id"})));
+    }
+    let row: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT title, status, created_at, updated_at FROM issues WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(&ws.db)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((title, status, created, updated)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "found": true,
+                "title": title,
+                "status": business_status_label(&status),
+                "submitted_at": created,
+                "updated_at": updated,
+            })),
+        ),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"found": false})),
+        ),
+    }
+}
+
+const FEEDBACK_PAGE_HTML: &str = include_str!("../../assets/feedback_status.html");
+
+/// 反馈状态只读页：输入 id 即查进度。纯静态 HTML，自带样式与查询脚本（调 /feedback/status）。
+async fn serve_feedback_page() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        FEEDBACK_PAGE_HTML,
+    )
 }
 
 // ── M10 embeddable widget ──────────────────────────────────────────────────────

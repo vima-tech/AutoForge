@@ -81,6 +81,27 @@ pub fn run() {
                 core::concurrency::ConcurrencyManager::new(max_slots, pause_threshold);
             concurrency.update_config(None, None, Some(queue_strategy));
 
+            // 启动恢复：用 DB 真实在产状态回填并发计数器（崩溃/重启后内存从 0 起，否则
+            // 背压阈值误判、dashboard 少报）。计数 executing→active、pending_code_review→待审。
+            {
+                let (active, pending): (i64, i64) = tauri::async_runtime::block_on(async {
+                    let a = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM change_requests WHERE status='executing'",
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or(0);
+                    let p = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM change_requests WHERE status='pending_code_review'",
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or(0);
+                    (a, p)
+                });
+                concurrency.backfill(active.max(0) as usize, pending.max(0) as usize);
+            }
+
             // 合并门构建池 + cgroup CPU 预算：按配置初始化。构建池全平台；CPU 预算仅
             // Linux 且 pct>0 时尝试，失败优雅降级（见 core::cpubudget）。
             let (build_slots, cpu_budget_pct) = tauri::async_runtime::block_on(async {
@@ -372,6 +393,12 @@ pub fn run() {
             commands::change_requests::get_worktree_session,
             commands::change_requests::get_code_diff,
             commands::change_summary::generate_change_summary,
+            commands::issues::get_issue_lifecycle,
+            commands::trace::llm_usage_stats,
+            commands::review_assist::generate_code_review_summary,
+            commands::review_assist::get_code_review_summary,
+            commands::review_assist::generate_release_notes,
+            commands::review_assist::get_release_notes,
             commands::change_requests::get_merge_conflict,
             commands::change_requests::retry_merge,
             commands::change_requests::ai_resolve_merge_conflict,
@@ -420,6 +447,7 @@ pub fn run() {
             commands::workspace::list_workspace_files,
             commands::workspace::read_workspace_file,
             commands::workspace::write_workspace_file,
+            commands::workspace::undo_workspace_file,
             commands::orchestration::start_conversation_task,
             commands::orchestration::draft_coding_brief,
             commands::orchestration::draft_coding_brief_detailed,

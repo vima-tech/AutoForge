@@ -341,13 +341,19 @@ pub async fn get_merge_conflict(
 /// 若此时 dev 已含解（或冲突已消）即可干净落地。
 #[tauri::command]
 pub async fn retry_merge(cr_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    sqlx::query(
-        "UPDATE change_requests SET status='pending_merge', updated_at=datetime('now') WHERE id=?",
+    // 状态守卫（对齐 revert_change_request 的原子门）：仅从失败态重试，避免把已合并/合并中/
+    // 其他状态的 CR 错误重置为 pending_merge 并重新入队（覆盖有效状态、重复合并）。
+    let guarded = sqlx::query(
+        "UPDATE change_requests SET status='pending_merge', updated_at=datetime('now')
+         WHERE id=? AND status IN ('merge_failed','merge_conflict')",
     )
     .bind(&cr_id)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
+    if guarded.rows_affected() == 0 {
+        return Err("仅合并失败/冲突的需求可重试合并（可能已合并或状态已变化）".to_string());
+    }
     let cr: ChangeRequest = sqlx::query_as("SELECT * FROM change_requests WHERE id=?")
         .bind(&cr_id)
         .fetch_one(&state.db)
@@ -588,9 +594,12 @@ pub(crate) async fn create_cr_for_issue(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Enqueue execution job
+    // Enqueue execution job。不再吞掉 enqueue 错误（旧码 `let _ =` 会让 job_executions 写失败
+    // 时悄无声息地留下「issue=pending_execution、CR 已建、却无执行任务」的孤儿 CR）。
+    // 现在向上抛出失败让调用方可见；即便此处失败，启动恢复（recover_orphaned_executions）
+    // 也会按幂等键 `execution:<cr>` 重新入队，孤儿 CR 会在下次启动自愈。
     let idem_key = format!("execution:{}", cr_id);
-    let _ = enqueue(
+    enqueue(
         db,
         job_tx,
         "execution",
@@ -600,7 +609,8 @@ pub(crate) async fn create_cr_for_issue(
             project_id: issue.project_id.clone(),
         },
     )
-    .await;
+    .await
+    .map_err(|e| format!("CR 已创建但执行任务入队失败（将于下次启动自动重排）：{e}"))?;
 
     sqlx::query_as::<_, ChangeRequest>("SELECT * FROM change_requests WHERE id=?")
         .bind(&cr_id)
@@ -912,12 +922,6 @@ async fn approve_cr_review_2(
         return Err(format!("变更请求当前状态为 {}，不可审核通过", cr.status));
     }
 
-    record_review_2_outcome(db, cr_id, true).await;
-
-    // 合并 CR：全部成员需求各记一条「review_2 approved」审计。
-    record_admin_decision_all(db, &cr.project_id, cr_id, "review_2", "approved", admin_id, suggestions)
-        .await?;
-
     // 规整人工提交信息：去空白、空串落 NULL（合并任务回退默认模板）、限长 2KB。
     // 仅在「自定义提交信息」开关开启时采纳；关闭时强制 NULL，合并走默认模板。
     let merge_msg = if crate::core::gate::custom_merge_message_enabled(db).await {
@@ -929,8 +933,12 @@ async fn approve_cr_review_2(
         None
     };
 
-    sqlx::query(
-        "UPDATE change_requests SET status='pending_merge', admin_suggestions_2=?, merge_commit_message=?, admin_id=?, approved_at=datetime('now'), updated_at=datetime('now') WHERE id=?"
+    // 原子认领：仅 pending_code_review→pending_merge，且只有一个并发调用能 rows_affected>0。
+    // 上面的预检查只给出友好报错；真正的并发门是这条带 status 条件的 UPDATE——否则两次几乎
+    // 同时的审核通过会双双越过预检查，各自重复记审计、重复入队合并、并**两次** release_pending_review
+    // （污染并发计数器，使其虚高、永久挤占审核槽位）。
+    let claimed = sqlx::query(
+        "UPDATE change_requests SET status='pending_merge', admin_suggestions_2=?, merge_commit_message=?, admin_id=?, approved_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND status='pending_code_review'"
     )
     .bind(suggestions.unwrap_or(""))
     .bind(&merge_msg)
@@ -939,6 +947,15 @@ async fn approve_cr_review_2(
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
+    if claimed.rows_affected() == 0 {
+        return Err("变更请求状态已变化，不可重复审核通过".to_string());
+    }
+
+    // 以下副作用仅「认领成功」的那一个调用执行一次。
+    record_review_2_outcome(db, cr_id, true).await;
+    // 合并 CR：全部成员需求各记一条「review_2 approved」审计。
+    record_admin_decision_all(db, &cr.project_id, cr_id, "review_2", "approved", admin_id, suggestions)
+        .await?;
 
     // 入队合并流水线（开关 ON → 并行 premerge；OFF → legacy merge）。统一唯一键，杜绝撞
     // 历史 completed 行被去重不派发（CR 卡死 pending_merge 的根因）。
