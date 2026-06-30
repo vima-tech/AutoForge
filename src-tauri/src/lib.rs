@@ -335,6 +335,8 @@ pub fn run() {
             commands::issues::submit_issue,
             commands::issues::retry_analysis,
             commands::issues::reanalyze_with_feedback,
+            commands::issues::defer_issue,
+            commands::issues::reactivate_issue,
             commands::issues::update_issue_acceptance,
             commands::issues::import_issue_attachment,
             commands::issues::list_issue_attachments,

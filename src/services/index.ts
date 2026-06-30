@@ -534,6 +534,14 @@ export const retryAnalysis = (issueId: string) =>
 export const reanalyzeWithFeedback = (issueId: string, feedback: string) =>
   ipc<void>('reanalyze_with_feedback', { issueId, feedback });
 
+// 暂不处置：把待审核/分析失败/分析中的需求搁置为 deferred（不进流水线，重启只能重新分析）。
+export const deferIssue = (issueId: string) =>
+  ipc<void>('defer_issue', { issueId });
+
+// 重新启用被拒绝/搁置的需求：mode='reanalyze' 回分析队列；mode='review' 仅 rejected 且有分析时直接退回需求审核。
+export const reactivateIssue = (issueId: string, mode: 'reanalyze' | 'review') =>
+  ipc<void>('reactivate_issue', { issueId, mode });
+
 // 人审改 AI 生成的验收标准（acceptance_json，JSON 数组字符串）。
 export const updateIssueAcceptance = (issueId: string, acceptanceJson: string) =>
   ipc<void>('update_issue_acceptance', { issueId, acceptanceJson });

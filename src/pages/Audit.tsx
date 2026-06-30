@@ -11,7 +11,7 @@ import { toggleMaximizeOnDoubleClick } from '../lib/window';
 import { fmtShort, fmtFull } from '../utils/datetime';
 import {
   listActiveProjects, listChangeRequests, listChangeRequestsPage, countPendingIssueReviews, getChangeRequestByIssue, getWorktreeSession, getCodeDiff, review2, review2Batch, getCrGrade,
-  retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback,
+  retryChangeRequest, deleteChangeRequest, retryAnalysis, reanalyzeWithFeedback, deferIssue, reactivateIssue,
   openUrl, getIssue, listIssuesPage, listIssueStatuses, listIssuesByStatuses, listIssueTitles, exportIssues,
   getIssueAnalysis, review1, review1Batch, parseAnalysisSpec, updateIssueAcceptance, refineTriage, rejectIssues,
   listMergeCandidates, review1Merge, getChangeRequestIssues, type MergeCandidate, type CrIssueRef,
@@ -87,6 +87,7 @@ const STATUS_LABEL: Record<string, string> = {
   reverting: '撤销中',
   reverted: '已撤销',
   rejected: '已拒绝',
+  deferred: '暂不处置',
 };
 const STATUS_COLOR: Record<string, string> = {
   analysis_failed: 'red',
@@ -106,6 +107,7 @@ const STATUS_COLOR: Record<string, string> = {
   reverting: 'amber',
   reverted: 'violet',
   rejected: 'red',
+  deferred: 'violet',
 };
 // Failed states float to the top so abnormal requirements are easy to find and resolve.
 const STATUS_ORDER = ['execution_failed', 'merge_failed', 'merge_conflict', 'pending_code_review', 'executing', 'pending_execution', 'pending_merge', 'merge_testing', 'merge_ready', 'pending_issue_review', 'no_change_needed', 'merged', 'rejected'];
@@ -1402,11 +1404,11 @@ const LEDGER_STATUS_LABEL: Record<string, string> = {
   pending_issue_review: '需求审核', pending_execution: '待编码', executing: '编码中',
   pending_code_review: '代码审核', pending_merge: '待合并', merge_testing: '合并中', merge_ready: '待落地', merged: '已合并',
   reverting: '撤销中', reverted: '已撤销',
-  rejected: '已拒绝', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
+  rejected: '已拒绝', deferred: '暂不处置', merge_failed: '合并失败', merge_conflict: '合并冲突', execution_failed: '执行失败', no_change_needed: '无需改动',
 };
 const LEDGER_STATUS_CHIP: Record<string, string> = {
   triage: '', pending_analysis: 'amber', analysis_failed: 'red', pending_issue_review: 'amber',
-  executing: 'blue', pending_code_review: 'amber', merged: 'green', rejected: '', merge_failed: 'red',
+  executing: 'blue', pending_code_review: 'amber', merged: 'green', rejected: '', deferred: 'violet', merge_failed: 'red',
   merge_conflict: 'amber', no_change_needed: 'blue', reverting: 'amber', reverted: 'violet',
   pending_merge: 'blue', merge_testing: 'blue', merge_ready: 'amber',
 };
@@ -2123,45 +2125,15 @@ function AcceptancePanel({ issue }: { issue: Issue }) {
   );
 }
 
-function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide, onRetryAnalysis, onReanalyze }: {
+// 需求报告正文（描述 + 附件 + 验收 + 分析摘要/规格）——需求审核视图、全屏阅读、
+// 全量总账的「详情查看」三处共用，保证被拒/搁置需求看到的内容与审核态完全一致。
+function IssueReportBody({ issue, analysis, analysisLoading }: {
   issue: Issue; analysis: IssueAnalysis | null; analysisLoading: boolean;
-  submitting: boolean; decided: string | null;
-  advice: string; setAdvice: (v: string) => void;
-  onDecide: (decision: 'approved' | 'rejected') => void;
-  onRetryAnalysis: () => void;
-  onReanalyze: () => void;
 }) {
-  const canReview = issue.status === 'pending_issue_review' && !decided;
   const analysisFailed = issue.status === 'analysis_failed';
   const spec = parseAnalysisSpec(analysis?.analysis_json);
-  // Analysis concluded the requirement needs no code change (misjudgment /
-  // already satisfied / pure question). Don't recommend sending it to coding —
-  // demote 批准 from the primary action and surface the reason. Human still decides.
   const notRecommended = spec?.triage?.needs_changes === false;
-
-  // 全屏阅读模式（与代码审核 / 会议室阅读模式风格一致）：衬线字体 + 报纸波点底纹
-  const [fsReader, setFsReader] = useState(false);
-  const reqReaderScrollRef = useRef<HTMLDivElement>(null);
-  const [readerScale, setReaderScale] = useState(() => {
-    const v = Number(localStorage.getItem('audit.diffScale'));
-    return v >= 0.85 && v <= 2 ? v : 1.1;
-  });
-  const bumpScale = (delta: number) => setReaderScale(s => {
-    const next = Math.min(2, Math.max(0.85, Math.round((s + delta) * 100) / 100));
-    localStorage.setItem('audit.diffScale', String(next));
-    return next;
-  });
-  useEffect(() => {
-    if (!fsReader) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFsReader(false); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [fsReader]);
-  // 切换需求时退出全屏，避免残留覆盖到新选中项
-  useEffect(() => { setFsReader(false); }, [issue.id]);
-
-  // 需求描述 + 分析结果正文——内嵌视图与全屏阅读共用（全屏时不限 760，交由 CSS --measure 控制）
-  const renderReportBody = () => (
+  return (
     <div className="report">
       <h2><Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />需求描述</h2>
       <p style={{ whiteSpace: 'pre-line' }}>{issue.description || '（无描述）'}</p>
@@ -2237,6 +2209,48 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
 
     </div>
   );
+}
+
+function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided, advice, setAdvice, onDecide, onDefer, onRetryAnalysis, onReanalyze }: {
+  issue: Issue; analysis: IssueAnalysis | null; analysisLoading: boolean;
+  submitting: boolean; decided: string | null;
+  advice: string; setAdvice: (v: string) => void;
+  onDecide: (decision: 'approved' | 'rejected') => void;
+  onDefer: () => void;
+  onRetryAnalysis: () => void;
+  onReanalyze: () => void;
+}) {
+  const canReview = issue.status === 'pending_issue_review' && !decided;
+  const analysisFailed = issue.status === 'analysis_failed';
+  const spec = parseAnalysisSpec(analysis?.analysis_json);
+  // Analysis concluded the requirement needs no code change (misjudgment /
+  // already satisfied / pure question). Don't recommend sending it to coding —
+  // demote 批准 from the primary action and surface the reason. Human still decides.
+  const notRecommended = spec?.triage?.needs_changes === false;
+
+  // 全屏阅读模式（与代码审核 / 会议室阅读模式风格一致）：衬线字体 + 报纸波点底纹
+  const [fsReader, setFsReader] = useState(false);
+  const reqReaderScrollRef = useRef<HTMLDivElement>(null);
+  const [readerScale, setReaderScale] = useState(() => {
+    const v = Number(localStorage.getItem('audit.diffScale'));
+    return v >= 0.85 && v <= 2 ? v : 1.1;
+  });
+  const bumpScale = (delta: number) => setReaderScale(s => {
+    const next = Math.min(2, Math.max(0.85, Math.round((s + delta) * 100) / 100));
+    localStorage.setItem('audit.diffScale', String(next));
+    return next;
+  });
+  useEffect(() => {
+    if (!fsReader) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFsReader(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fsReader]);
+  // 切换需求时退出全屏，避免残留覆盖到新选中项
+  useEffect(() => { setFsReader(false); }, [issue.id]);
+
+  // 需求描述 + 分析结果正文——内嵌视图与全屏阅读、详情查看（IssueDetailModal）共用同一组件。
+  const renderReportBody = () => <IssueReportBody issue={issue} analysis={analysis} analysisLoading={analysisLoading} />;
 
   return (
     <>
@@ -2268,6 +2282,10 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
             : canReview
               ? <>
                   <button className="btn btn-danger" onClick={() => onDecide('rejected')} disabled={submitting}><Icon name="x" size={15} />拒绝</button>
+                  <button className="btn" onClick={onDefer} disabled={submitting}
+                    title="暂不处置：搁置该需求，不进入编码；后续可在「全量需求总账」里重新分析（项目演进后重判）">
+                    <Icon name="clock" size={15} />暂不处置
+                  </button>
                   <button className={notRecommended ? 'btn' : 'btn btn-primary'} onClick={() => onDecide('approved')} disabled={submitting}
                     title={notRecommended ? 'AI 分析认为无需改动代码，不建议进入编码；如确需执行可继续' : undefined}>
                     <Icon name="check" size={15} />批准 · 进入编码
@@ -2345,6 +2363,117 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
   );
 }
 
+// ── IssueDetailModal（全量总账「详情查看」浮层）─────────────────────────────────
+// 被拒 / 暂不处置 / 待整理等无审核闸口归宿的需求，在此只读查看完整内容（描述 + 附件 +
+// 验收 + 分析），并对「已拒绝 / 暂不处置」提供重新启用入口。浮在总账之上；按 DESIGN，
+// 关闭只走 ✕ / Esc（不点遮罩关闭）。
+function IssueDetailModal({ issueId, onClose, onReactivated, showOk, showError }: {
+  issueId: string;
+  onClose: () => void;
+  onReactivated: () => void;
+  showOk: (m: string) => void;
+  showError: (m: string) => void;
+}) {
+  const [issue, setIssue] = useState<Issue | null>(null);
+  const [analysis, setAnalysis] = useState<IssueAnalysis | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      const iss = await getIssue(issueId).catch(() => null);
+      if (cancelled) return;
+      setIssue(iss);
+      const an = await getIssueAnalysis(issueId).catch(() => null);
+      if (cancelled) return;
+      setAnalysis(an);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [issueId]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const reactivate = async (mode: 'reanalyze' | 'review') => {
+    if (!issue) return;
+    setBusy(true);
+    try {
+      await reactivateIssue(issue.id, mode);
+      showOk(mode === 'reanalyze' ? '已重新启用 · 送回分析队列' : '已退回需求审核');
+      onReactivated();
+      onClose();
+    } catch (e) {
+      showError('重新启用失败：' + String(e));
+    } finally { setBusy(false); }
+  };
+
+  const status = issue?.status;
+  const hasAnalysis = !!analysis;
+  return (
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.55)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
+      <div style={{ width: 'min(860px, calc(100vw - 80px))', height: 'min(720px, calc(100vh - 64px))', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        <div className="audit-top" style={{ borderBottom: '1px solid var(--border)' }}>
+          <div className="audit-top-info">
+            <div className="audit-top-titlerow">
+              <span className="req-id" style={{ fontSize: 'var(--text-control)' }}>{issueId.slice(0, 10)}</span>
+              <CopyIdButton value={issueId} title="复制需求编号" />
+              <span className="audit-top-title" style={{ fontWeight: 700, fontSize: 'var(--text-title)' }} title={issue?.title}>{issue?.title || '需求详情'}</span>
+              {status && <span className={'chip ' + (STATUS_COLOR[status] ?? '')}>{STATUS_LABEL[status] ?? status}</span>}
+            </div>
+            {issue && (
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span className={'chip ' + (SEV_COLOR[issue.category] || 'blue')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.category}</span>
+                <span className={'chip ' + (SEV_COLOR[issue.severity] || '')} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }}>{issue.severity}</span>
+                {(() => { const s = issueSourceMeta(issue.source_type); return (
+                  <span className={'chip ' + s.chip} style={{ padding: '0 7px', fontSize: 'var(--text-micro)' }} title={`需求来源：${s.label}`}>
+                    <Icon name="inbox" size={11} style={{ marginRight: 3, opacity: .7 }} />来源 · {s.label}
+                  </span>
+                ); })()}
+                <span>{fmtFull(issue.created_at)}</span>
+              </div>
+            )}
+          </div>
+          <button className="icon-btn" title="关闭 (Esc)" onClick={onClose}><Icon name="x" size={18} /></button>
+        </div>
+
+        <div ref={scrollRef} className="diff-viewport scroll" style={{ flex: 1, minHeight: 0 }}>
+          {loading
+            ? <div className="empty-compact" style={{ padding: '40px 0' }}>加载中…</div>
+            : issue
+              ? <IssueReportBody issue={issue} analysis={analysis} analysisLoading={false} />
+              : <div className="empty" style={{ flex: 1 }}><Icon name="alert" /><div>需求不存在或已被删除</div></div>}
+        </div>
+
+        {(status === 'rejected' || status === 'deferred') && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 18px', borderTop: '1px solid var(--border)', background: 'var(--bg-1)' }}>
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+              {status === 'deferred' ? '暂不处置 · 重启只能重新分析（项目可能已变化）' : '已拒绝 · 可重新启用'}
+            </span>
+            <span style={{ flex: 1 }} />
+            {status === 'rejected' && hasAnalysis && (
+              <button className="btn btn-sm" disabled={busy} onClick={() => reactivate('review')}
+                title="沿用已有分析结果，直接退回「需求审核」闸口">
+                <Icon name="refresh" size={14} />退回需求审核
+              </button>
+            )}
+            <button className="btn btn-sm btn-primary" disabled={busy} onClick={() => reactivate('reanalyze')}
+              title="回到分析队列重新分析，完成后进入「需求审核」">
+              <Icon name="refresh" size={14} />{busy ? '处理中…' : '重新分析'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── AuditPage ────────────────────────────────────────────────────────────────
 
 export default function AuditPage({ target, onTargetConsumed, openLedger, onLedgerConsumed, stageTarget, onStageConsumed }: {
@@ -2374,6 +2503,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [showMerged, setShowMerged] = useState(false);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
   const [showLedger, setShowLedger] = useState(false);
+  // 从总账下钻、但无审核闸口归宿的需求（已拒绝 / 暂不处置 / 待整理等）的「详情查看」浮层。
+  const [detailIssueId, setDetailIssueId] = useState<string | null>(null);
   // 总账打开时的初始状态筛选：流水线节点跳到 triage/分析中/已合并等只读环节时预置。
   const [ledgerStatus, setLedgerStatus] = useState<string | undefined>(undefined);
   // 总账刷新信号：整理/拒绝后自增，触发总账重载首页（背景事件刷新不动它，避免浏览中被重置）。
@@ -3137,6 +3268,23 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     } finally { setSubmitting(false); }
   };
 
+  // 需求审核：暂不处置 → 搁置为 deferred（离开待审队列，可在总账里重新分析）。
+  const doDefer = async () => {
+    if (!activeIssueId || submitting) return;
+    setSubmitting(true);
+    try {
+      await deferIssue(activeIssueId);
+      setSel(null);
+      if (activeProject) await loadList(activeProject.id);
+      await loadProjectReviewCounts();
+      setLedgerRefresh(v => v + 1);
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+      showOk('已暂不处置 · 需求已搁置（可在「全量需求总账」里重新分析）');
+    } catch (e) {
+      showError('暂不处置失败：' + String(e));
+    } finally { setSubmitting(false); }
+  };
+
   // 需求审核：批准 → 创建 CR 进入编码；拒绝 → 归档（后端按设计返回 Err）。
   const doReview1 = async (decision: 'approved' | 'rejected') => {
     if (!activeIssueId || submitting) return;
@@ -3847,6 +3995,7 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               submitting={submitting} decided={decided}
               advice={advice} setAdvice={setAdvice}
               onDecide={d => d === 'rejected' ? setConfirmReject('review1') : doReview1('approved')}
+              onDefer={doDefer}
               onRetryAnalysis={doRetryAnalysis} onReanalyze={doReanalyze}
             />
           ) : cr ? (
@@ -4097,7 +4246,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
               <LedgerView projectId={activeProject?.id ?? ''} refreshKey={ledgerRefresh} sel={sel}
                 onSelectIssue={async id => {
                   // 下钻到该需求并对齐审核闸口：有变更请求(已进入代码阶段，含已合并)→切「审核代码」选中其 CR；
-                  // 否则仍在需求阶段→切「审核需求」选中该需求；triage/分析中等无可下钻目标的状态保持总账打开。
+                  // 仍在审核闸口的需求→切「审核需求」选中；其余无审核闸口归宿的状态（已拒绝 / 暂不处置 /
+                  // 待整理 / 分析中等）→开「详情查看」浮层只读查看，避免被默认落位 effect 清掉而无处可看。
                   // 标记 gate 已定，避免默认落位 effect 覆盖此次跳转意图。
                   // 分批加载下 CR 可能未载入，resolveCr 命中内存则直接用、否则按需补拉单条。
                   const cr = await resolveCr(id);
@@ -4108,6 +4258,8 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
                   } else if (pendingIssues.some(i => i.id === id)) {
                     gateInitRef.current = loadedProjectId;
                     setGate('issue'); setSel({ kind: 'issue', id }); setDecided(null); setShowLedger(false);
+                  } else {
+                    setDetailIssueId(id);
                   }
                 }}
                 onRefineTriage={refineTriageItems} onRejectIssues={rejectIssuesItems}
@@ -4118,6 +4270,21 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             </div>
           </div>
         </div>
+      )}
+
+      {detailIssueId && (
+        <IssueDetailModal
+          issueId={detailIssueId}
+          onClose={() => setDetailIssueId(null)}
+          onReactivated={async () => {
+            if (activeProject) await loadList(activeProject.id);
+            await loadProjectReviewCounts();
+            setLedgerRefresh(v => v + 1);
+            window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+          }}
+          showOk={showOk}
+          showError={showError}
+        />
       )}
 
       {logModal && (

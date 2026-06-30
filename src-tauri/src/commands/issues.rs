@@ -231,6 +231,7 @@ fn issue_status_label(status: &str) -> &str {
         "reverting" => "撤销中",
         "reverted" => "已撤销",
         "rejected" => "已拒绝",
+        "deferred" => "暂不处置",
         "merge_failed" => "合并失败",
         "merge_conflict" => "合并冲突",
         "execution_failed" => "执行失败",
@@ -610,6 +611,104 @@ pub async fn reanalyze_with_feedback(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 「暂不处置」：把待审核 / 分析失败的需求搁置为 `deferred`。
+///
+/// 搁置态是临时停泊，不进入流水线、不能直接编码——这类需求很可能因项目演进发生变化，
+/// 重新启用时只能走「重新分析」（见 `reactivate_issue`）。仅允许从「待需求审核」「分析失败」
+/// 「分析中」三种尚未落地的需求侧状态进入，避免与运行中/已落地的下游产物脱节。
+#[tauri::command]
+pub async fn defer_issue(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let updated = sqlx::query(
+        "UPDATE issues SET status='deferred', updated_at=datetime('now')
+         WHERE id=? AND status IN ('pending_issue_review', 'analysis_failed', 'pending_analysis')",
+    )
+    .bind(&issue_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err("仅「待需求审核」「分析失败」「分析中」状态的需求可暂不处置".to_string());
+    }
+    Ok(())
+}
+
+/// 重新启用被「拒绝」或「暂不处置」的需求。
+///
+/// - `mode="reanalyze"`：从 `rejected` / `deferred` 回到 `pending_analysis` 并重新入队分析。
+///   搁置需求**只能**走这条路——项目可能已演进，必须重判而非直接复用旧结论。
+/// - `mode="review"`：仅 `rejected` 可用，且必须已有分析结果，直接退回 `pending_issue_review`
+///   省去重跑分析。搁置需求显式拒绝此模式。
+///
+/// 重新分析复用 `analysis:<id>:retry:<uuid>` 唯一幂等键，规避稳定键被旧 completed job 去重。
+#[tauri::command]
+pub async fn reactivate_issue(
+    issue_id: String,
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM issues WHERE id=?")
+        .bind(&issue_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(status) = status else {
+        return Err("需求不存在".to_string());
+    };
+    if status != "rejected" && status != "deferred" {
+        return Err("仅「已拒绝」或「暂不处置」状态的需求可重新启用".to_string());
+    }
+
+    match mode.as_str() {
+        "reanalyze" => {
+            sqlx::query(
+                "UPDATE issues SET status='pending_analysis', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(&issue_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            crate::tasks::runner::enqueue(
+                &state.db,
+                &state.job_tx,
+                "analysis",
+                &format!("analysis:{}:retry:{}", issue_id, uuid::Uuid::new_v4()),
+                JobPayload::Analysis {
+                    issue_id: issue_id.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "review" => {
+            if status != "rejected" {
+                return Err("「暂不处置」的需求只能重新分析，不能直接退回需求审核".to_string());
+            }
+            let has_analysis: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM issue_analyses WHERE issue_id=? LIMIT 1")
+                    .bind(&issue_id)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if has_analysis.is_none() {
+                return Err("该需求尚无分析结果，请改用「重新分析」".to_string());
+            }
+            sqlx::query(
+                "UPDATE issues SET status='pending_issue_review', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(&issue_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        _ => Err("未知的重新启用模式".to_string()),
+    }
 }
 
 /// 列出某 CR 的测试遥测记录（review_2 合并前自动测试结果）。
