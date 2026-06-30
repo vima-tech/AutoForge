@@ -2522,6 +2522,9 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   const [showMerged, setShowMerged] = useState(false);
   const [pendingIssues, setPendingIssues] = useState<Issue[]>([]);
   const [showLedger, setShowLedger] = useState(false);
+  // 总账标题里的项目切换下拉开关；切换项目即调 setActiveProject，与功能审计页共享同一状态、自动同步。
+  const [ledgerProjOpen, setLedgerProjOpen] = useState(false);
+  const ledgerProjRef = useRef<HTMLDivElement>(null);
   // 从总账下钻、但无审核闸口归宿的需求（已拒绝 / 暂不处置 / 待整理等）的「详情查看」浮层。
   const [detailIssueId, setDetailIssueId] = useState<string | null>(null);
   // 总账打开时的初始状态筛选：流水线节点跳到 triage/分析中/已合并等只读环节时预置。
@@ -2953,7 +2956,18 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
   }, [stageTarget, loadedProjectId]);
 
   // 总账关闭后清掉预置筛选，下次从常规入口打开时回到「全部」。
-  useEffect(() => { if (!showLedger) setLedgerStatus(undefined); }, [showLedger]);
+  useEffect(() => { if (!showLedger) { setLedgerStatus(undefined); setLedgerProjOpen(false); } }, [showLedger]);
+  // 总账项目切换下拉：点击外部关闭。
+  useEffect(() => {
+    if (!ledgerProjOpen) return;
+    const close = (e: PointerEvent) => {
+      if (!(e.target instanceof Node)) return;
+      if (ledgerProjRef.current?.contains(e.target)) return;
+      setLedgerProjOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [ledgerProjOpen]);
 
   // 读取「自定义合并提交信息」开关（Settings 合并与放行面板）；关闭时审核页不显示输入框。
   useEffect(() => { getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {}); }, []);
@@ -4293,7 +4307,42 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
             <div style={{ padding: '16px 20px 12px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div className="eyebrow" style={{ fontSize: 'var(--text-section)', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
                 <span className="cn">全量需求总账</span>
-                {activeProject && <span className="chip ember">{activeProject.name}</span>}
+                {activeProject && (
+                  <div ref={ledgerProjRef} style={{ position: 'relative' }}>
+                    <button type="button" className="chip ember" onClick={() => setLedgerProjOpen(o => !o)}
+                      title="切换项目（同步功能审计页）"
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 5, cursor: 'pointer', border: 'none' }}>
+                      {activeProject.name}
+                      <Icon name="chevDown" size={12} style={{ transition: 'transform .15s', transform: ledgerProjOpen ? 'rotate(180deg)' : 'none' }} />
+                    </button>
+                    {ledgerProjOpen && (
+                      <div className="mention-pop" style={{ left: 0, top: 'calc(100% + 6px)', bottom: 'auto', minWidth: 240, maxWidth: 320, marginBottom: 0, zIndex: 40 }}>
+                        {projects.map(p => (
+                          <div key={p.id} className="mention-row" onClick={() => { if (p.id !== activeProject.id) setActiveProject(p); setLedgerProjOpen(false); }}>
+                            <div className="proj-logo" style={{ background: '#e8772e', width: 26, height: 26, fontSize: 'var(--text-label)', borderRadius: 8 }}>{p.name[0]}</div>
+                            <div style={{ minWidth: 0, flex: 1 }}>
+                              <div className="nm" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                {p.name}
+                                {p.id === activeProject.id && (
+                                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--ember)', display: 'inline-block', flexShrink: 0 }} />
+                                )}
+                              </div>
+                              <div className="rl">{p.description || p.slug}</div>
+                            </div>
+                            <span style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                              {(projectReviewCounts[p.id]?.issue ?? 0) > 0 && (
+                                <span className="chip amber" title="待审核需求" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)' }}>需 {projectReviewCounts[p.id].issue}</span>
+                              )}
+                              {(projectReviewCounts[p.id]?.code ?? 0) > 0 && (
+                                <span className="chip amber" title="待审核代码" style={{ padding: '1px 6px', fontSize: 'var(--text-micro)' }}>码 {projectReviewCounts[p.id].code}</span>
+                              )}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-sans)', letterSpacing: 0, textTransform: 'none' }}>所有状态 · 看 / 下钻 / 整理</span>
               </div>
               <button className="icon-btn" onClick={() => setShowLedger(false)}><Icon name="x" size={18} /></button>
