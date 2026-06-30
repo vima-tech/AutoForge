@@ -14,7 +14,7 @@
 
 ## 工作区写入限制
 
-Agent 写文件仅允许操作项目 .autoforge/docs/ 和 .autoforge/specs/ 目录，workspace.rs 强制校验路径，禁止 .. 路径越界。
+Agent 写文件仅允许操作项目 .autoforge/docs/、.autoforge/specs/ 和 .autoforge/deliverables/ 目录，workspace.rs 强制校验路径，禁止 .. 路径越界。
 
 ---
 

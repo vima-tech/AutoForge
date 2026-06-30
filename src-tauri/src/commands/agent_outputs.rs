@@ -89,6 +89,7 @@ pub async fn list_agent_output_roles(state: State<'_, AppState>) -> Result<Vec<S
 #[derive(Debug, Default, serde::Serialize)]
 pub struct FieldHealth {
     pub role: String,
+    /// 本次体检实际聚合的 schema 版本（默认解析为该 role 最新版本）。
     pub schema_version: Option<String>,
     pub total: i64,
     pub status_ok: i64,
@@ -96,6 +97,8 @@ pub struct FieldHealth {
     pub status_error: i64,
     /// 各叶子字段的填充率（按 created_at 倒序取样后聚合）。
     pub fields: Vec<FieldStat>,
+    /// 该 role 下全部可选 schema 版本及样本量（供 UI 切换；按最新优先）。
+    pub versions: Vec<VersionStat>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -104,6 +107,13 @@ pub struct FieldStat {
     pub filled: i64,
     pub total: i64,
     pub fill_rate: f64,
+}
+
+/// 某 role 下一个 schema 版本的样本量（供版本选择器）。
+#[derive(Debug, serde::Serialize)]
+pub struct VersionStat {
+    pub schema_version: String,
+    pub count: i64,
 }
 
 /// 递归收集 JSON 的叶子字段路径及其「是否填充」。数组视为叶子（非空即填充），不下钻元素索引避免路径爆炸。
@@ -144,16 +154,57 @@ pub async fn agent_output_field_health(
     project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<FieldHealth, String> {
-    let mut sql =
-        String::from("SELECT status, output_json FROM agent_outputs WHERE role = ?");
-    let mut binds: Vec<String> = vec![role.clone()];
-    if let Some(v) = schema_version.as_deref().filter(|s| !s.is_empty()) {
-        sql.push_str(" AND schema_version = ?");
-        binds.push(v.to_string());
+    let project = project_id.as_deref().filter(|s| !s.is_empty());
+
+    // 先枚举该 role 全部 schema 版本（按最新优先），供 UI 切换 + 默认解析最新版本。
+    // 跨版本混算会让 v2 新增字段被 v1 旧样本拉低填充率、误报成弱字段，故体检必须锚定单一版本。
+    let mut ver_sql = String::from(
+        "SELECT schema_version, COUNT(*) FROM agent_outputs WHERE role = ?",
+    );
+    let mut ver_binds: Vec<String> = vec![role.clone()];
+    if let Some(p) = project {
+        ver_sql.push_str(" AND project_id = ?");
+        ver_binds.push(p.to_string());
     }
-    if let Some(v) = project_id.as_deref().filter(|s| !s.is_empty()) {
+    ver_sql.push_str(" GROUP BY schema_version ORDER BY MAX(created_at) DESC");
+    let mut vq = sqlx::query_as::<_, (String, i64)>(&ver_sql);
+    for b in &ver_binds {
+        vq = vq.bind(b);
+    }
+    let versions: Vec<VersionStat> = vq
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(schema_version, count)| VersionStat {
+            schema_version,
+            count,
+        })
+        .collect();
+
+    // 解析目标版本：显式传入优先，否则取最新（versions 首项）；无任何样本则提前返回空体检。
+    let target_version = schema_version
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| versions.first().map(|v| v.schema_version.clone()));
+    let target_version = match target_version {
+        Some(v) => v,
+        None => {
+            return Ok(FieldHealth {
+                role,
+                versions,
+                ..Default::default()
+            })
+        }
+    };
+
+    let mut sql =
+        String::from("SELECT status, output_json FROM agent_outputs WHERE role = ? AND schema_version = ?");
+    let mut binds: Vec<String> = vec![role.clone(), target_version.clone()];
+    if let Some(p) = project {
         sql.push_str(" AND project_id = ?");
-        binds.push(v.to_string());
+        binds.push(p.to_string());
     }
     sql.push_str(" ORDER BY created_at DESC LIMIT 1000");
 
@@ -165,7 +216,8 @@ pub async fn agent_output_field_health(
 
     let mut health = FieldHealth {
         role,
-        schema_version,
+        schema_version: Some(target_version),
+        versions,
         ..Default::default()
     };
     // path -> filled 计数；分母统一用样本总数 total（某行缺该字段即记为未填充）。

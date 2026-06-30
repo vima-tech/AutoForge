@@ -4,9 +4,10 @@ import Select from '../components/Select';
 import {
   listLlmTraces, getLlmTrace, listTraceAgentNames, clearLlmTraces,
   listAgentOutputs, getAgentOutput, listAgentOutputRoles, clearAgentOutputs,
-  agentOutputFieldHealth,
+  agentOutputFieldHealth, llmUsageStats,
   type LlmTraceSummary, type LlmTrace, type TraceFilter,
   type AgentOutputSummary, type AgentOutput, type FieldHealth,
+  type LlmUsageStats,
 } from '../services';
 
 // span 类型 → chip 语义色（仅语义状态色，遵循设计系统）。
@@ -122,6 +123,14 @@ function SpanRow({ span }: { span: LlmTrace }) {
             {span.prompt_tokens != null && <span>in: {span.prompt_tokens}</span>}
             {span.completion_tokens != null && <span>out: {span.completion_tokens}</span>}
             {meta?.iteration != null && <span>iter: {meta.iteration}</span>}
+            {meta?.stage && <span>stage: <b style={{ color: 'var(--text-2)' }}>{meta.stage}</b></span>}
+            {meta?.terminated_by && (
+              <span>收尾: <b style={{ color: meta.terminated_by === 'model_final' ? 'var(--text-2)' : 'var(--amber)' }}>{meta.terminated_by}</b></span>
+            )}
+            {meta?.iters != null && <span>轮数: {meta.iters}</span>}
+            {meta?.tool_calls != null && (
+              <span>工具: {meta.tool_calls}{meta.tool_errors ? <b style={{ color: 'var(--red)' }}> ({meta.tool_errors} 失败)</b> : null}</span>
+            )}
             <span>{fmtTime(span.created_at)}</span>
           </div>
           {span.error && <TraceBlock label="错误" text={span.error} tone="error" />}
@@ -193,7 +202,8 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
     try { await navigator.clipboard.writeText(pretty); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* ignore */ }
   };
 
-  // 从结构化产出里取一句话结论（兼容不同 schema：test 用 verdict/summary，analysis 用 triage.analysis_summary）。
+  // 从结构化产出里取一句话结论：先认已知 schema 的关键字段，再退化为「首个非空短字符串叶子」兜底，
+  // 让 proposer/doc_writer 等未枚举的环节产出在列表里也有可读摘要。
   const headline = (j: string | null): string => {
     if (!j) return '';
     try {
@@ -201,6 +211,11 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
       if (o.verdict) return `${o.verdict}${o.summary ? ' · ' + o.summary : ''}`;
       if (o.triage?.analysis_summary) return o.triage.analysis_summary;
       if (o.summary) return o.summary;
+      if (typeof o.title === 'string' && o.title.trim()) return o.title.trim();
+      // 兜底：扫顶层字符串字段，取首个长度适中的非空值。
+      for (const v of Object.values(o)) {
+        if (typeof v === 'string' && v.trim().length >= 4 && v.length <= 200) return v.trim();
+      }
       return '';
     } catch { return ''; }
   };
@@ -237,8 +252,8 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
             </div>
           )}
           {rows.map(r => (
-            <div key={r.id} className="cfg-card" onClick={() => open(r.id)}
-              style={{ margin: '8px 10px', padding: '10px 12px', cursor: 'pointer', ...(selected === r.id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+            <div key={r.id} className={'cfg-card selectable' + (selected === r.id ? ' picked' : '')} onClick={() => open(r.id)}
+              style={{ margin: '8px 10px', padding: '10px 12px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{r.role}</span>
                 <span className={'chip ' + (OUT_STATUS_CHIP[r.status] ?? '')} style={{ fontSize: 'var(--text-micro)' }}>{r.status}</span>
@@ -300,10 +315,12 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
   );
 }
 
-// schema 体检：选 role → 字段填充率 + 状态分布，暴露长期空着的弱字段（优化循环）。
+// schema 体检：选 role（+ 可选 schema 版本）→ 字段填充率 + 状态分布，暴露长期空着的弱字段（优化循环）。
+// 体检锚定单一 schema 版本（默认最新），避免跨版本字段漂移污染填充率。
 function SchemaHealth() {
   const [roles, setRoles] = useState<string[]>([]);
   const [role, setRole] = useState('');
+  const [version, setVersion] = useState('');  // 空 = 后端解析为最新版本
   const [data, setData] = useState<FieldHealth | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -314,11 +331,15 @@ function SchemaHealth() {
     }).catch(() => {});
   }, []);
 
+  // 切换环节时重置版本选择，让后端回到「最新版本」默认。
+  useEffect(() => { setVersion(''); }, [role]);
+
   useEffect(() => {
     if (!role) { setData(null); return; }
     setLoading(true);
-    agentOutputFieldHealth(role).then(setData).catch(() => setData(null)).finally(() => setLoading(false));
-  }, [role]);
+    agentOutputFieldHealth(role, version || undefined)
+      .then(setData).catch(() => setData(null)).finally(() => setLoading(false));
+  }, [role, version]);
 
   const pct = (n: number) => `${Math.round(n * 100)}%`;
   // 填充率 → 语义色：低=红（弱字段）、中=琥珀、高=绿。
@@ -327,10 +348,20 @@ function SchemaHealth() {
   return (
     <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
       <div className="list-col" style={{ width: 220, flex: '0 0 220px', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)' }}>
-          <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">ROLE</span></div>
-          <Select value={role} onChange={setRole} style={{ width: '100%' }}
-            options={roles.map(r => ({ value: r, label: r }))} placeholder="选择环节" />
+        <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">ROLE</span></div>
+            <Select value={role} onChange={setRole} style={{ width: '100%' }}
+              options={roles.map(r => ({ value: r, label: r }))} placeholder="选择环节" />
+          </div>
+          {data && data.versions.length > 0 && (
+            <div>
+              <div className="eyebrow" style={{ fontSize: 'var(--text-caption)', marginBottom: 6 }}><span className="en">SCHEMA</span></div>
+              <Select value={data.schema_version ?? ''} onChange={setVersion} style={{ width: '100%' }}
+                options={data.versions.map(v => ({ value: v.schema_version, label: `v${v.schema_version} · ${v.count}` }))}
+                placeholder="版本" />
+            </div>
+          )}
         </div>
       </div>
       <div style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 18 }}>
@@ -372,8 +403,97 @@ function SchemaHealth() {
   );
 }
 
+// 用量 Tab：按模型聚合的 token 消耗与调用次数 + 合计。时间范围可切「近 7 天 / 30 天 / 全部」。
+const USAGE_RANGES: { label: string; days: number }[] = [
+  { label: '近 7 天', days: 7 },
+  { label: '近 30 天', days: 30 },
+  { label: '全部', days: 0 },
+];
+function UsageTab() {
+  const [days, setDays] = useState(7);
+  const [stats, setStats] = useState<LlmUsageStats | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    const since = days > 0
+      ? new Date(Date.now() - days * 86400000).toISOString().slice(0, 19).replace('T', ' ')
+      : undefined;
+    llmUsageStats(since)
+      .then(s => { if (alive) setStats(s); })
+      .catch(() => { if (alive) setStats(null); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [days]);
+
+  const fmt = (n: number) => n.toLocaleString();
+  return (
+    <div className="scroll" style={{ flex: 1, padding: 'clamp(12px, 1.6vw, 24px)' }}>
+      <div className="seg" style={{ marginBottom: 16, width: 'fit-content' }}>
+        {USAGE_RANGES.map(r => (
+          <button key={r.days} className={days === r.days ? 'on' : ''} onClick={() => setDays(r.days)}>{r.label}</button>
+        ))}
+      </div>
+
+      {/* 合计卡 */}
+      <div className="stat-grid" style={{ marginBottom: 16 }}>
+        {[
+          { label: '调用次数', val: stats ? fmt(stats.total_calls) : '—', color: 'var(--blue)' },
+          { label: '输入 tokens', val: stats ? fmt(stats.total_prompt_tokens) : '—', color: 'var(--violet)' },
+          { label: '输出 tokens', val: stats ? fmt(stats.total_completion_tokens) : '—', color: 'var(--amber)' },
+          { label: '总 tokens', val: stats ? fmt(stats.total_tokens) : '—', color: 'var(--ember)' },
+        ].map((c, i) => (
+          <div className="stat" key={i}>
+            <div className="stat-main">
+              <div className="stat-label">{c.label}</div>
+              <div className="stat-val" style={{ color: c.color }}>{c.val}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 按模型明细表 */}
+      <div className="panel">
+        <div className="panel-head"><span style={{ fontWeight: 700 }}>按模型用量</span></div>
+        <div style={{ padding: '8px 0' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-control)' }}>
+            <thead>
+              <tr style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', textTransform: 'uppercase' }}>
+                <th style={{ textAlign: 'left', padding: '6px 14px' }}>模型</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>调用</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>输入</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>输出</th>
+                <th style={{ textAlign: 'right', padding: '6px 14px' }}>总计</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats?.rows.map((r, i) => (
+                <tr key={i} style={{ borderTop: '1px solid var(--border)' }}>
+                  <td style={{ padding: '8px 14px' }}>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{r.model || '—'}</span>
+                    {r.provider && <span className="chip" style={{ marginLeft: 6, fontSize: 'var(--text-micro)' }}>{r.provider}</span>}
+                  </td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px' }}>{fmt(r.calls)}</td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px', color: 'var(--text-3)' }}>{fmt(r.prompt_tokens)}</td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px', color: 'var(--text-3)' }}>{fmt(r.completion_tokens)}</td>
+                  <td style={{ textAlign: 'right', padding: '8px 14px', fontWeight: 600 }}>{fmt(r.total_tokens)}</td>
+                </tr>
+              ))}
+              {!loading && (!stats || stats.rows.length === 0) && (
+                <tr><td colSpan={5} style={{ padding: '20px 14px', textAlign: 'center', color: 'var(--text-faint)' }}>暂无用量数据</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TracePage() {
-  const [tab, setTab] = useState<'trace' | 'outputs' | 'health'>('trace');
+  const [tab, setTab] = useState<'trace' | 'outputs' | 'usage' | 'health'>('trace');
+  const [usageKey, setUsageKey] = useState(0);
   const [outputsKey, setOutputsKey] = useState(0);
   const [healthKey, setHealthKey] = useState(0);
   const [issueId, setIssueId] = useState('');
@@ -434,6 +554,7 @@ export default function TracePage() {
         <div className="seg" style={{ marginLeft: 16 }}>
           <button className={tab === 'trace' ? 'on' : ''} onClick={() => setTab('trace')}>调用链路</button>
           <button className={tab === 'outputs' ? 'on' : ''} onClick={() => setTab('outputs')}>环节产出</button>
+          <button className={tab === 'usage' ? 'on' : ''} onClick={() => setTab('usage')}>用量</button>
           <button className={tab === 'health' ? 'on' : ''} onClick={() => setTab('health')}>schema 体检</button>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
@@ -451,6 +572,8 @@ export default function TracePage() {
                 <Icon name="trash" size={14} />清空
               </button>
             </>
+          ) : tab === 'usage' ? (
+            <button className="btn btn-sm" onClick={() => setUsageKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
           ) : (
             <button className="btn btn-sm" onClick={() => setHealthKey(k => k + 1)} title="刷新"><Icon name="refresh" size={14} />刷新</button>
           )}
@@ -460,6 +583,8 @@ export default function TracePage() {
       {tab === 'outputs' && (
         <AgentOutputsExplorer key={outputsKey} onDrill={(tid) => { setTab('trace'); openTrace(tid); }} />
       )}
+
+      {tab === 'usage' && <UsageTab key={usageKey} />}
 
       {tab === 'health' && <SchemaHealth key={healthKey} />}
 
@@ -506,9 +631,9 @@ export default function TracePage() {
             )}
             {traces.map(t => (
               <div key={t.trace_id}
-                className="cfg-card"
+                className={'cfg-card selectable' + (selected === t.trace_id ? ' picked' : '')}
                 onClick={() => openTrace(t.trace_id)}
-                style={{ margin: '8px 10px', padding: '10px 12px', cursor: 'pointer', ...(selected === t.trace_id ? { borderColor: 'var(--ember-tint-strong)' } : {}) }}>
+                style={{ margin: '8px 10px', padding: '10px 12px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span className="chip ember" style={{ fontSize: 'var(--text-micro)' }}>{t.agent_name || t.agent_role || 'agent'}</span>
                   {t.status === 'error' && <span className="chip red" style={{ fontSize: 'var(--text-micro)' }}>error</span>}

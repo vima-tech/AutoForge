@@ -56,6 +56,22 @@ pub async fn set_auto_conflict_resolve_enabled(
         .map_err(|e| e.to_string())
 }
 
+/// 合并并行化开关（默认关）。开启后合并拆为并行 premerge（测试出锁）+ 串行 land。
+#[tauri::command]
+pub async fn get_parallel_premerge_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(crate::core::gate::parallel_premerge_enabled(&state.db).await)
+}
+
+#[tauri::command]
+pub async fn set_parallel_premerge_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::core::gate::set_parallel_premerge_enabled(&state.db, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 合并提交信息自定义开关（默认关）。开启后代码审核页出现提交信息输入框。
 #[tauri::command]
 pub async fn get_custom_merge_message_enabled(state: State<'_, AppState>) -> Result<bool, String> {

@@ -19,6 +19,19 @@ pub async fn init(db_path: &str) -> Result<Db> {
         .execute(&pool)
         .await?;
     sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
+    // 性能调优（WAL 下安全）：提交不再每次 fsync、加大页缓存、对读启用 mmap、临时表入内存。
+    sqlx::query("PRAGMA synchronous=NORMAL")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA cache_size=-16000")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA mmap_size=268435456")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA temp_store=MEMORY")
+        .execute(&pool)
+        .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
 }

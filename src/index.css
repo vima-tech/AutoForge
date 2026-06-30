@@ -518,6 +518,40 @@
   color-scheme: light;
 }
 
+/* Breeze — 清爽天空蓝：低饱和、明亮通透，作为暖色系外的清爽选项。
+   暗色基调偏冷石板蓝且比其它 palette 更轻盈；浅色近白、空气感强。 */
+[data-theme="dark"][data-palette="breeze"] {
+  --bg: #121a22; --bg-1: #18222c; --bg-2: #1f2c38; --bg-3: #283744;
+  --surface-hover: #314250; --surface-active: #3b4f5f;
+  --titlebar: rgba(20,30,40,.74); --rail-bg: #0e151c; --rail-border: rgba(0,0,0,.4);
+  --rail-item-color: #7c8e9e; --rail-item-hover-bg: rgba(255,255,255,.06); --rail-item-hover-color: #dce9f5;
+  --me-avatar-bg: linear-gradient(135deg,#273c4d,#18222c); --me-avatar-color: #6fbaee; --av-status-border: var(--bg-1);
+  --border: rgba(168,210,242,.12); --border-strong: rgba(168,210,242,.22);
+  --text: #eaf2fa; --text-2: #b5c7d8; --text-3: #8294a6; --text-faint: #586a7a;
+  --ember: #3d9be0; --ember-soft: #6fbaee; --ember-deep: #2a78b6; --ember-tint: rgba(61,155,224,.15); --ember-tint-strong: rgba(61,155,224,.24);
+  --molten: linear-gradient(135deg,#7cc5f3 0%,#3d9be0 58%,#2a78b6 100%);
+  --green: #5ea8a0; --green-soft: #7cc6bd; --blue: #5891cf; --violet: #8a82c8; --red: #d2675a; --amber: #c79b48;
+  --bubble-me: linear-gradient(135deg,#7cc5f3,#3d9be0); --bubble-me-text: #06151f; --bubble-them: #1d2935; --bubble-them-text: #eaf2fa;
+  --code-bg: #0b1117;
+  color-scheme: dark;
+}
+
+[data-theme="light"][data-palette="breeze"] {
+  --bg: #eaf2fa; --bg-1: #f2f7fc; --bg-2: #fbfdff; --bg-3: #ffffff;
+  --surface-hover: #e4eef7; --surface-active: #d6e6f2;
+  --titlebar: rgba(249,252,255,.84); --rail-bg: #f2f7fc; --rail-border: rgba(38,78,118,.12);
+  --rail-item-color: #74879a; --rail-item-hover-bg: rgba(38,78,118,.07); --rail-item-hover-color: #14222f;
+  --me-avatar-bg: linear-gradient(135deg,#ffffff,#e7f1fb); --me-avatar-color: #2a78b6; --av-status-border: var(--bg-3);
+  --border: rgba(38,78,118,.12); --border-strong: rgba(38,78,118,.21);
+  --text: #14222f; --text-2: #4f6478; --text-3: #7e91a4; --text-faint: #a5b4c3;
+  --ember: #2f88cf; --ember-soft: #57a5de; --ember-deep: #216aa6; --ember-tint: rgba(47,136,207,.12); --ember-tint-strong: rgba(47,136,207,.20);
+  --molten: linear-gradient(135deg,#63b1e8 0%,#2f88cf 58%,#216aa6 100%);
+  --green: #549b8e; --green-soft: #6fbaad; --blue: #4d87c3; --violet: #7d74bb; --red: #c95d52; --amber: #b98e3a;
+  --bubble-me: linear-gradient(135deg,#63b1e8,#2f88cf); --bubble-me-text: #06151f; --bubble-them: #ffffff; --bubble-them-text: #14222f;
+  --code-bg: #e4eef7;
+  color-scheme: light;
+}
+
 /* Theme polish pass: small tonal corrections without changing the theme system. */
 [data-theme="dark"] {
   --shadow-sm: 0 1px 2px rgba(0,0,0,.28), 0 1px 1px rgba(0,0,0,.16);
@@ -1010,6 +1044,10 @@ button { font-family: inherit; cursor: pointer; }
 }
 .search input { border: none; background: none; outline: none; color: var(--text); font-size: var(--text-control); width: 100%; font-family: var(--font-sans); }
 .search svg { width: 15px; height: 15px; color: var(--text-3); flex: none; }
+/* 搜索框内的清空按钮：清零原生 button 内边距，并覆盖 .search svg / .icon-btn svg
+   的尺寸冲突，让 X 图标在小尺寸按钮里真正居中、不溢出。 */
+.search .icon-btn { padding: 0; }
+.search .icon-btn svg { width: 13px; height: 13px; }
 
 .content {
   flex: 1; min-width: 0;
@@ -1639,8 +1677,32 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
   animation: asr-pulse 1.1s ease-in-out infinite;
 }
 @keyframes asr-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .6; } }
+@keyframes pulse-ring { 0% { transform: scale(1); opacity: .8; } to { transform: scale(1.3); opacity: 0; } }
+@keyframes progress-pulse { 0%,100% { opacity: .6; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .composer-asr-dot { animation: none; } }
 [data-motion="off"] .composer-asr-dot { animation: none; }
+
+/* 骨架屏：加载占位条，ember 微光横扫，预示即将到来的内容布局。
+   只用表面层级 + ember-tint，尊重 reduced-motion / data-motion。 */
+.skel {
+  position: relative; overflow: hidden; border-radius: var(--radius-sm);
+  background: var(--bg-3);
+}
+.skel::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, var(--ember-tint), transparent);
+  transform: translateX(-100%);
+  animation: skel-sweep 1.4s ease-in-out infinite;
+}
+@keyframes skel-sweep { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .skel::after { animation: none; } }
+[data-motion="off"] .skel::after { animation: none; }
+/* 加载状态文案切换：淡入上浮，让巡回的步骤提示有连续感。 */
+.cs-phase { display: inline-block; animation: cs-phase-in .34s cubic-bezier(.2,.7,.3,1) both; }
+@keyframes cs-phase-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .cs-phase { animation: none; } }
+[data-motion="off"] .cs-phase { animation: none; }
 .composer-pending { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 8px; }
 .composer-pending-item {
   display: inline-flex; align-items: center; gap: 6px; max-width: 178px;
@@ -1917,9 +1979,27 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .preview-url { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: var(--text-label); color: var(--text-2); padding: 8px 11px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 9px; }
 .preview-url .live { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(79,157,107,.25); flex: none; }
 
-.req-item { padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s; border: 1px solid transparent; }
+/* 分组标题：粘性吸顶——组内滚动时标题钉在列表顶部，滚入下一组时由后一标题顶替。
+   背景用 list-col 底色 var(--bg-1)，行从其下方完整穿过；z-index 高于 .req-item(relative)。 */
+.req-group-head { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; padding: 8px 12px 6px; background: var(--bg-1); font-size: var(--text-caption); letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); font-weight: 600; border-bottom: 1px solid var(--border); }
+/* 可折叠分组标题：整行可点；hover 时轻微提示可交互（chevron/勾选框各自 stopPropagation） */
+.req-group-head.clickable:hover { color: var(--text-3); background: var(--surface-hover); }
+/* 列表行：左侧批量勾选框独占一列（gutter），右侧主内容纵向排布——把勾选与内容解耦，命中区更大、对齐更稳。 */
+.req-item { display: flex; align-items: flex-start; gap: 9px; padding: 12px 13px; border-radius: 12px; cursor: pointer; position: relative; transition: background .12s, border-color .12s, box-shadow .12s; border: 1px solid transparent; }
 .req-item:hover { background: var(--surface-hover); }
-.req-item.active { background: var(--bg-3); border-color: var(--ember-tint-strong); }
+.req-item-main { flex: 1 1 auto; min-width: 0; }
+.req-check { display: flex; flex-shrink: 0; align-items: center; cursor: pointer; padding-top: 1px; }
+/* 勾选框 hover/选中放大命中区并给 ember 光环，呼应 focus 态 */
+.req-check:hover > span { border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); }
+/* 选中态：ember 余烬高亮——着色底 + ember 实边 + 柔光环 + 左侧指示条（呼应 rail 激活态），
+   让当前选中需求在长列表中一眼可辨。 */
+.req-item.active { background: var(--ember-tint); border-color: var(--ember); box-shadow: 0 0 0 3px var(--ember-tint); }
+.req-item.active::before {
+  content: ""; position: absolute; left: 0; top: 9px; bottom: 9px;
+  width: 3px; border-radius: 0 99px 99px 0; background: var(--ember);
+}
+.req-item.active .req-title { color: var(--ember-soft); }
+[data-theme="light"] .req-item.active .req-title { color: var(--ember-deep); }
 .req-item-top { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
 .req-id { font-family: var(--font-mono); font-size: var(--text-caption); color: var(--ember); font-weight: 700; white-space: nowrap; flex: none; }
 .req-time { margin-left: auto; font-family: var(--font-mono); font-size: var(--text-caption); color: var(--text-3); white-space: nowrap; }
@@ -1963,7 +2043,10 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 /* 实时日志窗口（行号 + 按行高亮 + 跟随滚动） */
 .log-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 0; background: var(--code-bg); font-family: var(--font-mono); font-size: var(--text-caption); line-height: 1.65; }
 .log-empty { padding: 20px 18px; color: var(--text-faint); font-family: var(--font-sans); font-size: var(--text-label); }
-.log-line { display: flex; align-items: flex-start; padding: 0 14px 0 0; border-left: 2px solid transparent; }
+/* content-visibility: 视口外的日志行跳过布局/绘制，上千行长日志也能秒开、滚动不卡；
+   contain-intrinsic-size 的 auto 记住实测高度（行可换行高度不定），未渲染时回退约一行高，
+   保证滚动条尺寸与跳转（含自动滚到底）稳定。配合 LogLine 的 React.memo 一并降本。 */
+.log-line { display: flex; align-items: flex-start; padding: 0 14px 0 0; border-left: 2px solid transparent; content-visibility: auto; contain-intrinsic-size: auto 18px; }
 .log-line:hover { background: var(--surface-hover); }
 .log-gut {
   flex: none; width: 46px; padding-right: 12px; text-align: right;
@@ -2138,6 +2221,9 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 }
 .dock-advice-row input:focus { border-color: var(--ember); }
 .dock-advice-row .btn { flex: none; }
+/* dock 内分段切换（管理员建议 / 合并信息）：紧凑、左对齐，不拉满整行 */
+.dock-seg { align-self: flex-start; padding: 2px; }
+.dock-seg button { padding: 3px 10px; font-size: var(--text-caption); }
 
 .iter-warn {
   margin: 0 0 12px; padding: 10px 13px; border-radius: 12px;
@@ -2186,9 +2272,22 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
 .set-h { font-family: var(--font-display); font-size: var(--text-page-title); font-weight: 800; letter-spacing: -.01em; }
 .set-desc { color: var(--text-3); font-size: var(--text-body); margin: 6px 0 22px; line-height: var(--leading-relaxed); }
 
-.cfg-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 15px; padding: 16px 18px; margin-bottom: 13px; transition: border-color .14s; }
+.cfg-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 15px; padding: 16px 18px; margin-bottom: 13px; transition: border-color .14s, background .14s, box-shadow .14s; }
 .cfg-card.add { border-style: dashed; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-3); cursor: pointer; padding: 18px; font-weight: 600; }
 .cfg-card.add:hover { border-color: var(--ember); color: var(--ember); }
+/* 可选列表项的悬停/选中态：呼应 .filter-chip.on / .conv-item.active 的 ember 激活语言，
+   选中态用 ember 实色描边 + tint 底 + 光环 + 左侧 ember 指示条，区别于仅微调描边的旧实现，
+   保证各 palette × dark/light 下「当前选中哪一条」一目了然。 */
+.cfg-card.selectable { position: relative; cursor: pointer; }
+.cfg-card.selectable:hover { border-color: var(--border-strong); background: var(--surface-hover); }
+.cfg-card.picked {
+  border-color: var(--ember); background: var(--ember-tint);
+  box-shadow: var(--shadow-sm), 0 0 0 3px var(--ember-tint);
+}
+.cfg-card.picked::before {
+  content: ""; position: absolute; left: 0; top: 12px; bottom: 12px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--ember); pointer-events: none;
+}
 .cfg-top { display: flex; align-items: center; gap: 12px; }
 .cfg-logo { width: 40px; height: 40px; border-radius: 11px; display: grid; place-items: center; color: #fff; font-weight: 800; font-family: var(--font-display); flex: none; }
 .cfg-name { font-weight: 700; font-size: var(--text-title); }

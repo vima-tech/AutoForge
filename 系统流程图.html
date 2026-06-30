@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AutoForge · 系统流程图</title>
+<!-- Mermaid 由 CDN 加载（绘制流程图）；离线时图形不渲染，但文字说明与状态表仍可读。 -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#16110d; --bg-1:#1b150f; --bg-2:#211a13; --bg-3:#2a2017;
+    --surface-hover:#322619; --border:rgba(245,210,170,.10); --border-strong:rgba(245,210,170,.18);
+    --text:#f4e9df; --text-2:#cbb9a6; --text-3:#9c8b79; --text-faint:#6f6051;
+    --ember:#e8772e; --ember-soft:#f29a55; --ember-deep:#c2571a;
+    --ember-tint:rgba(232,119,46,.14); --ember-tint-strong:rgba(232,119,46,.22);
+    --green:#5cc079; --amber:#e0a83a; --red:#e06a5a; --blue:#5aa6e0; --violet:#a98ae0;
+    --green-tint:rgba(92,192,121,.14); --amber-tint:rgba(224,168,58,.14);
+    --red-tint:rgba(224,106,90,.14); --blue-tint:rgba(90,166,224,.14); --violet-tint:rgba(169,138,224,.14);
+    --font-display:'Archivo','Noto Sans SC',system-ui,sans-serif;
+    --font-sans:'Noto Sans SC',system-ui,sans-serif;
+    --font-mono:'JetBrains Mono','SFMono-Regular',ui-monospace,monospace;
+    --radius:14px; --radius-sm:9px;
+    --shadow:0 14px 40px -18px rgba(0,0,0,.7);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.6}
+  body{padding:0 0 80px}
+  .wrap{max-width:1240px;margin:0 auto;padding:0 28px}
+
+  /* Header */
+  header.top{
+    position:sticky;top:0;z-index:20;
+    background:rgba(22,17,13,.82);backdrop-filter:blur(20px) saturate(1.4);
+    border-bottom:1px solid var(--border);
+  }
+  .top-in{max-width:1240px;margin:0 auto;padding:18px 28px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+  .brand{display:flex;flex-direction:column;gap:4px}
+  .kicker{font-family:var(--font-mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--ember-soft)}
+  h1{font-family:var(--font-display);font-weight:800;font-size:26px;margin:0;letter-spacing:-.01em;
+     background:linear-gradient(135deg,#f4a93c,#e8772e,#d65f1c);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .sub{color:var(--text-3);font-size:13px}
+  .seg{margin-left:auto;display:inline-flex;background:var(--bg-3);border:1px solid var(--border-strong);border-radius:var(--radius-sm);padding:4px;gap:4px}
+  .seg button{font-family:var(--font-mono);font-size:12px;letter-spacing:.04em;color:var(--text-2);
+     background:transparent;border:0;padding:8px 16px;border-radius:7px;cursor:pointer;transition:.14s}
+  .seg button.on{background:var(--ember-tint-strong);color:var(--ember-soft);box-shadow:inset 0 0 0 1px rgba(232,119,46,.4)}
+
+  /* Sections */
+  section{display:none;animation:rise .34s ease}
+  section.show{display:block}
+  @keyframes rise{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+  .intro{margin:30px 0 14px;padding:18px 20px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius)}
+  .intro h2{font-family:var(--font-display);font-size:19px;margin:0 0 8px}
+  .intro p{margin:6px 0;color:var(--text-2);font-size:14px}
+  .intro b{color:var(--ember-soft);font-weight:600}
+  code{font-family:var(--font-mono);font-size:12.5px;background:var(--bg-3);padding:1px 6px;border-radius:5px;color:var(--ember-soft)}
+
+  /* Legend */
+  .legend{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 22px}
+  .lg{display:inline-flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:11px;
+      letter-spacing:.04em;color:var(--text-2);background:var(--bg-2);border:1px solid var(--border);padding:6px 11px;border-radius:99px}
+  .sw{width:13px;height:13px;border-radius:4px;flex:none}
+  .sw.user{background:var(--ember)} .sw.ai{background:var(--blue)} .sw.gate{background:var(--amber)}
+  .sw.auto{background:var(--violet)} .sw.term{background:var(--green)} .sw.fail{background:var(--red)}
+
+  /* Diagram panel */
+  .panel{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--radius);
+     padding:14px;box-shadow:var(--shadow);overflow-x:auto}
+  .mermaid{font-family:var(--font-sans)!important;min-width:760px}
+
+  /* Status reference table */
+  .tbl-wrap{margin-top:30px}
+  .tbl-wrap h3{font-family:var(--font-display);font-size:17px;margin:0 0 12px}
+  table{width:100%;border-collapse:collapse;font-size:13px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);background:var(--bg-3)}
+  td:first-child{font-family:var(--font-mono);font-size:12px;color:var(--ember-soft);white-space:nowrap}
+  tr:last-child td{border-bottom:0}
+  td .st{font-family:var(--font-mono);font-size:11px;padding:1px 7px;border-radius:99px;display:inline-block;margin:1px 0}
+  .st.g{background:var(--green-tint);color:var(--green)} .st.a{background:var(--amber-tint);color:var(--amber)}
+  .st.r{background:var(--red-tint);color:var(--red)} .st.b{background:var(--blue-tint);color:var(--blue)}
+  .st.v{background:var(--violet-tint);color:var(--violet)} .st.e{background:var(--ember-tint);color:var(--ember-soft)}
+  footer{margin-top:40px;color:var(--text-faint);font-size:12px;font-family:var(--font-mono);text-align:center}
+  .mm-loading{font-family:var(--font-mono);font-size:12px;color:var(--text-3);padding:40px;text-align:center}
+  /* 可拖拽 / 缩放视口 */
+  .mm-viewport{position:relative;height:74vh;min-height:460px;overflow:hidden;
+     background:var(--bg-1);border-radius:10px;cursor:grab;touch-action:none;user-select:none}
+  .mm-viewport.grabbing{cursor:grabbing}
+  .mm-viewport:fullscreen{width:100vw;height:100vh;border-radius:0;background:var(--bg)}
+  .mm-viewport:-webkit-full-screen{width:100vw;height:100vh;border-radius:0;background:var(--bg)}
+  .mm-viewport:fullscreen .mm-hint{bottom:16px}
+  .mm-canvas{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform}
+  .mm-canvas svg{display:block;max-width:none!important;height:auto}
+  .mm-controls{position:absolute;top:12px;right:12px;display:flex;flex-direction:column;gap:6px;z-index:5}
+  .mm-controls button{width:34px;height:34px;font-family:var(--font-mono);font-size:17px;line-height:1;
+     color:var(--text);background:var(--bg-3);border:1px solid var(--border-strong);border-radius:9px;cursor:pointer;
+     display:flex;align-items:center;justify-content:center;transition:.12s;box-shadow:var(--shadow)}
+  .mm-controls button:hover{background:var(--surface-hover);color:var(--ember-soft);border-color:var(--ember)}
+  .mm-zlabel{font-family:var(--font-mono);font-size:10px;color:var(--text-3);text-align:center;margin-top:1px}
+  .mm-hint{position:absolute;left:12px;bottom:10px;font-family:var(--font-mono);font-size:10.5px;letter-spacing:.04em;
+     color:var(--text-2);background:rgba(22,17,13,.72);border:1px solid var(--border);padding:4px 10px;border-radius:99px;pointer-events:none;z-index:5;max-width:calc(100% - 80px)}
+  @media (prefers-reduced-motion: reduce){ section{animation:none} .mm-controls button{transition:none} }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <span class="kicker">AutoForge · Human-Lite-in-the-Loop</span>
+      <h1>系统流程图</h1>
+    </div>
+    <div class="sub">自主软件工厂 · 需求→分析→人审→实现→人审→自动测试→自动合并</div>
+    <div class="seg" role="tablist">
+      <button id="t-user" class="on" onclick="show('user')">用户侧流程</button>
+      <button id="t-mod" onclick="show('mod')">底层模块流程</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="legend">
+    <span class="lg"><i class="sw user"></i> 人工节点（操作者决策）</span>
+    <span class="lg"><i class="sw ai"></i> AI 自动处理</span>
+    <span class="lg"><i class="sw gate"></i> 自动闸门（测试 / 安全 / 门控）</span>
+    <span class="lg"><i class="sw auto"></i> 引擎 / 队列 / 并发</span>
+    <span class="lg"><i class="sw term"></i> 终态（成功）</span>
+    <span class="lg"><i class="sw fail"></i> 失败 / 阻断 / 拒绝</span>
+  </div>
+
+  <!-- ============ USER SIDE ============ -->
+  <section id="sec-user" class="show">
+    <div class="intro">
+      <h2>用户侧流程 — 操作者只在两个节点决策</h2>
+      <p>AutoForge 把「需求 → 上线」的链条自动化。<b>操作者（人）只在两个审核闸口做决策</b>：<b>需求审核</b>（AI 分析后）与 <b>代码审核</b>（AI 实现后）。其余分析、实现、测试、合并全自动。</p>
+      <p>所有人工节点集中在 <code>功能审计</code> 页（Audit.tsx）；需求从多渠道进入；<code>会议室</code> 是并行的协作/产出空间，可绑定项目并把文档写进 <code>.autoforge/</code> 工作区。</p>
+    </div>
+    <div class="panel">
+      <div class="mermaid-out" id="out-user"><div class="mm-loading">流程图渲染中…</div></div>
+    </div>
+  </section>
+
+  <!-- ============ BACKEND MODULES ============ -->
+  <section id="sec-mod">
+    <div class="intro">
+      <h2>底层模块流程 — Rust 引擎内部</h2>
+      <p>后端纯 Rust（async/tokio），零外部依赖（SQLite）。任务经<b>进程内 mpsc 队列</b>调度，<code>job_executions</code> 幂等键防重复执行。所有 git 操作走 <code>GitProxy</code> 拦截危险命令；事件只走 <code>event::emit(app, AppEvent)</code> 单一出口（顺手沉淀通知收件箱）。</p>
+      <p>三类后台任务：<b>Analysis</b>（需求分析）、<b>Execution</b>（worktree 代码实现）、<b>Merge</b>（含 dev-sync / 测试门 / 安全门 / squash 落地 / 自托管隔离推送）；外加 <b>Testing / Revert / SecurityAudit</b>。并发由 <code>Semaphore</code> 槽位 + pending_review 背压阈值控制。</p>
+    </div>
+    <div class="panel">
+      <div class="mermaid-out" id="out-mod"><div class="mm-loading">流程图渲染中…</div></div>
+    </div>
+
+    <div class="tbl-wrap">
+      <h3>状态机参考 · issues / change_requests 关键状态值</h3>
+      <table>
+        <thead><tr><th>阶段</th><th>状态值（真实字面量）</th><th>含义 / 触发</th></tr></thead>
+        <tbody>
+          <tr><td>接收</td><td><span class="st b">triage</span> <span class="st b">pending_analysis</span></td><td>Triage 待整理池 / Flow 自动入队分析</td></tr>
+          <tr><td>分析</td><td><span class="st a">pending_issue_review</span> <span class="st r">analysis_failed</span> <span class="st r">rejected</span></td><td>分析完成待需求审核 / 分析失败可重试 / 注入或人工拒绝</td></tr>
+          <tr><td>实现前</td><td><span class="st e">pending_execution</span> <span class="st v">executing</span></td><td>需求审核通过建 CR 入队 / 占到槽位执行中</td></tr>
+          <tr><td>实现后</td><td><span class="st a">pending_code_review</span> <span class="st r">execution_failed</span> <span class="st g">no_change_needed</span></td><td>实现完成待代码审核 / 执行或提交失败 / Agent 判定无需改动</td></tr>
+          <tr><td>合并</td><td><span class="st e">pending_merge</span> <span class="st r">merge_conflict</span> <span class="st r">merge_failed</span></td><td>代码审核通过/门控降级待合并 / dev-sync 冲突 / 测试或安全门阻断</td></tr>
+          <tr><td>终态</td><td><span class="st g">merged</span> <span class="st v">reverting</span> <span class="st v">reverted</span></td><td>已 squash 落 dev / 撤销中 / 已 git revert</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    AutoForge · 流程图依据 src-tauri 实际代码绘制（tasks/runner·execution·merge·testing·analysis · intake/gateway · commands/change_requests）
+  </footer>
+</div>
+
+<script>
+  const DEFS = {
+    user: "flowchart TD\n    classDef user fill:#3a2410,stroke:#e8772e,stroke-width:2px,color:#f4e9df;\n    classDef ai fill:#16283a,stroke:#5aa6e0,stroke-width:1.5px,color:#dbe9f4;\n    classDef gate fill:#332710,stroke:#e0a83a,stroke-width:1.5px,color:#f4ecd9;\n    classDef term fill:#16321f,stroke:#5cc079,stroke-width:1.5px,color:#dff4e6;\n    classDef fail fill:#321616,stroke:#e06a5a,stroke-width:1.5px,color:#f4dede;\n    classDef auto fill:#241a32,stroke:#a98ae0,stroke-width:1.5px,color:#ece4f4;\n    classDef note fill:#211a13,stroke:#6f6051,stroke-width:1px,color:#cbb9a6;\n\n    subgraph IN[\"需求进入 · 多渠道\"]\n        direction LR\n        C1[\"手动提交 / 速录念头\"]:::user\n        C2[\"Webhook 接口\"]:::ai\n        C3[\"GitHub Issue 同步\"]:::ai\n        C4[\"代码扫描 / TODO 巡检\"]:::ai\n        C5[\"批量导入 CSV/JSON\"]:::user\n        C6[\"反馈 Widget（限流·可吊销 token）\"]:::ai\n        C7[\"会议录音 → AI 拆纪要\"]:::user\n    end\n\n    IN --> MODE{\"入口模式\"}:::auto\n    MODE -->|\"Triage 模式\"| TRI[\"待整理池 triage<br/>（暂不分析）\"]:::note\n    TRI -->|\"triage Agent 补全/分类<br/>或人工整理\"| ANA\n    MODE -->|\"Flow 模式（默认）\"| ANA[\"🤖 AI 自动需求分析<br/>真实性·可行性·优先级<br/>分类·受影响模块·验收标准\"]:::ai\n\n    ANA -->|\"分析失败\"| ANAF[\"analysis_failed<br/>审核页可『重新分析』\"]:::fail\n    ANA --> REV1{\"🧑 需求审核<br/>（功能审计页）\"}:::user\n\n    REV1 -->|\"拒绝\"| RJ1[\"rejected<br/>归档，可同需求再次提交『复活』\"]:::fail\n    REV1 -->|\"重新分析<br/>（补充意见·reanalyze_with_feedback）\"| ANA\n    REV1 -->|\"通过<br/>（可附实现建议）\"| CR[\"创建变更请求 CR<br/>→ 进入实现队列\"]:::auto\n\n    CR --> EXEC[\"🤖 AI 自动代码实现<br/>独立 git worktree 内<br/>调用 Claude Code CLI\"]:::ai\n    EXEC -.->|\"实时可见\"| WATCH[\"审核页：进度心跳 / 预览环境<br/>迭代轮次（≥3 轮提示）\"]:::note\n    EXEC -->|\"分析后认为无需改动\"| NOCH[\"no_change_needed<br/>（附 Agent 说明）\"]:::term\n    EXEC -->|\"执行/提交失败\"| EXF[\"execution_failed<br/>可『重新执行』\"]:::fail\n    EXEC --> GRADE[\"风险评级 + 安全预检<br/>（grader 打分 tier/class）\"]:::auto\n\n    GRADE -->|\"低风险且该类已获信任<br/>门控降级（默认关）\"| AUTOP[\"自动放行 → 合并\"]:::auto\n    GRADE -->|\"标准路径\"| REV2{\"🧑 代码审核<br/>看 Diff / 预览 / 测试结果<br/>填写合并信息\"}:::user\n\n    REV2 -->|\"拒绝\"| RJ2[\"rejected<br/>预览环境终止\"]:::fail\n    REV2 -->|\"退回重做<br/>+ 修改意见\"| EXEC\n    REV2 -->|\"通过\"| GATE\n\n    AUTOP --> GATE{\"自动闸门\"}:::gate\n    GATE --> G1[\"合并前：把 dev 并入分支<br/>跑测试门 + 安全扫描门\"]:::gate\n    G1 -->|\"测试/安全未过\"| BLK[\"merge_failed / merge_conflict<br/>阻断合并，等人工/AI 处理\"]:::fail\n    G1 -->|\"全部通过\"| MERGE[\"🤖 自动合并到 dev<br/>（squash，1 CR = 1 提交）\"]:::auto\n\n    MERGE --> DONE[\"✅ merged<br/>需求闭环\"]:::term\n    DONE -.-> SEC[\"合并后安全审计\"]:::ai\n    DONE -.-> REVERT[\"可『撤销该需求改动』<br/>（git revert squash 提交）\"]:::user\n    DONE -.-> KB[\"沉淀为成功样本<br/>（Innate 经验召回）\"]:::auto\n\n    subgraph PAR[\"并行能力（随时可用）\"]\n        direction LR\n        P1[\"会议室：群聊/直聊<br/>绑定项目·@提及·写 .autoforge 文档\"]:::user\n        P2[\"项目管理：物料库·扫描·备份\"]:::user\n        P3[\"设置：LLM/Agent·并发·通知·主题\"]:::user\n        P4[\"通知收件箱 + Trace 链路追踪\"]:::auto\n    end",
+    mod:  "flowchart TD\n    classDef entry fill:#3a2410,stroke:#e8772e,stroke-width:1.5px,color:#f4e9df;\n    classDef ai fill:#16283a,stroke:#5aa6e0,stroke-width:1.5px,color:#dbe9f4;\n    classDef gate fill:#332710,stroke:#e0a83a,stroke-width:1.5px,color:#f4ecd9;\n    classDef term fill:#16321f,stroke:#5cc079,stroke-width:1.5px,color:#dff4e6;\n    classDef fail fill:#321616,stroke:#e06a5a,stroke-width:1.5px,color:#f4dede;\n    classDef auto fill:#241a32,stroke:#a98ae0,stroke-width:1.5px,color:#ece4f4;\n    classDef db fill:#211a13,stroke:#9c8b79,stroke-width:1px,color:#cbb9a6;\n\n    %% ---------- INTAKE ----------\n    subgraph GW[\"intake/gateway.rs · 统一接收网关\"]\n        direction TB\n        REC[\"receive(payload, mode)\"]:::entry\n        REC --> INJ{\"has_obvious_injection()<br/>注入/越权检测\"}:::gate\n        INJ -->|\"命中\"| REJ[\"拒绝提交\"]:::fail\n        INJ -->|\"通过\"| FP[\"fingerprint() 去重<br/>同指纹活跃→返回原条目<br/>rejected→复活\"]:::auto\n        FP --> INS[\"INSERT issues<br/>Flow→pending_analysis<br/>Triage→triage\"]:::db\n    end\n\n    INS -->|\"Flow 模式\"| ENQ\n    INS -.->|\"Triage：等 refine_triage\"| ENQ\n\n    %% ---------- QUEUE / RUNNER ----------\n    ENQ[\"runner::enqueue(job_type, idem_key, payload)<br/>INSERT OR IGNORE job_executions<br/>仅新行/failed 行才派发 JobMsg\"]:::auto\n    ENQ --> MPSC([\"tokio mpsc channel (256)\"]):::auto\n    MPSC --> LOOP[\"runner::start 主循环<br/>每条 JobMsg → spawn 子任务\"]:::auto\n    LOOP --> DISP{\"dispatch_job<br/>按 JobPayload 分发\"}:::auto\n\n    %% startup recovery\n    BOOT[\"启动恢复<br/>requeue_orphaned_executions/analyses<br/>executing→pending_execution + 清 worktree\"]:::auto -.-> ENQ\n\n    DISP -->|\"Analysis\"| TANA\n    DISP -->|\"Execution\"| SLOT\n    DISP -.->|\"Testing（保留·当前不单独入队）\"| TGATE\n    DISP -->|\"Merge\"| MRUN\n    DISP -->|\"Revert\"| TREV[\"tasks/revert.rs<br/>git revert squash 提交<br/>merged→reverting→reverted\"]:::auto\n    DISP -->|\"SecurityAudit\"| TSEC[\"tasks/security_audit.rs<br/>合并后审计 diff\"]:::ai\n\n    %% ---------- ANALYSIS TASK ----------\n    subgraph AN[\"tasks/analysis.rs\"]\n        direction TB\n        TANA[\"注入快检 + Layer-1 LLM 消毒<br/>（可信源跳过）\"]:::ai\n        TANA --> ANL[\"analysis Agent（绑定自定义 LLM）<br/>Innate 召回经验 → 结构化产出<br/>真实性/可行性/优先级/验收标准\"]:::ai\n        ANL -->|\"失败/空响应\"| ANFAIL[\"issues=analysis_failed\"]:::fail\n        ANL -->|\"成功\"| ANOK[\"写 issue_analyses + agent_outputs<br/>issues=pending_issue_review\"]:::db\n    end\n    ANOK --> EV1[\"需求审核就绪<br/>event::ReviewNeeded(stage=1)\"]:::auto\n\n    %% ---------- EXECUTION TASK ----------\n    subgraph EX[\"tasks/execution.rs\"]\n        direction TB\n        SLOT{\"wait_for_execution_slot<br/>原子占槽 UPDATE：项目内<br/>(executing+pending_review)<max_slots<br/>且全局 pending_review<阈值<br/>+ CPU 负载背压\"}:::auto\n        SLOT -->|\"无槽\"| WAIT[\"job=waiting<br/>轮询重试\"]:::db\n        WAIT --> SLOT\n        SLOT -->|\"占到槽\"| WT[\"GitProxy worktree add -b<br/>autoforge/<cr>-i<n> 基于 dev<br/>记录 base_commit（分叉点）\"]:::auto\n        WT -->|\"worktree 失败\"| EXF1[\"execution_failed\"]:::fail\n        WT --> CODE[\"build_prompt + Innate 召回<br/>code_agent.run（claude/codex/opencode）<br/>禁用 Bash(git *)·墙钟+空闲双超时真杀\"]:::ai\n        CODE -->|\"exit≠0\"| EXF2[\"execution_failed<br/>（附退出码+输出）\"]:::fail\n        CODE -->|\"exit0 但无 diff\"| NOC[\"no_change_needed\"]:::term\n        CODE --> CMT[\"worktree 内提交改动<br/>grader 评级 tier/change_class\"]:::auto\n    end\n    CMT --> GDEC{\"core/gate::should_auto_pass<br/>低风险+受信类（默认关）?\"}:::gate\n    GDEC -->|\"是\"| PM[\"pending_merge<br/>记 auto_approved → enqueue Merge\"]:::auto\n    GDEC -->|\"否\"| PCR[\"pending_code_review<br/>event::ReviewNeeded(stage=2)<br/>transition_to_pending_review()\"]:::db\n\n    %% 代码审核（review_2）in commands/change_requests.rs\n    PCR --> R2{\"代码审核<br/>（review_2 命令 · 人工/batch）\"}:::entry\n    R2 -->|\"approved + 合并信息\"| PM\n    R2 -->|\"revision\"| SLOT\n    R2 -->|\"rejected\"| RJ2[\"rejected<br/>release_pending_review\"]:::fail\n    PM --> ENQ\n\n    %% ---------- MERGE TASK ----------\n    subgraph MG[\"tasks/merge.rs（合并唯一落地路径）\"]\n        direction TB\n        MRUN[\"持锁：merge_lock(project) → cr_lock(cr)<br/>同项目串行，跨项目并行\"]:::auto\n        MRUN --> SNAP[\"快照 CR 相对 base_commit 的 diff<br/>（在并入 dev 前，保持只含本 CR 改动）\"]:::db\n        SNAP --> SYNC{\"Phase1 sync_dev_into_worktree<br/>把最新 dev 并入 CR 分支(rerere)\"}:::auto\n        SYNC -->|\"冲突\"| CONF[\"merge_conflict<br/>存冲突文件/diff·emit MergeConflict\"]:::fail\n        CONF -->|\"自动解冲突开关 ON\"| AIRES[\"ai_resolve_conflict（后台脱锁）<br/>code agent 消除冲突标记\"]:::ai\n        CONF -.->|\"人工三方解决 / 一键重试\"| AIRES\n        AIRES --> FIN[\"finalize_resolution<br/>校验标记全清→提交→复跑测试门\"]:::gate\n        FIN -->|\"通过\"| PCR\n        FIN -->|\"未过\"| BLK2[\"merge_failed / merge_conflict\"]:::fail\n\n        SYNC -->|\"clean\"| TG[\"Phase2 测试门 run_and_gate<br/>（worktree 上跑配置的 unit/integration/lint…）\"]:::gate\n        TG -->|\"失败\"| TGF[\"dev_merged? merge_conflict : merge_failed\"]:::fail\n        TG -->|\"通过\"| SECG{\"安全门 pre_merge_gate<br/>启发式扫描 diff\"}:::gate\n        SECG -->|\"高危\"| SGF[\"merge_failed（安全阻断）\"]:::fail\n        SECG -->|\"通过\"| LAND{\"land_on_dev<br/>dev 是否为主仓库活动分支?\"}:::auto\n        LAND -->|\"否·常规项目\"| FAST[\"checkout dev<br/>merge --squash + commit<br/>（人审合并信息）\"]:::auto\n        LAND -->|\"是·自托管 AutoForge\"| ISO[\"隔离 worktree 基于 origin/dev<br/>squash 提交 → push origin/dev<br/>不碰本地活动树\"]:::auto\n    end\n\n    TGATE[\"tasks/testing.rs::run_and_gate<br/>由合并 Phase2 / finalize_resolution 直接调用<br/>build_pool(Semaphore) 限并发编译·超时真杀进程组<br/>失败→建 Bug issue + scan_finding\"]:::gate\n    TG -.-> TGATE\n    FAST --> MOK[\"change_requests/issues=merged<br/>删 worktree·preview terminated<br/>merge_commit SHA 落库\"]:::term\n    ISO --> MOK\n    MOK --> POST[\"enqueue SecurityAudit<br/>Innate：成功样本入库 + 召回回灌+evolve<br/>event::CrMerged\"]:::auto\n\n    %% ---------- CROSS-CUTTING ----------\n    subgraph X[\"横切设施\"]\n        direction LR\n        CC[\"core/concurrency.rs：Mutex 计数器<br/>执行准入=原子 SQL UPDATE（wait_for_execution_slot）<br/>项目内活跃<max_slots · 全局待审<阈值\"]:::auto\n        EVT[\"core/event.rs<br/>AppEvent → app.emit + 通知收件箱\"]:::auto\n        SECRT[\"core/secrets.rs<br/>密钥信封加密（keyring+AES-GCM）\"]:::db\n        KBX[\"knowledge / Innate<br/>召回·校准回路·经验沉淀\"]:::ai\n        REAP[\"core/reaper + cpubudget<br/>进程组回收·CPU 预算闸\"]:::auto\n    end"
+  };
+  const controllers = {};
+  const ICON_EXPAND = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>';
+  const ICON_COMPRESS = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>';
+  const ICON_DOWNLOAD = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>';
+  const FILE_NAME = { 'out-user':'autoforge-user-flow', 'out-mod':'autoforge-module-flow' };
+  function exportSvg(host, elId){
+    const svg = host.querySelector('svg'); if(!svg) return;
+    const clone = svg.cloneNode(true);
+    clone.removeAttribute('style');
+    clone.setAttribute('xmlns','http://www.w3.org/2000/svg');
+    const data = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n'+data], {type:'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = (FILE_NAME[elId]||'autoforge-flow')+'.svg';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  }
+  function toggleFullscreen(host){
+    if(document.fullscreenElement===host){ if(document.exitFullscreen) document.exitFullscreen(); return; }
+    if(document.fullscreenElement && document.exitFullscreen){ document.exitFullscreen(); }
+    if(host.requestFullscreen){ host.requestFullscreen().catch(function(){}); }
+    else if(host.webkitRequestFullscreen){ host.webkitRequestFullscreen(); }
+  }
+  document.addEventListener('fullscreenchange', function(){
+    const fsEl = document.fullscreenElement;
+    // 切换全屏按钮图标 + 提示
+    document.querySelectorAll('.mm-controls button[data-act="full"]').forEach(function(b){
+      const host = b.closest('.mm-viewport');
+      const on = host && host===fsEl;
+      b.innerHTML = on ? ICON_COMPRESS : ICON_EXPAND;
+      b.title = on ? '退出全屏' : '全屏';
+    });
+    // 容器尺寸剧变 → 重新适配（进入全屏的那张，或退出后当前可见的那张）
+    requestAnimationFrame(function(){
+      Object.keys(controllers).forEach(function(k){
+        const host=document.getElementById(k), c=controllers[k];
+        if(c && host && (host===fsEl || host.offsetParent!==null)) c.fit();
+      });
+    });
+  });
+  function show(which){
+    document.getElementById('sec-user').classList.toggle('show', which==='user');
+    document.getElementById('sec-mod').classList.toggle('show', which==='mod');
+    document.getElementById('t-user').classList.toggle('on', which==='user');
+    document.getElementById('t-mod').classList.toggle('on', which==='mod');
+    const c = controllers[which==='user'?'out-user':'out-mod'];
+    if(c && !c.isTouched()) requestAnimationFrame(c.fit);
+    try{ localStorage.setItem('af_flow_tab', which); }catch(_){}
+  }
+  function activeTab(){ return document.getElementById('sec-user').classList.contains('show') ? 'user' : 'mod'; }
+  function boot(){
+    if(!window.mermaid){
+      document.querySelectorAll('.mermaid-out').forEach(function(el){
+        el.innerHTML='<div class="mm-loading">离线无法加载 Mermaid 图形库；文字说明与状态表仍可阅读。</div>';
+      });
+      return;
+    }
+    mermaid.initialize({
+      startOnLoad:false, theme:'base', securityLevel:'loose',
+      flowchart:{ curve:'basis', nodeSpacing:42, rankSpacing:54, useMaxWidth:true, htmlLabels:true },
+      themeVariables:{
+        background:'#1b150f',
+        primaryColor:'#211a13', primaryTextColor:'#f4e9df', primaryBorderColor:'#e8772e',
+        lineColor:'#9c8b79', secondaryColor:'#241a32', tertiaryColor:'#16283a',
+        fontFamily:"'Noto Sans SC',system-ui,sans-serif", fontSize:'14px',
+        clusterBkg:'#16110d', clusterBorder:'rgba(245,210,170,.18)', titleColor:'#f29a55',
+        edgeLabelBackground:'#1b150f', nodeBorder:'#e8772e'
+      }
+    });
+    renderInto('out-user', DEFS.user, 'g-user');
+    renderInto('out-mod',  DEFS.mod,  'g-mod');
+    window.addEventListener('resize', function(){
+      Object.keys(controllers).forEach(function(k){ var c=controllers[k]; if(c && !c.isTouched()) c.fit(); });
+    });
+    // 恢复上次浏览的标签页
+    try{ const saved=localStorage.getItem('af_flow_tab'); if(saved==='mod') show('mod'); }catch(_){}
+    // 键盘快捷键：1/2 切换 · F 全屏 · +/− 缩放 · 0 复位（编辑态不拦截）
+    document.addEventListener('keydown', function(e){
+      if(e.ctrlKey||e.metaKey||e.altKey) return;
+      const t=e.target; if(t && (t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable)) return;
+      const k=e.key;
+      if(k==='1'){ show('user'); return; }
+      if(k==='2'){ show('mod'); return; }
+      const c=controllers[activeTab()==='user'?'out-user':'out-mod']; if(!c) return;
+      if(k==='f'||k==='F'){ toggleFullscreen(document.getElementById(activeTab()==='user'?'out-user':'out-mod')); }
+      else if(k==='+'||k==='='){ c.zoomIn(); }
+      else if(k==='-'||k==='_'){ c.zoomOut(); }
+      else if(k==='0'){ c.reset(); }
+      else return;
+      e.preventDefault();
+    });
+  }
+  function renderInto(elId, def, gid){
+    const host = document.getElementById(elId);
+    mermaid.render(gid, def).then(function(r){
+      host.classList.add('mm-viewport');
+      host.innerHTML =
+        '<div class="mm-canvas">'+r.svg+'</div>'+
+        '<div class="mm-controls">'+
+          '<button data-act="full" title="全屏（F）">'+ICON_EXPAND+'</button>'+
+          '<button data-act="export" title="导出 SVG">'+ICON_DOWNLOAD+'</button>'+
+          '<button data-act="in" title="放大（+）">+</button>'+
+          '<button data-act="out" title="缩小（−）">−</button>'+
+          '<button data-act="reset" title="适配 / 复位（0 · 双击画布）">↻</button>'+
+          '<div class="mm-zlabel">100%</div>'+
+        '</div>'+
+        '<div class="mm-hint">滚轮/双指缩放 · 拖拽平移 · 双击复位 · 快捷键 1/2 切换 · F 全屏 · +/− 0</div>';
+      const svg = host.querySelector('svg');
+      const ctl = makePanZoom(host, svg);
+      controllers[elId] = ctl;
+      host.querySelector('.mm-controls').addEventListener('click', function(e){
+        const b = e.target.closest('button'); if(!b) return;
+        if(b.dataset.act==='in') ctl.zoomIn();
+        else if(b.dataset.act==='out') ctl.zoomOut();
+        else if(b.dataset.act==='full') toggleFullscreen(host);
+        else if(b.dataset.act==='export') exportSvg(host, elId);
+        else ctl.reset();
+      });
+      requestAnimationFrame(ctl.fit);
+    }).catch(function(e){
+      host.innerHTML = '<div class="mm-loading">图形渲染失败：'+(e&&e.message?e.message:e)+'</div>';
+    });
+  }
+  // 轻量 pan/zoom：变换作用在 .mm-canvas，host 为裁剪视口。鼠标滚轮/按钮缩放（以光标为锚点）、
+  // 拖拽平移；触屏单指平移 + 双指捏合。未手动操作前随视口自适应居中。
+  function makePanZoom(host, svg){
+    const vb = svg.viewBox && svg.viewBox.baseVal;
+    let natW = (vb && vb.width) ? vb.width : (parseFloat(svg.getAttribute('width'))||svg.clientWidth||800);
+    let natH = (vb && vb.height) ? vb.height : (parseFloat(svg.getAttribute('height'))||svg.clientHeight||600);
+    svg.removeAttribute('width'); svg.removeAttribute('height');
+    svg.style.maxWidth='none'; svg.style.width=natW+'px'; svg.style.height=natH+'px';
+    const canvas = host.querySelector('.mm-canvas');
+    const label  = host.querySelector('.mm-zlabel');
+    const MIN=0.1, MAX=8;
+    let scale=1, tx=0, ty=0, touched=false;
+    function apply(){
+      canvas.style.transform='translate('+tx+'px,'+ty+'px) scale('+scale+')';
+      if(label) label.textContent=Math.round(scale*100)+'%';
+    }
+    function fit(){
+      const w=host.clientWidth, h=host.clientHeight;
+      if(!w||!h||!natW||!natH) return;
+      const s=Math.min(w/natW, h/natH)*0.96;
+      scale = s>0 ? Math.min(s,1) : 1;   // 适配时不超过原始尺寸，避免小图被放大糊化
+      tx=(w-natW*scale)/2; ty=(h-natH*scale)/2;
+      apply();
+    }
+    function zoomAt(cx,cy,factor){
+      const ns=Math.min(MAX, Math.max(MIN, scale*factor));
+      tx = cx-(cx-tx)*(ns/scale);
+      ty = cy-(cy-ty)*(ns/scale);
+      scale=ns; touched=true; apply();
+    }
+    host.addEventListener('wheel', function(e){
+      e.preventDefault();
+      const r=host.getBoundingClientRect();
+      zoomAt(e.clientX-r.left, e.clientY-r.top, e.deltaY<0 ? 1.12 : 1/1.12);
+    }, {passive:false});
+    host.addEventListener('dblclick', function(e){
+      if(e.target.closest('.mm-controls')) return;
+      touched=false; fit();   // 双击画布 → 适配/复位
+    });
+    let dragging=false, sx=0, sy=0;
+    host.addEventListener('mousedown', function(e){
+      if(e.target.closest('.mm-controls')) return;
+      dragging=true; touched=true; sx=e.clientX-tx; sy=e.clientY-ty;
+      host.classList.add('grabbing'); e.preventDefault();
+    });
+    window.addEventListener('mousemove', function(e){
+      if(!dragging) return; tx=e.clientX-sx; ty=e.clientY-sy; apply();
+    });
+    window.addEventListener('mouseup', function(){ dragging=false; host.classList.remove('grabbing'); });
+    function tdist(e){ const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY; return Math.hypot(dx,dy); }
+    let pinch=0;
+    host.addEventListener('touchstart', function(e){
+      if(e.touches.length===1){ dragging=true; touched=true; sx=e.touches[0].clientX-tx; sy=e.touches[0].clientY-ty; }
+      else if(e.touches.length===2){ dragging=false; pinch=tdist(e); }
+    }, {passive:false});
+    host.addEventListener('touchmove', function(e){
+      e.preventDefault();
+      if(e.touches.length===1 && dragging){ tx=e.touches[0].clientX-sx; ty=e.touches[0].clientY-sy; apply(); }
+      else if(e.touches.length===2){
+        const d=tdist(e);
+        if(pinch){ const r=host.getBoundingClientRect();
+          const mx=(e.touches[0].clientX+e.touches[1].clientX)/2-r.left,
+                my=(e.touches[0].clientY+e.touches[1].clientY)/2-r.top;
+          zoomAt(mx,my, d/pinch); }
+        pinch=d;
+      }
+    }, {passive:false});
+    host.addEventListener('touchend', function(e){ if(e.touches.length===0) dragging=false; if(e.touches.length<2) pinch=0; });
+    function center(factor){ const r=host.getBoundingClientRect(); zoomAt(r.width/2, r.height/2, factor); }
+    return {
+      fit: fit,
+      zoomIn:  function(){ center(1.25); },
+      zoomOut: function(){ center(1/1.25); },
+      reset:   function(){ touched=false; fit(); },
+      isTouched: function(){ return touched; }
+    };
+  }
+  if(document.readyState!=='loading') boot(); else document.addEventListener('DOMContentLoaded', boot);
+</script>
+</body>
+</html>

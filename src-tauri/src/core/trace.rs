@@ -14,12 +14,17 @@
 
 use crate::db::Db;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// 单条 I/O 文本入库上限，避免超大 prompt 撑爆 trace 表。
+/// 单条 system_prompt / error 文本入库上限，避免超大 prompt 撑爆 trace 表。
 const MAX_FIELD_CHARS: usize = 16_000;
+
+/// 入/出参（llm/tool 的 input/output）单独放宽到更大上限：工具循环里 messages 数组逐轮
+/// 膨胀，按 16K 截断会把最早的原始 prompt / 首批工具结果截没，排查时丢上下文。64K 兼顾留存与体积。
+const MAX_IO_CHARS: usize = 64_000;
 
 /// 关联标签（用于按需求/会议室/项目/任务筛选 trace）。
 #[derive(Clone, Default)]
@@ -46,13 +51,22 @@ tokio::task_local! {
     static RUN: TraceRun;
 }
 
-fn truncate(s: &str) -> String {
-    if s.chars().count() <= MAX_FIELD_CHARS {
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        let head: String = s.chars().take(MAX_FIELD_CHARS).collect();
-        format!("{head}\n…[已截断 {} 字符]", s.chars().count() - MAX_FIELD_CHARS)
+        let head: String = s.chars().take(max).collect();
+        format!("{head}\n…[已截断 {} 字符]", s.chars().count() - max)
     }
+}
+
+fn truncate(s: &str) -> String {
+    truncate_to(s, MAX_FIELD_CHARS)
+}
+
+/// 入/出参专用截断（更大上限），用于 llm/tool 的 input/output。
+fn truncate_io(s: &str) -> String {
+    truncate_to(s, MAX_IO_CHARS)
 }
 
 fn nonempty(s: &str) -> Option<String> {
@@ -65,29 +79,65 @@ fn current_tags() -> TraceTags {
 }
 
 /// 设置关联标签覆盖 `f` 执行期间（best-effort；用于编排/直聊/分析等入口）。
-pub async fn with_tags<F: Future>(tags: TraceTags, f: F) -> F::Output {
-    TAGS.scope(tags, f).await
+pub fn with_tags<'a, F>(tags: TraceTags, f: F) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>>
+where
+    F: Future + Send + 'a,
+{
+    Box::pin(TAGS.scope(tags, f))
 }
 
 /// 把 `f` 作为一次「Agent 调用」追踪：建立 trace_id（继承当前 tags + 取 Agent 维度），
 /// `f` 内部的 llm/tool span 会自动挂到该 trace 下。root span 需调用方在 `f` 结束后用
 /// [`record_root`] 补写（以拿到最终出参/状态/耗时）。
-pub async fn scope_run<F: Future>(db: &Db, agent: &crate::models::agent::Agent, f: F) -> F::Output {
+pub fn scope_run<'a, F>(
+    db: &'a Db,
+    agent: &'a crate::models::agent::Agent,
+    f: F,
+) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>>
+where
+    F: Future + Send + 'a,
+{
+    scope_run_labeled(
+        db,
+        Some(agent.id.as_str()),
+        Some(agent.role.as_str()),
+        Some(agent.name.as_str()),
+        f,
+    )
+}
+
+/// 同 [`scope_run`]，但不要求 [`Agent`]——供没有 Agent 实体的 LLM 调用建立 trace（如直连
+/// claude CLI 的需求分析兜底、Layer-1 安全检测）。agent 维度按显式标签写入，缺省留空。
+/// 已在某个 run 内则复用（不新建 trace_id），与 [`scope_run`] 一致。
+pub fn scope_run_labeled<'a, F>(
+    db: &'a Db,
+    agent_id: Option<&'a str>,
+    agent_role: Option<&'a str>,
+    agent_name: Option<&'a str>,
+    f: F,
+) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>>
+where
+    F: Future + Send + 'a,
+{
     // 已处于某个 trace run 中（如编排把 LLM 调用 + 写文件包进同一 run）→ 复用，
     // 避免新建 trace_id 把同一 Agent 动作拆成多条互不关联的 trace。
     if RUN.try_with(|_| ()).is_ok() {
-        return f.await;
+        return Box::pin(f);
     }
     let run = TraceRun {
         db: db.clone(),
         trace_id: Uuid::new_v4().to_string(),
         tags: current_tags(),
-        agent_id: nonempty(&agent.id),
-        agent_role: nonempty(&agent.role),
-        agent_name: nonempty(&agent.name),
+        agent_id: agent_id.and_then(nonempty),
+        agent_role: agent_role.and_then(nonempty),
+        agent_name: agent_name.and_then(nonempty),
         seq: Arc::new(AtomicI64::new(0)),
     };
-    RUN.scope(run, f).await
+    // Type-erase and heap-allocate the task-local wrapper.  Keeping this as an
+    // `async fn<F>` makes rustc build a poll stack frame proportional to F; the
+    // tool-enabled system-role future is large enough to overflow Tokio's 2 MiB
+    // worker stack (observed as SIGSEGV in this function prologue).
+    Box::pin(RUN.scope(run, f))
 }
 
 fn run() -> Option<TraceRun> {
@@ -120,15 +170,21 @@ async fn insert(
     total_tokens: Option<i64>,
     latency_ms: Option<i64>,
     metadata_json: Option<&str>,
+    // root span 的 id 恒等于 trace_id，可能被嵌套调用层各自补写一次（如 run_agent_text
+    // 被 run_agent_text_with_tools 的无工具分支复用同一 RUN）。用 INSERT OR REPLACE 让
+    // 「最后一个收尾的外层」覆盖写入、保留最完整的出参/状态/metadata，且永不产生重复 root。
+    // llm/tool span 的 id 是唯一 uuid，走普通 INSERT。
+    replace: bool,
 ) {
-    let res = sqlx::query(
-        "INSERT INTO llm_traces (
+    let verb = if replace { "INSERT OR REPLACE INTO" } else { "INSERT INTO" };
+    let res = sqlx::query(&format!(
+        "{verb} llm_traces (
             id, trace_id, parent_id, seq, kind, name,
             agent_id, agent_role, agent_name, project_id, issue_id, conversation_id, task_id,
             provider, model, system_prompt, status, error, input, output,
             prompt_tokens, completion_tokens, total_tokens, latency_ms, metadata_json, ended_at
          ) VALUES (?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?, datetime('now'))",
-    )
+    ))
     .bind(id)
     .bind(&run.trace_id)
     .bind(parent_id)
@@ -147,8 +203,8 @@ async fn insert(
     .bind(system_prompt.map(truncate))
     .bind(status)
     .bind(error.map(truncate))
-    .bind(input.map(truncate))
-    .bind(output.map(truncate))
+    .bind(input.map(truncate_io))
+    .bind(output.map(truncate_io))
     .bind(prompt_tokens)
     .bind(completion_tokens)
     .bind(total_tokens)
@@ -162,6 +218,7 @@ async fn insert(
 }
 
 /// 写 root（kind=agent）span：整体出入参 + 状态 + 耗时。seq=-1 置顶。
+#[allow(clippy::too_many_arguments)]
 pub async fn record_root(
     input: &str,
     system_prompt: Option<&str>,
@@ -169,6 +226,7 @@ pub async fn record_root(
     status: &str,
     error: Option<&str>,
     latency_ms: i64,
+    metadata_json: Option<&str>,
 ) {
     let Some(run) = run() else { return };
     let id = run.trace_id.clone();
@@ -177,7 +235,8 @@ pub async fn record_root(
         run.agent_name.clone().as_deref(),
         None, None, system_prompt, status, error,
         Some(input), Some(output),
-        None, None, None, Some(latency_ms), None,
+        None, None, None, Some(latency_ms), metadata_json,
+        true, // root：INSERT OR REPLACE，幂等 + last-wins
     )
     .await;
 }
@@ -207,6 +266,7 @@ pub async fn record_llm(
         Some(provider), Some(model), system_prompt, status, error,
         Some(input), Some(output),
         prompt_tokens, completion_tokens, total_tokens, Some(latency_ms), metadata_json,
+        false,
     )
     .await;
 }
@@ -218,11 +278,38 @@ pub async fn record_tool(name: &str, input: &str, output: &str, ok: bool, latenc
     let seq = run.seq.fetch_add(1, Ordering::Relaxed);
     let id = Uuid::new_v4().to_string();
     let trace_id = run.trace_id.clone();
+    // 失败时把失败内容也写进 error 列（而非仅留在 output），以便按
+    // `WHERE kind='mcp' AND status='error'` 直接扫出失败原因，无需逐条打开 output。
+    let error = if ok { None } else { nonempty(output) };
     insert(
         &run, &id, Some(&trace_id), seq, kind, Some(name),
-        None, None, None, if ok { "ok" } else { "error" }, None,
+        None, None, None, if ok { "ok" } else { "error" }, error.as_deref(),
         Some(input), Some(output),
         None, None, None, Some(latency_ms), None,
+        false,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn trace_scope_erases_large_future_size() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let large_future = async move {
+            let payload = [0_u8; 256 * 1024];
+            std::hint::black_box(payload);
+        };
+
+        let scoped = scope_run_labeled(&db, None, None, None, large_future);
+        assert_eq!(
+            std::mem::size_of_val(&scoped),
+            std::mem::size_of::<usize>() * 2,
+            "trace wrappers must remain boxed instead of copying F onto a worker stack"
+        );
+    }
 }

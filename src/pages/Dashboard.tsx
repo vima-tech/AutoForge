@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import Icon from '../components/Icon';
 import Select from '../components/Select';
 import IntakePanel from '../components/IntakePanel';
-import { getPipelineStats, listActiveProjects, listIssues, listTriageIssues, getAutosupplySettings, type PipelineStats, type Project, type Issue, type AutosupplySettings } from '../services';
+import { getPipelineStats, listActiveProjects, listIssues, listTriageIssues, getAutosupplySettings, issueSourceMeta, type PipelineStats, type Project, type Issue, type AutosupplySettings } from '../services';
 import { useOperator, DEFAULT_OPERATOR } from '../operator';
 
 // 按本地时段给出问候语前缀。
@@ -31,11 +31,15 @@ const STATUS_LABEL: Record<string, string> = {
   executing: 'AI 执行中',
   pending_code_review: '待代码审核',
   pending_merge: '待合并',
+  merge_testing: '合并中',
+  merge_ready: '待落地',
   execution_failed: '执行失败',
   merge_failed: '合并失败',
   merge_conflict: '合并冲突',
   no_change_needed: '无需改动',
   merged: '已合并',
+  reverting: '撤销中',
+  reverted: '已撤销',
   rejected: '已拒绝',
 };
 const STATUS_COLOR: Record<string, string> = {
@@ -47,11 +51,15 @@ const STATUS_COLOR: Record<string, string> = {
   executing: 'blue',
   pending_code_review: 'ember',
   pending_merge: 'blue',
+  merge_testing: 'blue',
+  merge_ready: 'amber',
   execution_failed: 'red',
   merge_failed: 'red',
   merge_conflict: 'amber',
   no_change_needed: 'blue',
   merged: 'green',
+  reverting: 'amber',
+  reverted: 'violet',
   rejected: 'red',
 };
 
@@ -93,7 +101,7 @@ const buildPipeline = (p: StageCounts) => [
   { ic: 'inbox', name: '需求入口',   cnt: p.triage,           stage: 'triage',           state: p.triage > 0 ? 'active' : 'done' },
   { ic: 'search', name: '需求分析',  cnt: p.pending_analysis, stage: 'pending_analysis', state: p.pending_analysis > 0 ? 'active' : 'done' },
   { ic: 'check', name: '需求审核',   cnt: p.pending_review_1, stage: 'pending_issue_review', state: p.pending_review_1 > 0 ? 'active' : 'done' },
-  { ic: 'code', name: 'Claude Code', cnt: p.executing,        stage: 'executing',        state: p.executing > 0 ? 'active' : '' },
+  { ic: 'code', name: '代码 Agent', cnt: p.executing,        stage: 'executing',        state: p.executing > 0 ? 'active' : '' },
   { ic: 'eye', name: '代码审核',     cnt: p.pending_review_2, stage: 'pending_code_review', state: p.pending_review_2 > 3 ? 'warn' : p.pending_review_2 > 0 ? 'active' : '' },
   { ic: 'merge', name: '合并 dev',   cnt: p.merged,           stage: 'merged',           state: p.merged > 0 ? 'done' : '' },
 ];
@@ -116,12 +124,16 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
   const [triage, setTriage] = useState<Issue[]>([]);
   const [autosupply, setAutosupply] = useState<AutosupplySettings | null>(null);
   const operator = useOperator();
+  // 卸载守卫：Tauri invoke 不支持 AbortSignal，故用 mounted ref 在 await 之后、
+  // setState 之前拦截已卸载组件的状态更新，避免 React 警告与潜在内存泄漏。
+  const mounted = useRef(true);
 
   const loadAll = useCallback(async () => {
     const [s, ps, is, tri, supply] = await Promise.all([
       getPipelineStats(), listActiveProjects(), listIssues(),
       listTriageIssues().catch(() => [] as Issue[]), getAutosupplySettings().catch(() => null),
     ]);
+    if (!mounted.current) return;
     setTriage(tri);
     setAutosupply(supply);
     setStats(s);
@@ -132,6 +144,9 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
   }, []);
 
   useEffect(() => {
+    // 每次 effect 运行（含 StrictMode 的卸载→重挂载、loadAll 变更重订阅）都重置为
+    // true，否则首次 cleanup 置 false 后重挂载会永久跳过 setState。
+    mounted.current = true;
     loadAll();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const debounced = () => {
@@ -139,16 +154,18 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
       timer = setTimeout(() => { timer = null; loadAll(); }, 500);
     };
     let unlisten: (() => void) | undefined;
-    listen<unknown>('AutoForge://event', debounced).then(fn => { unlisten = fn; });
+    listen<unknown>('autoforge://event', debounced).then(fn => { unlisten = fn; });
     return () => {
+      // 置 false 同时覆盖初始 loadAll() 与 debounce 触发的 loadAll() 两条路径。
+      mounted.current = false;
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
   }, [loadAll]);
 
   // ── derived ────────────────────────────────────────────────────────────────
-  // 队列只看「在途」需求，过滤掉已合并/已拒绝等终态
-  const queueIssues = issues.filter(i => i.status !== 'merged' && i.status !== 'rejected');
+  // 队列只看「在途」需求，过滤掉已合并/已拒绝/已撤销等终态（已撤销可在审计页「恢复需求」后重回队列）
+  const queueIssues = issues.filter(i => i.status !== 'merged' && i.status !== 'rejected' && i.status !== 'reverted');
   const activeProjectCount = projects.filter(p => p.status === 'active').length;
   const pendingReview = stats?.pending_review_slots ?? stats?.pending_review_2 ?? 0;
   const pauseThreshold = stats?.pause_threshold ?? 20;
@@ -214,6 +231,45 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
           ))}
         </div>
 
+        {/* 运营洞察 / 产线健康：从实时 pipeline_stats 派生的几个关键经营指标，
+            让操作者一眼看出「在产多少、卡在哪、产出与拒绝、是否被背压暂停」。 */}
+        {stats && (() => {
+          const wip = stats.pending_analysis + stats.pending_review_1 + stats.executing + stats.pending_review_2;
+          const stages: { name: string; cnt: number }[] = [
+            { name: '需求分析', cnt: stats.pending_analysis },
+            { name: '需求审核', cnt: stats.pending_review_1 },
+            { name: '代码 Agent', cnt: stats.executing },
+            { name: '代码审核', cnt: stats.pending_review_2 },
+          ];
+          const bottleneck = stages.reduce((a, b) => (b.cnt > a.cnt ? b : a), stages[0]);
+          const decided = stats.merged + stats.rejected;
+          const rejectRate = decided > 0 ? Math.round((stats.rejected / decided) * 100) : 0;
+          const cards = [
+            { label: '在产 WIP', val: String(wip), hint: '分析+审核+编码中', color: 'var(--blue)' },
+            { label: '瓶颈环节', val: bottleneck.cnt > 0 ? bottleneck.name : '无积压', hint: bottleneck.cnt > 0 ? `积压 ${bottleneck.cnt} 条` : '流转顺畅', color: bottleneck.cnt > 3 ? 'var(--red)' : bottleneck.cnt > 0 ? 'var(--amber)' : 'var(--green)' },
+            { label: '已交付', val: String(stats.merged), hint: `拒绝率 ${rejectRate}%`, color: 'var(--green)' },
+            { label: '背压状态', val: stageLabel, hint: `待审 ${stats.pending_review_slots}/${stats.pause_threshold}`, color: stageBar },
+          ];
+          return (
+            <div className="panel" style={{ marginBottom: 16, padding: '14px 18px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                <Icon name="sliders" size={15} style={{ color: 'var(--ember)' }} />
+                <span style={{ fontWeight: 700, fontSize: 'var(--text-title)' }}>运营洞察</span>
+                <span className="chip" style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)' }}>实时</span>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+                {cards.map((c, i) => (
+                  <div key={i} style={{ background: 'var(--bg-3)', borderRadius: 'var(--radius)', padding: '12px 14px' }}>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-3)' }}>{c.label}</div>
+                    <div style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 'var(--text-metric)', lineHeight: 1, margin: '6px 0 4px', color: c.color }}>{c.val}</div>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>{c.hint}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* pipeline — 逐项目完整流水线，自动轮播，主页的「看」中枢 */}
         <div className="panel" style={{ marginBottom: 16 }}>
           <div className="panel-head">
@@ -266,11 +322,19 @@ export default function Dashboard({ onOpenInAudit, onOpenStage }: {
                 style={{ cursor: 'pointer' }} title="在功能审计中查看">
                 <div className="q-pr">{i + 1}</div>
                 <div className="q-main">
-                  <div className="q-title">{q.title}</div>
+                  <div className="q-title">
+                    {!!q.restored_from_revert && (
+                      <span className="dot" style={{ display: 'inline-block', background: 'var(--violet)', marginRight: 6, verticalAlign: 'middle' }} title="撤销恢复的需求" />
+                    )}
+                    {q.title}
+                  </div>
                   <div className="q-meta">
                     <span className="req-id" style={{ color: 'var(--text-3)' }}>{q.id.slice(0, 10)}</span>
                     <span className={'chip ' + (SEV_COLOR[q.category] || 'blue')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{q.category}</span>
                     <span className={'chip ' + (SEV_COLOR[q.severity] || '')} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }}>{q.severity}</span>
+                    {(() => { const s = issueSourceMeta(q.source_type); return (
+                      <span className={'chip ' + s.chip} style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} title={`需求来源：${s.label}`}>{s.label}</span>
+                    ); })()}
                     <span>· {projects.find(p => p.id === q.project_id)?.name ?? '—'}</span>
                   </div>
                 </div>

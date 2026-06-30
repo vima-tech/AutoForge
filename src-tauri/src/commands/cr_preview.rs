@@ -2,10 +2,12 @@
 //!
 //! Unlike `dev_server.rs` — which runs the project's *main* repo — this starts a
 //! dev server inside the change-request's **worktree**, so the "本次改动" preview
-//! reflects the CR's actual code. Supports two project kinds:
-//!   - `web`   → start the dev command, embed `url` in an iframe.
-//!   - `tauri` → start the web frontend dev server for the iframe, and optionally
-//!               launch the native desktop window via `app_command` (escape hatch D).
+//! reflects the CR's actual code. Supports these project kinds:
+//!   - `web`     → start the dev command, embed `url` in an iframe.
+//!   - `tauri`   → start the web frontend dev server for the iframe, and optionally
+//!     launch the native desktop window via `app_command` (escape hatch D).
+//!   - `miniapp` → 微信小程序：无可 iframe 的 localhost server，预览=一次性编译产物
+//!     （`build_cr_miniapp` run-to-completion，不进 dev_servers、不分配端口、不探活）。
 //!
 //! When the project has no preview config the status is `no_config` / kind `none`,
 //! and the frontend collapses the preview area (fallback C).
@@ -14,7 +16,7 @@ use crate::core::git::GitProxy;
 use crate::models::change_request::ChangeRequest;
 use crate::models::project::Project;
 use crate::models::worktree::WorktreeSession;
-use crate::state::{worktrees_base, AppState, DevServerHandle};
+use crate::state::{worktrees_base, AppState, ChildHandle, DevServerHandle};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -40,7 +42,7 @@ struct DevSpec {
 #[derive(Debug, Serialize)]
 pub struct CrPreviewStatus {
     pub cr_id: String,
-    /// "web" | "tauri" | "none"
+    /// "web" | "tauri" | "miniapp" | "none"
     pub kind: String,
     /// "no_config" | "no_session" | "idle" | "starting" | "running" | "stopped"
     pub status: String,
@@ -152,28 +154,46 @@ struct EffectiveSpec {
 fn effective_spec(config_yaml: Option<&str>, dir: &str) -> Option<EffectiveSpec> {
     let explicit = parse_dev_spec_raw(config_yaml);
     let det = detect_framework(dir);
+    let suggestion = crate::core::stack::suggest_run_config(std::path::Path::new(dir));
 
     let explicit_kind = explicit.as_ref().and_then(|s| s.kind.as_deref());
     // Explicit kind always wins; `none` disables preview. When unset, fall back to
-    // detection — this is what stops a Tauri project from being shown as plain web.
+    // detection — this is what stops a Tauri project from being shown as plain web,
+    // and a 微信小程序 from being shown as a (non-existent) localhost web server.
     let (kind, auto_detected) = match explicit_kind {
         Some("tauri") => ("tauri".to_string(), false),
         Some("web") => ("web".to_string(), false),
+        Some("miniapp") => ("miniapp".to_string(), false),
         Some("none") => return None,
-        _ => (
-            if det.is_tauri { "tauri".to_string() } else { "web".to_string() },
-            det.is_tauri,
-        ),
+        _ => {
+            if det.is_tauri {
+                ("tauri".to_string(), true)
+            } else if suggestion.dev_kind.as_deref() == Some("miniapp") {
+                ("miniapp".to_string(), true)
+            } else {
+                ("web".to_string(), false)
+            }
+        }
     };
 
-    let command = explicit
-        .as_ref()
-        .and_then(|s| s.command.clone())
-        .filter(|c| !c.trim().is_empty())
-        .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))
-        // 非 npm 栈（Java/Go/Python 后端、静态站）的兜底：用栈画像建议的 dev 命令，
-        // 使这些项目也能启动预览（端口探活），而不是直接 no_config。
-        .or_else(|| crate::core::stack::suggest_run_config(std::path::Path::new(dir)).dev_command)?;
+    // 小程序：预览语义是「一次性编译产物」而非 dev server，命令取 build 而非 dev。
+    let command = if kind == "miniapp" {
+        explicit
+            .as_ref()
+            .and_then(|s| s.command.clone())
+            .filter(|c| !c.trim().is_empty())
+            .or_else(|| suggestion.build_command.clone())
+            .or_else(|| suggestion.dev_command.clone())?
+    } else {
+        explicit
+            .as_ref()
+            .and_then(|s| s.command.clone())
+            .filter(|c| !c.trim().is_empty())
+            .or_else(|| det.dev_script.clone().map(|s| format!("npm run {s}")))
+            // 非 npm 栈（Java/Go/Python 后端、静态站）的兜底：用栈画像建议的 dev 命令，
+            // 使这些项目也能启动预览（端口探活），而不是直接 no_config。
+            .or_else(|| suggestion.dev_command.clone())?
+    };
 
     // Preview URL is fixed to localhost on the auto-allocated port (no longer configurable).
     let url = "http://localhost:{port}".to_string();
@@ -326,7 +346,7 @@ pub async fn get_cr_preview(
     let key = format!("cr:{cr_id}");
 
     // If a server is already tracked for this CR, report its live status.
-    let handle_info: Option<(Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+    let handle_info: Option<(ChildHandle, String)> = {
         let servers = state.dev_servers.lock().await;
         servers.get(&key).map(|h| (h.child.clone(), h.url.clone()))
     };
@@ -458,6 +478,125 @@ pub async fn start_cr_preview(
     })
 }
 
+/// 微信小程序编译产物（一次性 build 的结果）。区别于 dev server：无持久进程、无端口、无探活。
+#[derive(Debug, Serialize)]
+pub struct MiniappBuildResult {
+    pub cr_id: String,
+    pub success: bool,
+    /// 进程退出码（正常退出取实际码；被信号杀死等异常取 -1）。
+    pub exit_code: i32,
+    /// 编译产物目录（相对 worktree 根，探测常见输出目录得到）；未找到则 None。
+    pub artifact_dir: Option<String>,
+    /// 执行的编译命令（已注入实际参数）。
+    pub command: String,
+    /// 档位 2：是否已用微信开发者工具 CLI 自动打开产物目录（未配置 CLI / 拉起失败 → false）。
+    pub launched_devtools: bool,
+}
+
+/// 编译微信小程序 CR：**一次性跑 build 命令到结束**，不像 dev server 那样长驻/探活。
+/// stdout+stderr 写入与 web 预览同一份日志文件（前端 `start_preview_log_tail` 可实时订阅），
+/// 退出后探测产物目录返回。产物可用微信开发者工具打开（档位 1：手动；档位 2 见 §3.3 CLI 拉起）。
+#[tauri::command]
+pub async fn build_cr_miniapp(
+    cr_id: String,
+    state: State<'_, AppState>,
+) -> Result<MiniappBuildResult, String> {
+    let (project, session) = load_ctx(&state.db, &cr_id).await?;
+    let session = session.ok_or_else(|| "该变更尚无 worktree 会话（实现未开始或已清理）".to_string())?;
+    let spec = effective_spec(
+        crate::commands::run_config::effective_config(&project).as_deref(),
+        &session.worktree_path,
+    )
+    .ok_or_else(|| "未能识别小程序工程或缺少编译命令".to_string())?;
+    if spec.kind != "miniapp" {
+        return Err("当前变更不是微信小程序工程（预览类型非 miniapp）".to_string());
+    }
+
+    let command = spec.command.clone();
+    // 复用 web 预览的日志文件路径，前端日志订阅无需区分。写入命令头便于诊断。
+    let (out, err) = log_stdio(&preview_log_path(&cr_id), &command, &session.worktree_path)?;
+    let mut cmd = crate::core::platform::shell(&command);
+    cmd.current_dir(&session.worktree_path)
+        .stdout(out)
+        .stderr(err);
+    crate::core::platform::detach_process_group(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| format!("启动编译失败: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待编译进程失败: {e}"))?;
+    let exit_code = status.code().unwrap_or(-1);
+    let success = status.success();
+
+    // 探测常见小程序产物目录（Taro: dist；uni-app: dist/build/mp-weixin / unpackage/...；mpx: dist/wx）。
+    let artifact_dir = if success {
+        find_miniapp_artifact(&session.worktree_path)
+    } else {
+        None
+    };
+
+    // 档位 2：若配置了微信开发者工具 CLI 路径，编译成功后自动用它打开产物目录。
+    // best-effort：未配置 / 路径不存在 / 拉起失败都静默降级到档位 1（手动打开），绝不报硬错。
+    let launched_devtools = match (&artifact_dir, success) {
+        (Some(rel), true) => {
+            let abs = std::path::Path::new(&session.worktree_path).join(rel);
+            launch_devtools(&state, &abs).await
+        }
+        _ => false,
+    };
+
+    Ok(MiniappBuildResult {
+        cr_id,
+        success,
+        exit_code,
+        artifact_dir,
+        command,
+        launched_devtools,
+    })
+}
+
+/// 档位 2：用微信开发者工具 CLI 打开产物目录（`<cli> open --project <abs>`）。
+/// 读 app_settings 的 `miniapp.devtools_cli_path`；未配置 / 文件不存在 / spawn 失败 → 返回 false（降级档位 1）。
+async fn launch_devtools(state: &AppState, artifact_abs: &std::path::Path) -> bool {
+    let cli = match sqlx::query_scalar::<_, String>(
+        "SELECT value FROM app_settings WHERE key='miniapp.devtools_cli_path'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(p)) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => return false,
+    };
+    if !std::path::Path::new(&cli).exists() {
+        return false;
+    }
+    let mut cmd = tokio::process::Command::new(&cli);
+    cmd.arg("open")
+        .arg("--project")
+        .arg(artifact_abs)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::core::platform::detach_process_group(&mut cmd);
+    cmd.spawn().is_ok()
+}
+
+/// 探测微信小程序编译产物目录（返回相对 worktree 根的路径）。按常见框架输出约定逐一探测。
+fn find_miniapp_artifact(worktree: &str) -> Option<String> {
+    let root = std::path::Path::new(worktree);
+    const CANDIDATES: &[&str] = &[
+        "dist/build/mp-weixin",      // uni-app (vue-cli)
+        "unpackage/dist/build/mp-weixin", // uni-app (HBuilderX/vite)
+        "dist/weapp",                // Taro (可配置)
+        "dist/wx",                   // mpx
+        "dist",                      // Taro 默认 / 通用兜底
+    ];
+    CANDIDATES
+        .iter()
+        .find(|rel| root.join(rel).is_dir())
+        .map(|rel| rel.to_string())
+}
+
 #[tauri::command]
 pub async fn stop_cr_preview(cr_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut servers = state.dev_servers.lock().await;
@@ -573,7 +712,14 @@ pub async fn list_local_branches(
     let branches = out
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.contains("HEAD detached") && !l.contains("(no branch)"))
+        // 排除 AutoForge 内部 worktree 分支（execution 创建的 `autoforge/<cr>-i<n>`），
+        // 它们只是 CR 实现的临时检出，不是用户可启动的项目分支。
+        .filter(|l| {
+            !l.is_empty()
+                && !l.contains("HEAD detached")
+                && !l.contains("(no branch)")
+                && !l.starts_with("autoforge/")
+        })
         .map(|name| BranchInfo {
             name: name.to_string(),
             is_current: name == current,
@@ -752,7 +898,7 @@ pub async fn list_branch_previews(
         .unwrap_or_else(|| "web".to_string());
     let prefix = format!("branch:{project_id}:");
 
-    let entries: Vec<(String, Arc<Mutex<Option<tokio::process::Child>>>, String)> = {
+    let entries: Vec<(String, ChildHandle, String)> = {
         let servers = state.dev_servers.lock().await;
         servers
             .iter()
@@ -825,6 +971,121 @@ pub async fn get_branch_preview_log(project_id: String, branch: String) -> Resul
         Ok(s) => Ok(s),
         Err(_) => Ok(String::new()),
     }
+}
+
+// ── 预览日志实时 tail（事件驱动）─────────────────────────────────────────────
+//
+// 预览/dev-server 子进程的 stdout+stderr 直写日志文件、不流经 Rust（见 `log_stdio` /
+// `dev_server`），故无法像 code-agent 那样在管道上挂 LogSink。改为：前端打开日志弹窗时
+// 启动一个后台 tail 任务，周期读取该日志文件的「新增字节」转成 `AppEvent::PreviewLog`
+// 增量推给前端——前端只 append，不再每秒全文重取/重解析/重渲染。子进程仍只写文件，与
+// Rust 保持解耦（不被父进程抽水速度牵制）。
+
+const TAIL_INTERVAL_MS: u64 = 600;
+/// 首次推送只回带尾部这么多字节，避免超长 build 日志一次性灌爆前端。
+const TAIL_INITIAL_CAP: u64 = 64 * 1024;
+
+#[allow(clippy::type_complexity)]
+static PREVIEW_TAILERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+> = std::sync::OnceLock::new();
+
+fn preview_tailers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>> {
+    PREVIEW_TAILERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 把前端弹窗 sig 解析成日志文件 key：`cr:<id>` → `<id>`；`branch:<pid>:<branch>` →
+/// `branch_log_key`。git refname 不含 `:`，故 `branch:` 后按首个 `:` 切分无歧义。
+fn log_key_from_sig(sig: &str) -> Option<String> {
+    if let Some(id) = sig.strip_prefix("cr:") {
+        return Some(id.to_string());
+    }
+    if let Some(rest) = sig.strip_prefix("branch:") {
+        let (pid, branch) = rest.split_once(':')?;
+        return Some(branch_log_key(pid, branch));
+    }
+    None
+}
+
+/// 启动某日志弹窗的实时 tail。重复启动同一 sig 会先停旧任务（处理重订阅/重挂载）。
+#[tauri::command]
+pub async fn start_preview_log_tail(app: tauri::AppHandle, sig: String) -> Result<(), String> {
+    let Some(file_key) = log_key_from_sig(&sig) else {
+        return Err(format!("无法解析日志标识: {sig}"));
+    };
+    let path = preview_log_path(&file_key);
+
+    // 先停掉同 sig 的旧任务，避免重复推送。
+    if let Some(old) = preview_tailers().lock().unwrap().remove(&sig) {
+        old.abort();
+    }
+
+    let task_sig = sig.clone();
+    let handle = tokio::spawn(async move {
+        let mut offset: u64 = 0;
+        let mut first = true;
+        // 跨轮保留「未构成完整 UTF-8 字符」的尾部字节，下一轮拼回，避免多字节字符被切碎。
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if len < offset {
+                // 文件被重建（新一轮预览覆盖写）→ 从头重读。
+                offset = 0;
+                first = true;
+                pending.clear();
+            }
+            if len > offset {
+                // 首次只取尾部 TAIL_INITIAL_CAP，避免一次性灌爆。
+                let trim_lead = first && len - offset > TAIL_INITIAL_CAP;
+                let start = if trim_lead { len - TAIL_INITIAL_CAP } else { offset };
+                if let Ok(mut f) = std::fs::File::open(&path) {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut buf = Vec::new();
+                    if f.seek(SeekFrom::Start(start)).is_ok() && f.read_to_end(&mut buf).is_ok() {
+                        offset = len;
+                        let mut slice = &buf[..];
+                        if trim_lead {
+                            // 截断点可能落在多字节字符中间：跳过前导续字节对齐到字符边界。
+                            let skip = slice.iter().take_while(|&&b| b & 0xC0 == 0x80).count();
+                            slice = &slice[skip..];
+                        }
+                        pending.extend_from_slice(slice);
+                        // 只发送可构成完整 UTF-8 的前缀，残余留到下轮。
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(_) => pending.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid > 0 {
+                            let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                            pending.drain(..valid);
+                            crate::core::event::emit(
+                                &app,
+                                crate::core::event::AppEvent::PreviewLog {
+                                    key: task_sig.clone(),
+                                    chunk,
+                                },
+                            );
+                        }
+                    }
+                }
+                first = false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(TAIL_INTERVAL_MS)).await;
+        }
+    });
+
+    preview_tailers().lock().unwrap().insert(sig, handle);
+    Ok(())
+}
+
+/// 停止某日志弹窗的 tail（前端关闭弹窗时调用）。
+#[tauri::command]
+pub async fn stop_preview_log_tail(sig: String) -> Result<(), String> {
+    if let Some(h) = preview_tailers().lock().unwrap().remove(&sig) {
+        h.abort();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -918,6 +1179,40 @@ mod tests {
         assert_eq!(spec.kind, "web");
         assert!(!spec.frontend_only);
         assert!(!spec.auto_detected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn miniapp_detected_with_build_command_not_dev_server() {
+        // Taro 工程：自动识别为 miniapp，预览命令取 build（非 dev server）。
+        let root = std::env::temp_dir().join(format!("af-cr-taro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("project.config.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build:weapp":"taro build --type weapp","dev:weapp":"taro build --type weapp --watch"},"dependencies":{"@tarojs/taro":"^4"}}"#,
+        )
+        .unwrap();
+
+        let spec = effective_spec(None, root.to_str().unwrap()).unwrap();
+        assert_eq!(spec.kind, "miniapp");
+        assert_eq!(spec.command, "npm run build:weapp"); // build，不是 dev
+        assert!(!spec.can_launch_app);
+        assert!(!spec.frontend_only);
+        assert!(spec.auto_detected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_miniapp_artifact_probes_common_dirs() {
+        let root = std::env::temp_dir().join(format!("af-cr-artifact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dist/build/mp-weixin")).unwrap();
+        assert_eq!(
+            find_miniapp_artifact(root.to_str().unwrap()).as_deref(),
+            Some("dist/build/mp-weixin")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

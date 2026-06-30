@@ -11,6 +11,19 @@ use tauri::{AppHandle, State};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+// 会议室「立即编码」草稿：AI 梳理讨论后的结构化需求描述
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodingBrief {
+    pub title: String,
+    pub functional_points: Vec<String>,
+    pub involved_modules: Vec<String>,
+    pub constraints: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub requirement_type: String,
+    pub risk_level: String,
+    pub raw_text: String, // 保留原始文本供编辑
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConversationPlan {
     steps: Vec<ConversationPlanStep>,
@@ -30,6 +43,20 @@ struct AgentOutcome {
     agent_name: String,
     ok: bool,
     text: String,
+}
+
+/// 系统角色 Agent 执行入参聚合体。
+/// 把 run_system_agent_markdown / run_system_agent_text 共用的一组参数收拢成结构体，
+/// 避免函数签名参数过多（clippy::too_many_arguments）。字段均为借用，生命周期统一为 'a。
+#[derive(Debug, Clone)]
+struct SystemAgentParams<'a> {
+    conversation_id: &'a str,
+    agent: &'a Agent,
+    kind: &'a str,
+    prompt: &'a str,
+    fallback_system_prompt: &'a str,
+    project_id: Option<&'a str>,
+    recall_key: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +90,23 @@ pub async fn start_conversation_task(
             .map_err(|e| e.to_string())?;
     if trigger_exists.is_none() {
         return Err("触发消息不存在或不属于当前对话".to_string());
+    }
+
+    // 会话串行锁：把「检查是否已有运行中任务 + 插入新任务」做成对并发调用原子的临界区。
+    // 否则两条几乎同时到达的消息（或前端重试）会各自插入一条 running 任务，同一会话并发跑多个
+    // 任务、互相覆盖消息流。锁内拒绝重复，保证同一会话任一时刻至多一个 running 任务。
+    let lock = crate::state::conversation_lock(&payload.conversation_id);
+    let _guard = lock.lock().await;
+
+    let already_running: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM conversation_tasks WHERE conversation_id=? AND status='running' LIMIT 1",
+    )
+    .bind(&payload.conversation_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if already_running.is_some() {
+        return Err("当前会话已有正在运行的任务，请等待其完成后再试".to_string());
     }
 
     let task_id = Uuid::new_v4().to_string();
@@ -122,6 +166,579 @@ pub async fn start_conversation_task(
     Ok(task)
 }
 
+/// 会议室「立即编码」第一步（AI 起草）：把一次会议室讨论 + 项目上下文，用一次轻量 LLM
+/// pass 梳理成一份**可直接交给编码 AI 执行的工单草稿**（标题 + 功能点要点 + 范围/约束/验收）。
+/// 返回纯文本草稿，由前端填进确认弹窗供操作者编辑——草稿是辅助而非闸门，操作者确认才进入编码。
+#[tauri::command]
+pub async fn draft_coding_brief(
+    conversation_id: String,
+    window_size: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+
+    let prompt = build_brief_prompt(&context);
+
+    crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 构造「立即编码」需求梳理的提示词。三个入口（非流式 / 详细 / 流式）共用一份，
+/// 保证不同路径产出的工单结构完全一致。
+fn build_brief_prompt(context: &str) -> String {
+    format!(
+        "下面是一段会议室讨论与项目上下文。请把其中达成的开发意图梳理成一份**清晰、可直接交给\
+         编码 AI 执行的需求工单**。\n\n\
+         ## 输出格式\n\
+         严格按以下结构输出，不要省略任何环节：\n\n\
+         **标题：** <一句话需求标题，简洁有力>\n\n\
+         **功能点与需求：**\n\
+         - <功能点 1：用户故事或具体任务>\n\
+         - <功能点 2>\n\
+         - （如需多项功能，继续列举）\n\n\
+         **涉及的模块与文件：**\n\
+         根据讨论推断可能需要修改的关键模块/文件路径（如 src/pages/Dashboard.tsx, src-tauri/src/commands/issues.rs 等）。\n\
+         - <模块/文件 1>\n\
+         - <模块/文件 2>\n\
+         - （列出最可能受影响的 3-5 个关键点）\n\n\
+         **关键约束与技术考量：**\n\
+         - 列举讨论中提及的设计约束、兼容性需求、性能要求等\n\n\
+         **验收要点：**\n\
+         - 描述如何判断功能已正确实现\n\n\
+         **需求类型：** <功能新增 | 功能改进 | Bug修复 | 重构优化 | 其他>\n\
+         **初步风险等级：** <低 | 中 | 高>\n\n\
+         ## 输出原则\n\
+         1. 只保留与「本次要编码的需求」直接相关的内容，剔除闲聊与已废弃的设想。\n\
+         2. 推断（而非直译）讨论意图——从对话中读出隐含的功能需求。\n\
+         3. 涉及的文件与模块要基于讨论背景与项目结构推测，帮助编码 AI 快速定位。\n\
+         4. 用中文，简洁明确，直接给工单——不要反问、不要寒暄、不要解释你在做什么。\n\n\
+         ## 讨论与项目上下文\n{context}"
+    )
+}
+
+/// 从标记文本中提取 markdown 列表项
+fn extract_list_items(text: &str, start_marker: &str, end_marker: Option<&str>) -> Vec<String> {
+    let mut items = Vec::new();
+    if let Some(start) = text.find(start_marker) {
+        let after = &text[start + start_marker.len()..];
+        let end = if let Some(m) = end_marker {
+            after.find(m).unwrap_or(after.len())
+        } else {
+            after.len()
+        };
+        let section = &after[..end];
+        for line in section.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('-') || trimmed.starts_with('•') || trimmed.starts_with('*') {
+                let item = trimmed[1..].trim().to_string();
+                if !item.is_empty() && !item.starts_with('（') {
+                    items.push(item);
+                }
+            }
+        }
+    }
+    items
+}
+
+/// 提取简单的字段值（用于「字段：值」格式）
+fn extract_field(text: &str, field_name: &str) -> String {
+    let patterns = vec![
+        format!("**{}[：:] **", field_name),
+        format!("{}[：:]", field_name),
+        format!("**{}**[：:]", field_name),
+    ];
+    for pattern in patterns {
+        for line in text.lines() {
+            if line.contains(&pattern.replace("[：:]", ":")) || line.contains(&pattern.replace("[：:]", "：")) {
+                if let Some(colon_pos) = line.find(':').or_else(|| line.find('：')) {
+                    let value = line[colon_pos + 1..].trim().replace("**", "").trim().to_string();
+                    if !value.is_empty() {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// 根据需求的特征精化风险评估：考虑涉及的模块数、关键字、复杂度等
+fn refine_risk_assessment(brief: &CodingBrief) -> String {
+    let mut risk_score: i32 = 0;
+
+    // 1. 涉及模块数：超过 5 个模块为高风险
+    if brief.involved_modules.len() > 5 {
+        risk_score += 3;
+    } else if brief.involved_modules.len() > 2 {
+        risk_score += 2;
+    }
+
+    // 2. 功能点数：超过 5 个为高风险
+    if brief.functional_points.len() > 5 {
+        risk_score += 2;
+    }
+
+    // 3. 约束数：多个约束可能增加复杂度
+    if brief.constraints.len() > 3 {
+        risk_score += 1;
+    }
+
+    // 4. 关键字检测：某些操作词暗示高风险
+    let content = format!(
+        "{} {} {} {} {}",
+        brief.title,
+        brief.functional_points.join(" "),
+        brief.involved_modules.join(" "),
+        brief.constraints.join(" "),
+        brief.requirement_type
+    );
+
+    let high_risk_keywords = vec![
+        "重构", "迁移", "删除", "大规模", "底层", "API", "权限",
+        "安全", "性能优化", "并发", "分布式", "数据库", "核心",
+    ];
+    for keyword in high_risk_keywords {
+        if content.contains(keyword) {
+            risk_score += 2;
+            break; // 避免重复计分
+        }
+    }
+
+    let medium_risk_keywords = vec!["修改", "改进", "重新设计", "兼容"];
+    for keyword in medium_risk_keywords {
+        if content.contains(keyword) {
+            risk_score += 1;
+            break;
+        }
+    }
+
+    // 5. 需求类型：修复通常低风险，新增中等风险，重构高风险
+    match brief.requirement_type.as_str() {
+        "重构优化" => risk_score += 2,
+        "Bug修复" => risk_score = risk_score.saturating_sub(1),
+        "功能新增" => risk_score += 1,
+        _ => {}
+    }
+
+    // 计算最终风险等级
+    if risk_score >= 5 {
+        "高".to_string()
+    } else if risk_score >= 3 {
+        "中".to_string()
+    } else {
+        "低".to_string()
+    }
+}
+
+/// 会议室「立即编码」详细版（内部用）：返回结构化的代码草稿，前端用于展示预览信息。
+fn parse_coding_brief(text: &str) -> CodingBrief {
+    let mut brief = CodingBrief {
+        title: String::new(),
+        functional_points: Vec::new(),
+        involved_modules: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        requirement_type: "其他".to_string(),
+        risk_level: "中".to_string(),
+        raw_text: text.to_string(),
+    };
+
+    // 提取标题
+    for line in text.lines() {
+        if line.contains("标题") && (line.contains("：") || line.contains(":")) {
+            if let Some(colon_pos) = line.find(':').or_else(|| line.find('：')) {
+                let title = line[colon_pos + 1..].trim().replace("**", "").trim().to_string();
+                if !title.is_empty() {
+                    brief.title = title;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 提取功能点
+    brief.functional_points = extract_list_items(text, "功能点与需求", Some("涉及的模块"));
+    if brief.functional_points.is_empty() {
+        brief.functional_points = extract_list_items(text, "**功能点与需求**", Some("**涉及"));
+    }
+
+    // 提取涉及的模块与文件
+    brief.involved_modules = extract_list_items(text, "涉及的模块与文件", Some("关键约束"));
+    if brief.involved_modules.is_empty() {
+        brief.involved_modules = extract_list_items(text, "相关文件", Some("约束"));
+    }
+
+    // 提取约束和技术考量
+    brief.constraints = extract_list_items(text, "关键约束与技术考量", Some("验收要点"));
+    if brief.constraints.is_empty() {
+        brief.constraints = extract_list_items(text, "技术考量", Some("验收"));
+    }
+
+    // 提取验收要点
+    brief.acceptance_criteria = extract_list_items(text, "验收要点", Some("需求类型"));
+    if brief.acceptance_criteria.is_empty() {
+        brief.acceptance_criteria = extract_list_items(text, "验收标准", Some("需求"));
+    }
+
+    // 提取需求类型
+    brief.requirement_type = extract_field(text, "需求类型");
+    if brief.requirement_type.is_empty() {
+        brief.requirement_type = "其他".to_string();
+    }
+
+    // 提取风险等级
+    brief.risk_level = extract_field(text, "初步风险等级");
+    if brief.risk_level.is_empty() {
+        brief.risk_level = extract_field(text, "风险等级");
+    }
+    if brief.risk_level.is_empty() {
+        brief.risk_level = "中".to_string();
+    }
+
+    brief
+}
+
+/// 会议室「立即编码」详细版：返回结构化代码草稿，含标题、功能点、文件范围、风险等级等。
+/// 前端用这些数据展示预览信息，让操作者清晰了解背景。
+#[tauri::command]
+pub async fn draft_coding_brief_detailed(
+    conversation_id: String,
+    window_size: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<CodingBrief, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+    let prompt = build_brief_prompt(&context);
+
+    let text = crate::agents::llm::run_agent_text(&state.db, &agent, &prompt, None, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut brief = parse_coding_brief(&text);
+    // 根据需求特征精化风险评估
+    brief.risk_level = refine_risk_assessment(&brief);
+    Ok(brief)
+}
+
+/// 会议室「立即编码」流式版：边生成边把 AI 的思考增量通过 `CodingBriefChunk` 事件推给前端，
+/// 消除「干等」的等待感；生成结束后解析为结构化 `CodingBrief` 返回。前端订阅事件实时滚动日志，
+/// promise resolve 时拿到结构化结果填表。
+#[tauri::command]
+pub async fn draft_coding_brief_stream(
+    conversation_id: String,
+    window_size: Option<i64>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodingBrief, String> {
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&conversation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", conversation_id))?;
+    if conversation.project_id.is_none() {
+        return Err("仅绑定项目的群聊可使用「立即编码」".to_string());
+    }
+
+    let window = window_size.unwrap_or(30).clamp(5, 100);
+    let context = assemble_conversation_context(&state.db, &conversation_id, window).await?;
+    if context.trim().is_empty() {
+        return Err("当前会议室没有可梳理的讨论内容".to_string());
+    }
+    let agent = load_brief_agent(&state.db).await?;
+    let prompt = build_brief_prompt(&context);
+
+    // 每段增量转成 CodingBriefChunk 事件发射。闭包只捕获 AppHandle + conversation_id，
+    // 业务逻辑（llm.rs）仍对 Tauri 无感知——事件出口唯一走 event::emit。
+    let app_for_chunk = app.clone();
+    let conv_for_chunk = conversation_id.clone();
+    let mut on_chunk = move |chunk: &str| {
+        event::emit(
+            &app_for_chunk,
+            event::AppEvent::CodingBriefChunk {
+                conversation_id: conv_for_chunk.clone(),
+                chunk: chunk.to_string(),
+            },
+        );
+    };
+
+    let text = crate::agents::llm::run_agent_text_streaming(
+        &state.db,
+        &agent,
+        &prompt,
+        None,
+        &mut on_chunk,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut brief = parse_coding_brief(&text);
+    brief.risk_level = refine_risk_assessment(&brief);
+    Ok(brief)
+}
+
+/// 会议室「立即编码」入参：操作者在确认弹窗里给出标题 + 功能点工单（可由 `draft_coding_brief`
+/// 起草后编辑），可选会话窗口大小与操作者标识。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartConversationCoding {
+    pub conversation_id: String,
+    pub title: String,
+    pub brief: String,
+    pub window_size: Option<i64>,
+    pub admin_id: Option<String>,
+    /// 前端生成的 UUID，用于幂等去重；重复请求命中时直接返回已有 CR。
+    pub client_request_id: Option<String>,
+}
+
+/// 会议室「立即编码」第二步（直奔编码）：依据操作者确认的功能点工单，**自动创建需求 → 建 CR →
+/// 入队编码执行**，跳过需求审核（review_1）队列——操作者在会议室点「立即编码」即视为需求侧的
+/// 人工决策；代码审核（review_2）仍是合并前的唯一闸门，架构「双审核 / 合并唯一入口」不被破坏。
+/// 会话快照 + 项目上下文作为 `work_context` 随 CR 落库，注入编码工单的「需求来源」段。
+#[tauri::command]
+pub async fn start_conversation_coding(
+    payload: StartConversationCoding,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::models::change_request::ChangeRequest, String> {
+    let db = &state.db;
+    let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
+        .bind(&payload.conversation_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("conversation {} not found", payload.conversation_id))?;
+    let project_id = conversation
+        .project_id
+        .clone()
+        .ok_or_else(|| "仅绑定项目的群聊可使用「立即编码」".to_string())?;
+    let project =
+        sqlx::query_as::<_, crate::models::project::Project>("SELECT * FROM projects WHERE id=?")
+            .bind(&project_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    let title = payload.title.trim().to_string();
+    let brief = payload.brief.trim().to_string();
+    if title.is_empty() || brief.is_empty() {
+        return Err("需求标题与功能点不能为空".to_string());
+    }
+    // 工单内容会进编码 agent 工单，按安全规则过注入消毒（操作者输入也可能来自被污染的讨论）。
+    if crate::core::security::has_obvious_injection(&title)
+        || crate::core::security::has_obvious_injection(&brief)
+    {
+        return Err("内容包含可疑指令，已拦截".to_string());
+    }
+
+    // 组装会话 + 项目上下文作为编码背景（best-effort：失败不阻断，工单本身已足够编码）。
+    let window = payload.window_size.unwrap_or(30).clamp(5, 100);
+    let work_context = match assemble_conversation_context(db, &payload.conversation_id, window).await
+    {
+        Ok(c) if !c.trim().is_empty() => Some(c),
+        _ => None,
+    };
+
+    let admin_id = payload.admin_id.as_deref().unwrap_or("admin").to_string();
+
+    // 会话串行锁：把「幂等查重 → 建 Issue → 建 CR」整段做成对并发原子的临界区。
+    // 否则操作者双击/前端重试会让两次调用都越过下面的查重（彼此都还没插入），各建一条
+    // Issue+CR（重复编码同一需求）。Level-2（未传 client_request_id）尤其只有 check-then-insert
+    // 保护，无 DB 唯一约束兜底，必须靠此锁关闭 TOCTOU 窗口。
+    let lock = crate::state::conversation_lock(&payload.conversation_id);
+    let _guard = lock.lock().await;
+
+    // ── 幂等去重 ──────────────────────────────────────────────────────────────
+    // Level 1：client_request_id 精确匹配（前端 UUID，最强保证）。
+    // Level 2：同 project + title + source_type='conversation' + status='pending_execution' 近似兜底。
+    // 命中时直接返回既有 CR；若 Issue 存在但 CR 尚无（前次半途失败），补建 CR 后返回。
+    let maybe_existing: Option<crate::models::issue::Issue> =
+        if let Some(ref req_id) = payload.client_request_id {
+            sqlx::query_as::<_, crate::models::issue::Issue>(
+                "SELECT * FROM issues WHERE client_request_id = ?",
+            )
+            .bind(req_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+    let maybe_existing = if maybe_existing.is_none() {
+        sqlx::query_as::<_, crate::models::issue::Issue>(
+            "SELECT * FROM issues \
+             WHERE project_id = ? AND source_type = 'conversation' AND title = ? \
+             AND status = 'pending_execution' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&project_id)
+        .bind(&title)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        maybe_existing
+    };
+    if let Some(ref ex_issue) = maybe_existing {
+        if let Some(cr) = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
+            "SELECT * FROM change_requests WHERE issue_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&ex_issue.id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            return Ok(cr);
+        }
+        // Issue 存在但 CR 尚无（上次调用中途失败）：补建 CR 后返回。
+        return crate::commands::change_requests::create_cr_for_issue(
+            db,
+            &state.job_tx,
+            ex_issue,
+            &project,
+            Some("会议室「立即编码」：操作者在讨论中确认功能点后直接进入编码"),
+            &admin_id,
+            work_context.as_deref(),
+        )
+        .await;
+    }
+    // ── End 幂等去重 ─────────────────────────────────────────────────────────
+
+    // 创建需求：express 路径直接落 pending_execution（不入分析/需求审核队列）。
+    let issue_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO issues (id, project_id, source_type, title, description, category, status, source_ref, client_request_id)
+         VALUES (?, ?, 'conversation', ?, ?, 'Feature', 'pending_execution', ?, ?)",
+    )
+    .bind(&issue_id)
+    .bind(&project_id)
+    .bind(&title)
+    .bind(&brief)
+    .bind(&payload.conversation_id)
+    .bind(&payload.client_request_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let issue = sqlx::query_as::<_, crate::models::issue::Issue>("SELECT * FROM issues WHERE id=?")
+        .bind(&issue_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let cr = crate::commands::change_requests::create_cr_for_issue(
+        db,
+        &state.job_tx,
+        &issue,
+        &project,
+        Some("会议室「立即编码」：操作者在讨论中确认功能点后直接进入编码"),
+        &admin_id,
+        work_context.as_deref(),
+    )
+    .await?;
+
+    // 操作者收件箱 + 总览：与正常录入一致地广播 IssueCreated。
+    event::emit(
+        &app,
+        event::AppEvent::IssueCreated {
+            issue_id: issue_id.clone(),
+            project_id: project_id.clone(),
+        },
+    );
+
+    // 回写一条会议室记录，让讨论留痕「这次讨论触发了哪条编码」（best-effort，失败不阻断）。
+    let note = format!(
+        "⚡ 已据本次讨论创建需求 **{title}** 并立即开始编码（CR `{}`）。进度与代码审核请见「变更审核」页。",
+        cr.id
+    );
+    if let Ok(Some(planner)) = load_planner_agent(db).await {
+        if let Ok(message_id) =
+            insert_agent_markdown_message(db, &payload.conversation_id, &planner.id, &note).await
+        {
+            event::emit(
+                &app,
+                event::AppEvent::MessageReceived {
+                    conversation_id: payload.conversation_id.clone(),
+                    message_id,
+                },
+            );
+        }
+    }
+
+    Ok(cr)
+}
+
+/// Recover conversation (会议室) AI tasks orphaned by a previous process exit.
+///
+/// A task is created `running` and driven by an in-memory `tauri::async_runtime::spawn`
+/// task that dies with the process. Unlike pipeline jobs, these are **not** auto-resumed:
+/// re-running would re-post AI messages, re-spend LLM tokens, and re-write workspace files
+/// — all user-visible side effects. So we close them out as `failed`（注明重启中断）and let
+/// the operator re-send the trigger. In-flight steps/runs are closed the same way so the
+/// task detail view doesn't show phantom spinners.
+///
+/// Run ONCE at startup, before any new task can be spawned. DB-only (no Tauri types) so it
+/// stays callable from non-Tauri entry points.
+pub async fn fail_orphaned_conversation_tasks(db: &crate::db::Db) -> usize {
+    const REASON: &str = "任务因程序重启中断，请重新发送指令触发。";
+    // Close in-flight steps/runs first so no child row outlives its parent task.
+    let _ = sqlx::query(
+        "UPDATE conversation_task_runs SET status='failed', completed_at=datetime('now') WHERE status='running'",
+    )
+    .execute(db)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE conversation_task_steps SET status='failed', error=?, completed_at=datetime('now') WHERE status='running'",
+    )
+    .bind(REASON)
+    .execute(db)
+    .await;
+    let affected = sqlx::query(
+        "UPDATE conversation_tasks SET status='failed', error=?, completed_at=datetime('now') WHERE status='running'",
+    )
+    .bind(REASON)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected() as usize)
+    .unwrap_or(0);
+    if affected > 0 {
+        info!(
+            "startup recovery: failed {} interrupted conversation task(s)",
+            affected
+        );
+    }
+    affected
+}
+
 #[tauri::command]
 pub async fn list_conversation_tasks(
     conversation_id: String,
@@ -170,6 +787,11 @@ async fn compress_context_now(
     conversation_id: &str,
     mode: &str,
 ) -> Result<(), String> {
+    // 会话串行锁：同一会话的压缩/结论与任务编排互斥，避免并发交织重复插摘要、重复排除原消息。
+    // 持锁跨越「读消息→调 LLM→原子写回」全过程，后到的并发请求会在此排队、再读时已是压缩后状态。
+    let lock = crate::state::conversation_lock(conversation_id);
+    let _guard = lock.lock().await;
+
     let conversation = sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id=?")
         .bind(conversation_id)
         .fetch_optional(db)
@@ -229,7 +851,16 @@ async fn compress_context_now(
     };
 
     let (ok, summary) = run_system_agent_text(
-        db, &agent, used_kind, &prompt, fallback_system, project_id, Some(&source),
+        db,
+        &SystemAgentParams {
+            conversation_id,
+            agent: &agent,
+            kind: used_kind,
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id,
+            recall_key: Some(&source),
+        },
     )
     .await;
     if !ok {
@@ -247,15 +878,10 @@ async fn compress_context_now(
         summary.trim(),
         messages.len()
     );
+    // 原子写回：摘要插入 + 原消息排除同生共死（见 commit_compression）。
+    let excluded_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let message_id =
-        insert_agent_markdown_message(db, conversation_id, &agent.id, &markdown).await?;
-    for msg in &messages {
-        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
-            .bind(&msg.id)
-            .execute(db)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+        commit_compression(db, conversation_id, &agent.id, &markdown, &excluded_ids).await?;
     event::emit(
         app,
         event::AppEvent::MessageReceived {
@@ -291,7 +917,18 @@ async fn execute_conversation_task(
         &project_prefix,
     )
     .await?;
-    let members = load_schedulable_members(&db, &payload.conversation_id).await?;
+    let mut members = load_schedulable_members(&db, &payload.conversation_id).await?;
+    // 内置「编码 Agent」：在绑定了项目的群聊里，作为一个可 @ 的虚拟成员自动出现（不入库）。
+    // 被显式 @ 时用当前系统默认编码 Agent 只读跑仓库作答。详见 [`BUILTIN_CODE_AGENT_ID`]。
+    if conversation.conv_type == "group"
+        && conversation
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    {
+        members.push(builtin_code_agent_member());
+    }
     // Roster of who else is in the room (name + specialty), injected into every
     // agent prompt so agents know whom they can @ to bring in the right expert.
     let roster = build_member_roster(&members);
@@ -332,19 +969,22 @@ async fn execute_conversation_task(
     let mut next_step_index = 0usize;
 
     for step in plan.steps.iter() {
+        let ctx = ChatTaskCtx {
+            db: &db,
+            app: &app,
+            conversation_id: &payload.conversation_id,
+            snapshot: &snapshot,
+            accumulated: &accumulated,
+            roster: &roster,
+            project_id: conversation.project_id.as_deref(),
+        };
         let (outcomes, step_failed) = run_plan_step(
-            &db,
-            &app,
+            &ctx,
             &task_id,
-            &payload.conversation_id,
             next_step_index,
             &step.step_type,
             &step.agents,
             &step.instruction,
-            &snapshot,
-            &accumulated,
-            &roster,
-            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -382,19 +1022,22 @@ async fn execute_conversation_task(
         let step_type = if to_run.len() > 1 { "parallel" } else { "single" };
         let instruction =
             "你在群聊中被其他 Agent @ 点名。请针对点名你的发言内容作出明确回应（同意/反对/补充并说明理由）。";
+        let ctx = ChatTaskCtx {
+            db: &db,
+            app: &app,
+            conversation_id: &payload.conversation_id,
+            snapshot: &snapshot,
+            accumulated: &accumulated,
+            roster: &roster,
+            project_id: conversation.project_id.as_deref(),
+        };
         let (outcomes, step_failed) = run_plan_step(
-            &db,
-            &app,
+            &ctx,
             &task_id,
-            &payload.conversation_id,
             next_step_index,
             step_type,
             &to_run,
             instruction,
-            &snapshot,
-            &accumulated,
-            &roster,
-            conversation.project_id.as_deref(),
         )
         .await?;
         next_step_index += 1;
@@ -425,17 +1068,16 @@ async fn execute_conversation_task(
 
     if asks_for_synthesis(&payload.instruction) && !plan_has_final_single {
         if let Some(summarizer) = load_system_role_agent(&db, "summarizer").await? {
-            let outcome = run_summarizer(
-                &db,
-                &app,
-                &payload.conversation_id,
-                &summarizer,
-                &payload.instruction,
-                &snapshot,
-                &accumulated,
-                conversation.project_id.as_deref(),
-            )
-            .await?;
+            let ctx = ChatTaskCtx {
+                db: &db,
+                app: &app,
+                conversation_id: &payload.conversation_id,
+                snapshot: &snapshot,
+                accumulated: &accumulated,
+                roster: &roster,
+                project_id: conversation.project_id.as_deref(),
+            };
+            let outcome = run_summarizer(&ctx, &summarizer, &payload.instruction).await?;
             if !outcome.ok {
                 any_failed = true;
             }
@@ -448,17 +1090,16 @@ async fn execute_conversation_task(
 
     if asks_for_artifact(&payload.instruction) && !plan_has_final_single {
         if let Some(doc_writer) = load_system_role_agent(&db, "doc_writer").await? {
-            let outcome = run_doc_writer(
-                &db,
-                &app,
-                &payload.conversation_id,
-                &doc_writer,
-                &payload.instruction,
-                &snapshot,
-                &accumulated,
-                conversation.project_id.as_deref(),
-            )
-            .await?;
+            let ctx = ChatTaskCtx {
+                db: &db,
+                app: &app,
+                conversation_id: &payload.conversation_id,
+                snapshot: &snapshot,
+                accumulated: &accumulated,
+                roster: &roster,
+                project_id: conversation.project_id.as_deref(),
+            };
+            let outcome = run_doc_writer(&ctx, &doc_writer, &payload.instruction).await?;
             if !outcome.ok {
                 any_failed = true;
             }
@@ -573,7 +1214,12 @@ async fn build_plan(
     if !needs_planner {
         // `@所有人`：被点名的恰好覆盖全部可调度成员（且不止一人）。让全员并发就同一话题
         // 表态，并显式要求互相分析、@ 彼此尽快收敛到一致意见（后续链式 @ 跟进阶段接力）。
-        let is_everyone = mentioned.len() > 1 && mentioned.len() == members.len();
+        // 计数排除内置「编码 Agent」——它不随 `@所有人` 广播（重型 CLI），不应影响"全员"判定。
+        let real_member_count = members
+            .iter()
+            .filter(|m| m.id != BUILTIN_CODE_AGENT_ID)
+            .count();
+        let is_everyone = mentioned.len() > 1 && mentioned.len() == real_member_count;
         let step_instruction = if is_everyone {
             consensus_instruction(instruction)
         } else {
@@ -779,19 +1425,34 @@ fn fallback_plan(
 /// concurrently, then marks the step done). Returns each agent's outcome plus
 /// whether any agent in the step failed. Shared by the plan loop and the
 /// chained-@mention follow-up phase.
+/// Shared, borrowed context threaded through the group-chat (会议室) task
+/// execution family — plan steps, per-agent runs, and post-plan system agents
+/// (summarizer / doc_writer / markdown) all need the same handful of
+/// dependencies plus the running discussion snapshot. Bundling them keeps each
+/// helper's signature under the `clippy::too_many_arguments` threshold without
+/// changing behavior. All fields are borrows; a `ChatTaskCtx` is cheap to
+/// rebuild and only lives for one helper call, so it never outlives the
+/// borrowed data.
+struct ChatTaskCtx<'a> {
+    db: &'a crate::db::Db,
+    app: &'a AppHandle,
+    conversation_id: &'a str,
+    /// Frozen transcript of the conversation fed into each agent prompt.
+    snapshot: &'a str,
+    /// Running tail of replies produced earlier in this task pass.
+    accumulated: &'a str,
+    /// Human-readable roster of schedulable members (used by step agents only).
+    roster: &'a str,
+    project_id: Option<&'a str>,
+}
+
 async fn run_plan_step(
-    db: &crate::db::Db,
-    app: &AppHandle,
+    ctx: &ChatTaskCtx<'_>,
     task_id: &str,
-    conversation_id: &str,
     step_index: usize,
     step_type: &str,
     agents: &[String],
     instruction: &str,
-    snapshot: &str,
-    accumulated: &str,
-    roster: &str,
-    project_id: Option<&str>,
 ) -> Result<(Vec<AgentOutcome>, bool), String> {
     let step_id = Uuid::new_v4().to_string();
     let agent_ids_json = serde_json::to_string(agents).map_err(|e| e.to_string())?;
@@ -806,24 +1467,18 @@ async fn run_plan_step(
     .bind(step_type)
     .bind(&agent_ids_json)
     .bind(instruction)
-    .execute(db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
     let mut calls = Vec::new();
     for agent_id in agents {
         calls.push(run_agent_for_step(
-            db.clone(),
-            app.clone(),
-            task_id.to_string(),
-            step_id.clone(),
-            conversation_id.to_string(),
-            agent_id.clone(),
-            instruction.to_string(),
-            snapshot.to_string(),
-            accumulated.to_string(),
-            roster.to_string(),
-            project_id.map(str::to_string),
+            ctx,
+            task_id,
+            &step_id,
+            agent_id,
+            instruction,
         ));
     }
 
@@ -862,7 +1517,7 @@ async fn run_plan_step(
         None::<&str>
     })
     .bind(&step_id)
-    .execute(db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -944,17 +1599,11 @@ fn detect_mentioned_agents(text: &str, members: &[Agent]) -> Vec<String> {
 }
 
 async fn run_agent_for_step(
-    db: crate::db::Db,
-    app: AppHandle,
-    task_id: String,
-    step_id: String,
-    conversation_id: String,
-    agent_id: String,
-    instruction: String,
-    snapshot: String,
-    accumulated: String,
-    roster: String,
-    project_id: Option<String>,
+    ctx: &ChatTaskCtx<'_>,
+    task_id: &str,
+    step_id: &str,
+    agent_id: &str,
+    instruction: &str,
 ) -> Result<AgentOutcome, String> {
     let run_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -963,27 +1612,37 @@ async fn run_agent_for_step(
          VALUES (?, ?, ?, ?, 'running', datetime('now'))",
     )
     .bind(&run_id)
-    .bind(&task_id)
-    .bind(&step_id)
-    .bind(&agent_id)
-    .execute(&db)
+    .bind(task_id)
+    .bind(step_id)
+    .bind(agent_id)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let agent = load_agent(&db, &agent_id).await?;
-    let roster_section = if roster.trim().is_empty() {
+    // 内置「编码 Agent」虚拟成员不入库，合成其 Agent；其余成员照常查库。
+    let agent = if agent_id == BUILTIN_CODE_AGENT_ID {
+        builtin_code_agent_member()
+    } else {
+        load_agent(ctx.db, agent_id).await?
+    };
+    // 编码 Agent 后端成员：改走 CLI 只读跑项目仓库作答的路径（不经 LLM tool-loop）。
+    // 复用已插入的 run_id 这条 conversation_task_runs 行。
+    if let Some(code_agent_id) = agent.code_agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        return run_code_agent_reply(ctx, &run_id, &agent, code_agent_id, instruction).await;
+    }
+    let roster_section = if ctx.roster.trim().is_empty() {
         String::new()
     } else {
         format!(
             "群聊成员名单（了解在场成员；话题相关时可 @名字 点名协作）：\n{}\n\n",
-            roster
+            ctx.roster
         )
     };
     let prompt = format!(
         "{}以下是群聊对话快照：\n{}\n\n前置 Agent 发言：\n{}\n\n当前任务：\n{}\n\n请以 {} 的身份在群聊中直接回复。保持观点明确，必要时输出结构化 Markdown。\n优先自己把问题答完，不必为了协作而刻意 @ 别人；但当某部分确实更适合其他成员的专长、或你想就分歧点邀请其表态时，可以自然地用 @对方名字 点名（仅 @ 名单中的成员，且只 @ 与当前话题真正相关的成员）。不要为了凑发言或客套而 @ 无关成员。",
         roster_section,
-        snapshot,
-        if accumulated.trim().is_empty() { "无" } else { &accumulated },
+        ctx.snapshot,
+        if ctx.accumulated.trim().is_empty() { "无" } else { ctx.accumulated },
         instruction,
         agent.name
     );
@@ -999,19 +1658,49 @@ async fn run_agent_for_step(
             crate::agents::roles::OUTPUT_FORMAT_GUIDE
         )
     };
-    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 代码扫描(项目仓库) + 勾选的 MCP server 工具。
-    let tool_ctx = crate::agents::tools::ToolContext::resolve(&db, project_id.as_deref()).await;
+    // 群聊步骤 Agent 的工具集：内置工具(capabilities 白名单) + 只读代码情报(绑定项目时无条件补齐)
+    // + 勾选的 MCP server 工具。用 chat 版装配，确保群聊里 Agent 总能真正读到项目代码而非空口承诺。
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(ctx.db, ctx.project_id).await;
     let registry =
-        crate::agents::tools::build_registry_for_agent(&db, &agent, &tool_ctx).await;
+        crate::agents::tools::build_registry_for_chat_agent(ctx.db, &agent, &tool_ctx).await;
     // 多模态：收集最近上下文窗口内的图片附件，交给绑定多模态 LLM 的 Agent 识别。
     // 非多模态 LLM 会在 llm 层静默忽略这些图片（快照里仍保留「[图片: …]」文字描述）。
-    let images = collect_context_images(&db, &conversation_id, 40, 6).await;
+    let images = collect_context_images(ctx.db, ctx.conversation_id, 40, 6).await;
+    // 实时活动流：把 Agent 的工具动作与回复正文逐字增量转成 `AgentThinking` 事件推给前端，
+    // 消除会议室「干等」的等待感。闭包只捕获 AppHandle + 标识串，业务层（llm.rs）对 Tauri 无感知。
+    // seq 在本次执行内递增，前端据此按序拼接；run_id 区分并行步骤里同时发言的多个 Agent。
+    let think_app = ctx.app;
+    let think_conv = ctx.conversation_id.to_string();
+    let think_run = run_id.clone();
+    let think_aid = agent_id.to_string();
+    let think_aname = agent.name.clone();
+    let mut think_seq: u64 = 0;
+    let mut on_think = move |ev: crate::agents::llm::ThinkEvent| {
+        let (kind, text) = match ev {
+            crate::agents::llm::ThinkEvent::Token(t) => ("token", t),
+            crate::agents::llm::ThinkEvent::Tool { summary, .. } => ("tool", summary),
+        };
+        event::emit(
+            think_app,
+            event::AppEvent::AgentThinking {
+                conversation_id: think_conv.clone(),
+                run_id: think_run.clone(),
+                agent_id: think_aid.clone(),
+                agent_name: think_aname.clone(),
+                kind: kind.to_string(),
+                text,
+                seq: think_seq,
+            },
+        );
+        think_seq += 1;
+    };
     // 把「LLM 调用 + 解析 <write-file> + 落盘」包进同一个 trace run：写文件以 tool span
     // 挂在与本次 Agent 调用相同的 trace 下，链路追踪里即可审计 Agent 写了哪些工作区文件。
     let (ok, text, text_after_writes, error, write_blocks) =
-        crate::core::trace::scope_run(&db, &agent, async {
-            let result = crate::agents::llm::run_agent_text_with_tools(
-                &db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
+        crate::core::trace::scope_run(ctx.db, &agent, async {
+            let result = crate::agents::llm::run_agent_text_with_tools_streaming(
+                ctx.db, &agent, &prompt, Some(system_prompt.as_str()), &images, &registry,
+                &mut on_think,
             )
             .await;
             let (ok, text, error) = match result {
@@ -1025,7 +1714,7 @@ async fn run_agent_for_step(
             let (text_after_writes, file_writes) =
                 crate::commands::workspace::parse_agent_file_writes(&text);
             let write_blocks =
-                crate::commands::workspace::execute_agent_writes(&db, &conversation_id, file_writes)
+                crate::commands::workspace::execute_agent_writes(ctx.db, ctx.conversation_id, file_writes)
                     .await;
             (ok, text, text_after_writes, error, write_blocks)
         })
@@ -1041,7 +1730,7 @@ async fn run_agent_for_step(
         //    使「提交到流水线」按钮真正可用。
         if let Some(obj) = artifact.as_object_mut() {
             obj.insert("t".to_string(), serde_json::json!("artifact"));
-            if let Some(pid) = project_id.as_deref() {
+            if let Some(pid) = ctx.project_id {
                 let meta = obj
                     .entry("_meta")
                     .or_insert_with(|| serde_json::json!({}));
@@ -1055,7 +1744,162 @@ async fn run_agent_for_step(
     for wb in write_blocks {
         blocks.push(wb);
     }
-    let content_json = serde_json::to_string(&blocks).unwrap_or_default();
+    finalize_chat_reply(ctx, &run_id, agent_id, &agent.name, &blocks, ok, text, error).await
+}
+
+/// 编码 Agent 后端成员的群聊回复：在项目仓库内**只读**跑 CLI（claude/codex）回答问题，把实时
+/// 活动转成「思考」流推前端，最终落库末轮答案。需群聊**绑定带仓库的项目**（要有真实代码可读）；
+/// 未绑定 / 解析失败 / 该 kind 不支持只读问答（opencode）时，落一条说明性消息优雅降级，
+/// 不抛错卡住整个任务。复用调用方已插入的 `run_id` 运行行。
+async fn run_code_agent_reply(
+    ctx: &ChatTaskCtx<'_>,
+    run_id: &str,
+    agent: &Agent,
+    code_agent_id: &str,
+    instruction: &str,
+) -> Result<AgentOutcome, String> {
+    // 1) 需要项目仓库（只读读取真实代码）。完整加载项目行：repo_path 与（内置成员的）
+    //    resolve 都要用它。
+    let project = match ctx.project_id {
+        Some(pid) => sqlx::query_as::<_, crate::models::project::Project>(
+            "SELECT * FROM projects WHERE id=?",
+        )
+        .bind(pid)
+        .fetch_optional(ctx.db)
+        .await
+        .map_err(|e| e.to_string())?,
+        None => None,
+    };
+    let repo_path = project
+        .as_ref()
+        .map(|p| p.repo_path.clone())
+        .unwrap_or_default();
+    if repo_path.trim().is_empty() {
+        let msg = format!(
+            "我是编码 Agent 成员「{}」，需要本群聊**绑定一个带仓库路径的项目**才能读取真实代码作答。\
+             请在群聊设置里绑定项目后再 @ 我。",
+            agent.name
+        );
+        let blocks = vec![serde_json::json!({ "t": "md", "md": msg.clone() })];
+        return finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, true, msg, None)
+            .await;
+    }
+    // repo_path 非空蕴含 project 必为 Some。
+    let project = project.expect("repo_path non-empty implies project loaded");
+
+    // 2) 解析编码 Agent 后端：
+    //    - 内置「编码 Agent」虚拟成员（哨兵 BUILTIN_CODE_AGENT_ID）→ resolve（当前系统默认，
+    //      含项目覆盖、硬兜底 claude），随设置里选的默认而变；
+    //    - 显式绑定某 code_agents.id 的成员 → resolve_by_id（查不到/停用即降级，不静默兜底）。
+    let code_agent = if code_agent_id == BUILTIN_CODE_AGENT_ID {
+        Some(crate::agents::code_agent::resolve(ctx.db, &project).await)
+    } else {
+        crate::agents::code_agent::resolve_by_id(ctx.db, code_agent_id).await
+    };
+    let Some(code_agent) = code_agent else {
+        let msg = format!(
+            "我绑定的编码 Agent 不可用（可能已被删除或停用）。请在「设置 → Agent」里为成员「{}」\
+             重新指定编码 Agent 后端。",
+            agent.name
+        );
+        let blocks = vec![serde_json::json!({ "t": "md", "md": msg.clone() })];
+        return finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, true, msg, None)
+            .await;
+    };
+
+    // 3) prompt：群聊上下文 + 只读读真实代码的措辞（不输出写文件指令）。
+    let roster_section = if ctx.roster.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "群聊成员名单（话题相关时可 @名字 协作）：\n{}\n\n",
+            ctx.roster
+        )
+    };
+    let prompt = format!(
+        "{roster}以下是群聊对话快照：\n{snap}\n\n前置 Agent 发言：\n{acc}\n\n当前任务：\n{ins}\n\n\
+         你是群聊成员「{name}」，可直接读取并检索本项目仓库的**真实代码**来回答。请基于真实代码\
+         作答（点明涉及的文件/符号与关键流程），结论先行、观点明确，用简洁中文 Markdown。\
+         你处于**只读**模式：可读代码、检索、分析，但不会改动任何文件，也不要输出文件写入指令。\
+         若某部分确实更适合其他成员，可自然地用 @对方名字 点名（仅 @ 名单中相关成员），\
+         不要为凑协作而 @ 无关成员。",
+        roster = roster_section,
+        snap = ctx.snapshot,
+        acc = if ctx.accumulated.trim().is_empty() { "无" } else { ctx.accumulated },
+        ins = instruction,
+        name = agent.name,
+    );
+
+    // 4) 限额复用「执行」配置；MCP 复用「适用于编码 Agent」的只读情报（如 codegraph）。
+    let (wall_secs, idle_secs) = crate::commands::system::load_execution_limits(ctx.db).await;
+    let limits = crate::agents::code_agent::RunLimits { wall_secs, idle_secs };
+    let code_mcp = crate::agents::code_agent::load_code_agent_mcp(ctx.db).await;
+
+    // 5) 实时活动 → 「思考」流：把 CLI 边跑边吐的可读增量转成 AgentThinking(token) 推前端，
+    //    消除会议室干等。业务层对 Tauri 仅经 event::emit 感知。
+    let (log_tx, mut log_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agents::code_agent::LogChunk>();
+    let forward = {
+        let app = ctx.app.clone();
+        let conv = ctx.conversation_id.to_string();
+        let rid = run_id.to_string();
+        let aid = agent.id.clone();
+        let aname = agent.name.clone();
+        tokio::spawn(async move {
+            let mut seq: u64 = 0;
+            while let Some(c) = log_rx.recv().await {
+                event::emit(
+                    &app,
+                    event::AppEvent::AgentThinking {
+                        conversation_id: conv.clone(),
+                        run_id: rid.clone(),
+                        agent_id: aid.clone(),
+                        agent_name: aname.clone(),
+                        kind: "token".to_string(),
+                        text: c.text,
+                        seq,
+                    },
+                );
+                seq += 1;
+            }
+        })
+    };
+
+    // 6) 只读跑仓库取末轮答案。
+    let result = code_agent
+        .answer(&repo_path, &prompt, limits, &code_mcp, Some(&log_tx))
+        .await;
+    drop(log_tx); // 关闭 sink，让转发任务收尾
+    let _ = forward.await;
+
+    let (ok, text, error) = match result {
+        Ok(t) => (true, t, None),
+        Err(e) => (
+            false,
+            format!("[编码 Agent「{}」执行失败] {}", agent.name, e),
+            Some(e.to_string()),
+        ),
+    };
+    let blocks = vec![serde_json::json!({ "t": "md", "md": text.clone() })];
+    finalize_chat_reply(ctx, run_id, &agent.id, &agent.name, &blocks, ok, text, error).await
+}
+
+/// 落库一条 Agent 群聊回复（LLM 后端与编码 Agent 后端两路共用）：写 `messages`、更新本次
+/// `conversation_task_runs`（状态/output_text/error）、广播 `MessageReceived` 并撤下实时活动
+/// 卡片，返回 `AgentOutcome`（其 `text` 供后续轮次 / 链式 @ 累计）。`blocks` 为已构建好的消息
+/// 块数组（md / artifact / file_written…），`run_id` 为调用方已插入的运行行 id。
+#[allow(clippy::too_many_arguments)]
+async fn finalize_chat_reply(
+    ctx: &ChatTaskCtx<'_>,
+    run_id: &str,
+    agent_id: &str,
+    agent_name: &str,
+    blocks: &[serde_json::Value],
+    ok: bool,
+    text: String,
+    error: Option<String>,
+) -> Result<AgentOutcome, String> {
+    let content_json = serde_json::to_string(blocks).unwrap_or_default();
 
     let message_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -1063,10 +1907,10 @@ async fn run_agent_for_step(
          VALUES (?, ?, ?, ?)",
     )
     .bind(&message_id)
-    .bind(&conversation_id)
-    .bind(&agent_id)
+    .bind(ctx.conversation_id)
+    .bind(agent_id)
     .bind(&content_json)
-    .execute(&db)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -1079,61 +1923,72 @@ async fn run_agent_for_step(
     .bind(&message_id)
     .bind(&text)
     .bind(&error)
-    .bind(&run_id)
-    .execute(&db)
+    .bind(run_id)
+    .execute(ctx.db)
     .await
     .map_err(|e| e.to_string())?;
 
     event::emit(
-        &app,
+        ctx.app,
         event::AppEvent::MessageReceived {
-            conversation_id,
+            conversation_id: ctx.conversation_id.to_string(),
             message_id,
+        },
+    );
+    // 收尾：通知前端撤下本次执行的实时活动卡片，换成刚落库的正式消息气泡。
+    event::emit(
+        ctx.app,
+        event::AppEvent::AgentThinking {
+            conversation_id: ctx.conversation_id.to_string(),
+            run_id: run_id.to_string(),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            kind: "done".to_string(),
+            text: String::new(),
+            seq: u64::MAX,
         },
     );
 
     Ok(AgentOutcome {
-        agent_id,
-        agent_name: agent.name,
+        agent_id: agent_id.to_string(),
+        agent_name: agent_name.to_string(),
         ok,
         text,
     })
 }
 
 async fn run_summarizer(
-    db: &crate::db::Db,
-    app: &AppHandle,
-    conversation_id: &str,
+    ctx: &ChatTaskCtx<'_>,
     agent: &Agent,
     instruction: &str,
-    snapshot: &str,
-    accumulated: &str,
-    project_id: Option<&str>,
 ) -> Result<AgentOutcome, String> {
     let prompt = format!(
         "以下是群聊对话快照：\n{}\n\n本轮 Agent 发言：\n{}\n\n用户原始请求：\n{}\n\n请作为群聊总结器输出最终结论。要求：\n- 综合各方观点，不重复完整原文。\n- 如果用户要求裁决，明确给出裁决和理由。\n- 输出后续行动建议。\n- 使用结构化 Markdown。",
-        snapshot,
-        if accumulated.trim().is_empty() { "无" } else { accumulated },
+        ctx.snapshot,
+        if ctx.accumulated.trim().is_empty() { "无" } else { ctx.accumulated },
         instruction
     );
     let fallback_system =
         "你是 AutoForge 的系统总结器，负责把多 Agent 讨论压缩成清晰、可执行、可追溯的结论。";
     run_system_agent_markdown(
-        db, app, conversation_id, agent, "summarizer", &prompt, fallback_system,
-        project_id, Some(instruction),
+        ctx,
+        &SystemAgentParams {
+            conversation_id: ctx.conversation_id,
+            agent,
+            kind: "summarizer",
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id: ctx.project_id,
+            recall_key: Some(instruction),
+        },
     )
     .await
 }
 
 async fn run_doc_writer(
-    db: &crate::db::Db,
-    app: &AppHandle,
-    conversation_id: &str,
+    ctx: &ChatTaskCtx<'_>,
     agent: &Agent,
     instruction: &str,
-    snapshot: &str,
-    accumulated: &str,
-    project_id: Option<&str>,
 ) -> Result<AgentOutcome, String> {
     let default_kind = infer_artifact_kind(instruction);
     let prompt = format!(
@@ -1159,11 +2014,11 @@ JSON 结构：
 - body 要可直接作为 PRD、ADR、测试计划或实施方案的初稿使用。
 - 不要遗漏背景、目标、范围、约束、风险和下一步。
 - rows 控制在 3 到 6 行。"#,
-        snapshot,
-        if accumulated.trim().is_empty() {
+        ctx.snapshot,
+        if ctx.accumulated.trim().is_empty() {
             "无"
         } else {
-            accumulated
+            ctx.accumulated
         },
         instruction,
         default_kind
@@ -1171,16 +2026,25 @@ JSON 结构：
     let fallback_system =
         "你是 AutoForge 的系统文档生成器，负责把群聊讨论沉淀为可引用、可迭代的文档产物。";
     let (ok, raw) = run_system_agent_text(
-        db, agent, "doc_writer", &prompt, fallback_system, project_id, Some(instruction),
+        ctx.db,
+        &SystemAgentParams {
+            conversation_id: ctx.conversation_id,
+            agent,
+            kind: "doc_writer",
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id: ctx.project_id,
+            recall_key: Some(instruction),
+        },
     )
     .await;
     if !ok {
         let message_id =
-            insert_agent_markdown_message(db, conversation_id, &agent.id, &raw).await?;
+            insert_agent_markdown_message(ctx.db, ctx.conversation_id, &agent.id, &raw).await?;
         event::emit(
-            app,
+            ctx.app,
             event::AppEvent::MessageReceived {
-                conversation_id: conversation_id.to_string(),
+                conversation_id: ctx.conversation_id.to_string(),
                 message_id,
             },
         );
@@ -1197,7 +2061,7 @@ JSON 结构：
         "[{}] {}\n\n{}",
         artifact.kind, artifact.title, artifact.body
     );
-    insert_agent_artifact_message(db, app, conversation_id, &agent.id, artifact).await?;
+    insert_agent_artifact_message(ctx.db, ctx.app, ctx.conversation_id, &agent.id, artifact).await?;
 
     Ok(AgentOutcome {
         agent_id: agent.id.clone(),
@@ -1208,29 +2072,23 @@ JSON 结构：
 }
 
 async fn run_system_agent_markdown(
-    db: &crate::db::Db,
-    app: &AppHandle,
-    conversation_id: &str,
-    agent: &Agent,
-    kind: &str,
-    prompt: &str,
-    fallback_system_prompt: &str,
-    project_id: Option<&str>,
-    recall_key: Option<&str>,
+    ctx: &ChatTaskCtx<'_>,
+    params: &SystemAgentParams<'_>,
 ) -> Result<AgentOutcome, String> {
-    let (ok, text) =
-        run_system_agent_text(db, agent, kind, prompt, fallback_system_prompt, project_id, recall_key).await;
-    let message_id = insert_agent_markdown_message(db, conversation_id, &agent.id, &text).await?;
+    let (ok, text) = run_system_agent_text(ctx.db, params).await;
+    let message_id =
+        insert_agent_markdown_message(ctx.db, params.conversation_id, &params.agent.id, &text)
+            .await?;
     event::emit(
-        app,
+        ctx.app,
         event::AppEvent::MessageReceived {
-            conversation_id: conversation_id.to_string(),
+            conversation_id: params.conversation_id.to_string(),
             message_id,
         },
     );
     Ok(AgentOutcome {
-        agent_id: agent.id.clone(),
-        agent_name: agent.name.clone(),
+        agent_id: params.agent.id.clone(),
+        agent_name: params.agent.name.clone(),
         ok,
         text,
     })
@@ -1238,28 +2096,29 @@ async fn run_system_agent_markdown(
 
 async fn run_system_agent_text(
     db: &crate::db::Db,
-    agent: &Agent,
-    kind: &str,
-    prompt: &str,
-    fallback_system_prompt: &str,
-    project_id: Option<&str>,
-    recall_key: Option<&str>,
+    params: &SystemAgentParams<'_>,
 ) -> (bool, String) {
     // 用注册表内置提示词（按 prompt_mode）+ Innate 召回，让群聊系统角色随经验越用越好。
     let system_prompt = crate::agents::llm::build_role_system_prompt(
-        agent,
-        Some(kind),
-        Some(fallback_system_prompt),
-        project_id,
-        recall_key,
+        params.agent,
+        Some(params.kind),
+        Some(params.fallback_system_prompt),
+        params.project_id,
+        params.recall_key,
     )
     .await;
     // 系统角色也可按需用工具（代码扫描/web_search）：注册表按 capabilities 白名单 + 项目绑定装配；
     // 为空（未开启工具/无项目）时 run_agent_text_with_tools 自动回退到无工具单轮，行为不变。
-    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, project_id).await;
-    let registry = crate::agents::tools::build_registry_for_agent(db, agent, &tool_ctx).await;
+    let tool_ctx = crate::agents::tools::ToolContext::resolve(db, params.project_id).await;
+    let registry =
+        crate::agents::tools::build_registry_for_agent(db, params.agent, &tool_ctx).await;
     match crate::agents::llm::run_agent_text_with_tools(
-        db, agent, prompt, system_prompt.as_deref(), &[], &registry,
+        db,
+        params.agent,
+        params.prompt,
+        system_prompt.as_deref(),
+        &[],
+        &registry,
     )
     .await
     {
@@ -1312,7 +2171,16 @@ async fn maybe_compress_context(
     let fallback_system = "你是 AutoForge 的上下文压缩器，负责在长对话超过窗口条数后生成可靠摘要，降低后续 Agent 的上下文负担。";
     // 召回键用待压缩内容，命中该对话主题相关的项目经验。
     let (ok, summary) = run_system_agent_text(
-        db, &compressor, "context_compressor", &prompt, fallback_system, project_id, Some(&source),
+        db,
+        &SystemAgentParams {
+            conversation_id,
+            agent: &compressor,
+            kind: "context_compressor",
+            prompt: &prompt,
+            fallback_system_prompt: fallback_system,
+            project_id,
+            recall_key: Some(&source),
+        },
     )
     .await;
     if !ok {
@@ -1324,15 +2192,10 @@ async fn maybe_compress_context(
         summary.trim(),
         to_compress.len()
     );
+    // 原子写回：摘要插入 + 原消息排除同生共死（见 commit_compression）。
+    let excluded_ids: Vec<String> = to_compress.iter().map(|m| m.id.clone()).collect();
     let message_id =
-        insert_agent_markdown_message(db, conversation_id, &compressor.id, &markdown).await?;
-    for msg in to_compress {
-        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
-            .bind(&msg.id)
-            .execute(db)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+        commit_compression(db, conversation_id, &compressor.id, &markdown, &excluded_ids).await?;
     event::emit(
         app,
         event::AppEvent::MessageReceived {
@@ -1376,6 +2239,41 @@ async fn build_context_snapshot(
     Ok(format!("{}{}", project_prefix, conv_text))
 }
 
+/// 组装「会议室立即编码」用的上下文：项目上下文（claude.md/agents.md/pinned 文件/工作区
+/// 文件清单）+ 最近 `window` 条对话快照。复用与 AI 任务完全相同的取材，保证交给编码 agent
+/// 的背景与会议室里看到的一致。
+pub(crate) async fn assemble_conversation_context(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    window: i64,
+) -> Result<String, String> {
+    let project_prefix =
+        crate::commands::project_context::load_project_context_for_conversation(db, conversation_id)
+            .await;
+    build_context_snapshot(db, conversation_id, window, &project_prefix).await
+}
+
+/// 加载用于「梳理功能点」的 Agent：优先 forge_role=analysis 的分析 Agent（绑定低成本 LLM），
+/// 否则回退 planner 系统角色。两者皆缺 → 报错，提示去设置绑定 LLM。
+async fn load_brief_agent(db: &crate::db::Db) -> Result<Agent, String> {
+    if let Some(a) = sqlx::query_as::<_, Agent>(
+        "SELECT * FROM agents
+         WHERE (',' || COALESCE(forge_role, '') || ',') LIKE '%,analysis,%'
+           AND llm_id IS NOT NULL
+         ORDER BY created_at LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        return Ok(a);
+    }
+    if let Some(a) = load_planner_agent(db).await? {
+        return Ok(a);
+    }
+    Err("未配置可用于梳理需求的 Agent（请在设置中为「分析」或 planner 角色绑定 LLM）".to_string())
+}
+
 /// Truncate a string to at most `max_bytes`, keeping the tail (most recent
 /// content) on a char boundary and prepending `notice` when content was dropped.
 fn truncate_keep_tail(s: &str, max_bytes: usize, notice: &str) -> String {
@@ -1414,6 +2312,40 @@ async fn messages_to_context_text(
         }
     }
     Ok(parts.join("\n\n"))
+}
+
+/// 原子提交一次压缩/结论：在**单事务**内插入摘要消息 + 把被压缩的原消息标记为
+/// `excluded_from_context=1`。要么全成功要么全回滚——杜绝「摘要已插入但原消息未排除
+/// （下轮重复压缩、摘要叠摘要）」或「原消息已排除但摘要插入失败（内容凭空丢失）」的半完成态。
+async fn commit_compression(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    agent_id: &str,
+    markdown: &str,
+    excluded_ids: &[String],
+) -> Result<String, String> {
+    let content_json = serde_json::json!([{ "t": "md", "md": markdown }]).to_string();
+    let message_id = Uuid::new_v4().to_string();
+    let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, from_agent, content_json) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&message_id)
+    .bind(conversation_id)
+    .bind(agent_id)
+    .bind(&content_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    for id in excluded_ids {
+        sqlx::query("UPDATE messages SET excluded_from_context=1 WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(message_id)
 }
 
 async fn insert_agent_markdown_message(
@@ -1524,6 +2456,21 @@ async fn message_to_prompt_text(db: &crate::db::Db, msg: &Message) -> Result<Str
                     .unwrap_or("图片");
                 parts.push(format!("[图片: {}]", label));
             }
+            Some("ws_ref") => {
+                let path = block.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if !path.is_empty() {
+                    match load_workspace_ref_content(db, &msg.conversation_id, path).await {
+                        Ok(content) => parts.push(format!(
+                            "[工作区文件引用 - .autoforge/{}]\n```\n{}\n```",
+                            path, content
+                        )),
+                        Err(e) => parts.push(format!(
+                            "[工作区文件引用: .autoforge/{} 读取失败: {}]",
+                            path, e
+                        )),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1562,6 +2509,37 @@ async fn load_text_attachment_content(
         Ok(Some(text.chars().take(MAX_CHARS).collect::<String>()))
     } else {
         Ok(Some(text.to_string()))
+    }
+}
+
+/// 解析消息携带的工作区文件引用（ws_ref 块）：经会话定位项目 repo_path，
+/// 再用 workspace 守卫读取 .autoforge/ 下的文件内容（限 docs/specs，禁越界），
+/// 构建 Agent 提示时按需调用，避免把全文塞进存储的消息。
+async fn load_workspace_ref_content(
+    db: &crate::db::Db,
+    conversation_id: &str,
+    rel_under_autoforge: &str,
+) -> Result<String, String> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT p.repo_path FROM conversations c \
+         JOIN projects p ON p.id = c.project_id WHERE c.id = ?",
+    )
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (repo_path,) = row.ok_or_else(|| "会话未绑定项目".to_string())?;
+    if repo_path.is_empty() {
+        return Err("项目未配置仓库路径".to_string());
+    }
+    let content =
+        crate::commands::workspace::read_workspace_path(&repo_path, rel_under_autoforge).await?;
+    // 防止单个引用文件撑爆上下文，与文本附件一致截断到 50k 字符。
+    const MAX_CHARS: usize = 50_000;
+    if content.chars().count() > MAX_CHARS {
+        Ok(content.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        Ok(content)
     }
 }
 
@@ -1815,6 +2793,11 @@ fn route_by_relevance(instruction: &str, members: &[Agent]) -> Option<String> {
     let hay = instruction.to_lowercase();
     let mut best: Option<(usize, &str)> = None;
     for m in members {
+        // 编码 Agent 成员（CLI 重型、只读跑仓库）只在被**显式 @** 时触发，绝不参与零成本
+        // 关键词自动选人——避免日常闲聊误把昂贵 CLI 拉起来。见 [[迁移 0079]]。
+        if is_code_agent_member(m) {
+            continue;
+        }
         let mut score = 0usize;
         for kw in [
             m.name.as_str(),
@@ -1828,7 +2811,7 @@ fn route_by_relevance(instruction: &str, members: &[Agent]) -> Option<String> {
                 score += 1;
             }
         }
-        if score > 0 && best.map_or(true, |(b, _)| score > b) {
+        if score > 0 && best.is_none_or(|(b, _)| score > b) {
             best = Some((score, m.id.as_str()));
         }
     }
@@ -1854,7 +2837,57 @@ async fn last_speaking_member(
     .ok()
     .flatten();
     let last = last.map(|(a,)| a)?;
-    members.iter().find(|m| m.id == last).map(|m| m.id.clone())
+    // 同理：编码 Agent 成员不作为"对话连续性默认接话人"自动续接，只在被显式 @ 时回复。
+    members
+        .iter()
+        .find(|m| m.id == last && !is_code_agent_member(m))
+        .map(|m| m.id.clone())
+}
+
+/// 内置「编码 Agent」虚拟成员的稳定 id。它**不入库**（不在 `agents` / `conversation_members`
+/// 表），仅在运行时注入到「绑定了项目的群聊」的成员集中：被显式 @ 时用**当前系统默认编码
+/// Agent**（`code_agent::resolve`，含项目覆盖、硬兜底 claude）只读跑仓库作答——随设置里选的
+/// 默认而变，无需把群成员逐个切成编码 Agent。前端 `Conversations.tsx` 用同名常量在 @ 候选 /
+/// 作者渲染里镜像它，改这个值需两端同步。
+pub const BUILTIN_CODE_AGENT_ID: &str = "__builtin_code_agent__";
+
+/// 构造内置「编码 Agent」虚拟成员。`code_agent_id` 置为 [`BUILTIN_CODE_AGENT_ID`] 作哨兵：据此
+/// `is_code_agent_member` 为真（只在显式 @ 时触发、不参与自动选人/连续性接话），且
+/// `run_code_agent_reply` 走 `resolve`（当前默认）而非 `resolve_by_id`。
+fn builtin_code_agent_member() -> Agent {
+    Agent {
+        id: BUILTIN_CODE_AGENT_ID.to_string(),
+        name: "编码 Agent".to_string(),
+        name_en: "CodeAgent".to_string(),
+        role: "只读读项目真实代码答疑".to_string(),
+        color: "#e8772e".to_string(),
+        initial: "码".to_string(),
+        llm_id: None,
+        system_prompt: String::new(),
+        forge_role: None,
+        role_type: "system".to_string(),
+        system_kind: None,
+        capabilities_json: "[]".to_string(),
+        max_concurrency: 1,
+        visible_in_chat: true,
+        mentionable: true,
+        enabled: true,
+        prompt_mode: "builtin".to_string(),
+        memory_enabled: false,
+        code_agent_id: Some(BUILTIN_CODE_AGENT_ID.to_string()),
+        created_at: String::new(),
+    }
+}
+
+/// 该成员是否由编码 Agent（CLI）后端驱动（`agents.code_agent_id` 非空）。这类成员只读跑项目
+/// 仓库作答、进程重，故只在被**显式 @mention** 或单点指定时触发，不参与自动选人/连续性接话。
+fn is_code_agent_member(agent: &Agent) -> bool {
+    agent
+        .code_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
 }
 
 fn infer_artifact_kind(text: &str) -> &'static str {

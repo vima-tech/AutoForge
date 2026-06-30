@@ -230,28 +230,25 @@ pub async fn read_project_file(
     if repo_path.is_empty() {
         return Err("项目未设置仓库路径".to_string());
     }
+    read_repo_file(&repo_path, &rel_path)
+}
 
-    // Prevent directory traversal
-    for comp in PathBuf::from(&rel_path).components() {
+/// 守卫读取仓库内一个文件（防越界 + 白名单后缀 + 2MB 上限）。供蓝图/孵化台引用项目文件复用。
+pub fn read_repo_file(repo_path: &str, rel_path: &str) -> Result<String, String> {
+    for comp in PathBuf::from(rel_path).components() {
         if matches!(comp, Component::ParentDir | Component::RootDir) {
             return Err("路径越界：不允许访问项目目录外的文件".to_string());
         }
     }
-
-    let base = PathBuf::from(&repo_path);
-    let full_path = safe_join(&base, &rel_path)?;
-
-    if !is_allowed_ext(&rel_path) {
+    let base = PathBuf::from(repo_path);
+    let full_path = safe_join(&base, rel_path)?;
+    if !is_allowed_ext(rel_path) {
         return Err("该文件类型不允许读取".to_string());
     }
     let meta = std::fs::metadata(&full_path).map_err(|e| e.to_string())?;
     if meta.len() > MAX_PROJECT_FILE_BYTES {
-        return Err(format!(
-            "文件超过 2 MB 上限（{} KB）",
-            meta.len() / 1024
-        ));
+        return Err(format!("文件超过 2 MB 上限（{} KB）", meta.len() / 1024));
     }
-
     std::fs::read_to_string(&full_path).map_err(|e| e.to_string())
 }
 

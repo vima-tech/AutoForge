@@ -18,7 +18,8 @@ export type SensitiveFieldRow = { table: string; fields: string; rule: MaskRule 
 export type ProjectConfigForm = {
   // dev — 审计预览环境 (cr_preview.rs / dev_server.rs)。预览地址固定为
   // http://localhost:{port}，不再可配；prod URL 也已移除。
-  devKind: 'web' | 'tauri';
+  // 'web'=网站/后台前端 | 'tauri'=桌面 | 'miniapp'=微信小程序（预览=一次性编译产物，非 dev server）
+  devKind: 'web' | 'tauri' | 'miniapp';
   devCommand: string;
   appCommand: string;
   // test / quality — 巡检与合并前测试 (testing.rs)
@@ -77,7 +78,7 @@ function parseJsonForm(obj: any): ProjectConfigForm {
   const deploy = obj.deploy ?? {};
   const sens: any[] = Array.isArray(preview.sensitive_fields) ? preview.sensitive_fields : [];
   return {
-    devKind: dev.kind === 'tauri' ? 'tauri' : 'web',
+    devKind: dev.kind === 'tauri' ? 'tauri' : dev.kind === 'miniapp' ? 'miniapp' : 'web',
     devCommand: str(dev.command),
     appCommand: str(dev.app_command),
     testUnit: str(test.unit?.command),
@@ -172,7 +173,7 @@ function parseSensitive(yaml: string): SensitiveFieldRow[] {
 function parseYamlForm(yaml: string): ProjectConfigForm {
   const s = flattenScalars(yaml);
   return {
-    devKind: s['dev.kind'] === 'tauri' ? 'tauri' : 'web',
+    devKind: s['dev.kind'] === 'tauri' ? 'tauri' : s['dev.kind'] === 'miniapp' ? 'miniapp' : 'web',
     devCommand: s['dev.command'] ?? '',
     appCommand: s['dev.app_command'] ?? '',
     testUnit: s['test.unit.command'] ?? '',
@@ -198,6 +199,7 @@ export function buildProjectConfig(form: ProjectConfigForm, existing: string | n
 
   const dev: Record<string, unknown> = {};
   if (form.devKind === 'tauri') dev.kind = 'tauri';
+  else if (form.devKind === 'miniapp') dev.kind = 'miniapp';
   if (form.devCommand.trim()) dev.command = form.devCommand.trim();
   if (form.devKind === 'tauri' && form.appCommand.trim()) dev.app_command = form.appCommand.trim();
   if (Object.keys(dev).length) obj.dev = dev;

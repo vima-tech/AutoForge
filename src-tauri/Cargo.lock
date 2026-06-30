@@ -365,6 +365,7 @@ dependencies = [
  "innate",
  "keyring",
  "lettre",
+ "libc",
  "once_cell",
  "qrcode",
  "rand 0.8.6",
@@ -2624,9 +2625,9 @@ dependencies = [
 
 [[package]]
 name = "innate"
-version = "0.1.12"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbe0baebfaa25a5c424cfb8a3e263d64b17206db2cdbf8f719b745d10bd0cce8"
+checksum = "c6a909d5f0d6b11992480b78b2597b711856735c976188e853b8f9dd93726882"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4103,9 +4104,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",

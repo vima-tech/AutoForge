@@ -122,6 +122,15 @@ impl NotificationDraft {
                 link_ref: Some(cr_id.clone()),
                 thread_key: Some(cr_id.clone()),
             }),
+            AppEvent::CrReverted { cr_id, .. } => Some(NotificationDraft {
+                category: "result",
+                kind: "cr_reverted",
+                title: "需求改动已撤销".into(),
+                body: cr_id.clone(),
+                link_page: Some("audit"),
+                link_ref: Some(cr_id.clone()),
+                thread_key: Some(cr_id.clone()),
+            }),
             AppEvent::SecurityAuditCompleted {
                 cr_id,
                 severity,
@@ -154,6 +163,15 @@ impl NotificationDraft {
                 thread_key: Some(cr_id.clone()),
             }),
             // 心跳 / 高频 / 已有独立角标覆盖 —— 不入收件箱。
+            AppEvent::AutosupplyDegraded { reason } => Some(NotificationDraft {
+                category: "intervene",
+                kind: "autosupply_degraded",
+                title: "自喂料深度提议器异常".into(),
+                body: format!("proposer 连续多轮无产出，需介入：{reason}"),
+                link_page: Some("settings"),
+                link_ref: None,
+                thread_key: Some("autosupply_degraded".into()),
+            }),
             AppEvent::WorktreeUpdate { .. }
             | AppEvent::TaskProgress { .. }
             | AppEvent::PreviewUpdate { .. }
@@ -161,7 +179,11 @@ impl NotificationDraft {
             | AppEvent::MessageReceived { .. }
             | AppEvent::ConversationTaskUpdated { .. }
             | AppEvent::AsrResult { .. }
-            | AppEvent::AutosupplyStatus { .. } => None,
+            | AppEvent::AutosupplyStatus { .. }
+            | AppEvent::CodeAgentLog { .. }
+            | AppEvent::PreviewLog { .. }
+            | AppEvent::CodingBriefChunk { .. }
+            | AppEvent::AgentThinking { .. } => None,
         }
     }
 }

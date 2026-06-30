@@ -254,13 +254,14 @@ async fn ensure_and_sync_docs(project_id: &str, state: &AppState) -> Result<(), 
     sync_repo_docs(project_id, &docs_dir, state).await
 }
 
-async fn get_or_create_material_folder(
+/// 查找 (project_id, parent_id, name) 对应的文件夹（大小写不敏感，挑最稳定的一条）。
+async fn find_material_folder(
     project_id: &str,
     parent_id: Option<&str>,
     name: &str,
     state: &AppState,
-) -> Result<MaterialFolder, String> {
-    let existing = match parent_id {
+) -> Result<Option<MaterialFolder>, String> {
+    match parent_id {
         Some(parent_id) => {
             sqlx::query_as::<_, MaterialFolder>(
                 "SELECT * FROM material_folders
@@ -287,21 +288,31 @@ async fn get_or_create_material_folder(
             .await
         }
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+}
 
-    if let Some(folder) = existing {
+async fn get_or_create_material_folder(
+    project_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+    state: &AppState,
+) -> Result<MaterialFolder, String> {
+    // 快路径：已存在直接返回。
+    if let Some(folder) = find_material_folder(project_id, parent_id, name, state).await? {
         return Ok(folder);
     }
 
+    // 幂等插入：依赖 idx_material_folders_uniq(project_id, COALESCE(parent_id,''), name)
+    // 唯一索引，并发同步下只有一条能落库，其余被忽略——杜绝重复文件夹竞态。
     let id = Uuid::new_v4().to_string();
     let now = now_str();
     sqlx::query(
-        "INSERT INTO material_folders (id, project_id, parent_id, name, sort_order, created_at, updated_at)
+        "INSERT OR IGNORE INTO material_folders (id, project_id, parent_id, name, sort_order, created_at, updated_at)
          VALUES (?, ?, ?, ?, 0, ?, ?)",
     )
     .bind(&id)
     .bind(project_id)
-    .bind(&parent_id)
+    .bind(parent_id)
     .bind(name)
     .bind(&now)
     .bind(&now)
@@ -309,11 +320,10 @@ async fn get_or_create_material_folder(
     .await
     .map_err(|e| e.to_string())?;
 
-    sqlx::query_as::<_, MaterialFolder>("SELECT * FROM material_folders WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| e.to_string())
+    // 回查真正存活的那条（可能是本次插入的，也可能是并发竞争者赢得的那条）。
+    find_material_folder(project_id, parent_id, name, state)
+        .await?
+        .ok_or_else(|| "创建物料文件夹后未能回查到记录".to_string())
 }
 
 /// Walk `.autoforge/docs/` and upsert its contents into the DB.

@@ -156,3 +156,68 @@ pub async fn clear_llm_traces(
     }
     Ok(())
 }
+
+// ── LLM 用量与成本视图（#64）────────────────────────────────────────────────
+// 把 llm_traces 里 kind='llm' 的 span 按 model 聚合，给出调用次数与 token 消耗，
+// 供 Trace 页「用量」Tab 展示整体消耗结构（成本随各模型单价折算，单价前端可配）。
+
+/// 按模型聚合的用量行。
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct LlmUsageRow {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// LLM 用量统计：按 model 聚合的明细 + 合计。可选时间下限（ISO 字符串，空=全部）。
+#[derive(serde::Serialize)]
+pub struct LlmUsageStats {
+    pub rows: Vec<LlmUsageRow>,
+    pub total_calls: i64,
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[tauri::command]
+pub async fn llm_usage_stats(
+    since: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<LlmUsageStats, String> {
+    // since 为空则不过滤；非空按 created_at >= since 过滤（前端传「近7天」等下限）。
+    let since_filter = since.filter(|s| !s.trim().is_empty());
+    let rows: Vec<LlmUsageRow> = sqlx::query_as(
+        "SELECT provider, model,
+                COUNT(*) AS calls,
+                COALESCE(SUM(prompt_tokens),0)     AS prompt_tokens,
+                COALESCE(SUM(completion_tokens),0) AS completion_tokens,
+                COALESCE(SUM(total_tokens),0)      AS total_tokens
+         FROM llm_traces
+         WHERE kind='llm' AND (?1 IS NULL OR created_at >= ?1)
+         GROUP BY provider, model
+         ORDER BY total_tokens DESC",
+    )
+    .bind(&since_filter)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut stats = LlmUsageStats {
+        total_calls: 0,
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        total_tokens: 0,
+        rows: vec![],
+    };
+    for r in &rows {
+        stats.total_calls += r.calls;
+        stats.total_prompt_tokens += r.prompt_tokens;
+        stats.total_completion_tokens += r.completion_tokens;
+        stats.total_tokens += r.total_tokens;
+    }
+    stats.rows = rows;
+    Ok(stats)
+}

@@ -1,0 +1,8 @@
+# Rust 工具链锁定 —— 确保团队构建环境一致（rustup 自动按此安装/切换）
+# 项目使用 edition 2021，README 要求 Rust 1.75+。
+# 这里只声明 stable 通道（不钉死具体版本号），避免频繁的版本冲突与强制下载；
+# 如需复现完全一致的构建，可将 channel 改为具体版本（如 "1.78.0"）。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "default"

@@ -866,3 +866,57 @@ pub async fn ai_generate_specs(
 
     Ok(format!("已生成 {} 条规格，已写入 .autoforge/specs/", total))
 }
+
+/// 追加一批 db 源规格并刷新对应聚合文件 + CLAUDE.md @import。供项目蓝图 apply 复用
+/// （与 ai_generate_specs 同一落库/落盘路径，但**追加**而非清空既有规格）。
+/// 非宪法级 category 回落到 architecture，避免散落分类不被聚合写出。
+/// 入参 `specs`：`(category, title, content)`。返回写入条数。
+pub async fn insert_db_specs(
+    project_id: &str,
+    specs: &[(String, String, String)],
+    state: &AppState,
+) -> Result<usize, String> {
+    let now = now_str();
+    let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (category, title, content) in specs {
+        let cat = if is_aggregate(category) {
+            category.clone()
+        } else {
+            "architecture".to_string()
+        };
+        // 续接该分类现有最大 sort_order，保持稳定排序。
+        let next: i64 = sqlx::query_as::<_, (Option<i64>,)>(
+            "SELECT MAX(sort_order) FROM project_specs WHERE project_id = ? AND category = ?",
+        )
+        .bind(project_id)
+        .bind(&cat)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .0
+        .map(|v| v + 1)
+        .unwrap_or(0);
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO project_specs
+             (id, project_id, category, title, content, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(project_id)
+        .bind(&cat)
+        .bind(title)
+        .bind(content)
+        .bind(next)
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        touched.insert(cat);
+    }
+    for cat in &touched {
+        write_category_file(project_id, cat, state).await?;
+    }
+    Ok(specs.len())
+}

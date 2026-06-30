@@ -15,8 +15,15 @@ use tauri::Manager;
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Quiet the rmcp MCP client: at INFO it dumps the entire server
+                // `peer_info` (incl. codegraph's multi-KB instructions block) on
+                // every connect, plus per-call "task cancelled / serve finished /
+                // child exited" lines. We spawn a fresh MCP client per analysis,
+                // so this floods the log. Keep our own crates at info; override
+                // anytime via RUST_LOG.
+                tracing_subscriber::EnvFilter::new("info,rmcp=warn")
+            }),
         )
         .init();
 
@@ -73,6 +80,46 @@ pub fn run() {
             let concurrency =
                 core::concurrency::ConcurrencyManager::new(max_slots, pause_threshold);
             concurrency.update_config(None, None, Some(queue_strategy));
+
+            // 启动恢复：用 DB 真实在产状态回填并发计数器（崩溃/重启后内存从 0 起，否则
+            // 背压阈值误判、dashboard 少报）。计数 executing→active、pending_code_review→待审。
+            {
+                let (active, pending): (i64, i64) = tauri::async_runtime::block_on(async {
+                    let a = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM change_requests WHERE status='executing'",
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or(0);
+                    let p = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM change_requests WHERE status='pending_code_review'",
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or(0);
+                    (a, p)
+                });
+                concurrency.backfill(active.max(0) as usize, pending.max(0) as usize);
+            }
+
+            // 合并门构建池 + cgroup CPU 预算：按配置初始化。构建池全平台；CPU 预算仅
+            // Linux 且 pct>0 时尝试，失败优雅降级（见 core::cpubudget）。
+            let (build_slots, cpu_budget_pct) = tauri::async_runtime::block_on(async {
+                (
+                    commands::system::load_build_slots(&db).await,
+                    commands::system::load_cpu_budget_pct(&db).await,
+                )
+            });
+            state::init_build_pool(build_slots);
+            core::cpubudget::init(cpu_budget_pct);
+
+            // 出站 LLM 并发闸：按配置初始化，削平批量任务（如一次分析 50 条需求）打到
+            // 服务商的瞬时并发，防 429 限流。设置变更时由 update_concurrency_config 热更新。
+            let llm_concurrency = tauri::async_runtime::block_on(
+                commands::system::load_llm_concurrency(&db),
+            );
+            agents::llm::set_llm_concurrency(llm_concurrency);
+
             let job_tx = tasks::runner::start(db.clone(), app_handle.clone(), concurrency.clone());
 
             let webhook_handle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
@@ -91,6 +138,30 @@ pub fn run() {
                     std::collections::HashMap::new(),
                 )),
                 autosupply_running: autosupply_running.clone(),
+            });
+
+            // 启动恢复：上次进程退出（崩溃/重启）时在途的代码实现任务，其内存轮询任务已
+            // 随进程消失，但 CR 仍停在 pending_execution/executing 且无人再去抢槽位——批量
+            // 合并腾空槽位也救不回。这里在任何 driver 任务产生前重排它们，使流水线自愈。
+            let db_for_requeue = db.clone();
+            let tx_for_requeue = job_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                // 先回收上次崩溃残留的孤儿 agent 进程组（在旧 worktree 里还在烧 CPU 的
+                // claude + 其子进程），再重排执行任务（重排会 fork 全新 worktree）。
+                core::reaper::reap_orphans_under(&state::worktrees_base());
+                tasks::runner::requeue_orphaned_executions(&db_for_requeue, &tx_for_requeue).await;
+                // 同样救回卡在 pending_analysis 的孤儿需求：要么进程中途退出，要么旧版
+                // 用稳定 analysis:<id> 重新分析时被已 completed 的 job 行去重而从未派发。
+                tasks::runner::requeue_orphaned_analyses(&db_for_requeue, &tx_for_requeue).await;
+                // 救回卡在 pending_merge 的孤儿合并：review_2/自动合并门/解冲突回落已置态并入队，
+                // 但 Merge 驱动任务随进程消失。Merge 幂等（git merge --squash 重跑空操作），可安全重排。
+                tasks::runner::requeue_orphaned_merges(&db_for_requeue, &tx_for_requeue).await;
+                // 救回卡在 reverting 的孤儿撤销：git revert 不幂等，绝不自动重跑——回滚到稳定态
+                // merged，由人确认 dev 后手动重试。
+                tasks::runner::recover_orphaned_reverts(&db_for_requeue).await;
+                // 关闭卡在 running 的孤儿会议室任务：交互式、有副作用（发消息/扣费/写文件），
+                // 不自动重跑，标 failed 让用户重新发指令。
+                commands::orchestration::fail_orphaned_conversation_tasks(&db_for_requeue).await;
             });
 
             // 主动巡检调度器（design §6.2 mode B）：每 24h 对活跃项目跑全量巡检
@@ -127,13 +198,32 @@ pub fn run() {
             let app_for_supply = app_handle.clone();
             let running_for_supply = autosupply_running.clone();
             tauri::async_runtime::spawn(async move {
+                use tasks::autosupply;
                 loop {
-                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
-                    let sleep_min = cfg.interval_min.max(5) as u64;
-                    tokio::time::sleep(std::time::Duration::from_secs(sleep_min * 60)).await;
-                    let cfg = tasks::autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    let cfg = autosupply::AutosupplyConfig::load(&db_for_supply).await;
+                    if !cfg.enabled {
+                        // 关闭时每分钟复查一次是否被重新开启（不睡满整个间隔）。
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    // 按「距上次实际运行已过多久」计算到下次触发的剩余时间，而非每次重启
+                    // 都重新睡满一个完整间隔——这样 dev 热重载/频繁重启不再清零计时器。
+                    let interval_secs = cfg.interval_min.max(5) * 60;
+                    let wait_secs = match autosupply::last_run_unix(&db_for_supply).await {
+                        Some(last) => {
+                            let elapsed = (autosupply::now_unix() - last).max(0);
+                            (interval_secs - elapsed).max(0)
+                        }
+                        None => 0, // 从未运行过 → 尽快补跑
+                    };
+                    // 即便已到期，也给启动留 20s 缓冲，避免开机瞬间与初始化抢资源。
+                    let secs = if wait_secs == 0 { 20 } else { wait_secs as u64 };
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    // 醒来后重载配置（睡眠期间可能被关闭或改了间隔）。
+                    let cfg = autosupply::AutosupplyConfig::load(&db_for_supply).await;
                     if cfg.enabled {
-                        let _ = tasks::autosupply::run_cycle(
+                        // run_cycle 内部会在成功运行后写入 last_run_at。
+                        let _ = autosupply::run_cycle(
                             &db_for_supply,
                             &tx_for_supply,
                             &app_for_supply,
@@ -258,13 +348,22 @@ pub fn run() {
             commands::issues::list_issues_page,
             commands::issues::list_issue_statuses,
             commands::issues::list_issues_by_statuses,
+            commands::issues::count_pending_issue_reviews,
+            commands::issues::export_issues,
             commands::issues::list_issue_titles,
             commands::issues::get_issue,
             commands::issues::get_issue_analysis,
             commands::issues::submit_issue,
             commands::issues::retry_analysis,
             commands::issues::reanalyze_with_feedback,
+            commands::issues::defer_issue,
+            commands::issues::reactivate_issue,
             commands::issues::update_issue_acceptance,
+            commands::issues::import_issue_attachment,
+            commands::issues::list_issue_attachments,
+            commands::issues::issue_attachment_data_url,
+            commands::issues::open_issue_attachment,
+            commands::issues::delete_issue_attachment,
             commands::issues::list_cr_test_runs,
             commands::intake::get_intake_config,
             commands::intake::update_intake_config,
@@ -290,16 +389,35 @@ pub fn run() {
             commands::change_requests::list_change_requests_page,
             commands::change_requests::get_change_request_by_issue,
             commands::change_requests::get_change_request,
+            commands::change_requests::get_default_merge_message,
             commands::change_requests::get_worktree_session,
             commands::change_requests::get_code_diff,
+            commands::change_summary::generate_change_summary,
+            commands::issues::get_issue_lifecycle,
+            commands::trace::llm_usage_stats,
+            commands::review_assist::generate_code_review_summary,
+            commands::review_assist::get_code_review_summary,
+            commands::review_assist::generate_release_notes,
+            commands::review_assist::get_release_notes,
             commands::change_requests::get_merge_conflict,
             commands::change_requests::retry_merge,
             commands::change_requests::ai_resolve_merge_conflict,
+            commands::change_requests::revert_change_request,
+            commands::conflicts::get_conflict_detail,
+            commands::conflicts::resolve_conflict_manually,
+            commands::conflicts::open_conflict_workspace,
             commands::change_requests::review_1,
             commands::change_requests::review_1_batch,
+            commands::change_requests::review_1_merge,
+            commands::change_requests::split_change_request,
+            commands::change_requests::detach_and_requeue,
+            commands::change_requests::get_change_request_issues,
+            commands::requirement_merge::list_merge_candidates,
+            commands::requirement_merge::preview_batch_bind,
             commands::change_requests::review_2,
             commands::change_requests::review_2_batch,
             commands::change_requests::retry_change_request,
+            commands::change_requests::restore_change_request,
             commands::change_requests::delete_change_request,
             commands::conversations::list_conversations,
             commands::conversations::list_messages,
@@ -331,7 +449,12 @@ pub fn run() {
             commands::workspace::list_workspace_files,
             commands::workspace::read_workspace_file,
             commands::workspace::write_workspace_file,
+            commands::workspace::undo_workspace_file,
             commands::orchestration::start_conversation_task,
+            commands::orchestration::draft_coding_brief,
+            commands::orchestration::draft_coding_brief_detailed,
+            commands::orchestration::draft_coding_brief_stream,
+            commands::orchestration::start_conversation_coding,
             commands::orchestration::list_conversation_tasks,
             commands::orchestration::compress_conversation_context,
             commands::knowledge::run_conversation_command,
@@ -354,6 +477,8 @@ pub fn run() {
             commands::notifications::mark_all_notifications_read,
             commands::settings::get_asr_settings,
             commands::settings::set_asr_settings,
+            commands::settings::get_miniapp_devtools_path,
+            commands::settings::set_miniapp_devtools_path,
             commands::asr::transcribe_recording_segment,
             commands::asr::transcribe_recording_file,
             commands::asr::asr_realtime_start,
@@ -380,6 +505,7 @@ pub fn run() {
             commands::mcp::update_mcp_server,
             commands::mcp::delete_mcp_server,
             commands::mcp::test_mcp_connection,
+            commands::mcp::discover_code_intel_map,
             commands::settings::list_agents,
             commands::settings::create_agent,
             commands::settings::update_agent,
@@ -387,6 +513,9 @@ pub fn run() {
             commands::settings::set_agent_forge_role,
             commands::settings::list_role_catalog,
             commands::settings::set_role_slot,
+            commands::settings::set_default_llm,
+            commands::settings::bulk_bind_roles,
+            commands::settings::apply_role_preset,
             commands::system::system_health,
             commands::system::system_resources,
             commands::system::check_claude_auth,
@@ -396,6 +525,12 @@ pub fn run() {
             commands::code_agents::set_default_code_agent,
             commands::code_agents::set_project_code_agent,
             commands::code_agents::check_code_agent_auth,
+            commands::code_agents::list_code_agent_runs,
+            commands::code_agents::get_code_agent_run,
+            commands::code_agents::get_running_code_agent_log,
+            commands::code_agent_skills::list_code_agent_skills,
+            commands::code_agent_skills::upsert_code_agent_skill,
+            commands::code_agent_skills::delete_code_agent_skill,
             commands::system::pipeline_stats,
             commands::system::get_badge_counts,
             commands::system::update_concurrency_config,
@@ -416,6 +551,7 @@ pub fn run() {
             commands::cr_preview::get_cr_preview,
             commands::cr_preview::start_cr_preview,
             commands::cr_preview::stop_cr_preview,
+            commands::cr_preview::build_cr_miniapp,
             commands::cr_preview::launch_cr_app,
             commands::cr_preview::get_cr_preview_log,
             commands::cr_preview::list_local_branches,
@@ -423,6 +559,8 @@ pub fn run() {
             commands::cr_preview::list_branch_previews,
             commands::cr_preview::stop_branch_preview,
             commands::cr_preview::get_branch_preview_log,
+            commands::cr_preview::start_preview_log_tail,
+            commands::cr_preview::stop_preview_log_tail,
             commands::materials::list_material_folders,
             commands::materials::create_material_folder,
             commands::materials::rename_material_folder,
@@ -446,6 +584,14 @@ pub fn run() {
             commands::specs::scan_spec_files,
             commands::specs::get_spec_content,
             commands::specs::set_spec_injection,
+            commands::blueprint::start_blueprint_draft,
+            commands::blueprint::refine_blueprint_draft,
+            commands::blueprint::patch_blueprint_draft,
+            commands::blueprint::get_blueprint_draft,
+            commands::blueprint::list_blueprint_drafts,
+            commands::blueprint::delete_blueprint_draft,
+            commands::blueprint::apply_blueprint_draft,
+            commands::blueprint::code_blueprint_draft,
             commands::security::list_security_audits,
             commands::deploy::list_deployments,
             commands::deploy::generate_deploy_script,
@@ -469,12 +615,15 @@ pub fn run() {
             commands::artifacts::reveal_delivery_artifact,
             commands::scan::run_proactive_scan,
             commands::run_config::ai_generate_run_config,
+            commands::run_config::detect_project_category,
             commands::grading::get_cr_grade,
             commands::grading::list_auto_pass_policy,
             commands::grading::get_auto_pass_enabled,
             commands::grading::set_auto_pass_enabled,
             commands::grading::get_auto_conflict_resolve_enabled,
             commands::grading::set_auto_conflict_resolve_enabled,
+            commands::grading::get_parallel_premerge_enabled,
+            commands::grading::set_parallel_premerge_enabled,
             commands::grading::get_custom_merge_message_enabled,
             commands::grading::set_custom_merge_message_enabled,
             commands::notify::list_notify_channels,
@@ -494,6 +643,13 @@ pub fn run() {
             commands::preview::mask_preview_data,
             commands::preview::provision_preview_container,
         ])
-        .run(tauri::generate_context!())
-        .expect("error running AutoForge");
+        .build(tauri::generate_context!())
+        .expect("error building AutoForge")
+        .run(|_app, event| {
+            // 退出时回收所有在途 code agent 进程组，杜绝退出/重启后 claude（及其
+            // ripgrep/构建子进程）变成孤儿继续烧 CPU。
+            if let tauri::RunEvent::Exit = event {
+                core::reaper::kill_all();
+            }
+        });
 }

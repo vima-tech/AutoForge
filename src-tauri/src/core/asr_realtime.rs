@@ -136,10 +136,8 @@ pub async fn transcribe_segment(db: &Db, pcm: Vec<u8>) -> Result<String, String>
     let mut out = String::new();
     while let Some(msg) = read.next().await {
         match msg {
-            Ok(Message::Text(t)) => {
-                if collect_sentence(&t, &mut out) {
-                    break;
-                }
+            Ok(Message::Text(t)) if collect_sentence(&t, &mut out) => {
+                break;
             }
             Ok(Message::Close(_)) => break,
             Err(e) => return Err(format!("WS 读取错误：{}", e)),
@@ -205,8 +203,8 @@ async fn drive(
                 }
             },
             msg = read.next() => match msg {
-                Some(Ok(Message::Text(t))) => {
-                    if handle_event(&t, app, session_id) { break; }
+                Some(Ok(Message::Text(t))) if handle_event(&t, app, session_id) => {
+                    break;
                 }
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Err(e)) => return Err(anyhow!("WS 读取错误：{}", e)),

@@ -109,4 +109,36 @@ impl ConcurrencyManager {
     pub fn queue_strategy(&self) -> String {
         self.queue_strategy.lock().unwrap().clone()
     }
+
+    /// 启动恢复：用 DB 真实在产状态回填内存计数器。崩溃/重启后这些计数器从 0 起，
+    /// 而 DB 里可能仍有 `executing`（active）与 `pending_code_review`（待人审）的 CR——
+    /// 不回填则：① dashboard 少报在产/待审；② 更关键的是 pending_review 阈值暂停逻辑误判
+    /// （以为 0 待审而继续放行新执行），把人审队列冲垮。以 DB 计数为准直接覆盖（幂等）。
+    pub fn backfill(&self, active: usize, pending_review: usize) {
+        *self.active.lock().unwrap() = active;
+        *self.pending_review.lock().unwrap() = pending_review;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backfill_overwrites_counters_and_drives_stage() {
+        let m = ConcurrencyManager::new(5, 20);
+        // 初始全 0 → normal。
+        assert_eq!(m.status().pending_review, 0);
+        assert_eq!(m.status().stage, "normal");
+        // 回填到达暂停阈值 → paused（验证回填真正影响背压判定）。
+        m.backfill(3, 20);
+        let s = m.status();
+        assert_eq!(s.active_slots, 3);
+        assert_eq!(s.pending_review, 20);
+        assert_eq!(s.stage, "paused");
+        // 再次回填覆盖（幂等，不累加）。
+        m.backfill(1, 5);
+        assert_eq!(m.status().pending_review, 5);
+        assert_eq!(m.status().active_slots, 1);
+    }
 }

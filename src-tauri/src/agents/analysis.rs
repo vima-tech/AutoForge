@@ -526,6 +526,15 @@ pub async fn build_project_context(repo_path: &str) -> String {
         }
     }
 
+    // 技术栈画像 + 默认约定（与执行阶段 build_prompt 同源）。让分析阶段也认得栈，
+    // 避免对 Taro 等工程给出错误的文件路径/约定（分析产出的 affected_files 会被编码 Agent 直接信任）。
+    {
+        let hint = crate::core::stack::stack_hint(std::path::Path::new(repo_path));
+        if !hint.trim().is_empty() {
+            parts.push(format!("## 技术栈画像（自动检测）\n{}", hint));
+        }
+    }
+
     // Recent git log
     if let Ok(out) = Command::new("git")
         .arg("-C").arg(repo_path)
@@ -582,7 +591,7 @@ fn list_dirs_depth2(root: &str) -> String {
 /// Resolve the agent holding the `analysis` forge role (comma-separated field).
 /// Returns the first enabled match by creation order, or None if unassigned.
 async fn resolve_analysis_agent(db: &crate::db::Db) -> Option<crate::models::agent::Agent> {
-    sqlx::query_as::<_, crate::models::agent::Agent>(
+    let holder = sqlx::query_as::<_, crate::models::agent::Agent>(
         "SELECT * FROM agents
          WHERE (',' || COALESCE(forge_role, '') || ',') LIKE '%,analysis,%'
            AND enabled=1
@@ -592,7 +601,9 @@ async fn resolve_analysis_agent(db: &crate::db::Db) -> Option<crate::models::age
     .fetch_optional(db)
     .await
     .ok()
-    .flatten()
+    .flatten()?;
+    // 未绑定 LLM 时回落全局默认 LLM（治本：漏配不致命）。
+    Some(crate::agents::llm::with_default_llm(db, holder).await)
 }
 
 pub async fn analyze(
@@ -602,6 +613,7 @@ pub async fn analyze(
     project_context: Option<&str>,
     project_id: Option<&str>,
     recalled: Option<&str>,
+    image_paths: &[std::path::PathBuf],
 ) -> Result<AnalysisResult> {
     let prompt = match project_context.filter(|c| !c.trim().is_empty()) {
         Some(ctx) => format!(
@@ -642,7 +654,7 @@ pub async fn analyze(
             // 包一层 scope_run（内部 LLM 调用复用同一 trace），以便取到 trace_id 链回下钻。
             crate::core::trace::scope_run(db, &agent, async {
                 let raw = crate::agents::llm::run_agent_text_with_tools(
-                    db, &agent, &prompt, Some(&sys), &[], &registry,
+                    db, &agent, &prompt, Some(&sys), image_paths, &registry,
                 )
                 .await?;
                 let tid = crate::core::trace::current_trace_id();
@@ -660,7 +672,36 @@ pub async fn analyze(
                 ),
                 None => SYSTEM_PROMPT.to_string(),
             };
-            (local_claude::run_text(&prompt, Some(&sys)).await?, None)
+            // 无分析 Agent 的兜底也走 claude CLI——同样建立 trace 边界（root + claude-cli
+            // llm span），确保这条 LLM 请求不丢；trace_id 链回 agent_outputs 下钻。
+            crate::core::trace::scope_run_labeled(
+                db,
+                None,
+                Some("需求分析"),
+                Some("Claude Code"),
+                async {
+                    let t0 = std::time::Instant::now();
+                    let res =
+                        local_claude::run_text_with_images(&prompt, Some(&sys), image_paths).await;
+                    let (status, out, err) = match &res {
+                        Ok(s) => ("ok", s.clone(), None),
+                        Err(e) => ("error", String::new(), Some(e.to_string())),
+                    };
+                    crate::core::trace::record_root(
+                        &prompt,
+                        Some(&sys),
+                        &out,
+                        status,
+                        err.as_deref(),
+                        t0.elapsed().as_millis() as i64,
+                        None,
+                    )
+                    .await;
+                    let tid = crate::core::trace::current_trace_id();
+                    res.map(|raw| (raw, tid))
+                },
+            )
+            .await?
         }
     };
 
@@ -709,22 +750,27 @@ pub fn parse_spec(text: &str) -> Option<IssueAnalysisSpec> {
         duplicate_hint: Option<String>,
     }
     let l: LegacyFlat = serde_json::from_str(json_str).ok()?;
-    let mut spec = IssueAnalysisSpec::default();
-    spec.triage = Triage {
-        authenticity_score: l.authenticity_score.unwrap_or(0.5),
-        feasibility_score: l.feasibility_score.unwrap_or(0.5),
-        priority_suggestion: l.priority_suggestion.unwrap_or(5),
-        category_suggestion: l.category_suggestion.unwrap_or_else(|| "Feature".to_string()),
-        severity_suggestion: l.severity_suggestion.unwrap_or_else(|| "medium".to_string()),
-        is_duplicate: l.is_duplicate.unwrap_or(false),
-        duplicate_of: None,
-        duplicate_hint: l.duplicate_hint.unwrap_or_default(),
-        needs_changes: true,
-        no_change_reason: String::new(),
-        analysis_summary: l.analysis_summary.unwrap_or_default(),
-        confidence: 0.5,
+    let spec = IssueAnalysisSpec {
+        triage: Triage {
+            authenticity_score: l.authenticity_score.unwrap_or(0.5),
+            feasibility_score: l.feasibility_score.unwrap_or(0.5),
+            priority_suggestion: l.priority_suggestion.unwrap_or(5),
+            category_suggestion: l.category_suggestion.unwrap_or_else(|| "Feature".to_string()),
+            severity_suggestion: l.severity_suggestion.unwrap_or_else(|| "medium".to_string()),
+            is_duplicate: l.is_duplicate.unwrap_or(false),
+            duplicate_of: None,
+            duplicate_hint: l.duplicate_hint.unwrap_or_default(),
+            needs_changes: true,
+            no_change_reason: String::new(),
+            analysis_summary: l.analysis_summary.unwrap_or_default(),
+            confidence: 0.5,
+        },
+        scope: Scope {
+            affected_modules: l.affected_modules.unwrap_or_default(),
+            ..Default::default()
+        },
+        ..Default::default()
     };
-    spec.scope.affected_modules = l.affected_modules.unwrap_or_default();
     Some(spec)
 }
 

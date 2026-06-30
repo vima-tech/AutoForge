@@ -10,6 +10,7 @@
 
 | 优先级 | 提案 | 状态 | 一句话 |
 |--------|------|------|--------|
+| P1 | [撤销 + 人工解冲突 + 合并可靠性](AutoForge-撤销与人工解冲突与合并可靠性-功能提案.md) | 📝 待实现 | 稳定撤销 issue 改动（squash 提交 + `git revert <sha>`）+ 逐 hunk 决策式三方解冲突器（B+C 外部 IDE 兜底）+ 修合并状态机审计缺陷（H1 squash↔no-ff 分叉、H2 同 worktree 无锁并发、M1 enqueue 幂等不防重执行）；迁移 0058，任务清单 `撤销与人工解冲突与合并可靠性-tasks.json` |
 | P2 | [代码 Agent 可插拔](AutoForge-代码Agent可插拔-功能提案.md) | ✅ 已实现 | 抽 `CodeAgent` trait，claude/codex/opencode 配置驱动互换 + 全局默认/per-project 选择（2026-06-20 落地，迁移 0057，107 测试通过；任务清单 `代码Agent可插拔-tasks.json`） |
 | P2 | [@提及/头像脱离 mock](AutoForge-提及与头像脱离Mock改用DB真源-功能提案-v2.md) | 📝 待实现 | `Avatar.tsx:19` / `Markdown.tsx:25` 仍 import `mock` 写死的 5 个 Agent，自建 Agent 的提及/头像渲染失败 |
 | P3 | [Schema 驱动 Agent](schema-driven-agents.md) | 🟢 主体落地 | 脚手架+`agent_outputs`(0040)+analysis/test 样板已有；**本批(2026-06-20)新增**批量(1→N)解析、triage/proposer 升级为 schema 驱动并落库、字段级体检命令+Trace「schema 体检」面板（cargo test 104 passed）；剩版本 A/B·失败回灌·其余角色接入 |

@@ -4,10 +4,11 @@ import Select from './Select';
 import { fmtFull } from '../utils/datetime';
 import {
   getIntakeConfig, updateIntakeConfig, syncGithubIssues, bulkImportIssues,
-  bulkImportFile, exportBulkTemplate, submitIssue,
+  bulkImportFile, exportBulkTemplate, submitIssue, importIssueAttachment,
   getProjectWebhookToken, regenerateProjectWebhookToken, getWebhookStatus,
   type IntakeConfig, type SyncResult, type BulkResult, type WidgetToken, type WebhookStatus,
 } from '../services';
+import AttachmentBar, { fileToUpload } from './AttachmentBar';
 
 // ── Intake helpers ────────────────────────────────────────────────────────────
 
@@ -49,19 +50,26 @@ function ProjectManualTab({ projectId }: { projectId: string }) {
   const [submitting, setSubmitting] = useState(false);
   const [okTitle, setOkTitle] = useState('');
   const [err, setErr] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
   const isBug = form.category === 'Bug';
 
   const submit = async () => {
     if (!form.title.trim()) { setErr('需求标题不能为空'); return; }
     setSubmitting(true); setErr(''); setOkTitle('');
     try {
-      await submitIssue({
+      const issue = await submitIssue({
         project_id: projectId, title: form.title, description: form.description,
         category: form.category, severity: form.severity,
         ...(isBug ? { repro_steps: form.repro_steps, environment: form.environment, expected: form.expected, actual: form.actual } : {}),
       });
+      // 两阶段：需求入库后把附件挂到该需求（图片可供 vision 分析）。
+      for (const f of files) {
+        try { await importIssueAttachment({ issue_id: issue.id, ...(await fileToUpload(f)) }); }
+        catch (e) { console.warn('附件上传失败', f.name, e); }
+      }
       setOkTitle(form.title.trim());
       setForm({ title: '', description: '', category: 'Feature', severity: 'medium', repro_steps: '', environment: '', expected: '', actual: '' });
+      setFiles([]);
     } catch (e) { setErr(String(e)); }
     finally { setSubmitting(false); }
   };
@@ -125,6 +133,11 @@ function ProjectManualTab({ projectId }: { projectId: string }) {
             </div>
           </>
         )}
+
+        <ISectionLabel>图片 / 附件</ISectionLabel>
+        <div style={{ marginBottom: 14 }}>
+          <AttachmentBar staged={files} onStaged={setFiles} />
+        </div>
 
         {okTitle && <IResultBanner ok>已提交「<strong>{okTitle}</strong>」，需求已进入分析队列</IResultBanner>}
         {err && <IResultBanner ok={false}>{err}</IResultBanner>}
@@ -522,8 +535,17 @@ const INTAKE_SUB_TABS: { id: IntakeSubTab; label: string; ic: string }[] = [
   { id: 'bulk',    label: '批量导入', ic: 'arrowUp' },
 ];
 
-export default function IntakePanel({ projectId }: { projectId: string }) {
-  const [subTab, setSubTab] = useState<IntakeSubTab>('manual');
+export default function IntakePanel({ projectId, tabOrder }: { projectId: string; tabOrder?: IntakeSubTab[] }) {
+  // 各页面可自定义 tab 顺序；缺省走 INTAKE_SUB_TABS 原序。未知 id 忽略，缺失的 tab 补齐到末尾。
+  const tabs = React.useMemo(() => {
+    if (!tabOrder || tabOrder.length === 0) return INTAKE_SUB_TABS;
+    const byId = new Map(INTAKE_SUB_TABS.map(t => [t.id, t]));
+    const ordered = tabOrder.map(id => byId.get(id)).filter(Boolean) as typeof INTAKE_SUB_TABS;
+    const rest = INTAKE_SUB_TABS.filter(t => !tabOrder.includes(t.id));
+    return [...ordered, ...rest];
+  }, [tabOrder]);
+
+  const [subTab, setSubTab] = useState<IntakeSubTab>(tabs[0].id);
   const [cfg, setCfg]       = useState<IntakeConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadErr, setLoadErr] = useState('');
@@ -540,7 +562,7 @@ export default function IntakePanel({ projectId }: { projectId: string }) {
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
       {/* sub-tab bar */}
       <div style={{ display: 'flex', gap: 2, padding: '10px 24px 0', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
-        {INTAKE_SUB_TABS.map(t => (
+        {tabs.map(t => (
           <button key={t.id} onClick={() => setSubTab(t.id)}
             style={{ background: 'none', border: 'none', padding: '6px 14px', cursor: 'pointer', fontSize: 'var(--text-control)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, color: subTab === t.id ? 'var(--ember)' : 'var(--text-3)', borderBottom: subTab === t.id ? '2px solid var(--ember)' : '2px solid transparent', marginBottom: -1, transition: 'color .15s' }}>
             <Icon name={t.ic as any} size={13} />{t.label}

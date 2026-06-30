@@ -1,5 +1,6 @@
 export type ThemePaletteId =
   | 'forge'
+  | 'breeze'
   | 'carbon'
   | 'moss'
   | 'harbor'
@@ -36,6 +37,13 @@ export const THEME_PALETTES: ThemePalette[] = [
     subtitle: '当前默认配色，温暖熔炉橙',
     accent: '#e8772e',
     swatches: ['#16110d', '#e8772e', '#f1e8d9'],
+  },
+  {
+    id: 'breeze',
+    name: 'Breeze Sky',
+    subtitle: '清爽天空蓝，明亮通透的浅色基调',
+    accent: '#3d9be0',
+    swatches: ['#dbe9f6', '#3d9be0', '#16222f'],
   },
   {
     id: 'carbon',

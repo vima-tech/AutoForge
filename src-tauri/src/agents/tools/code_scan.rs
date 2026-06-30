@@ -8,7 +8,8 @@
 //!
 //! 纯 Rust：每个工具只持有项目根目录 `repo_root`，不碰 db、不引用任何 Tauri 类型。
 //! 路径一律经 [`resolve_within`] 限定在仓库内，杜绝 `..` / 符号链接越界。
-//! 返回内容是不可信外部输入，由 [`super::ToolRegistry::invoke`] 统一过注入闸 + 截断。
+//! 返回内容是项目自有源码（半可信，与喂给编码 Agent 的源码同源），故 `reads_local_source=true`：
+//! 由 [`super::ToolRegistry::invoke`] 仅做截断、**豁免注入闸**——否则审计自身安全代码会被误杀。
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -163,6 +164,26 @@ fn collect_files(root: &Path, dir: &Path, depth: u32, out: &mut Vec<(String, u64
     }
 }
 
+/// 把 `subdir` 解析为待扫描的文件集合：既接受目录（递归收集），也接受**单个文件**
+/// （收敛到该文件本身）。模型常把文件路径误传给 `subdir`（想把范围限到一个文件），
+/// 容忍它能把一次必然作废的「不是目录」报错变成有用结果，避免无谓的工具轮次浪费。
+fn collect_scope(root: &Path, subdir: &str) -> Result<Vec<(String, u64)>> {
+    let start = resolve_within(root, subdir)?;
+    let mut files = Vec::new();
+    if start.is_file() {
+        // 显式点名的文件即使扩展名不在白名单也予以放行；非 UTF-8 会在读取阶段被跳过。
+        let size = std::fs::metadata(&start).map(|m| m.len()).unwrap_or(0);
+        if size <= MAX_FILE_BYTES {
+            let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let rel = start.strip_prefix(&root_canon).unwrap_or(start.as_path());
+            files.push((rel.to_string_lossy().replace('\\', "/"), size));
+        }
+    } else {
+        collect_files(root, &start, 0, &mut files);
+    }
+    Ok(files)
+}
+
 // ─────────────────────────── list_project_files ───────────────────────────
 
 pub struct ListProjectFilesTool {
@@ -186,21 +207,21 @@ impl Tool for ListProjectFilesTool {
                 "properties": {
                     "subdir": {
                         "type": "string",
-                        "description": "可选：只列出该子目录下的文件（相对仓库根，如 \"src/commands\"）。留空列全仓。"
+                        "description": "可选：限定范围（相对仓库根，如 \"src/commands\"）；传文件路径则只列该文件。留空列全仓。"
                     }
                 }
             }),
         )
     }
 
+    /// 读的是本仓库自有源码（半可信）→ 豁免注册表的注入闸，仅截断不丢弃。
+    fn reads_local_source(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value) -> Result<String> {
         let subdir = args.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
-        let start = resolve_within(&self.root, subdir)?;
-        if !start.is_dir() {
-            return Err(anyhow!("不是目录: {}", subdir));
-        }
-        let mut files = Vec::new();
-        collect_files(&self.root, &start, 0, &mut files);
+        let files = collect_scope(&self.root, subdir)?;
         if files.is_empty() {
             return Ok(format!(
                 "{} 下未找到可读的文本/代码文件。",
@@ -258,6 +279,11 @@ impl Tool for ReadProjectFileTool {
                 "required": ["path"]
             }),
         )
+    }
+
+    /// 读的是本仓库自有源码（半可信）→ 豁免注册表的注入闸，仅截断不丢弃。
+    fn reads_local_source(&self) -> bool {
+        true
     }
 
     async fn call(&self, args: Value) -> Result<String> {
@@ -343,7 +369,7 @@ impl Tool for SearchProjectCodeTool {
                     },
                     "subdir": {
                         "type": "string",
-                        "description": "可选：限定子目录（相对仓库根）。"
+                        "description": "可选：限定范围（相对仓库根）；传文件路径则只在该文件内检索。"
                     },
                     "regex": {
                         "type": "boolean",
@@ -362,6 +388,11 @@ impl Tool for SearchProjectCodeTool {
                 "required": ["query"]
             }),
         )
+    }
+
+    /// 读的是本仓库自有源码（半可信）→ 豁免注册表的注入闸，仅截断不丢弃。
+    fn reads_local_source(&self) -> bool {
+        true
     }
 
     async fn call(&self, args: Value) -> Result<String> {
@@ -383,10 +414,7 @@ impl Tool for SearchProjectCodeTool {
             .map(|n| (n as usize).clamp(1, SEARCH_MAX_RESULTS_CAP))
             .unwrap_or(40);
 
-        let start = resolve_within(&self.root, subdir)?;
-        if !start.is_dir() {
-            return Err(anyhow!("不是目录: {}", subdir));
-        }
+        let files = collect_scope(&self.root, subdir)?;
 
         // 构造匹配器：正则用 regex 引擎，子串用（按需小写化的）contains。
         let matcher = if is_regex {
@@ -400,9 +428,6 @@ impl Tool for SearchProjectCodeTool {
         } else {
             Matcher::SubstrCi(query.to_ascii_lowercase())
         };
-
-        let mut files = Vec::new();
-        collect_files(&self.root, &start, 0, &mut files);
 
         let mut hits = Vec::new();
         let mut scanned_files = 0usize;

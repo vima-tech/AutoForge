@@ -29,7 +29,18 @@ pub enum JobPayload {
     Testing {
         change_request_id: String,
     },
+    /// 合并前阶段（Phase1 dev-sync + 测试门 + 安全门），不持 merge_lock，多 CR 可并行
+    /// （受 build_pool 节流）。通过后置 merge_ready 并入队 Merge(land)。
+    Premerge {
+        change_request_id: String,
+    },
+    /// 落地阶段：持 merge_lock 串行，再校验 dev 是否前进后 land 到 dev。
+    /// 当 CR 未经 premerge（开关关 / 旧数据）时，merge::land_run 路由回 legacy 全流程。
     Merge {
+        change_request_id: String,
+    },
+    /// 撤销一个已合并 CR 的改动：在 dev 上 `git revert` 其 squash 提交。
+    Revert {
         change_request_id: String,
     },
     SecurityAudit {

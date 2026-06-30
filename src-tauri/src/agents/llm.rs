@@ -8,7 +8,40 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// 工具循环最大轮数，防止模型无限调用工具。每轮 = 一次模型调用 + 一批工具执行。
-const MAX_TOOL_ITERS: usize = 6;
+/// 深度分析类 Agent（带 CodeGraph MCP + 项目文件工具）常需多轮检索取证，6 轮过紧会在
+/// 模型仍在调工具时被截断；耗尽后由 `*_final_synthesis` 强制收口，保证仍产出真实答复。
+const MAX_TOOL_ITERS: usize = 10;
+
+/// 工具预算耗尽时的「强制收口」指令：要求模型基于已收集到的全部信息直接给出完整最终答复，
+/// 不得再请求工具、不得只写前导语。用于把「轮数耗尽」从「返回半截前导语 / 未执行的
+/// <tool_call> 残文」救成「真正作答」。
+const FINAL_SYNTHESIS_DIRECTIVE: &str = "工具调用预算已用尽。请**立即基于你已经收集到的全部信息，直接输出完整的最终答复**。不要再请求或描述任何工具调用，不要再写 <tool_call>/<function> 标签，也不要只写「让我看看 / 我来查一下」之类的前导语——现在就给出你能给出的最完整、最有用的结论。";
+
+/// 工具循环的诊断统计，回填到 root(agent) span 的 `metadata_json`，让「为什么这样收尾」
+/// 一眼可判，而不必扫完全部子 span。`terminated_by` 取值见各 `*_tool_loop` 的返回点。
+#[derive(Clone, Copy)]
+struct LoopStats {
+    iters: usize,
+    tool_calls: usize,
+    tool_errors: usize,
+    terminated_by: &'static str, // model_final | budget_exhausted | no_tools | degraded_no_tools
+}
+
+impl LoopStats {
+    /// 非工具循环路径（无工具单轮 / 降级）的零计数统计。
+    fn flat(terminated_by: &'static str) -> Self {
+        LoopStats { iters: 0, tool_calls: 0, tool_errors: 0, terminated_by }
+    }
+    fn to_metadata(self) -> String {
+        json!({
+            "iters": self.iters,
+            "tool_calls": self.tool_calls,
+            "tool_errors": self.tool_errors,
+            "terminated_by": self.terminated_by,
+        })
+        .to_string()
+    }
+}
 
 /// 注入 Innate 召回内容时使用的小节标题（不含 `## `）。这是 trace 判定「本次 LLM 调用
 /// 是否触发了记忆召回」的唯一锚点——`commands/trace.rs` 据此对 system_prompt 做 LIKE 匹配，
@@ -28,7 +61,194 @@ fn compose_tool_system(system_prompt: Option<&str>) -> String {
     }
 }
 
+/// 把工具入参的字符串原文按可能的类型归一：数字/布尔/null/数组/对象按 JSON 解析，
+/// 其余（含本就是字符串、含特殊字符的正则等）原样保留为字符串。
+/// 让 `<parameter=limit>50</parameter>` 这类文本入参也能正确填入期望 number 的工具 schema。
+fn coerce_arg_value(raw: &str) -> Value {
+    let t = raw.trim();
+    match serde_json::from_str::<Value>(t) {
+        // 已是合法 JSON 标量/复合：采纳其类型；但带引号的字符串去引号后仍按字符串处理。
+        Ok(Value::String(_)) => Value::String(t.to_string()),
+        Ok(v) => v,
+        Err(_) => Value::String(t.to_string()),
+    }
+}
+
+/// 解析「文本式工具调用」——部分 OpenAI 兼容模型（Qwen/MIMO/Hermes 系）在非原生
+/// function-calling 模式下，把工具调用写进 `message.content` 正文而非结构化的 `tool_calls`
+/// 字段，导致框架收不到调用、工具从不执行（proposer 长期空转的根因）。本函数兜底解析两类
+/// 常见写法，让这些模型的工具调用也能真正落地：
+/// (1) XML 风格 `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`（常外套 `<tool_call>`）；
+/// (2) Hermes JSON `<tool_call>{"name":"NAME","arguments":{...}}</tool_call>`。
+/// 返回 `(工具名, 入参 JSON)` 列表；解析不出任何调用则返回空（调用方据此走正常「最终回答」路径）。
+fn parse_textual_tool_calls(content: &str) -> Vec<(String, Value)> {
+    use regex::Regex;
+    let mut calls: Vec<(String, Value)> = Vec::new();
+
+    // —— 形式 2（优先）：<tool_call>{json}</tool_call>（Hermes 风格，含 name/arguments）——
+    if let Ok(re) = Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>") {
+        for cap in re.captures_iter(content) {
+            let Some(obj) = cap
+                .get(1)
+                .and_then(|m| serde_json::from_str::<Value>(m.as_str()).ok())
+            else {
+                continue;
+            };
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let args = obj
+                .get("arguments")
+                .or_else(|| obj.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // arguments 可能是 JSON 字符串（被双重序列化）→ 再解一层。
+            let args = match args {
+                Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(json!({})),
+                other => other,
+            };
+            calls.push((name.trim().to_string(), args));
+        }
+    }
+
+    // —— 形式 1：<function=NAME> ... </function>（可被 <tool_call> 包裹；逐个解析其内 <parameter=K>V）——
+    if let (Ok(func_re), Ok(param_re)) = (
+        Regex::new(r"(?s)<function=([^>\s]+)\s*>(.*?)</function>"),
+        Regex::new(r"(?s)<parameter=([^>\s]+)\s*>(.*?)</parameter>"),
+    ) {
+        for fcap in func_re.captures_iter(content) {
+            let name = fcap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let body = fcap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let mut args = serde_json::Map::new();
+            for pcap in param_re.captures_iter(body) {
+                let key = pcap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                let val = pcap.get(2).map(|m| m.as_str()).unwrap_or("");
+                if !key.is_empty() {
+                    args.insert(key.to_string(), coerce_arg_value(val));
+                }
+            }
+            calls.push((name.to_string(), Value::Object(args)));
+        }
+    }
+
+    calls
+}
+
+/// 末端净化：从「准备作为最终答复返回」的正文里剥掉工具调用残块
+/// （`<tool_call>…</tool_call>` / `<function=…>…</function>`）。这是无论走哪条路径都生效的
+/// 最后一道防线——即便某条返回路径漏接了收口逻辑，模型吐出的 `<tool_call>` 残文也不会原样
+/// 进入群聊发言 / 落库（曾出现「测试专家发言变成一段 opencode 配置文本式工具调用」的事故）。
+/// 仅当剥离后仍剩下有意义的正文时才剥；若整段几乎都是残块（剥完为空）则原样返回，交由上层
+/// 的 final_synthesis / 错误处理决定，避免把答复抹成空字符串。
+fn strip_tool_call_residue(text: &str) -> String {
+    use regex::Regex;
+    let mut out = text.to_string();
+    // 先剥 <tool_call>…</tool_call>（含其内包裹的 <function> 形式），再剥裸 <function>…</function>。
+    for pat in [
+        r"(?s)<tool_call>.*?</tool_call>",
+        r"(?s)<function=[^>]*>.*?</function>",
+    ] {
+        if let Ok(re) = Regex::new(pat) {
+            out = re.replace_all(&out, "").to_string();
+        }
+    }
+    let cleaned = out.trim();
+    if cleaned.is_empty() {
+        // 剥完没东西了 → 说明正文几乎全是残块，保留原文交给上层兜底，别返回空答复。
+        text.trim().to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// 单个工具结果回灌进对话前的体量上限（按字符计）。CodeGraph `explore`/`search` 等会返回
+/// **逐字源码 dump**，多轮叠加极易把上下文撑爆，进而诱发弱模型「丢失任务、回吐训练记忆」的
+/// 脱轨幻觉（曾观测到一条发言整段变成无关的 opencode 配置文本式工具调用）。超限时保留头部
+/// （信息密度最高）+ 少量尾部，中间以截断标记替代。
+const MAX_TOOL_OUTPUT_CHARS: usize = 12_000;
+
+/// 把单个工具输出按 [`MAX_TOOL_OUTPUT_CHARS`] 截断（UTF-8 安全，按字符切）。未超限原样返回。
+fn truncate_tool_output(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= MAX_TOOL_OUTPUT_CHARS {
+        return content.to_string();
+    }
+    let head_n = MAX_TOOL_OUTPUT_CHARS * 85 / 100;
+    let tail_n = MAX_TOOL_OUTPUT_CHARS - head_n;
+    let head: String = content.chars().take(head_n).collect();
+    let tail: String = content
+        .chars()
+        .skip(total.saturating_sub(tail_n))
+        .collect();
+    format!(
+        "{head}\n\n…[工具输出过长，已截断中间 {} 字符；如需更精确内容请用更聚焦的查询/参数重调]…\n\n{tail}",
+        total - head_n - tail_n
+    )
+}
+
+/// 工具调用去重：同一次工具循环内，若模型重复请求**完全相同**的 (工具名 + 入参)，直接返回
+/// 一句简短提示而不再真正执行——上一次的完整结果已在对话上下文里，重灌既烧 token 又会撑爆
+/// 上下文。`cache` 的 key 是 `name`+规范化后的 args JSON。弱模型常在同一查询上空转（trace 里
+/// 出现过对同一 symbol 反复 search/explore 22 次），此闸把这类空转成本压到接近零。
+async fn invoke_deduped(
+    registry: &ToolRegistry,
+    cache: &mut std::collections::HashSet<String>,
+    name: &str,
+    args: Value,
+) -> crate::agents::tools::ToolOutcome {
+    let key = format!(
+        "{name}\u{1}{}",
+        serde_json::to_string(&args).unwrap_or_default()
+    );
+    if !cache.insert(key) {
+        return crate::agents::tools::ToolOutcome {
+            content: format!(
+                "（已跳过重复调用：`{name}` 的这组入参刚才已执行过，结果见上文、不会变化。请勿重复调用同一工具，直接基于已获得的信息继续作答。）"
+            ),
+            ok: true,
+        };
+    }
+    registry.invoke(name, args).await
+}
+
+/// 无工具单轮文本生成。**自身即一个 trace 边界**：把整次调用包进 [`scope_run`] 并补写
+/// root(agent) span，确保经由本函数的每条 LLM 请求（含直连 claude CLI 的兜底路径、以及
+/// 会议分析 / 变更摘要 / 立即编码草拟等直接调用方）都进 trace、不丢失。
+/// 已处于某个 run 内（如被 [`run_agent_text_with_tools`] 的无工具分支复用）时 `scope_run`
+/// 自动复用同一 trace_id，root 走 INSERT OR REPLACE 幂等，不产生重复。
 pub async fn run_agent_text(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+) -> Result<String> {
+    crate::core::trace::scope_run(db, agent, async {
+        let t0 = std::time::Instant::now();
+        let result = run_agent_text_inner(db, agent, prompt, system_prompt, image_paths).await;
+        let (status, output, error) = match &result {
+            Ok(s) => ("ok", s.clone(), None),
+            Err(e) => ("error", String::new(), Some(e.to_string())),
+        };
+        crate::core::trace::record_root(
+            prompt,
+            system_prompt,
+            &output,
+            status,
+            error.as_deref(),
+            t0.elapsed().as_millis() as i64,
+            None,
+        )
+        .await;
+        result
+    })
+    .await
+}
+
+async fn run_agent_text_inner(
     db: &crate::db::Db,
     agent: &Agent,
     prompt: &str,
@@ -140,6 +360,17 @@ fn openai_user_content(prompt: &str, images: &[(String, String)]) -> Value {
 }
 
 /// 把用户文本与可选图片组装成 Anthropic 多模态 content：无图片时退化为纯字符串。
+/// 把 system 提示构造成带 `cache_control: ephemeral` 的结构化块，让 Anthropic 缓存这段
+/// （系统提示 + 项目上下文 + 规格）可复用前缀，命中后大幅降低输入延迟与成本。
+/// 不支持 prompt caching 的 Anthropic 兼容端点会优雅忽略 `cache_control` 字段，故零回归。
+fn anthropic_system_cached(system: &str) -> Value {
+    json!([{
+        "type": "text",
+        "text": system,
+        "cache_control": { "type": "ephemeral" }
+    }])
+}
+
 fn anthropic_user_content(prompt: &str, images: &[(String, String)]) -> Value {
     if images.is_empty() {
         return json!(prompt);
@@ -176,9 +407,9 @@ pub async fn run_agent_text_with_tools(
         let result =
             run_agent_text_with_tools_inner(db, agent, prompt, system_prompt, image_paths, registry)
                 .await;
-        let (status, output, error) = match &result {
-            Ok(s) => ("ok", s.clone(), None),
-            Err(e) => ("error", String::new(), Some(e.to_string())),
+        let (status, output, error, stats) = match &result {
+            Ok((s, st)) => ("ok", s.clone(), None, Some(*st)),
+            Err(e) => ("error", String::new(), Some(e.to_string()), None),
         };
         crate::core::trace::record_root(
             prompt,
@@ -187,9 +418,10 @@ pub async fn run_agent_text_with_tools(
             status,
             error.as_deref(),
             t0.elapsed().as_millis() as i64,
+            stats.map(|s| s.to_metadata()).as_deref(),
         )
         .await;
-        result
+        result.map(|(s, _)| s)
     })
     .await
 }
@@ -201,10 +433,11 @@ async fn run_agent_text_with_tools_inner(
     system_prompt: Option<&str>,
     image_paths: &[PathBuf],
     registry: &ToolRegistry,
-) -> Result<String> {
+) -> Result<(String, LoopStats)> {
     // 无工具 / 带图片 / 无自定义 LLM → 老路径，保持既有行为。
     if registry.is_empty() || !image_paths.is_empty() || agent.llm_id.is_none() {
-        return run_agent_text(db, agent, prompt, system_prompt, image_paths).await;
+        let text = run_agent_text(db, agent, prompt, system_prompt, image_paths).await?;
+        return Ok((text, LoopStats::flat("no_tools")));
     }
 
     let llm_id = agent.llm_id.as_ref().unwrap();
@@ -228,15 +461,100 @@ async fn run_agent_text_with_tools_inner(
     };
 
     match loop_result {
-        Ok(text) => Ok(text),
+        Ok(pair) => Ok(pair),
         Err(e) => {
             // 端点可能不支持 tools 字段等 → 优雅降级为无工具单轮。
+            // 标记 terminated_by=degraded_no_tools，让 trace 一眼看出「这次是降级路径产出的」，
+            // 而非误以为是正常工具循环（mimo 吐裸 <tool_call> 残文即源于此前不可见的降级）。
             eprintln!(
                 "[tools] 工具循环失败，回退无工具单轮（agent={}, spec={}): {}",
                 agent.name, spec, e
             );
-            run_agent_text(db, agent, prompt, system_prompt, image_paths).await
+            let text = run_agent_text(db, agent, prompt, system_prompt, image_paths).await?;
+            Ok((text, LoopStats::flat("degraded_no_tools")))
         }
+    }
+}
+
+/// 全局默认 LLM 的 id（`is_default=1` 且 `enabled=1`）；未设置则 `None`。
+/// 复用 `code_agents.is_default` 同款单选范式（命令层保证至多一个）。
+pub async fn default_llm_id(db: &crate::db::Db) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT id FROM llm_configs WHERE is_default=1 AND enabled=1 LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 若 `agent` 未绑定（或绑定空串）LLM，则回落全局默认 LLM。已绑定 / 无默认时原样返回。
+/// 无副作用、不落库——「漏配某角色」时让其仍能用默认 LLM 跑，而非硬挂。
+/// 供 system_kind 角色与 forge_role（analysis/test）解析共用。
+pub async fn with_default_llm(db: &crate::db::Db, mut agent: Agent) -> Agent {
+    let unbound = agent
+        .llm_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
+    if unbound {
+        if let Some(id) = default_llm_id(db).await {
+            agent.llm_id = Some(id);
+        }
+    }
+    agent
+}
+
+/// 按注册表为某 `system_kind` 合成一个临时（不落库）持有 Agent，绑定到给定 LLM。
+/// 用于「该角色根本没有持有者、但已设全局默认 LLM」——使对应产品链路不因漏配而硬挂。
+/// 注册表无该 kind 时返回 `None`。
+fn synth_role_agent(system_kind: &str, llm_id: String) -> Option<Agent> {
+    let def = crate::agents::roles::find(system_kind)?;
+    Some(Agent {
+        id: format!("role-synth:{system_kind}"),
+        name: def.name.to_string(),
+        name_en: def.name_en.to_string(),
+        role: def.desc.to_string(),
+        color: def.color.to_string(),
+        initial: def.initial.to_string(),
+        llm_id: Some(llm_id),
+        system_prompt: String::new(),
+        forge_role: None,
+        role_type: "system".to_string(),
+        system_kind: Some(def.kind.to_string()),
+        capabilities_json: def.default_caps.to_string(),
+        max_concurrency: 1,
+        visible_in_chat: false,
+        mentionable: false,
+        enabled: true,
+        prompt_mode: "builtin".to_string(),
+        memory_enabled: true,
+        code_agent_id: None,
+        created_at: String::new(),
+    })
+}
+
+/// 解析某 `system_kind` 角色的执行 Agent：
+/// 1) 取启用的持有者；其 `llm_id` 为空则回落全局默认 LLM；
+/// 2) 无持有者但已设全局默认 LLM → 按注册表合成临时 Agent（不落库）；
+/// 3) 无持有者且无默认 → `None`（调用方回落原报错）。
+async fn resolve_system_role_agent(db: &crate::db::Db, system_kind: &str) -> Option<Agent> {
+    let holder = sqlx::query_as::<_, Agent>(
+        "SELECT * FROM agents
+         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
+           AND enabled=1
+         ORDER BY created_at
+         LIMIT 1",
+    )
+    .bind(format!("%,{},%", system_kind))
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match holder {
+        Some(a) => Some(with_default_llm(db, a).await),
+        None => synth_role_agent(system_kind, default_llm_id(db).await?),
     }
 }
 
@@ -270,21 +588,17 @@ pub async fn run_system_role_text_traced(
     project_id: Option<&str>,
     recall_query: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    let agent = sqlx::query_as::<_, Agent>(
-        "SELECT * FROM agents
-         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
-           AND enabled=1
-         ORDER BY created_at
-         LIMIT 1",
-    )
-    .bind(format!("%,{},%", system_kind))
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| anyhow!("未配置系统角色 Agent: {}", system_kind))?;
+    // 解析持有者（含「未绑定→默认 LLM」回落与「无持有者→注册表合成」），见 resolve_system_role_agent。
+    let agent = resolve_system_role_agent(db, system_kind).await.ok_or_else(|| {
+        anyhow!(
+            "未配置系统角色 Agent: {}（请在「设置 → 角色」绑定 LLM，或设置一个全局默认 LLM 兜底）",
+            system_kind
+        )
+    })?;
 
     let Some(llm_id) = &agent.llm_id else {
         return Err(anyhow!(
-            "系统角色 Agent「{}」未绑定 LLM，请在角色指派/Agent 配置中选择可用 LLM",
+            "系统角色 Agent「{}」未绑定 LLM，且未设置全局默认 LLM；请在角色指派/Agent 配置中选择可用 LLM，或在 LLM 列表设一个默认",
             agent.name
         ));
     };
@@ -448,7 +762,7 @@ async fn run_anthropic(
         "temperature": cfg.temperature
     });
     if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
-        body["system"] = Value::String(system.to_string());
+        body["system"] = anthropic_system_cached(system);
     }
 
     // 图片 base64 体积巨大，trace 入参里只记文本 + 图片张数，避免 llm_traces 被撑爆。
@@ -500,6 +814,749 @@ async fn run_anthropic(
     text.ok_or_else(|| anyhow!("Anthropic 响应缺少 content[].text"))
 }
 
+// ── 流式文本生成（供「立即编码」实时思考日志） ──────────────────────────────
+//
+// 设计：保持 llm.rs 纯 Rust（零 Tauri）。流式增量通过 `on_chunk` 回调交给调用方
+// （命令层捕获 AppHandle 后转成 AppEvent 发射），本模块不感知事件系统。
+// 仅 openai / anthropic 两种 wire 格式走真流式（SSE）；未绑定 LLM / 绑定 Claude CLI
+// 时回退到非流式单次调用，把整段结果作为一个 chunk 回调，保证调用方逻辑统一。
+
+/// 流式文本生成：边生成边通过 `on_chunk` 回调吐出增量，返回完整文本。
+/// `on_chunk` 必须 `Send`（在 tokio 任务里跨 await 调用）。
+pub async fn run_agent_text_streaming(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    // 未绑定自定义 LLM（走本地 claude CLI）：无流式接口，回退非流式后整段回调。
+    let Some(llm_id) = &agent.llm_id else {
+        let text =
+            crate::agents::local_claude::run_text_with_images(prompt, system_prompt, &[]).await?;
+        on_chunk(&text);
+        return Ok(text);
+    };
+
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key).map_err(|e| anyhow!(e))?;
+    if !cfg.enabled {
+        return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
+    }
+
+    let t0 = std::time::Instant::now();
+    let result = match cfg.api_spec.to_ascii_lowercase().as_str() {
+        "anthropic" => run_anthropic_stream(&cfg, prompt, system_prompt, on_chunk).await,
+        _ => run_openai_stream(&cfg, prompt, system_prompt, on_chunk).await,
+    };
+
+    // trace：流式只在结束时落一条完整记录（增量已实时给了前端）。
+    let spec = if cfg.api_spec.eq_ignore_ascii_case("anthropic") { "anthropic" } else { "openai" };
+    let latency = t0.elapsed().as_millis() as i64;
+    match &result {
+        Ok(text) => {
+            crate::core::trace::record_llm(
+                spec, &cfg.model, system_prompt, prompt, text, "ok",
+                None, None, None, None, latency, None,
+            )
+            .await;
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                spec, &cfg.model, system_prompt, prompt, "", "error",
+                Some(&e.to_string()), None, None, None, latency, None,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+/// 解析 SSE 字节流：按行切分，对每个 `data: <payload>` 行调用 `handle`。
+/// `handle` 返回 `true` 表示「流已结束、应立即停止读取」（如 Anthropic 的 `message_stop`）。
+/// OpenAI 的 `[DONE]` 终止符由本函数直接识别并返回——**这一步至关重要**：很多网关在
+/// `data: [DONE]` 后并不关闭底层连接（keep-alive），若不主动 break，`stream.next()` 会一直
+/// 阻塞到 120s 超时，表现为「结果已出但任务迟迟不结束、取消无反应」。维护跨 chunk 残行缓冲。
+async fn parse_sse_stream(
+    resp: reqwest::Response,
+    mut handle: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("LLM HTTP {}: {}", status_code(status), trim_body(&text)));
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    // 两段式空闲超时兜底：应对「既不发 [DONE]/finish_reason、也不关连接」的非合规网关。
+    //  · 首 token 前（TTFT）：给足 90s 容纳大 prompt 的处理延迟；
+    //  · 已收到内容后：正常 SSE 的 token 间隔 < 1s，故 12s 静默即判定生成结束，立即收尾——
+    //    把这类网关下「文本已出完却仍空等到总超时」的体验从 ~90s 砍到 ~12s。
+    //
+    // ⚠️ 关键：idle 用「绝对截止时间」而非每轮新建的相对 timeout，且**只在收到真正的
+    // `data:` 行时才续期**。否则网关的 keep-alive（SSE 注释行 `:` / 空行 / ping）会让
+    // `stream.next()` 在 idle 窗口内不断返回，每轮都重置一个新的相对 timeout —— 计时器被
+    // 无限续命，生成早已停止却永不触发 idle，任务挂死到天荒地老（reqwest 的总超时对已
+    // 拿到 header 后手动消费的 body 流并不可靠）。绝对截止 + 仅 data 行续期可彻底免疫。
+    const TTFT_TIMEOUT: Duration = Duration::from_secs(90);
+    const POST_DATA_IDLE: Duration = Duration::from_secs(12);
+    // 截止时刻：首 data 行前用 TTFT，之后每见一条 data 行刷新为 now + POST_DATA_IDLE。
+    let mut deadline = tokio::time::Instant::now() + TTFT_TIMEOUT;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break; // 空闲超时：停止读取，调用方按已收内容判定
+        }
+        let chunk = match tokio::time::timeout(deadline - now, stream.next()).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,  // 流正常结束（连接关闭）
+            Err(_) => break,    // 到达绝对截止：停止读取
+        };
+        let bytes = chunk.map_err(|e| anyhow!("流式读取失败: {}", e))?;
+        // 注意：不在此处因「收到任意字节」就续期 —— keep-alive 注释/空行也是字节，
+        // 那样会复现被无限重置的 bug。续期只发生在下方确认是 `data:` 行时。
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        // 以换行为界处理完整行，保留最后一段可能不完整的残行。
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_string();
+            buf.drain(..=nl);
+            let Some(payload) = line.strip_prefix("data:") else { continue };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            // 见到真正的 data 行：刷新空闲截止（keep-alive 注释行/空行走不到这里）。
+            deadline = tokio::time::Instant::now() + POST_DATA_IDLE;
+            // OpenAI 显式终止符：立即收尾，不再等连接关闭。
+            if payload == "[DONE]" {
+                return Ok(());
+            }
+            if handle(payload) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_openai_stream(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    let client = http_client()?;
+    let mut messages = Vec::new();
+    if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({ "role": "user", "content": prompt }));
+
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&json!({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "stream": true
+        }));
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+
+    // 持有许可直到流读取完毕（见 send_llm 注释）。
+    let (resp, _llm_permit) = send_llm(req).await?;
+    let mut full = String::new();
+    parse_sse_stream(resp, |payload| {
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(delta) = v
+                .pointer("/choices/0/delta/content")
+                .and_then(|c| c.as_str())
+            {
+                if !delta.is_empty() {
+                    full.push_str(delta);
+                    on_chunk(delta);
+                }
+            }
+            // finish_reason 非空表示本次生成结束（[DONE] 之外的双保险）。
+            if v.pointer("/choices/0/finish_reason")
+                .map(|r| !r.is_null())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await?;
+
+    if full.trim().is_empty() {
+        return Err(anyhow!("OpenAI-compatible 流式响应为空"));
+    }
+    Ok(full.trim().to_string())
+}
+
+async fn run_anthropic_stream(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
+    let client = http_client()?;
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    if let Some(system) = system_prompt.filter(|s| !s.trim().is_empty()) {
+        body["system"] = anthropic_system_cached(system);
+    }
+
+    let req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body);
+    // 持有许可直到流读取完毕（见 send_llm 注释）。
+    let (resp, _llm_permit) = send_llm(req).await?;
+
+    let mut full = String::new();
+    parse_sse_stream(resp, |payload| {
+        // Anthropic 流式：content_block_delta 事件携带 delta.text 增量。
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(delta) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                if !delta.is_empty() {
+                    full.push_str(delta);
+                    on_chunk(delta);
+                }
+            }
+            // message_stop 事件表示整条消息结束 → 主动收尾，不等连接关闭。
+            if v.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
+                return true;
+            }
+        }
+        false
+    })
+    .await?;
+
+    if full.trim().is_empty() {
+        return Err(anyhow!("Anthropic 流式响应为空"));
+    }
+    Ok(full.trim().to_string())
+}
+
+// ── 带工具的流式文本生成（供会议室 Agent 回复的「实时活动流」） ────────────────
+//
+// 设计取舍：**不改写**久经考验的非流式工具循环（`run_*_tool_loop`），而是新增一条
+// 流式路径，把每一轮模型响应改走 SSE：正文 token 实时回调（`ThinkEvent::Token`），
+// 工具调用实时回调动作（`ThinkEvent::Tool`），工具结果回灌后续轮。任何一轮请求启动失败
+// （HTTP 错误 / 端点不支持 tools / 尚未吐出任何增量）即整体回退到非流式
+// `run_agent_text_with_tools`，把完整结果作为一个 token 块补发——保证「带流式反而答不出」
+// 不会比原来更糟（与既有 `degraded_no_tools` 降级同理）。llm.rs 仍保持纯 Rust、零 Tauri：
+// 事件出口由命令层用 `on_think` 闭包转成 `AppEvent`。
+
+/// 流式「思考」增量事件，交给调用方（命令层）转成 `AppEvent::AgentThinking`。
+pub enum ThinkEvent {
+    /// 回复正文的逐字增量。
+    Token(String),
+    /// Agent 正在执行的一次工具调用（已归一为可读动作描述）。
+    Tool { summary: String },
+}
+
+/// 由工具名 + 入参生成一句可读的「正在做什么」，用于实时活动流展示（如「检索代码「登录」」）。
+/// 未知工具（含外部 MCP）回退为「调用工具 <name>」。
+fn tool_action_summary(name: &str, args: &Value) -> String {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    match name {
+        "read_project_file" => format!("阅读文件 {}", s("path")),
+        "search_project_code" => format!("检索代码「{}」", s("query")),
+        "list_project_files" => {
+            let p = s("path");
+            if p.is_empty() { "浏览项目文件".to_string() } else { format!("浏览目录 {}", p) }
+        }
+        "read_spec" => {
+            let t = s("title");
+            format!("查阅规格 {}", if t.is_empty() { s("category") } else { t })
+        }
+        "list_specs" => "查阅项目规格".to_string(),
+        "web_search" => format!("联网搜索「{}」", s("query")),
+        "recall_memory" => "检索历史经验".to_string(),
+        "locate_symbol" => format!("定位符号 {}", s("symbol")),
+        "find_callers" => format!("分析调用者 {}", s("symbol")),
+        "impact_analysis" => format!("评估影响面 {}", s("symbol")),
+        _ => format!("调用工具 {}", name),
+    }
+}
+
+/// 带工具的流式文本生成（公开入口）：与 [`run_agent_text_with_tools`] 同构，但把模型生成
+/// 实时回调给 `on_think`。失败 / 不适用时回退到非流式实现并把整段结果作为一个 token 补发。
+/// 返回完整最终正文（用于落库 + 解析 `<write-file>`），与非流式版语义一致。
+pub async fn run_agent_text_with_tools_streaming(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+) -> Result<String> {
+    crate::core::trace::scope_run(db, agent, async {
+        let t0 = std::time::Instant::now();
+        let result = run_agent_text_with_tools_streaming_inner(
+            db, agent, prompt, system_prompt, image_paths, registry, on_think,
+        )
+        .await;
+        let (status, output, error) = match &result {
+            Ok(s) => ("ok", s.clone(), None),
+            Err(e) => ("error", String::new(), Some(e.to_string())),
+        };
+        crate::core::trace::record_root(
+            prompt, system_prompt, &output, status, error.as_deref(),
+            t0.elapsed().as_millis() as i64, None,
+        )
+        .await;
+        result
+    })
+    .await
+}
+
+async fn run_agent_text_with_tools_streaming_inner(
+    db: &crate::db::Db,
+    agent: &Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_paths: &[PathBuf],
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+) -> Result<String> {
+    // 无工具 / 无自定义 LLM：直接走真流式单轮（token 实时回调），覆盖纯聊天 Agent。
+    if registry.is_empty() && image_paths.is_empty() {
+        let mut cb = |c: &str| on_think(ThinkEvent::Token(c.to_string()));
+        return run_agent_text_streaming(db, agent, prompt, system_prompt, &mut cb).await;
+    }
+    // 带图片：流式 tool 循环不内联图片，回退非流式（含 vision 处理），整段作为一个 token 补发。
+    if !image_paths.is_empty() || agent.llm_id.is_none() {
+        let text = run_agent_text_with_tools(db, agent, prompt, system_prompt, image_paths, registry).await?;
+        on_think(ThinkEvent::Token(text.clone()));
+        return Ok(text);
+    }
+
+    let llm_id = agent.llm_id.as_ref().unwrap();
+    let mut cfg = sqlx::query_as::<_, LlmConfig>("SELECT * FROM llm_configs WHERE id=?")
+        .bind(llm_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow!("LLM 配置不存在: {}", llm_id))?;
+    cfg.api_key = crate::core::secrets::decrypt(&cfg.api_key).map_err(|e| anyhow!(e))?;
+    if !cfg.enabled {
+        return Err(anyhow!("LLM 配置已禁用: {}", cfg.name));
+    }
+
+    let spec = cfg.api_spec.to_ascii_lowercase();
+    // 是否已向前端吐出过增量：决定出错时能否安全回退（已吐出则不再重跑，避免重复显示）。
+    let mut emitted = false;
+    let loop_result = if spec == "anthropic" {
+        run_anthropic_tool_loop_streaming(&cfg, prompt, system_prompt, registry, on_think, &mut emitted).await
+    } else {
+        run_openai_tool_loop_streaming(&cfg, prompt, system_prompt, registry, on_think, &mut emitted).await
+    };
+
+    match loop_result {
+        Ok(text) => Ok(text),
+        Err(e) if !emitted => {
+            // 尚未吐出任何增量 → 安全回退到非流式实现（保留全部健壮性），整段作为一个 token 补发。
+            eprintln!(
+                "[stream] 流式工具循环失败，回退非流式（agent={}, spec={}): {}",
+                agent.name, spec, e
+            );
+            let text = run_agent_text_with_tools(db, agent, prompt, system_prompt, image_paths, registry).await?;
+            on_think(ThinkEvent::Token(text.clone()));
+            Ok(text)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 单轮 OpenAI 流式（带 tools）：实时回调正文 token，并从增量里拼装 tool_calls。
+/// 返回 (本轮正文, 工具调用列表 [(id, name, arguments_json_str)])。
+async fn openai_stream_round(
+    cfg: &LlmConfig,
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    with_tools: bool,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<(String, Vec<(String, String, String)>)> {
+    let mut payload = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    if with_tools {
+        payload["tools"] = json!(tools);
+        payload["tool_choice"] = json!("auto");
+    }
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&payload);
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+    // 持有许可直到流读取完毕（见 send_llm 注释）。
+    let (resp, _llm_permit) = send_llm(req).await?;
+
+    let mut text = String::new();
+    // index -> (id, name, arguments)；OpenAI 工具调用增量按 index 分片累积。
+    let mut tcs: std::collections::BTreeMap<i64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    parse_sse_stream(resp, |payload| {
+        let v = match serde_json::from_str::<Value>(payload) { Ok(v) => v, Err(_) => return false };
+        if let Some(d) = v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+            if !d.is_empty() {
+                text.push_str(d);
+                *emitted = true;
+                on_think(ThinkEvent::Token(d.to_string()));
+            }
+        }
+        if let Some(arr) = v.pointer("/choices/0/delta/tool_calls").and_then(|c| c.as_array()) {
+            for tc in arr {
+                let idx = tc.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let e = tcs.entry(idx).or_default();
+                if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                    if !id.is_empty() { e.0 = id.to_string(); }
+                }
+                if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                    if !n.is_empty() { e.1.push_str(n); }
+                }
+                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                    e.2.push_str(a);
+                }
+            }
+        }
+        v.pointer("/choices/0/finish_reason")
+            .map(|r| !r.is_null())
+            .unwrap_or(false)
+    })
+    .await?;
+    Ok((text, tcs.into_values().collect()))
+}
+
+/// OpenAI 流式工具循环：与 `run_openai_tool_loop` 同构但每轮走 SSE。耗尽 / 末轮直接以
+/// 已流式吐出的正文作答（不再二次合成，避免重复显示）。
+async fn run_openai_tool_loop_streaming(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<String> {
+    let client = http_client()?;
+    let tools = openai_tools(registry);
+    let mut messages: Vec<Value> = vec![
+        json!({ "role": "system", "content": compose_tool_system(system_prompt) }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+    let mut last_text = String::new();
+    // 同名+同入参的重复工具调用去重（防空转烧预算 / 撑爆上下文）。
+    let mut tool_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for iter in 0..MAX_TOOL_ITERS {
+        let (text, calls) =
+            openai_stream_round(cfg, &client, &messages, &tools, true, on_think, emitted).await?;
+        if !text.trim().is_empty() {
+            last_text = text.clone();
+        }
+        if calls.is_empty() {
+            // 兜底：部分模型（Qwen/MIMO/Hermes 系）把工具调用写进正文而非结构化 tool_calls 字段。
+            // 解析并执行，避免把 <tool_call>/<function> 残文当最终答复落库（与非流式工具循环同构）。
+            // 注意：这里**不再**用 `iter+1 < MAX_TOOL_ITERS` 设闸——末轮若仍是文本式调用，照样执行+
+            // continue，让 for 循环自然耗尽落到下方 final_synthesis 强制收口，而非把残文 return 出去
+            // （这正是「测试专家发言变成 <tool_call> 残文」事故的根因路径）。
+            let textual = parse_textual_tool_calls(&text);
+            if !textual.is_empty() {
+                messages.push(json!({ "role": "assistant", "content": text }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    on_think(ThinkEvent::Tool { summary: tool_action_summary(name, args) });
+                    *emitted = true;
+                    let outcome = invoke_deduped(registry, &mut tool_seen, name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[stream] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name, serde_json::to_string(args).unwrap_or_default(), truncate_tool_output(&outcome.content)
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
+            if text.trim().is_empty() {
+                return Err(anyhow!("OpenAI-compatible 流式响应缺少最终 content"));
+            }
+            // 末端净化：模型自认作答完毕，但正文里仍可能夹带工具调用残块 → 剥掉再返回。
+            return Ok(strip_tool_call_residue(&text));
+        }
+        // 助手回合（含 tool_calls）原样回灌，否则下一轮无法对应工具结果。
+        let tool_calls_json: Vec<Value> = calls
+            .iter()
+            .map(|(id, name, args)| {
+                json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args } })
+            })
+            .collect();
+        messages.push(json!({ "role": "assistant", "content": text, "tool_calls": tool_calls_json }));
+        for (id, name, args) in &calls {
+            let parsed = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+            on_think(ThinkEvent::Tool { summary: tool_action_summary(name, &parsed) });
+            *emitted = true;
+            let outcome = invoke_deduped(registry, &mut tool_seen, name, parsed).await;
+            if !outcome.ok {
+                eprintln!("[stream] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+            }
+            messages.push(json!({ "role": "tool", "tool_call_id": id, "content": truncate_tool_output(&outcome.content) }));
+        }
+        let _ = iter;
+    }
+    // 轮数耗尽：附收口指令，再走一轮无 tools 的流式请求逼模型直接作答（仍是真流式）。
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let (text, _) =
+        openai_stream_round(cfg, &client, &messages, &tools, false, on_think, emitted).await?;
+    Some(strip_tool_call_residue(&text))
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(strip_tool_call_residue(&last_text)).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，流式收口仍无正文", MAX_TOOL_ITERS))
+}
+
+/// 单轮 Anthropic 流式的请求载荷（messages / system / tools / with_tools），
+/// 将四个"内容参数"收拢成一个借用结构体，使 `anthropic_stream_round` 保持在
+/// clippy::too_many_arguments 上限（7）内。
+struct AnthropicRoundArgs<'a> {
+    messages: &'a [Value],
+    system: &'a str,
+    tools: &'a [Value],
+    with_tools: bool,
+}
+
+/// 单轮 Anthropic 流式（带 tools）：实时回调正文 token，并从 content_block 增量拼装 tool_use。
+/// 返回 (本轮正文, 工具调用列表 [(id, name, input_json_str)])。
+async fn anthropic_stream_round(
+    cfg: &LlmConfig,
+    client: &reqwest::Client,
+    args: &AnthropicRoundArgs<'_>,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<(String, Vec<(String, String, String)>)> {
+    let AnthropicRoundArgs { messages, system, tools, with_tools } = args;
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": cfg.temperature,
+        "stream": true
+    });
+    body["system"] = anthropic_system_cached(system);
+    if *with_tools {
+        body["tools"] = json!(tools);
+    }
+    let req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body);
+    // 持有许可直到流读取完毕（见 send_llm 注释）。
+    let (resp, _llm_permit) = send_llm(req).await?;
+
+    let mut text = String::new();
+    // content index -> (id, name, partial_json)；仅 tool_use 块入表。
+    let mut tools_acc: std::collections::BTreeMap<i64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    parse_sse_stream(resp, |payload| {
+        let Ok(v) = serde_json::from_str::<Value>(payload) else { return false };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_start") => {
+                let idx = v.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let cb = v.get("content_block");
+                if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = cb.and_then(|c| c.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let name = cb.and_then(|c| c.get("name")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    tools_acc.insert(idx, (id, name, String::new()));
+                }
+            }
+            Some("content_block_delta") => {
+                let idx = v.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let d = v.get("delta");
+                match d.and_then(|x| x.get("type")).and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(t) = d.and_then(|x| x.get("text")).and_then(|x| x.as_str()) {
+                            if !t.is_empty() {
+                                text.push_str(t);
+                                *emitted = true;
+                                on_think(ThinkEvent::Token(t.to_string()));
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(p) = d.and_then(|x| x.get("partial_json")).and_then(|x| x.as_str()) {
+                            if let Some(e) = tools_acc.get_mut(&idx) { e.2.push_str(p); }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // message_stop 表示整条消息结束 → 主动收尾，不等连接关闭。
+            Some("message_stop") => return true,
+            _ => {}
+        }
+        false
+    })
+    .await?;
+    Ok((text, tools_acc.into_values().collect()))
+}
+
+/// Anthropic 流式工具循环：与 `run_anthropic_tool_loop` 同构但每轮走 SSE。
+async fn run_anthropic_tool_loop_streaming(
+    cfg: &LlmConfig,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    registry: &ToolRegistry,
+    on_think: &mut (dyn FnMut(ThinkEvent) + Send),
+    emitted: &mut bool,
+) -> Result<String> {
+    let client = http_client()?;
+    let tools = anthropic_tools(registry);
+    let system = compose_tool_system(system_prompt);
+    let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": prompt })];
+    let mut last_text = String::new();
+    let mut tool_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for iter in 0..MAX_TOOL_ITERS {
+        let (text, calls) = anthropic_stream_round(
+            cfg, &client,
+            &AnthropicRoundArgs { messages: &messages, system: &system, tools: &tools, with_tools: true },
+            on_think, emitted,
+        )
+        .await?;
+        if !text.trim().is_empty() {
+            last_text = text.clone();
+        }
+        if calls.is_empty() {
+            // 兜底：非原生 function-calling 模型把工具调用写进正文。解析并执行，避免残文落库。
+            // 不再用 `iter+1 < MAX_TOOL_ITERS` 设闸——末轮文本式调用照样执行+continue，落到下方
+            // final_synthesis 强制收口，杜绝把 <tool_call> 残文 return 出去（与 OpenAI 流式同构）。
+            let textual = parse_textual_tool_calls(&text);
+            if !textual.is_empty() {
+                messages.push(json!({ "role": "assistant", "content": text }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    on_think(ThinkEvent::Tool { summary: tool_action_summary(name, args) });
+                    *emitted = true;
+                    let outcome = invoke_deduped(registry, &mut tool_seen, name, args.clone()).await;
+                    if !outcome.ok {
+                        eprintln!("[stream] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name, serde_json::to_string(args).unwrap_or_default(), truncate_tool_output(&outcome.content)
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
+            if text.trim().is_empty() {
+                return Err(anyhow!("Anthropic 流式响应缺少最终 text"));
+            }
+            // 末端净化：剥掉正文里夹带的工具调用残块再返回。
+            return Ok(strip_tool_call_residue(&text));
+        }
+        // 助手回合（text 块 + tool_use 块）原样回灌。
+        let mut content: Vec<Value> = Vec::new();
+        if !text.trim().is_empty() {
+            content.push(json!({ "type": "text", "text": text }));
+        }
+        for (id, name, args) in &calls {
+            let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+            content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
+        }
+        messages.push(json!({ "role": "assistant", "content": content }));
+        let mut results: Vec<Value> = Vec::new();
+        for (id, name, args) in &calls {
+            let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+            on_think(ThinkEvent::Tool { summary: tool_action_summary(name, &input) });
+            *emitted = true;
+            let outcome = invoke_deduped(registry, &mut tool_seen, name, input).await;
+            if !outcome.ok {
+                eprintln!("[stream] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+            }
+            results.push(json!({ "type": "tool_result", "tool_use_id": id, "content": truncate_tool_output(&outcome.content) }));
+        }
+        messages.push(json!({ "role": "user", "content": results }));
+        let _ = iter;
+    }
+    // 轮数耗尽：附收口指令，再走一轮无 tools 的流式请求逼模型直接作答。
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let (text, _) = anthropic_stream_round(
+        cfg, &client,
+        &AnthropicRoundArgs { messages: &messages, system: &system, tools: &tools, with_tools: false },
+        on_think, emitted,
+    )
+    .await?;
+    Some(strip_tool_call_residue(&text))
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(strip_tool_call_residue(&last_text)).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，流式收口仍无正文", MAX_TOOL_ITERS))
+}
+
+/// 工具循环提醒语：当 Agent 有可用工具却只回了「我去看看…」这类未兑现前导语、且未发出工具调用时，
+/// 用它促模型立即真正调用工具或直接给出完整答复，避免把空口承诺当最终回复返回。
+const TOOL_NUDGE: &str = "你刚才表示要进一步查看/检索/分析，但本轮没有实际调用任何工具。你现在就有可用工具（如 read_project_file / search_project_code / list_project_files 等）——请**立即调用**所需工具获取信息后再作答；若已掌握足够信息，请直接输出完整的最终答复，不要只描述你打算做什么。";
+
+/// 判断模型正文是否是「只宣告意图、未实际动手」的前导语（如「让我先看看…再…」）。
+/// 仅对**短**回复触发（实质答复通常更长，不应被打断），命中关键开场白线索即视为前导语。
+fn looks_like_unfulfilled_preamble(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > 120 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    const CUES: [&str; 20] = [
+        "让我先",
+        "让我看",
+        "让我查",
+        "让我检查",
+        "让我分析",
+        "让我读",
+        "让我了解",
+        "我先看",
+        "我先查",
+        "我来看",
+        "我去看",
+        "我看一下",
+        "我查一下",
+        "稍等",
+        "请稍候",
+        "马上为你",
+        "let me look",
+        "let me check",
+        "i'll look",
+        "i'll check",
+    ];
+    CUES.iter().any(|c| lower.contains(*c))
+}
+
 /// OpenAI 兼容工具调用循环：声明 tools → 解析 message.tool_calls → 执行 → 以
 /// role=tool 消息回灌 → 续轮，直到模型不再调用工具或达到轮数上限。
 async fn run_openai_tool_loop(
@@ -507,13 +1564,22 @@ async fn run_openai_tool_loop(
     prompt: &str,
     system_prompt: Option<&str>,
     registry: &ToolRegistry,
-) -> Result<String> {
+) -> Result<(String, LoopStats)> {
     let client = http_client()?;
     let tools = openai_tools(registry);
     let mut messages: Vec<Value> = Vec::new();
     // 工具循环的 system 始终带上不可信数据护栏（即使角色自身无 system）。
     messages.push(json!({ "role": "system", "content": compose_tool_system(system_prompt) }));
     messages.push(json!({ "role": "user", "content": prompt }));
+    // 记录最近一次模型正文，供轮数耗尽时优雅兜底（返回已有内容而非直接报错）。
+    let mut last_content = String::new();
+    // 是否已就「只说不做的前导语」提醒过一次（每个对话至多提醒一次，防止反复空转）。
+    let mut nudged = false;
+    // 诊断计数：工具调用总数 / 其中失败数，回填 root span metadata。
+    let mut tool_calls_count = 0usize;
+    let mut tool_errors_count = 0usize;
+    // 同名+同入参的重复工具调用去重（防空转烧预算 / 撑爆上下文）。
+    let mut tool_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut req = client
@@ -537,7 +1603,7 @@ async fn run_openai_tool_loop(
                 crate::core::trace::record_llm(
                     "openai", &cfg.model, system_prompt, &req_input, "", "error",
                     Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
-                    Some(&json!({ "iteration": iter }).to_string()),
+                    Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
                 )
                 .await;
                 return Err(e);
@@ -552,7 +1618,7 @@ async fn run_openai_tool_loop(
         crate::core::trace::record_llm(
             "openai", &cfg.model, system_prompt, &req_input,
             &serde_json::to_string(&msg).unwrap_or_default(), "ok", None, pt, ct, tt, latency,
-            Some(&json!({ "iteration": iter }).to_string()),
+            Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
         )
         .await;
 
@@ -562,13 +1628,73 @@ async fn run_openai_tool_loop(
             .cloned()
             .unwrap_or_default();
 
+        let content_str = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !content_str.is_empty() {
+            last_content = content_str.clone();
+        }
+
         if tool_calls.is_empty() {
-            return msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("OpenAI-compatible 响应缺少最终 content"));
+            // 原生 tool_calls 为空：兜底解析正文里的「文本式工具调用」（Qwen/MIMO/Hermes 系）。
+            // 命中则执行并以 user 文本回灌结果（避免 OpenAI 的 tool_call_id 配对约束），续轮。
+            let textual = parse_textual_tool_calls(&content_str);
+            if !textual.is_empty() {
+                messages.push(json!({ "role": "assistant", "content": content_str }));
+                let mut feedback = String::from(
+                    "以下是你请求的工具调用结果。请据此继续；若已掌握足够证据，直接输出最终结果（严格 JSON，不要再写 <tool_call>/<function> 标签）：\n",
+                );
+                for (name, args) in &textual {
+                    let outcome = invoke_deduped(registry, &mut tool_seen, name, args.clone()).await;
+                    tool_calls_count += 1;
+                    if !outcome.ok {
+                        tool_errors_count += 1;
+                        eprintln!("[tools] 文本式工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
+                    }
+                    feedback.push_str(&format!(
+                        "\n### 工具 `{}` 入参 {}\n{}\n",
+                        name,
+                        serde_json::to_string(args).unwrap_or_default(),
+                        truncate_tool_output(&outcome.content)
+                    ));
+                }
+                messages.push(json!({ "role": "user", "content": feedback }));
+                continue;
+            }
+            // 有可用工具，但模型只回了「让我先看看…」这类未兑现的前导语、且没发出任何工具调用：
+            // 追加一次提醒促其真正调用工具，避免把空口承诺当最终答复返回。每个对话至多提醒一次。
+            if !nudged
+                && !registry.is_empty()
+                && iter + 1 < MAX_TOOL_ITERS
+                && looks_like_unfulfilled_preamble(&content_str)
+            {
+                nudged = true;
+                messages.push(json!({ "role": "assistant", "content": content_str }));
+                messages.push(json!({ "role": "user", "content": TOOL_NUDGE }));
+                continue;
+            }
+            // 观测：有工具可用却仍以前导语收尾（提醒后依旧不调用），记一条告警便于复盘此类空转。
+            if !registry.is_empty() && looks_like_unfulfilled_preamble(&content_str) {
+                eprintln!(
+                    "[tools] Agent 在有工具可用时仅返回前导语、未调用任何工具，按现状返回：{}",
+                    content_str.chars().take(80).collect::<String>()
+                );
+            }
+            // 无工具调用（或已到末轮）：返回正文作为最终回答（剥掉可能夹带的工具调用残块）。
+            if content_str.is_empty() {
+                return Err(anyhow!("OpenAI-compatible 响应缺少最终 content"));
+            }
+            return Ok((
+                strip_tool_call_residue(&content_str),
+                LoopStats {
+                    iters: iter + 1,
+                    tool_calls: tool_calls_count,
+                    tool_errors: tool_errors_count,
+                    terminated_by: "model_final",
+                },
+            ));
         }
 
         // 助手回合（含 tool_calls）必须原样回灌，否则下一轮无法对应工具结果。
@@ -584,18 +1710,84 @@ async fn run_openai_tool_loop(
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
             let args = serde_json::from_str::<Value>(args_str).unwrap_or_else(|_| json!({}));
-            let outcome = registry.invoke(fname, args).await;
+            let outcome = invoke_deduped(registry, &mut tool_seen, fname, args).await;
+            tool_calls_count += 1;
             if !outcome.ok {
+                tool_errors_count += 1;
                 eprintln!("[tools] 工具 `{}` 返回失败/被拦截：{}", fname, outcome.content);
             }
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": id,
-                "content": outcome.content
+                "content": truncate_tool_output(&outcome.content)
             }));
         }
     }
-    Err(anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+    // 轮数耗尽：强制收口——去掉工具、附收口指令再请求一次，把模型逼到「直接作答」，
+    // 而不是把半截前导语 / 未执行的 <tool_call> 残文当最终答复返回（这是会议室 Agent
+    // 「答不出来」的主因）。收口失败时才回退到最近一次正文。
+    let text = openai_final_synthesis(cfg, system_prompt, messages, &last_content).await?;
+    Ok((
+        text,
+        LoopStats {
+            iters: MAX_TOOL_ITERS,
+            tool_calls: tool_calls_count,
+            tool_errors: tool_errors_count,
+            terminated_by: "budget_exhausted",
+        },
+    ))
+}
+
+/// 工具预算耗尽后的强制收口（OpenAI 兼容）：去掉 tools 字段、追加收口指令再请求一次，
+/// 逼模型基于已收集信息直接作答。失败 / 空则回退 `fallback`（最近一次正文），仍空才报错。
+async fn openai_final_synthesis(
+    cfg: &LlmConfig,
+    system_prompt: Option<&str>,
+    mut messages: Vec<Value>,
+    fallback: &str,
+) -> Result<String> {
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let client = http_client()?;
+    // 注意：不带 tools / tool_choice，强制模型走纯文本回复。
+    let mut req = client
+        .post(join_endpoint(&cfg.endpoint, "/v1/chat/completions"))
+        .json(&json!({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature
+        }));
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+    let req_input = serde_json::to_string(&messages).unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let text = match send_json(req).await {
+        Ok(body) => {
+            let msg = body.pointer("/choices/0/message").cloned().unwrap_or_default();
+            let (pt, ct, tt) = openai_usage(&body);
+            crate::core::trace::record_llm(
+                "openai", &cfg.model, system_prompt, &req_input,
+                &serde_json::to_string(&msg).unwrap_or_default(), "ok", None, pt, ct, tt,
+                t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            msg.get("content").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).unwrap_or_default()
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                "openai", &cfg.model, system_prompt, &req_input, "", "error",
+                Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            String::new()
+        }
+    };
+    Some(strip_tool_call_residue(&text))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some(strip_tool_call_residue(fallback)).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，强制收口仍无正文", MAX_TOOL_ITERS))
 }
 
 /// Anthropic 工具调用循环：声明 tools → 解析 content[].type=tool_use → 执行 →
@@ -605,10 +1797,19 @@ async fn run_anthropic_tool_loop(
     prompt: &str,
     system_prompt: Option<&str>,
     registry: &ToolRegistry,
-) -> Result<String> {
+) -> Result<(String, LoopStats)> {
     let client = http_client()?;
     let tools = anthropic_tools(registry);
     let mut messages: Vec<Value> = vec![json!({ "role": "user", "content": prompt })];
+    // 是否已就「只说不做的前导语」提醒过一次（每个对话至多提醒一次，防止反复空转）。
+    let mut nudged = false;
+    // 记录最近一次模型正文，供轮数耗尽时强制收口的回退用。
+    let mut last_text = String::new();
+    // 诊断计数：工具调用总数 / 其中失败数，回填 root span metadata。
+    let mut tool_calls_count = 0usize;
+    let mut tool_errors_count = 0usize;
+    // 同名+同入参的重复工具调用去重（防空转烧预算 / 撑爆上下文）。
+    let mut tool_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for iter in 0..MAX_TOOL_ITERS {
         let mut body = json!({
@@ -618,7 +1819,7 @@ async fn run_anthropic_tool_loop(
             "temperature": cfg.temperature,
             "tools": tools
         });
-        body["system"] = Value::String(compose_tool_system(system_prompt));
+        body["system"] = anthropic_system_cached(&compose_tool_system(system_prompt));
 
         let req_input = serde_json::to_string(&messages).unwrap_or_default();
         let t0 = std::time::Instant::now();
@@ -636,7 +1837,7 @@ async fn run_anthropic_tool_loop(
                 crate::core::trace::record_llm(
                     "anthropic", &cfg.model, system_prompt, &req_input, "", "error",
                     Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
-                    Some(&json!({ "iteration": iter }).to_string()),
+                    Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
                 )
                 .await;
                 return Err(e);
@@ -653,7 +1854,7 @@ async fn run_anthropic_tool_loop(
         crate::core::trace::record_llm(
             "anthropic", &cfg.model, system_prompt, &req_input,
             &serde_json::to_string(&content).unwrap_or_default(), "ok", None, pt, ct, tt, latency,
-            Some(&json!({ "iteration": iter }).to_string()),
+            Some(&json!({ "iteration": iter, "stage": "tool_loop" }).to_string()),
         )
         .await;
         let stop = value.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("");
@@ -668,11 +1869,48 @@ async fn run_anthropic_tool_loop(
                 .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Some(text)
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| anyhow!("Anthropic 响应缺少最终 text"));
+            // 有可用工具，但模型只回了未兑现的前导语、且没发出 tool_use：提醒一次促其真正调用工具。
+            if !nudged
+                && !registry.is_empty()
+                && iter + 1 < MAX_TOOL_ITERS
+                && looks_like_unfulfilled_preamble(&text)
+            {
+                nudged = true;
+                messages.push(json!({ "role": "assistant", "content": content.clone() }));
+                messages.push(json!({ "role": "user", "content": TOOL_NUDGE }));
+                continue;
+            }
+            // 观测：有工具可用却仍以前导语收尾，记一条告警便于复盘此类空转。
+            if !registry.is_empty() && looks_like_unfulfilled_preamble(&text) {
+                eprintln!(
+                    "[tools] Agent 在有工具可用时仅返回前导语、未调用任何工具，按现状返回：{}",
+                    text.chars().take(80).collect::<String>()
+                );
+            }
+            if text.trim().is_empty() {
+                return Err(anyhow!("Anthropic 响应缺少最终 text"));
+            }
+            return Ok((
+                strip_tool_call_residue(&text),
+                LoopStats {
+                    iters: iter + 1,
+                    tool_calls: tool_calls_count,
+                    tool_errors: tool_errors_count,
+                    terminated_by: "model_final",
+                },
+            ));
         }
 
+        // 记录本轮伴随 tool_use 的正文（若有），作为耗尽时强制收口的回退文本。
+        let turn_text = content
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !turn_text.trim().is_empty() {
+            last_text = turn_text;
+        }
         // 助手回合（含 tool_use 块）原样回灌。
         messages.push(json!({ "role": "assistant", "content": content.clone() }));
         let mut results = Vec::new();
@@ -683,19 +1921,95 @@ async fn run_anthropic_tool_loop(
             let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-            let outcome = registry.invoke(name, input).await;
+            let outcome = invoke_deduped(registry, &mut tool_seen, name, input).await;
+            tool_calls_count += 1;
             if !outcome.ok {
+                tool_errors_count += 1;
                 eprintln!("[tools] 工具 `{}` 返回失败/被拦截：{}", name, outcome.content);
             }
             results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": id,
-                "content": outcome.content
+                "content": truncate_tool_output(&outcome.content)
             }));
         }
         messages.push(json!({ "role": "user", "content": results }));
     }
-    Err(anyhow!("工具调用超过最大轮数 {}", MAX_TOOL_ITERS))
+    // 轮数耗尽：强制收口——去掉 tools 再请求一次，逼模型基于已收集信息直接作答，
+    // 而非直接报错丢弃整轮取证工作。
+    let text = anthropic_final_synthesis(cfg, system_prompt, messages, &last_text).await?;
+    Ok((
+        text,
+        LoopStats {
+            iters: MAX_TOOL_ITERS,
+            tool_calls: tool_calls_count,
+            tool_errors: tool_errors_count,
+            terminated_by: "budget_exhausted",
+        },
+    ))
+}
+
+/// 工具预算耗尽后的强制收口（Anthropic）：去掉 tools 字段、追加收口指令再请求一次，
+/// 逼模型基于已收集信息直接作答。失败 / 空则回退 `fallback`，仍空才报错。
+async fn anthropic_final_synthesis(
+    cfg: &LlmConfig,
+    system_prompt: Option<&str>,
+    mut messages: Vec<Value>,
+    fallback: &str,
+) -> Result<String> {
+    messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE }));
+    let client = http_client()?;
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": cfg.temperature
+    });
+    body["system"] = anthropic_system_cached(&compose_tool_system(system_prompt));
+    let req_input = serde_json::to_string(&messages).unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let text = match send_json(
+        client
+            .post(join_endpoint(&cfg.endpoint, "/v1/messages"))
+            .header("x-api-key", &cfg.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body),
+    )
+    .await
+    {
+        Ok(value) => {
+            let content = value.get("content").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let (pt, ct, tt) = anthropic_usage(&value);
+            crate::core::trace::record_llm(
+                "anthropic", &cfg.model, system_prompt, &req_input,
+                &serde_json::to_string(&content).unwrap_or_default(), "ok", None, pt, ct, tt,
+                t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            content
+                .iter()
+                .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string()
+        }
+        Err(e) => {
+            crate::core::trace::record_llm(
+                "anthropic", &cfg.model, system_prompt, &req_input, "", "error",
+                Some(&e.to_string()), None, None, None, t0.elapsed().as_millis() as i64,
+                Some(&json!({ "stage": "final_synthesis" }).to_string()),
+            )
+            .await;
+            String::new()
+        }
+    };
+    Some(strip_tool_call_residue(&text))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some(strip_tool_call_residue(fallback)).filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow!("工具调用超过最大轮数 {}，强制收口仍无正文", MAX_TOOL_ITERS))
 }
 
 fn openai_tools(registry: &ToolRegistry) -> Vec<Value> {
@@ -748,8 +2062,112 @@ fn anthropic_usage(value: &Value) -> (Option<i64>, Option<i64>, Option<i64>) {
     (i, o, total)
 }
 
+// ===== 出站 LLM 请求并发闸 + 限流退避（防 429）=====
+//
+// 批量任务（如一次分析 50 条需求）会在极短时间内对 LLM 服务商发起数十并发请求，极易触发
+// 429 限流，表现为大面积「分析失败」。这里在**所有出站 LLM 请求的唯一咽喉**（`send_llm`）
+// 上加两道控制：
+//   1) 进程级并发名额（Semaphore）：同时在途的 LLM 请求数不超过上限（默认 4，设置可调），
+//      无论上层入队多少任务，打到服务商的并发都被削平；
+//   2) 对 429 / 5xx / 529(overloaded) 的指数退避重试（尊重 `Retry-After` 头）：让偶发限流
+//      自愈，而非一次抖动就判败。
+// 该闸是跨所有 Agent 共享的（限流是服务商侧属性），与执行槽（CR 并发）正交，不引入 Tauri。
+
+/// 默认出站 LLM 并发上限。保守取 4——足够喂满单个服务商常规配额，又不至于一批就被限流。
+const DEFAULT_LLM_CONCURRENCY: usize = 4;
+/// 限流/暂时性错误的最大重试次数（不含首发）。
+const LLM_MAX_RETRIES: u32 = 4;
+/// 退避基数；实际等待 = base × 2^attempt（封顶 `LLM_RETRY_CAP`）+ 抖动。
+const LLM_RETRY_BASE: Duration = Duration::from_millis(800);
+/// 单次退避封顶，避免某次 `Retry-After` 过大把任务挂死太久。
+const LLM_RETRY_CAP: Duration = Duration::from_secs(30);
+
+// 用 RwLock<Arc<Semaphore>> 承载，以支持运行时改容量：改容量即整体替换为新 Semaphore，
+// 旧实例上的在途许可释放后自然消亡，新请求走新实例。替换瞬间在途数可能短暂略超新上限，
+// 可接受（只会偏保守，不会失控）。OnceLock 懒初始化，契合后端独立化的全局初始化器约定。
+static LLM_GATE: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<tokio::sync::Semaphore>>> =
+    std::sync::OnceLock::new();
+
+fn llm_gate_cell() -> &'static std::sync::RwLock<std::sync::Arc<tokio::sync::Semaphore>> {
+    LLM_GATE.get_or_init(|| {
+        std::sync::RwLock::new(std::sync::Arc::new(tokio::sync::Semaphore::new(
+            DEFAULT_LLM_CONCURRENCY,
+        )))
+    })
+}
+
+/// 设置出站 LLM 并发上限（启动时按设置初始化、设置变更时热更新；clamp 到 [1, 32]）。
+pub fn set_llm_concurrency(max: usize) {
+    let n = max.clamp(1, 32);
+    *llm_gate_cell().write().unwrap() = std::sync::Arc::new(tokio::sync::Semaphore::new(n));
+}
+
+async fn acquire_llm_permit() -> tokio::sync::OwnedSemaphorePermit {
+    // 克隆出当前 Semaphore 的 Arc，再 await——这样持锁时间极短，且不会卡住热更新（替换）。
+    let sem = llm_gate_cell().read().unwrap().clone();
+    // Semaphore 永不关闭，acquire 不会返回 Err。
+    sem.acquire_owned()
+        .await
+        .expect("llm gate semaphore closed")
+}
+
+/// 该 HTTP 状态是否值得重试：429（限流）、529（Anthropic overloaded）、5xx（服务端暂时性）。
+fn is_retryable_status(status: StatusCode) -> bool {
+    let c = status.as_u16();
+    c == 429 || c == 529 || status.is_server_error()
+}
+
+/// 解析 `Retry-After` 头（仅支持「秒」整数形式；HTTP-date 形式忽略，回落指数退避）。封顶 cap。
+fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let raw = resp.headers().get(reqwest::header::RETRY_AFTER)?;
+    let secs: u64 = raw.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(secs.min(LLM_RETRY_CAP.as_secs())))
+}
+
+/// 指数退避 + 抖动。抖动用纳秒时钟做廉价随机源（避免为此引入 rng 依赖），打散并发任务的
+/// 重试时刻，防止「整批同时退避、同时重试」再次撞墙（thundering herd）。
+fn backoff_delay(attempt: u32) -> Duration {
+    let capped = LLM_RETRY_BASE
+        .saturating_mul(1u32 << attempt.min(5))
+        .min(LLM_RETRY_CAP);
+    let span_ms = (capped.as_millis() as u64) / 2 + 1; // 抖动幅度 ~±25%
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % span_ms;
+    capped + Duration::from_millis(jitter_ms)
+}
+
+/// 出站 LLM 请求的统一通道：先占用并发名额，再对限流/暂时性错误退避重试。
+/// 返回成功（或最终不可重试）的响应与所持许可——**调用方须持有许可直到响应体/流读取完毕**，
+/// 否则并发名额会在数据还在传输时被提前释放，削平在途并发的效果就打了折。
+async fn send_llm(
+    req: reqwest::RequestBuilder,
+) -> Result<(reqwest::Response, tokio::sync::OwnedSemaphorePermit)> {
+    let permit = acquire_llm_permit().await;
+    let mut attempt = 0u32;
+    loop {
+        // 每次尝试都需要一份独立的 RequestBuilder（send 消耗 self）。本项目所有 LLM 请求体
+        // 都是 JSON，try_clone 必然成功；万一不可克隆则放弃重试、直接发原始请求。
+        let attempt_req = match req.try_clone() {
+            Some(r) => r,
+            None => return Ok((req.send().await?, permit)),
+        };
+        let resp = attempt_req.send().await?;
+        if is_retryable_status(resp.status()) && attempt < LLM_MAX_RETRIES {
+            let wait = parse_retry_after(&resp).unwrap_or_else(|| backoff_delay(attempt));
+            attempt += 1;
+            drop(resp);
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        return Ok((resp, permit));
+    }
+}
+
 async fn send_json(req: reqwest::RequestBuilder) -> Result<Value> {
-    let response = req.send().await?;
+    let (response, _permit) = send_llm(req).await?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -795,4 +2213,109 @@ fn status_code(status: StatusCode) -> String {
         .canonical_reason()
         .map(|reason| format!("{} {}", status.as_u16(), reason))
         .unwrap_or_else(|| status.as_u16().to_string())
+}
+
+#[cfg(test)]
+mod textual_tool_call_tests {
+    use super::*;
+
+    #[test]
+    fn parses_xml_function_format() {
+        // MIMO/Qwen 实际产出的格式（含外套 <tool_call> 与多个 <parameter>）。
+        let raw = r#"<tool_call>
+<function=search_project_code>
+<parameter=query>unwrap\(\)|expect\(</parameter>
+<parameter=path>core/src</parameter>
+<parameter=limit>50</parameter>
+</function>
+</tool_call>"#;
+        let calls = parse_textual_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "search_project_code");
+        assert_eq!(calls[0].1["query"], "unwrap\\(\\)|expect\\(");
+        assert_eq!(calls[0].1["path"], "core/src");
+        // limit 应被归一为数字而非字符串。
+        assert_eq!(calls[0].1["limit"], 50);
+    }
+
+    #[test]
+    fn parses_multiple_function_calls() {
+        let raw = "<function=read_project_file><parameter=path>a.rs</parameter></function>\
+                   <function=read_project_file><parameter=path>b.rs</parameter></function>";
+        let calls = parse_textual_tool_calls(raw);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1["path"], "b.rs");
+    }
+
+    #[test]
+    fn parses_hermes_json_format() {
+        let raw = r#"思考中…<tool_call>{"name":"read_project_file","arguments":{"path":"src/x.rs","limit":40}}</tool_call>"#;
+        let calls = parse_textual_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_project_file");
+        assert_eq!(calls[0].1["path"], "src/x.rs");
+        assert_eq!(calls[0].1["limit"], 40);
+    }
+
+    #[test]
+    fn plain_text_yields_no_calls() {
+        // 正常的 JSON 数组最终回答不应被误判为工具调用。
+        let raw = r#"[{"title":"x","kind":"engineering"}]"#;
+        assert!(parse_textual_tool_calls(raw).is_empty());
+    }
+
+    #[test]
+    fn coerce_keeps_regex_string_but_parses_scalars() {
+        assert_eq!(coerce_arg_value("50"), serde_json::json!(50));
+        assert_eq!(coerce_arg_value("true"), serde_json::json!(true));
+        assert_eq!(coerce_arg_value("core/src"), serde_json::json!("core/src"));
+        assert_eq!(coerce_arg_value("a|b\\("), serde_json::json!("a|b\\("));
+    }
+
+    #[test]
+    fn strip_removes_tool_call_residue_keeps_prose() {
+        // 复刻事故：最终答复里夹带文本式工具调用残块 → 必须剥掉，保留正文。
+        let raw = "结论：测试覆盖不足。\n<tool_call>\n<function=mcp__utils__mcp_read_file>\n<parameter=filePath>/x/y.json</parameter>\n</function>\n</tool_call>\n建议补集成测试。";
+        let out = strip_tool_call_residue(raw);
+        assert!(out.contains("结论：测试覆盖不足。"));
+        assert!(out.contains("建议补集成测试。"));
+        assert!(!out.contains("<tool_call>"));
+        assert!(!out.contains("<function="));
+    }
+
+    #[test]
+    fn strip_removes_bare_function_block() {
+        let raw = "前言<function=foo><parameter=a>1</parameter></function>后语";
+        let out = strip_tool_call_residue(raw);
+        assert_eq!(out, "前言后语");
+    }
+
+    #[test]
+    fn strip_all_residue_keeps_original_not_empty() {
+        // 整段几乎都是残块：剥完为空时保留原文交上层兜底，绝不返回空答复。
+        let raw = "<tool_call><function=foo><parameter=a>1</parameter></function></tool_call>";
+        let out = strip_tool_call_residue(raw);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn strip_noop_on_clean_text() {
+        let raw = "## 结论\n这是一段正常的最终答复，不含任何工具调用。";
+        assert_eq!(strip_tool_call_residue(raw), raw);
+    }
+
+    #[test]
+    fn truncate_passes_through_small_output() {
+        let s = "short output";
+        assert_eq!(truncate_tool_output(s), s);
+    }
+
+    #[test]
+    fn truncate_caps_large_output_with_marker() {
+        let big = "源".repeat(MAX_TOOL_OUTPUT_CHARS + 5000);
+        let out = truncate_tool_output(&big);
+        assert!(out.chars().count() < big.chars().count());
+        assert!(out.contains("已截断中间"));
+        // UTF-8 安全：按字符切，不应 panic（多字节字符）。
+    }
 }

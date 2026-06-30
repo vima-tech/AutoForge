@@ -1,9 +1,9 @@
 # Frontend
-node_modules/
+node_modules
 dist/
 
 # Rust / Tauri
-src-tauri/target/
+src-tauri/target
 
 # App data (local SQLite DB and worktrees)
 *.db
@@ -20,5 +20,9 @@ worktrees/
 Thumbs.db
 
 # IDE
-.vscode/
+# .vscode/ 选择性忽略：忽略个人化配置（settings.json 等），但保留团队共享的
+# 调试配置（launch.json）与扩展推荐（extensions.json）。
+.vscode/*
+!.vscode/launch.json
+!.vscode/extensions.json
 .idea/

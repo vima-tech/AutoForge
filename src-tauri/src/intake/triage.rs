@@ -310,7 +310,14 @@ pub async fn denoise_in_place(db: &Db, issue_ids: Vec<String>) -> DenoiseStats {
             stats.errors += 1;
             continue;
         };
-        if p.is_noise {
+        // 噪音、或 triage 判定为重复（duplicate_of 指向另一条已有需求）→ 一并丢弃。
+        // duplicate_of 此前被解析出来却从未使用，是「频繁重复」漏网的一环：现在闭合。
+        let is_duplicate = p
+            .duplicate_of
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if p.is_noise || is_duplicate {
             let _ = sqlx::query("DELETE FROM issues WHERE id=? AND status='triage'")
                 .bind(&issue.id)
                 .execute(db)

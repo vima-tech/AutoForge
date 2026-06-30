@@ -2,10 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import Icon from './Icon';
 import Select from './Select';
-import { listProjects, submitIssue, type Project } from '../services';
+import { listProjects, submitIssue, importIssueAttachment, type Project } from '../services';
 import { RealtimeAsr } from '../lib/realtimeAsr';
 import { registerVoiceSurface } from '../lib/voiceInput';
 import MeetingUpload from './MeetingUpload';
+import AttachmentBar, { fileToUpload } from './AttachmentBar';
 
 /**
  * 全局速录：随手把一个念头零结构地丢进「待整理池」（status=triage，不自动分析）。
@@ -21,6 +22,7 @@ export default function QuickCapture({ onClose, autoVoice }: { onClose: () => vo
   const [streaming, setStreaming] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [meetingOpen, setMeetingOpen] = useState(false);
+  const [files, setFiles] = useState<File[]>([]);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const rtRef = useRef<RealtimeAsr | null>(null);
   // 实时识别的文本拼接：base(起录时已有文本) + committed(已定句) + partial(当前增量句)。
@@ -93,14 +95,19 @@ export default function QuickCapture({ onClose, autoVoice }: { onClose: () => vo
     setBusy(true); setErr('');
     try {
       const first = text.trim().split(/[\n。.!?！？]/)[0]?.trim() ?? text.trim();
-      await submitIssue({
+      const issue = await submitIssue({
         project_id: projectId,
         title: first.length > 30 ? first.slice(0, 30) : first,
         description: text.trim(),
         source_type: 'quickcapture',
         mode: 'triage',
       });
-      setOk(true); setText('');
+      // 两阶段：需求入池后把暂存文件逐个挂到该需求（图片可供 vision 分析）。
+      for (const f of files) {
+        try { await importIssueAttachment({ issue_id: issue.id, ...(await fileToUpload(f)) }); }
+        catch (e) { console.warn('附件上传失败', f.name, e); }
+      }
+      setOk(true); setText(''); setFiles([]);
       setTimeout(() => taRef.current?.focus(), 30);
       setTimeout(() => setOk(false), 1800);
     } catch (e) { setErr(String(e)); }
@@ -163,6 +170,11 @@ export default function QuickCapture({ onClose, autoVoice }: { onClose: () => vo
           {connecting && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}><span className="dot amber" />连接中…</span>}
           {streaming && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 'var(--text-label)', color: 'var(--red)', fontFamily: 'var(--font-mono)' }}><span className="dot amber" />聆听中…</span>}
           {!streaming && err && <span style={{ fontSize: 'var(--text-label)', color: 'var(--red)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={err}>{err}</span>}
+        </div>
+
+        {/* 图片/附件：暂存模式，入池后随需求一起上传 */}
+        <div style={{ marginBottom: 12 }}>
+          <AttachmentBar staged={files} onStaged={setFiles} />
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>

@@ -35,6 +35,12 @@ pub struct AutosupplyConfig {
     pub scan_enabled: bool,
     pub proposer_enabled: bool,
     pub max_per_run: usize,
+    /// proposer（深度提议）的**独立**每轮预算，与 scanner 的 `max_per_run` 分开计——
+    /// 否则确定性 scanner 容易先打满 `max_per_run`、把高价值的 proposer 饿死。默认 8。
+    pub proposer_max_per_run: usize,
+    /// 严重度门槛：低于此级别的产物在入池前丢弃（low<medium<high<critical）。
+    /// 默认 low（不过滤）；调高可只保留高价值问题，进一步压制 linter 噪音。
+    pub min_severity: String,
     /// 静态代码分析（clippy/ruff/go vet/eslint），发现真实代码问题。默认开。
     pub analyze_enabled: bool,
     /// 前置整理：入池后立即跑 triage Agent 滤掉噪音、就地归一化幸存条目（仍留 triage 池）。
@@ -50,9 +56,21 @@ impl Default for AutosupplyConfig {
             scan_enabled: true,
             proposer_enabled: false,
             max_per_run: 20,
+            proposer_max_per_run: 8,
+            min_severity: "low".to_string(),
             analyze_enabled: true,
             triage_enabled: true,
         }
+    }
+}
+
+/// 严重度排序（用于 `min_severity` 门槛比较）。未知值按 medium 处理。
+pub fn severity_rank(s: &str) -> u8 {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "critical" => 3,
+        "high" => 2,
+        "low" => 0,
+        _ => 1, // medium / 未知
     }
 }
 
@@ -65,6 +83,8 @@ impl AutosupplyConfig {
             scan_enabled: get_bool(db, "autosupply.scan_enabled").await.unwrap_or(d.scan_enabled),
             proposer_enabled: get_bool(db, "autosupply.proposer_enabled").await.unwrap_or(d.proposer_enabled),
             max_per_run: get_i64(db, "autosupply.max_per_run").await.unwrap_or(d.max_per_run as i64).clamp(1, 200) as usize,
+            proposer_max_per_run: get_i64(db, "autosupply.proposer_max_per_run").await.unwrap_or(d.proposer_max_per_run as i64).clamp(1, 50) as usize,
+            min_severity: get_setting(db, "autosupply.min_severity").await.unwrap_or(d.min_severity),
             analyze_enabled: get_bool(db, "autosupply.analyze_enabled").await.unwrap_or(d.analyze_enabled),
             triage_enabled: get_bool(db, "autosupply.triage_enabled").await.unwrap_or(d.triage_enabled),
         }
@@ -84,6 +104,32 @@ async fn get_bool(db: &Db, key: &str) -> Option<bool> {
 }
 async fn get_i64(db: &Db, key: &str) -> Option<i64> {
     get_setting(db, key).await.and_then(|s| s.trim().parse::<i64>().ok())
+}
+async fn set_setting(db: &Db, key: &str, value: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(db)
+    .await;
+}
+
+/// 当前 Unix 时间戳（秒）。
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 上次自喂料**实际运行**的 Unix 时间戳（秒）；从未运行过返回 `None`。
+/// 调度器据此按"距上次运行已过多久"计算下次触发，使频繁重启（dev 热重载）
+/// 不再清零计时器。手动「立即运行」与定时触发共用此戳。
+pub async fn last_run_unix(db: &Db) -> Option<i64> {
+    get_i64(db, "autosupply.last_run_at").await
 }
 
 /// 一轮自喂料的统计。
@@ -121,18 +167,27 @@ pub async fn run_cycle(
     .await
     .unwrap_or_default();
 
-    let mut total = 0usize;
     let mut stats = CycleStats::default();
-    // 本轮新入池（或命中已有 triage 条目）的 id，供前置整理去噪。
+    // 本轮**新入池**的 triage 条目 id，供前置整理去噪。
     let mut fresh_ids: Vec<String> = Vec::new();
+    // 两类来源**各自独立**计预算：scanner 用 max_per_run，proposer 用 proposer_max_per_run。
+    // 关键：只有真正 INSERT 的全新条目才计入预算（去重命中不计），否则重复的 linter 条目
+    // 每轮把预算占满，既挡住新发现、也饿死高价值的 proposer。
+    let min_rank = severity_rank(&cfg.min_severity);
+    let mut scanned_new = 0usize;
+    let mut proposed_new = 0usize;
 
     for (pid, repo_path) in projects {
-        if total >= cfg.max_per_run {
+        if scanned_new >= cfg.max_per_run
+            && (!cfg.proposer_enabled || proposed_new >= cfg.proposer_max_per_run)
+        {
             break;
         }
 
-        if cfg.scan_enabled && !repo_path.is_empty() {
+        if cfg.scan_enabled && !repo_path.is_empty() && scanned_new < cfg.max_per_run {
             let mut payloads = scanner::scan_todos(&pid, &repo_path).await;
+            // 半成品/未实现桩：直击「功能只做了一半」的强信号（linter 覆盖不到）。
+            payloads.extend(scanner::scan_unfinished(&pid, &repo_path).await);
             payloads.extend(scanner::scan_cargo_audit(&pid, &repo_path).await);
             payloads.extend(scanner::scan_npm_audit(&pid, &repo_path).await);
             payloads.extend(scanner::scan_pip_audit(&pid, &repo_path).await);
@@ -142,32 +197,47 @@ pub async fn run_cycle(
                 payloads.extend(scanner::scan_static_analysis(&pid, &repo_path).await);
             }
             for p in payloads {
-                if total >= cfg.max_per_run {
+                if scanned_new >= cfg.max_per_run {
                     break;
                 }
-                // 安全护栏：永远 Triage。
-                if let Ok(issue) = gateway::receive(db, job_tx, app, p, IntakeMode::Triage).await {
-                    stats.scanned += 1;
-                    total += 1;
-                    if issue.status == "triage" {
-                        fresh_ids.push(issue.id);
+                // 严重度门槛：低于阈值的产物直接丢弃，不入池。
+                if severity_rank(p.severity.as_deref().unwrap_or("medium")) < min_rank {
+                    continue;
+                }
+                // 安全护栏：永远 Triage。只有真正新建才计预算 + 计入待整理。
+                if let Ok((issue, created)) =
+                    gateway::receive_with_status(db, job_tx, app, p, IntakeMode::Triage).await
+                {
+                    if created {
+                        stats.scanned += 1;
+                        scanned_new += 1;
+                        if issue.status == "triage" {
+                            fresh_ids.push(issue.id);
+                        }
                     }
                 }
             }
         }
 
-        if cfg.proposer_enabled && total < cfg.max_per_run {
-            let remaining = cfg.max_per_run.saturating_sub(total).min(8);
+        if cfg.proposer_enabled && proposed_new < cfg.proposer_max_per_run {
+            let remaining = cfg.proposer_max_per_run.saturating_sub(proposed_new);
             if let Ok(payloads) = proposer::propose(db, &pid, remaining).await {
                 for p in payloads {
-                    if total >= cfg.max_per_run {
+                    if proposed_new >= cfg.proposer_max_per_run {
                         break;
                     }
-                    if let Ok(issue) = gateway::receive(db, job_tx, app, p, IntakeMode::Triage).await {
-                        stats.proposed += 1;
-                        total += 1;
-                        if issue.status == "triage" {
-                            fresh_ids.push(issue.id);
+                    if severity_rank(p.severity.as_deref().unwrap_or("medium")) < min_rank {
+                        continue;
+                    }
+                    if let Ok((issue, created)) =
+                        gateway::receive_with_status(db, job_tx, app, p, IntakeMode::Triage).await
+                    {
+                        if created {
+                            stats.proposed += 1;
+                            proposed_new += 1;
+                            if issue.status == "triage" {
+                                fresh_ids.push(issue.id);
+                            }
                         }
                     }
                 }
@@ -181,5 +251,38 @@ pub async fn run_cycle(
         stats.discarded = denoise.discarded;
     }
 
+    // proposer 健康巡检：连续多轮失败 → 进收件箱提醒（避免深度提议器静默空转无人知）。
+    if cfg.proposer_enabled {
+        check_proposer_health(db, app).await;
+    }
+
+    // 记录本轮运行时间：下次调度据此按真实间隔计算，重启不再清零计时器。
+    // 仅真实运行的路径会到达这里（已在跑的并发轮在函数开头就提前返回）。
+    set_setting(db, "autosupply.last_run_at", &now_unix().to_string()).await;
+
     stats
+}
+
+/// proposer 健康巡检：最近多次结构化产出全部失败（status=error，多为模型工具调用格式不兼容
+/// 或 proposer 未绑定可用 LLM）→ 发 `AutosupplyDegraded` 进收件箱提醒操作者。
+/// 通知按 thread_key 折叠为一行，不会逐轮刷屏。
+async fn check_proposer_health(db: &Db, app: &AppHandle) {
+    const WINDOW: i64 = 6; // 巡检最近 6 次 proposer 产出
+    const MIN_STREAK: usize = 3; // 至少连续 3 次失败才告警，避免偶发抖动误报
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM agent_outputs WHERE role='proposer' ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(WINDOW)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if rows.len() >= MIN_STREAK && rows.iter().all(|s| s == "error") {
+        emit(
+            app,
+            AppEvent::AutosupplyDegraded {
+                reason: "最近多轮结构化产出解析失败（status=error）。常见原因：所选模型的工具调用格式不被支持，或 proposer 角色未绑定可用 LLM。建议改用支持原生 function-calling 的强推理模型。"
+                    .to_string(),
+            },
+        );
+    }
 }

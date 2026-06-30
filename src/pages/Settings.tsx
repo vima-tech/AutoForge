@@ -15,10 +15,11 @@ import {
   type ThemeMode, type ThemeSelection, type RailMode, type QuickCaptureShortcut, type ShortcutCombo,
 } from '../theme';
 import {
-  listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
+  listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection, setDefaultLlm,
+  bulkBindRoles, applyRolePreset,
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
-  getSystemHealth, checkClaudeAuth, updateConcurrencyConfig,
+  getSystemHealth, checkClaudeAuth, updateConcurrencyConfig, getConcurrencyConfig,
   listPreviewEnvironments, listTestSessions, listAdminDecisions, listJobFailures,
   getIntakeConfig, updateIntakeConfig, getWebhookStatus,
   listNotifyChannels, createNotifyChannel, updateNotifyChannel, deleteNotifyChannel, testNotifyChannel,
@@ -26,18 +27,20 @@ import {
   listAutoPassPolicy, getAutoPassEnabled, setAutoPassEnabled,
   getAutoConflictResolveEnabled, setAutoConflictResolveEnabled,
   getCustomMergeMessageEnabled, setCustomMergeMessageEnabled,
+  getParallelPremergeEnabled, setParallelPremergeEnabled,
   getKnowledgeSettings, setKnowledgeSettings,
   getKnowledgeEmbedding, setKnowledgeEmbedding,
   listProjects, selfUpdateStatus, selfUpdatePull, selfUpdatePending,
   getWebSearchSettings, setWebSearchSettings,
   getOpenDesignSettings, setOpenDesignSettings, getOpenDesignLog, type OpenDesignSettings,
   getAsrSettings, setAsrSettings, type AsrSettings as AsrSettingsT,
+  getMiniappDevtoolsPath, setMiniappDevtoolsPath,
   getAutosupplySettings, setAutosupplySettings, runAutosupplyNow, autosupplyIsRunning, type AutosupplySettings as AutosupplyT,
   getAutonomyLevel, setAutonomyLevel, type AutonomyLevel,
   listBuiltinTools, type BuiltinToolInfo,
   getSecretBackendStatus, type SecretBackend,
   exportConfig, importConfig, revealBackup, type BackupSummary, type ExportResult,
-  listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection,
+  listMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpConnection, discoverCodeIntelMap,
   type McpServer, type McpServerInput, type McpTransport,
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
@@ -46,7 +49,9 @@ import {
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
   type JobFailure,
   listCodeAgents, upsertCodeAgent, deleteCodeAgent, setDefaultCodeAgent,
-  setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT,
+  setProjectCodeAgent, checkCodeAgentAuth, type CodeAgent as CodeAgentT, type CodeAgentProbe,
+  listCodeAgentSkills, upsertCodeAgentSkill, deleteCodeAgentSkill,
+  type CodeAgentSkill as CodeAgentSkillT,
 } from '../services';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -104,7 +109,15 @@ function llmBindingState(llmId: string | null | undefined, llms: LlmRef[]): 'non
 // 下拉项标签：已停用的 LLM 追加标记，避免误选到不可用配置。
 const llmOptionLabel = (l: LlmRef) => l.enabled ? l.name : `${l.name}（已停用）`;
 
-function formatAgentSub(agent: Agent, llms: LlmRef[]) {
+function formatAgentSub(agent: Agent, llms: LlmRef[], codeAgents: CodeAgentT[] = []) {
+  // 编码 Agent 后端：成员由 CLI 只读跑仓库作答，副标题显示其后端而非 LLM。
+  const caId = agent.code_agent_id?.trim();
+  if (caId) {
+    const ca = codeAgents.find(c => c.id === caId);
+    return ca
+      ? `编码 Agent: ${ca.label}（${ca.kind}）${ca.enabled ? '' : ' · 已停用'}`
+      : `编码 Agent: ${caId}（配置缺失）`;
+  }
   if (!agent.llm_id) return 'LLM: 未指定 LLM';
   const m = llms.find(l => l.id === agent.llm_id);
   if (!m) return `LLM: ${agent.llm_id}（配置缺失）`;
@@ -173,6 +186,12 @@ function LLMSettings() {
     setConfigs(cs => cs.map(c => c.id === id ? updated : c));
   };
 
+  // 设为/取消全局默认 LLM：未显式绑定 LLM 的角色会回落到它，漏配不再致命。
+  const makeDefault = async (id: string, cur: boolean) => {
+    const next = await setDefaultLlm(cur ? '' : id);
+    setConfigs(next);
+  };
+
   const testConn = async (id: string) => {
     setTesting(id);
     setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
@@ -233,6 +252,7 @@ function LLMSettings() {
                 <div className="cfg-name">{v('name')}</div>
                 <div className="cfg-sub">{API_SPEC_LABEL[v('api_spec')] ?? v('api_spec')} · {v('model')}</div>
               </div>
+              {c.is_default && <span className="chip ember" title="未显式绑定 LLM 的角色会回落到此默认配置">★ 默认</span>}
               <span className={'chip ' + (c.enabled ? 'green' : '')}>{c.enabled ? '● 已启用' : '未启用'}</span>
               <Icon name={exp === c.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', marginLeft: 4 }} />
             </div>
@@ -280,6 +300,10 @@ function LLMSettings() {
                     <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>启用此连接</span>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(c.id)}><Icon name="trash" size={13} />删除</button>
+                      <button className="btn btn-sm" onClick={() => makeDefault(c.id, c.is_default)} disabled={!c.enabled}
+                        title={c.enabled ? '设为全局默认 LLM：未绑定 LLM 的角色自动回落到它' : '启用后才能设为默认'}>
+                        <Icon name="star" size={13} />{c.is_default ? '取消默认' : '设为默认'}
+                      </button>
                       <button className="btn btn-sm" onClick={() => testConn(c.id)} disabled={testing === c.id}>
                         <Icon name="zap" size={13} />{testing === c.id ? '测试中…' : '测试连接'}
                       </button>
@@ -412,9 +436,60 @@ function AsrSettings() {
   );
 }
 
+// ── 微信小程序预览（开发者工具 CLI 路径）─────────────────────────────────────
+// 档位 1（默认）：编译产物 + 手动用微信开发者工具打开；档位 2（本组件配置）：
+// 填 CLI 路径后，审核页编译成功自动 `cli open --project <产物目录>`，缺失/失败自动降级档位 1。
+function MiniappSettings() {
+  const [path, setPath] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { getMiniappDevtoolsPath().then(setPath).catch(e => setStatus(String(e))); }, []);
+
+  const save = async () => {
+    setBusy(true); setStatus('');
+    try { await setMiniappDevtoolsPath(path.trim()); setStatus('已保存'); }
+    catch (e) { setStatus(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const enabled = path.trim().length > 0;
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">小程序预览</div>
+      <div className="set-desc">微信小程序无法在浏览器内 iframe 预览。审核页对小程序 CR 提供<strong>一键编译</strong>（一次性 build，非 dev server）：编译产物目录可用<strong>微信开发者工具</strong>打开。此处可选填开发者工具 <strong>CLI 路径</strong>，填写后编译成功会自动用它打开产物目录（档位 2）；留空则仅提示产物路径手动打开（档位 1）。</div>
+
+      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+        <div className="cfg-top" style={{ gap: 10 }}>
+          <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="box" size={15} /></div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">微信开发者工具 · CLI</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>PREVIEW</span>
+            </div>
+            <div className="cfg-sub">编译成功后自动打开产物目录（可选）</div>
+          </div>
+          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '自动打开' : '手动打开'}</span>
+        </div>
+
+        <div className="cfg-fields rise" style={{ marginTop: 14 }}>
+          <div className="field full"><label>开发者工具 CLI 路径（可空）</label>
+            <input type="text" className="mono" value={path}
+              placeholder="如 /Applications/wechatwebdevtools.app/Contents/MacOS/cli"
+              onChange={e => setPath(e.target.value)} />
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy} onClick={save}><Icon name="check" size={14} />保存</button>
+            {status && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{status}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── 工厂自喂料（autosupply）设置 ──────────────────────────────────────────────
 function AutosupplySettings() {
-  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20, analyze_enabled: true, triage_enabled: true });
+  const [cfg, setCfg] = useState<AutosupplyT>({ enabled: false, interval_min: 1440, scan_enabled: true, proposer_enabled: false, max_per_run: 20, proposer_max_per_run: 8, min_severity: 'low', analyze_enabled: true, triage_enabled: true });
   const [level, setLevel] = useState<AutonomyLevel>('strict');
   const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
@@ -427,7 +502,7 @@ function AutosupplySettings() {
     // 并订阅 AutosupplyStatus 事件实时跟随开始/结束（手动或周期调度均覆盖）。
     autosupplyIsRunning().then(setRunning).catch(() => {});
     let unlisten: (() => void) | undefined;
-    listen<{ type?: string; running?: boolean }>('AutoForge://event', e => {
+    listen<{ type?: string; running?: boolean }>('autoforge://event', e => {
       if (e.payload?.type === 'autosupply_status') setRunning(!!e.payload.running);
     }).then(fn => { unlisten = fn; });
     return () => { unlisten?.(); };
@@ -481,10 +556,20 @@ function AutosupplySettings() {
               onChange={e => setCfg(c => ({ ...c, interval_min: Math.max(5, Number(e.target.value) || 1440) }))}
               onBlur={() => save(cfg)} />
           </div>
-          <div className="field"><label>每轮入池上限</label>
+          <div className="field"><label>扫描每轮入池上限</label>
             <input type="number" min="1" max="200" value={cfg.max_per_run}
               onChange={e => setCfg(c => ({ ...c, max_per_run: Math.max(1, Math.min(200, Number(e.target.value) || 20)) }))}
               onBlur={() => save(cfg)} />
+          </div>
+          <div className="field"><label>严重度门槛</label>
+            <Select value={cfg.min_severity} onChange={v => save({ ...cfg, min_severity: v })}
+              options={[
+                { value: 'low', label: '全部（low+，不过滤）' },
+                { value: 'medium', label: 'medium 及以上（滤掉皮毛）' },
+                { value: 'high', label: 'high 及以上（只要要紧的）' },
+                { value: 'critical', label: '仅 critical（最严苛）' },
+              ]} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 6 }}>低于此级别的产物入池前丢弃，进一步压制 linter 噪音。</span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
             <Switch on={cfg.scan_enabled} onToggle={() => save({ ...cfg, scan_enabled: !cfg.scan_enabled })} />
@@ -500,8 +585,16 @@ function AutosupplySettings() {
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12, margin: 0 }}>
             <Switch on={cfg.proposer_enabled} onToggle={() => save({ ...cfg, proposer_enabled: !cfg.proposer_enabled })} />
-            <span>proposer 工程提议<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（默认关，需绑定 proposer 角色 LLM）</span></span>
+            <span>proposer 深度审计提议<span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>（资深代码审计师，找 linter 发现不了的深层问题；独立预算，不被扫描挤占；建议绑定强模型）</span></span>
           </div>
+          {cfg.proposer_enabled && (
+            <div className="field"><label>proposer 每轮上限（独立预算）</label>
+              <input type="number" min="1" max="50" value={cfg.proposer_max_per_run}
+                onChange={e => setCfg(c => ({ ...c, proposer_max_per_run: Math.max(1, Math.min(50, Number(e.target.value) || 8)) }))}
+                onBlur={() => save(cfg)} />
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 6 }}>与扫描预算分开计；确定性扫描不再饿死深度提议。</span>
+            </div>
+          )}
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 4 }}>
             <button className="btn" disabled={running} onClick={runNow}>
               <Icon name="refresh" size={14} style={{ animation: running ? 'spin 1s linear infinite' : undefined }} />{running ? '运行中…' : '立即跑一轮'}
@@ -515,25 +608,30 @@ function AutosupplySettings() {
 }
 
 function ToolsSettings() {
-  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false, fetch_content: false });
-  const [apiKey, setApiKey] = useState('');
+  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false, tavily_key_set: false, brave_key_set: false, multi_source: true, fetch_content: false });
+  const [tavilyKey, setTavilyKey] = useState('');
+  const [braveKey, setBraveKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
+  const [open, setOpen] = useState(false); // 默认折叠，节省高度
 
   useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
 
-  // 生效 provider：未配置/配置不全一律退回免 Key 的 DuckDuckGo，故默认始终可用。
-  const eff = ws.provider || 'duckduckgo';
-  const enabled =
-    eff === 'duckduckgo' ||
-    (eff === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
-    (eff === 'searxng' && ws.endpoint.trim().length > 0);
+  // DuckDuckGo 始终兜底，故联网搜索始终可用；强源数量决定多源 fan-out 的广度。
+  const tavilyOn = ws.tavily_key_set || tavilyKey.trim().length > 0;
+  const braveOn = ws.brave_key_set || braveKey.trim().length > 0;
+  const searxOn = ws.endpoint.trim().length > 0;
+  const premiumCount = [tavilyOn, braveOn, searxOn].filter(Boolean).length;
 
   const save = async () => {
     setBusy(true);
     try {
-      const r = await setWebSearchSettings(ws.provider || 'duckduckgo', ws.endpoint, ws.max_results, apiKey.trim() || undefined, ws.fetch_content);
-      setWs(r); setApiKey(''); setStatus('已保存');
+      const r = await setWebSearchSettings({
+        provider: ws.provider || 'duckduckgo', endpoint: ws.endpoint, max_results: ws.max_results,
+        tavily_key: tavilyKey.trim() || undefined, brave_key: braveKey.trim() || undefined,
+        multi_source: ws.multi_source, fetch_content: ws.fetch_content,
+      });
+      setWs(r); setTavilyKey(''); setBraveKey(''); setStatus('已保存');
     } catch (e) { setStatus(String(e)); }
     finally { setBusy(false); }
   };
@@ -543,44 +641,56 @@ function ToolsSettings() {
       <div className="set-h">工具 & MCP</div>
       <div className="set-desc">为 Agent 启用外部工具。工具结果视为不可信外部输入，回灌上下文前自动过安全过滤。仅 OpenAI 兼容 / Anthropic 接口规范的 LLM 支持工具调用。</div>
 
-      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
-        <div className="cfg-top" style={{ gap: 10 }}>
+      <div className="cfg-card" style={{ borderColor: 'var(--ember-tint-strong)' }}>
+        <div className="cfg-top" style={{ gap: 10, cursor: 'pointer', userSelect: 'none' }} onClick={() => setOpen(o => !o)}>
           <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="search" size={15} /></div>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search / deep_research</span>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>TOOL</span>
             </div>
-            <div className="cfg-sub">原生免 Key 联网搜索（DuckDuckGo），可选搜索后自动读取正文</div>
+            <div className="cfg-sub">多源并行检索（DuckDuckGo{premiumCount > 0 ? ` + ${premiumCount} 强源` : ''}）· 深度研究 · 可选自动读取正文</div>
           </div>
-          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
+          <span className="chip green" style={{ flexShrink: 0 }}>{ws.multi_source && premiumCount > 0 ? '多源并行' : '已启用'}</span>
+          <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
         </div>
 
+        {open && (
         <div className="cfg-fields rise" style={{ marginTop: 14 }}>
-          <div className="field"><label>搜索 Provider</label>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button type="button" className={`switch${ws.multi_source ? ' on' : ''}`} role="switch" aria-checked={ws.multi_source}
+              onClick={() => setWs(w => ({ ...w, multi_source: !w.multi_source }))}><i /></button>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--text-control)' }}>多源并行检索</div>
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>开启后每次查询并行打所有已配置的源（DDG 永远兜底），跨源去重并按相关性重排；关闭则只用下方首选源。</div>
+            </div>
+          </div>
+          <div className="field"><label>首选源（多源关闭时生效）</label>
             <Select value={ws.provider || 'duckduckgo'} onChange={val => setWs(w => ({ ...w, provider: val }))}
               options={[
                 { value: 'duckduckgo', label: 'DuckDuckGo（免 Key · 默认）' },
                 { value: 'searxng', label: 'SearXNG（自托管，无需 Key）' },
                 { value: 'tavily', label: 'Tavily（需 API Key）' },
+                { value: 'brave', label: 'Brave（需 API Key）' },
               ]} />
           </div>
           <div className="field"><label>返回结果数</label>
             <input type="number" min="1" max="10" value={ws.max_results}
               onChange={e => setWs(w => ({ ...w, max_results: Math.max(1, Math.min(10, Number(e.target.value) || 5)) }))} />
           </div>
-          {ws.provider === 'searxng' && (
-            <div className="field full"><label>SearXNG Endpoint</label>
-              <input type="text" className="mono" value={ws.endpoint} placeholder="https://searx.example.com"
-                onChange={e => setWs(w => ({ ...w, endpoint: e.target.value }))} />
-            </div>
-          )}
-          {ws.provider === 'tavily' && (
-            <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Tavily API Key</label>
-              <input type="password" className="mono" value={apiKey}
-                placeholder={ws.api_key_set ? '已设置（留空则不修改）' : 'tvly-...'}
-                onChange={e => setApiKey(e.target.value)} />
-            </div>
-          )}
+          <div className="field full"><label>SearXNG Endpoint（可选，自托管免 Key）</label>
+            <input type="text" className="mono" value={ws.endpoint} placeholder="https://searx.example.com"
+              onChange={e => setWs(w => ({ ...w, endpoint: e.target.value }))} />
+          </div>
+          <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Tavily API Key（可选，advanced 深度 + 摘要）</label>
+            <input type="password" className="mono" value={tavilyKey}
+              placeholder={ws.tavily_key_set ? '已设置（留空则不修改）' : 'tvly-...'}
+              onChange={e => setTavilyKey(e.target.value)} />
+          </div>
+          <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Brave Search API Key（可选，独立索引）</label>
+            <input type="password" className="mono" value={braveKey}
+              placeholder={ws.brave_key_set ? '已设置（留空则不修改）' : 'BSA...'}
+              onChange={e => setBraveKey(e.target.value)} />
+          </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button type="button" className={`switch${ws.fetch_content ? ' on' : ''}`} role="switch" aria-checked={ws.fetch_content}
               onClick={() => setWs(w => ({ ...w, fetch_content: !w.fetch_content }))}><i /></button>
@@ -595,10 +705,13 @@ function ToolsSettings() {
           </div>
           <div className="field full">
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
-              默认走 DuckDuckGo，无需任何配置即可联网搜索。需在「角色 Agent / 自定义 Agent」能力中勾选 web_search / web_fetch 的 Agent 才会实际调用对应工具。
+              默认走 DuckDuckGo，无需任何配置即可联网搜索；配置 Tavily/Brave/SearXNG 后多源并行提升质量。
+              <b>deep_research</b> 会自动拆解子问题、多源调研、精读多个来源并综合为带引用的简报（需在 Agent 能力中勾选）。
+              需在「角色 Agent / 自定义 Agent」能力中勾选 web_search / web_fetch / deep_research 的 Agent 才会实际调用对应工具。
             </span>
           </div>
         </div>
+        )}
       </div>
 
       <OpenDesignSettingsCard />
@@ -614,6 +727,7 @@ function OpenDesignSettingsCard() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [log, setLog] = useState('');
+  const [open, setOpen] = useState(false); // 默认折叠，节省高度
 
   useEffect(() => { getOpenDesignSettings().then(setOd).catch(e => setStatus(String(e))); }, []);
 
@@ -633,7 +747,7 @@ function OpenDesignSettingsCard() {
 
   return (
     <div className="cfg-card" style={{ marginTop: 14 }}>
-      <div className="cfg-top" style={{ gap: 10 }}>
+      <div className="cfg-top" style={{ gap: 10, cursor: 'pointer', userSelect: 'none' }} onClick={() => setOpen(o => !o)}>
         <div className="cfg-logo" style={{ background: 'var(--violet)', width: 28, height: 28 }}><Icon name="palette" size={15} /></div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="cfg-name cfg-name-line"><span className="cfg-name-text">OpenDesign · 本地服务</span>
@@ -641,8 +755,10 @@ function OpenDesignSettingsCard() {
           </div>
           <div className="cfg-sub">默认自动拉起：检测本地 open-design 检出（无则克隆）→ pnpm install → tools-dev 启动，就绪后打开浏览器</div>
         </div>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
 
+      {open && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field full"><label>本地检出路径（可选）</label>
           <input type="text" className="mono" value={od.repo_path} placeholder="留空则自动探测 ~/projects/open-design 等，找不到再克隆到自管目录"
@@ -672,9 +788,17 @@ function OpenDesignSettingsCard() {
           </span>
         </div>
       </div>
+      )}
     </div>
   );
 }
+
+// 代码情报默认能力映射（codegraph）。「填入默认」按钮用，也是占位提示。
+const CODEGRAPH_CAP_PRESET = JSON.stringify({
+  locate_symbol: { tool: 'codegraph_search', args: { query: '$SYMBOL', projectPath: '$REPO', limit: 1 } },
+  find_callers: { tool: 'codegraph_callers', args: { symbol: '$SYMBOL', projectPath: '$REPO', limit: 5 } },
+  impact_analysis: { tool: 'codegraph_impact', args: { symbol: '$SYMBOL', projectPath: '$REPO', depth: 2 } },
+}, null, 2);
 
 function McpServers() {
   const [servers, setServers] = useState<McpServer[]>([]);
@@ -684,6 +808,11 @@ function McpServers() {
   const [test, setTest] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  // 代码情报「高级设置（能力映射）」的展开态——默认折叠，留空即走约定，无需展开。
+  const [advExp, setAdvExp] = useState<Set<string>>(new Set());
+  const toggleAdv = (id: string) => setAdvExp(prev => {
+    const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n;
+  });
 
   const reload = () => Promise.all([listMcpServers(), listAgents()])
     .then(([s, a]) => { setServers(s); setAgents(a); })
@@ -705,12 +834,24 @@ function McpServers() {
     setDraft(s.id, 'agent_ids_json', JSON.stringify([...cur]));
   };
 
+  // 能力映射是否「未填写」（空 / {} / 纯空白）。
+  const mapIsEmpty = (m?: string | null) => !m || ['', '{}'].includes(m.trim());
+
   const save = async (id: string) => {
     const d = drafts[id] ?? {};
     if (Object.keys(d).length === 0) { setExp(null); return; }
     setBusy(id);
     try {
-      const updated = await updateMcpServer(id, d);
+      let updated = await updateMcpServer(id, d);
+      // 适用于编码 Agent 且能力映射未填写：保存后按约定发现并回填持久化（用刚存的最新配置连接）。
+      if (updated.for_code_agent && mapIsEmpty(updated.capability_map_json)) {
+        const m = await discoverCodeIntelMap(id).catch(() => '{}');
+        if (!mapIsEmpty(m)) {
+          updated = await updateMcpServer(id, { capability_map_json: m });
+          setAdvExp(prev => new Set(prev).add(id));
+          setTest(t => ({ ...t, [id]: '✓ 已按约定发现并填入能力映射' }));
+        }
+      }
       setServers(ss => ss.map(s => s.id === id ? updated : s));
       setDrafts(x => { const n = { ...x }; delete n[id]; return n; });
     } catch (e) { setTest(t => ({ ...t, [id]: '保存失败: ' + String(e) })); }
@@ -730,6 +871,18 @@ function McpServers() {
     try {
       const tools = await testMcpConnection(id);
       setTest(t => ({ ...t, [id]: tools.length ? `✓ 发现 ${tools.length} 个工具：${tools.join(', ')}` : '✓ 已连接，但无工具' }));
+      // 适用于编码 Agent 且能力映射未填写：按约定发现并填入草稿（供检查后保存）。
+      const sv = servers.find(x => x.id === id); const dr = drafts[id] ?? {};
+      const forCodeNow = Boolean(dr.for_code_agent ?? sv?.for_code_agent ?? false);
+      const curMap = String(dr.capability_map_json ?? sv?.capability_map_json ?? '');
+      if (forCodeNow && mapIsEmpty(curMap)) {
+        const m = await discoverCodeIntelMap(id).catch(() => '{}');
+        if (!mapIsEmpty(m)) {
+          setDraft(id, 'capability_map_json', m);
+          setAdvExp(prev => new Set(prev).add(id));
+          setTest(t => ({ ...t, [id]: (t[id] ?? '') + '　·　已按约定填入能力映射，检查后保存生效' }));
+        }
+      }
     } catch (e) { setTest(t => ({ ...t, [id]: '✗ ' + String(e) })); }
     finally { setBusy(null); }
   };
@@ -738,11 +891,12 @@ function McpServers() {
     <div style={{ marginTop: 22 }}>
       {confirmDel && <ConfirmModal msg="确认删除此 MCP Server？" onOk={() => doDelete(confirmDel)} onCancel={() => setConfirmDel(null)} />}
       <div className="set-h" style={{ fontSize: 'var(--text-section)' }}>MCP Servers</div>
-      <div className="set-desc">接入外部 MCP 工具生态。每个 server 勾选适用的 Agent —— 仅被勾选的 Agent 会加载其工具。MCP 工具结果同样过安全过滤。</div>
+      <div className="set-desc">接入外部 MCP 工具生态。每个 server 的适用面有两个正交维度，可同时开启：勾选「角色 Agent」让会议室 Agent 调用其工具；开「适用于编码 Agent」让编码 Agent 在 worktree 内实时调用本 server 工具（pull），并对含代码情报能力的 server 额外做执行前预查（push）。MCP 工具结果同样过安全过滤。</div>
 
       {servers.map(s => {
         const d = drafts[s.id] ?? {};
         const transport = String(val(s, d, 'transport') ?? 'stdio') as McpTransport;
+        const forCode = Boolean(val(s, d, 'for_code_agent') ?? false);
         const scoped = scopedAgents(s, d);
         const en = Boolean(d.enabled ?? s.enabled);
         return (
@@ -753,7 +907,7 @@ function McpServers() {
                 <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{String(val(s, d, 'name') ?? '')}</span>
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>{transport.toUpperCase()}</span>
                 </div>
-                <div className="cfg-sub">{scoped.length ? `适用 ${scoped.length} 个 Agent` : '未勾选任何 Agent'}</div>
+                <div className="cfg-sub">{[scoped.length ? `${scoped.length} 个角色 Agent` : '', forCode ? '编码 Agent' : ''].filter(Boolean).join(' · ') || '未启用任何适用面'}</div>
               </div>
               <span className={'chip ' + (en ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{en ? '已启用' : '未启用'}</span>
               <Icon name={exp === s.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)' }} />
@@ -766,6 +920,15 @@ function McpServers() {
                 <div className="field"><label>传输方式</label>
                   <Select value={transport} onChange={v => setDraft(s.id, 'transport', v)}
                     options={[{ value: 'stdio', label: 'stdio（本地子进程）' }, { value: 'http', label: 'HTTP（远程 streamable）' }]} />
+                </div>
+                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  <Switch on={forCode} onToggle={() => setDraft(s.id, 'for_code_agent', !forCode)} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)' }}>适用于编码 Agent</div>
+                    <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                      开启后本 server 对编码 Agent 生效，两条机制：①<b>实时调用（pull）</b>——工具注入 CLI，agent 在 worktree 内自主调用任意 MCP 工具（claude 完整支持 / codex 实验性 / opencode 暂不支持）；②<b>代码情报预查（push）</b>——若含 locate_symbol 等能力，执行前预查并注入 prompt。与下方「角色 Agent」正交，可同时开。
+                    </div>
+                  </div>
                 </div>
                 {transport === 'stdio' ? (<>
                   <div className="field full"><label>启动命令 command</label>
@@ -790,7 +953,31 @@ function McpServers() {
                       onChange={e => setDraft(s.id, 'headers_json', e.target.value)} />
                   </div>
                 </>)}
-                <div className="field full"><label>适用 Agent（勾选后该 Agent 加载本 server 的工具）</label>
+                {forCode && (
+                  <div className="field full">
+                    <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                      编码 Agent 的代码情报由 AutoForge 在执行前 push 式调用并注入实现 prompt，三家 code agent 一致受益。
+                      默认按工具命名自动发现（codegraph 等常见工具无需任何配置）；仅非常规工具才需在下方手动指定映射。
+                    </span>
+                    <button type="button" className="btn btn-sm btn-ghost" style={{ alignSelf: 'flex-start', marginTop: 6 }}
+                      onClick={() => toggleAdv(s.id)}>
+                      <Icon name={advExp.has(s.id) ? 'chevDown' : 'chevRight'} size={13} />高级：自定义能力映射
+                    </button>
+                    {advExp.has(s.id) && (
+                      <div style={{ marginTop: 8 }}>
+                        <label style={{ marginBottom: 8 }}>能力映射 capability_map（可选，留空自动按工具命名约定发现；占位符 $SYMBOL / $REPO）</label>
+                        <textarea className="mono" rows={6} style={{ resize: 'vertical', width: '100%' }}
+                          value={String(val(s, d, 'capability_map_json') ?? '{}')}
+                          placeholder={`格式示例（仅 codegraph）：\n${CODEGRAPH_CAP_PRESET}`}
+                          onChange={e => setDraft(s.id, 'capability_map_json', e.target.value)} />
+                        <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>
+                          locate_symbol / find_callers → 各自的工具名 + 参数。$SYMBOL 替换为符号名、$REPO 替换为主仓路径。
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="field full"><label>适用的角色 Agent（勾选后该会议室 Agent 加载本 server 的工具，pull 式直接调用）</label>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '6px 0' }}>
                     {agents.length === 0 && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>暂无 Agent</span>}
                     {agents.map(a => {
@@ -829,6 +1016,7 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [hideIds, setHideIds] = useState<Set<string>>(new Set());
   const [llmNames, setLlmNames] = useState<LlmRef[]>([]);
+  const [codeAgents, setCodeAgents] = useState<CodeAgentT[]>([]);
   const [exp, setExp] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Partial<Agent>>>({});
   const [saveStatus, setSaveStatus] = useState<Record<string, string>>({});
@@ -836,12 +1024,14 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
   const [loading, setLoading] = useState(true);
 
   const reload = () =>
-    Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog()]).then(([ags, llms, cat]) => {
-      setAgents(ags);
-      setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
-      setLlmNames(llms.map(l => ({ id: l.id, name: l.name, enabled: l.enabled })));
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    Promise.all([listAgents(), listLlmConfigs(), listRoleCatalog(), listCodeAgents()])
+      .then(([ags, llms, cat, cas]) => {
+        setAgents(ags);
+        setHideIds(new Set(cat.map(s => s.holder?.id).filter(Boolean) as string[]));
+        setLlmNames(llms.map(l => ({ id: l.id, name: l.name, enabled: l.enabled })));
+        setCodeAgents(cas);
+        setLoading(false);
+      }).catch(() => setLoading(false));
 
   useEffect(() => { reload(); }, []);
 
@@ -898,9 +1088,11 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
               <Avatar agent={a} size={32} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="cfg-name cfg-name-line"><span className="cfg-name-text">{v('name')}</span></div>
-                <div className="cfg-sub">{formatAgentSub(a, llmNames)}</div>
+                <div className="cfg-sub">{formatAgentSub(a, llmNames, codeAgents)}</div>
               </div>
               {(() => {
+                // 编码 Agent 后端成员不绑 LLM，不显示 LLM 缺失/停用告警。
+                if (a.code_agent_id?.trim()) return null;
                 const st = llmBindingState(a.llm_id, llmNames);
                 if (!a.enabled || st === 'ok' || st === 'none') return null;
                 return <span className="chip red" style={{ flexShrink: 0, fontSize: 'var(--text-micro)', padding: '1px 6px' }}
@@ -915,12 +1107,44 @@ function CustomAgents({ onChanged }: { onChanged: () => void }) {
                   <div className="field"><label>名称</label>
                     <input value={v('name')} onChange={e => setDraft(a.id, 'name', e.target.value)} />
                   </div>
-                  <div className="field"><label>使用的 LLM</label>
-                    <Select
-                      value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
-                      onChange={val => setDraft(a.id, 'llm_id', val || null)}
-                      options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]} />
-                  </div>
+                  {(() => {
+                    const curCa = d.code_agent_id !== undefined ? (d.code_agent_id ?? '') : (a.code_agent_id ?? '');
+                    const backend = curCa ? 'code_agent' : 'llm';
+                    return <>
+                      <div className="field"><label>后端</label>
+                        <div className="seg">
+                          {/* 清空发空串 ''（→ Some(Some(""))）才能触发后端 NULL 分支；发 null 会被 serde 当「不改」。 */}
+                          <button className={backend === 'llm' ? 'on' : ''}
+                            onClick={() => setDraft(a.id, 'code_agent_id', '')}>LLM 配置</button>
+                          <button className={backend === 'code_agent' ? 'on' : ''} disabled={!codeAgents.length}
+                            title={!codeAgents.length ? '请先在「编码 Agent」标签页新增并启用一个编码 Agent' : '该成员改由编码 Agent(CLI) 只读跑项目仓库作答（仅绑定项目的群聊中生效）'}
+                            onClick={() => setDraft(a.id, 'code_agent_id', curCa || codeAgents[0]?.id || '')}>编码 Agent (CLI)</button>
+                        </div>
+                      </div>
+                      {backend === 'llm' ? (
+                        <div className="field"><label>使用的 LLM</label>
+                          <Select
+                            value={d.llm_id !== undefined ? String(d.llm_id ?? '') : (a.llm_id ?? '')}
+                            onChange={val => setDraft(a.id, 'llm_id', val || null)}
+                            options={[{ value: '', label: '— 未指定 —' }, ...llmNames.map(l => ({ value: l.id, label: llmOptionLabel(l) }))]} />
+                        </div>
+                      ) : (
+                        <div className="field"><label>编码 Agent</label>
+                          <Select
+                            value={curCa}
+                            onChange={val => setDraft(a.id, 'code_agent_id', val || codeAgents[0]?.id || '')}
+                            options={codeAgents.map(c => ({ value: c.id, label: `${c.label}（${c.kind}）${c.enabled ? '' : ' · 已停用'}` }))} />
+                        </div>
+                      )}
+                      {backend === 'code_agent' && (
+                        <div className="field full">
+                          <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                            编码 Agent 成员只在**绑定项目**的群聊中、被 @ 点名时作答：只读读取该项目仓库的真实代码来回答（不改任何文件、不参与自动选人）。
+                          </span>
+                        </div>
+                      )}
+                    </>;
+                  })()}
                   <div className="field full"><label>职责标签</label>
                     <input value={v('role')} onChange={e => setDraft(a.id, 'role', e.target.value)} />
                   </div>
@@ -1071,6 +1295,18 @@ function RoleSlotCard({ slot, llms, onApply }: {
         <span className={'chip ' + status.c} style={{ flexShrink: 0 }}>{status.t}</span>
         <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
       </div>
+      {open && slot.usage && (
+        <div className="rise" style={{
+          display: 'flex', alignItems: 'center', gap: 6, marginTop: 10,
+          padding: '4px 9px', borderRadius: 'var(--radius-sm)',
+          background: 'var(--ember-tint)', color: 'var(--text-2)',
+          fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-snug)',
+        }} title="该角色 LLM 在产品里被实际调用的位置">
+          <Icon name="at" size={12} style={{ color: 'var(--ember)', flexShrink: 0 }} />
+          <span style={{ color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.1em', flexShrink: 0 }}>用于</span>
+          <span style={{ minWidth: 0 }}>{slot.usage}</span>
+        </div>
+      )}
       {open && slot.llm_only && (
       <div className="cfg-fields rise" style={{ marginTop: 14 }}>
         <div className="field full"><label>使用的 LLM</label>
@@ -1209,6 +1445,93 @@ function EmbeddingConfigCard() {
   );
 }
 
+// 一键配置：把所有系统角色一次性绑定到 LLM，免去逐角色展开下拉。
+// uniform=全部同一模型；tiered=重角色配强模型、轻角色配快模型（与编码 Agent 的快/强分级同构）。
+function OneClickRolesCard({ llms, onApplied, onError }: {
+  llms: LlmRef[];
+  onApplied: (next: RoleSlot[]) => void;
+  onError: (msg: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<'uniform' | 'tiered'>('uniform');
+  const [uniLlm, setUniLlm] = useState('');
+  const [fastLlm, setFastLlm] = useState('');
+  const [strongLlm, setStrongLlm] = useState('');
+  const [overwrite, setOverwrite] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [okMsg, setOkMsg] = useState('');
+
+  // 仅可用（已启用）的 LLM 才能作为绑定目标。
+  const opts = llms.filter(l => l.enabled).map(l => ({ value: l.id, label: l.name }));
+  const canRun = mode === 'uniform' ? !!uniLlm : (!!fastLlm && !!strongLlm);
+
+  const run = async () => {
+    setBusy(true); onError(''); setOkMsg('');
+    try {
+      const next = mode === 'uniform'
+        ? await bulkBindRoles(uniLlm, overwrite)
+        : await applyRolePreset(fastLlm, strongLlm, overwrite);
+      onApplied(next);
+      setOkMsg(overwrite ? '已强制套用到全部角色' : '已套用到所有未配置角色');
+      setTimeout(() => setOkMsg(''), 2800);
+    } catch (e) { onError(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <div className="panel-head" onClick={() => setOpen(v => !v)} style={{ cursor: 'pointer' }}>
+        <div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />一键配置 · 铺满所有角色</div>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={16} style={{ color: 'var(--text-3)' }} />
+      </div>
+      {open && (
+        <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {opts.length === 0 ? (
+            <div className="chip amber"><Icon name="alert" size={12} />请先在「LLM 配置」添加并启用至少一个 LLM</div>
+          ) : (
+            <>
+              <div className="seg" style={{ alignSelf: 'flex-start' }}>
+                <button className={mode === 'uniform' ? 'on' : ''} onClick={() => setMode('uniform')}>全部同一模型</button>
+                <button className={mode === 'tiered' ? 'on' : ''} onClick={() => setMode('tiered')}>分级 · 快/强</button>
+              </div>
+              {mode === 'uniform' ? (
+                <div className="field full">
+                  <label>套用到全部角色的 LLM</label>
+                  <Select value={uniLlm} onChange={setUniLlm} options={opts} placeholder="选择一个 LLM" />
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  <div className="field">
+                    <label>快模型 · 轻角色</label>
+                    <Select value={fastLlm} onChange={setFastLlm} options={opts} placeholder="编排/整理/文档…" />
+                  </div>
+                  <div className="field">
+                    <label>强模型 · 重角色</label>
+                    <Select value={strongLlm} onChange={setStrongLlm} options={opts} placeholder="分析/安全/分级…" />
+                  </div>
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Switch on={overwrite} onToggle={() => setOverwrite(v => !v)} />
+                <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>
+                  覆盖已绑定的角色{overwrite ? '（强制全部改绑）' : '（默认只补未配置的角色）'}
+                </span>
+                <button className="btn btn-primary btn-sm" onClick={run} disabled={!canRun || busy}>
+                  <Icon name="zap" size={13} />{busy ? '套用中…' : '铺满所有角色'}
+                </button>
+              </div>
+              {okMsg && <div className="chip green" style={{ alignSelf: 'flex-start' }}><Icon name="check" size={12} />{okMsg}</div>}
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', lineHeight: 'var(--leading-normal)' }}>
+                提示：在「LLM 配置」给某个 LLM 点「设为默认」后，未显式绑定 LLM 的角色会自动回落到它——即便漏配也不会让对应链路失效。
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   const [slots, setSlots] = useState<RoleSlot[]>([]);
   const [llms, setLlms] = useState<LlmRef[]>([]);
@@ -1232,6 +1555,11 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   return (
     <div>
       {err && <div className="chip red" style={{ marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
+      <OneClickRolesCard
+        llms={llms}
+        onApplied={next => { setSlots(next); void refreshAgents(); onChanged(); }}
+        onError={setErr}
+      />
       {ROLE_GROUPS.map(g => {
         const rows = slots.filter(s => s.group === g.id);
         if (rows.length === 0) return null;
@@ -1288,7 +1616,7 @@ function RolesPage() {
   );
 }
 
-interface CodeAgentDraft { kind: string; label: string; program: string; model: string; extra: string; enabled: boolean; }
+interface CodeAgentDraft { kind: string; label: string; program: string; model: string; fast_model: string; strong_model: string; extra: string; enabled: boolean; }
 const CODE_AGENT_KINDS = [
   { value: 'claude', label: 'claude（Claude Code）' },
   { value: 'codex', label: 'codex（Codex CLI）' },
@@ -1298,7 +1626,8 @@ const CODE_AGENT_KINDS = [
 function CodeAgentSettings() {
   const [agents, setAgents] = useState<CodeAgentT[]>([]);
   const [drafts, setDrafts] = useState<Record<string, CodeAgentDraft>>({});
-  const [auth, setAuth] = useState<Record<string, boolean | null | 'loading'>>({});
+  // 'loading' = 探测中；CodeAgentProbe = 探测结果；null = 调用失败；undefined = 未检测。
+  const [auth, setAuth] = useState<Record<string, CodeAgentProbe | null | 'loading'>>({});
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState('');
   // 默认全部折叠，只显示头部摘要；点击头部展开编辑。
@@ -1312,7 +1641,7 @@ function CodeAgentSettings() {
   const toDraft = (a: CodeAgentT): CodeAgentDraft => {
     let extra: string[] = [];
     try { extra = JSON.parse(a.extra_args_json || '[]'); } catch { extra = []; }
-    return { kind: a.kind, label: a.label, program: a.program, model: a.model ?? '', extra: extra.join(' '), enabled: a.enabled };
+    return { kind: a.kind, label: a.label, program: a.program, model: a.model ?? '', fast_model: a.fast_model ?? '', strong_model: a.strong_model ?? '', extra: extra.join(' '), enabled: a.enabled };
   };
 
   const load = (autoCheck = false) => {
@@ -1322,8 +1651,9 @@ function CodeAgentSettings() {
         setAgents(list);
         setDrafts(Object.fromEntries(list.map(a => [a.id, toDraft(a)])));
         // 进入页面自动检测每个 agent 的可用性，避免一直停在「未检测」。
+        // 自动检测只验证工具（轻量、不烧 token）；模型探测留给手动「检测可用性」按钮。
         // 检测命令走进程组隔离（detach_process_group），可安全在此调用。
-        if (autoCheck) list.forEach(a => checkAuth(a.id));
+        if (autoCheck) list.forEach(a => checkAuth(a.id, false));
       })
       .catch(() => setAgents([]))
       .finally(() => setLoading(false));
@@ -1344,6 +1674,7 @@ function CodeAgentSettings() {
       await upsertCodeAgent({
         id: a.id, kind: d.kind, label: d.label.trim() || d.kind,
         program: d.program.trim() || d.kind, model: d.model.trim() || null,
+        fast_model: d.fast_model.trim() || null, strong_model: d.strong_model.trim() || null,
         extra_args: d.extra.split(/\s+/).filter(Boolean), enabled: d.enabled,
       });
       setMsg(`已保存 ${d.label || a.kind}`);
@@ -1358,9 +1689,11 @@ function CodeAgentSettings() {
     try { await deleteCodeAgent(a.id); load(); } catch (e) { setMsg(String(e)); }
   };
 
-  const checkAuth = async (id: string) => {
+  // probeModel=true 时额外用配置的模型发极小 prompt 验证模型本身可用（慢几秒）；
+  // 自动检测传 false 只验证工具。
+  const checkAuth = async (id: string, probeModel = false) => {
     setAuth(s => ({ ...s, [id]: 'loading' }));
-    try { const ok = await checkCodeAgentAuth(id); setAuth(s => ({ ...s, [id]: ok })); }
+    try { const r = await checkCodeAgentAuth(id, probeModel); setAuth(s => ({ ...s, [id]: r })); }
     catch { setAuth(s => ({ ...s, [id]: null })); }
   };
 
@@ -1379,6 +1712,8 @@ function CodeAgentSettings() {
       <div className="set-desc">
         选择驱动「代码实现」与「AI 解冲突」的 CLI 编码 agent。所有 agent 都在隔离 worktree 内执行，
         并被统一禁止 remote git 操作。项目可在「项目管理」单独覆盖；未覆盖时跟随这里的全局默认。
+        配了「快模型 / 强模型」后，系统会按分析阶段的风险（影响半径 / 文件数 / 复杂度）自动挑选：
+        低风险小改动走快模型省时省钱，跨模块或复杂改动走强模型保质量；留空则一律用上方默认模型。
       </div>
 
       <div className="cfg-card" style={{ marginBottom: 16 }}>
@@ -1394,8 +1729,11 @@ function CodeAgentSettings() {
       ) : agents.map(a => {
         const d = drafts[a.id]; if (!d) return null;
         const st = auth[a.id];
-        const dotColor = st === true ? 'var(--green)' : st === false || st === null ? 'var(--red)' : 'var(--text-faint)';
-        const authText = st === 'loading' ? '检测中…' : st === true ? '可用' : st === false ? '未就绪' : st === null ? '检测失败' : '未检测';
+        const loadingA = st === 'loading';
+        const probe = st && st !== 'loading' ? st : null; // CodeAgentProbe | null
+        const tool = probe?.tool;
+        const dotColor = tool === true ? 'var(--green)' : (tool === false || st === null) ? 'var(--red)' : 'var(--text-faint)';
+        const authText = loadingA ? '检测中…' : tool === true ? '可用' : tool === false ? '未就绪' : st === null ? '检测失败' : '未检测';
         const isOpen = expanded.has(a.id);
         return (
           <div className="panel" key={a.id} style={{ marginBottom: 12 }}>
@@ -1408,6 +1746,11 @@ function CodeAgentSettings() {
               {!isOpen && !d.enabled && <span className="chip" style={{ color: 'var(--text-faint)' }}>已停用</span>}
               <span className="dot" style={{ background: dotColor, marginLeft: 'auto' }} />
               <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{authText}</span>
+              {probe?.model != null && (
+                <span className={`chip ${probe.model ? 'green' : 'red'}`} title={probe.detail || undefined}>
+                  模型 {probe.model ? '可用' : '不可用'}{probe.model_name ? ` · ${probe.model_name}` : ''}
+                </span>
+              )}
             </div>
             {isOpen && (
             <div className="cfg-fields" style={{ padding: '12px 14px' }}>
@@ -1428,6 +1771,12 @@ function CodeAgentSettings() {
               <div className="field"><label>模型（可空，{d.kind === 'opencode' ? 'provider/model' : '裸名'}）</label>
                 <input value={d.model} onChange={e => setDraft(a.id, { model: e.target.value })} placeholder="默认" />
               </div>
+              <div className="field"><label>快模型（低风险改动，可空 → 回落上方模型）</label>
+                <input value={d.fast_model} onChange={e => setDraft(a.id, { fast_model: e.target.value })} placeholder={d.kind === 'opencode' ? 'anthropic/claude-haiku-4-5' : '如 sonnet / haiku'} />
+              </div>
+              <div className="field"><label>强模型（高风险改动，可空 → 回落上方模型）</label>
+                <input value={d.strong_model} onChange={e => setDraft(a.id, { strong_model: e.target.value })} placeholder={d.kind === 'opencode' ? 'anthropic/claude-opus-4-8' : '如 opus'} />
+              </div>
               <div className="field"><label>额外参数（空格分隔，可空）</label>
                 <input value={d.extra} onChange={e => setDraft(a.id, { extra: e.target.value })} placeholder="--flag value" />
               </div>
@@ -1437,9 +1786,16 @@ function CodeAgentSettings() {
                   <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)' }}>启用</span>
                 </div>
                 <button className="btn btn-primary btn-sm" onClick={() => save(a)}><Icon name="check" size={13} />保存</button>
-                <button className="btn btn-sm" onClick={() => checkAuth(a.id)}><Icon name="shield" size={13} />检测可用性</button>
+                <button className="btn btn-sm" disabled={loadingA} onClick={() => checkAuth(a.id, true)}
+                  title="验证 CLI 工具就绪，并用配置的模型发一个极小 prompt 确认模型可用（慢几秒、消耗极少量 token）">
+                  <Icon name="shield" size={13} />{loadingA ? '检测中…' : '检测可用性'}</button>
                 {!a.is_default && <button className="btn btn-sm btn-danger" style={{ marginLeft: 'auto' }} onClick={() => remove(a)}><Icon name="trash" size={13} />删除</button>}
               </div>
+              {probe?.detail && (
+                <div className="field full" style={{ marginTop: -4 }}>
+                  <span style={{ fontSize: 'var(--text-caption)', color: probe.model === false ? 'var(--red)' : 'var(--text-faint)', fontFamily: 'var(--font-mono)', wordBreak: 'break-word' }}>{probe.detail}</span>
+                </div>
+              )}
             </div>
             )}
           </div>
@@ -1454,24 +1810,186 @@ function CodeAgentSettings() {
   );
 }
 
+interface SkillDraft { name: string; description: string; body: string; project_id: string | null; enabled: boolean; }
+
+function CodeAgentSkillSettings() {
+  const [skills, setSkills] = useState<CodeAgentSkillT[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, SkillDraft>>({});
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState('');
+  const [confirmDel, setConfirmDel] = useState<CodeAgentSkillT | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpand = (id: string) => setExpanded(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const toDraft = (s: CodeAgentSkillT): SkillDraft =>
+    ({ name: s.name, description: s.description, body: s.body, project_id: s.project_id, enabled: s.enabled });
+
+  const load = () => {
+    setLoading(true);
+    Promise.all([listCodeAgentSkills(), listProjects().catch(() => [] as Project[])])
+      .then(([list, ps]) => {
+        setSkills(list);
+        setProjects(ps);
+        setDrafts(Object.fromEntries(list.map(s => [s.id, toDraft(s)])));
+      })
+      .catch(() => setSkills([]))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { load(); }, []);
+
+  const setDraft = (id: string, patch: Partial<SkillDraft>) =>
+    setDrafts(d => ({ ...d, [id]: { ...d[id], ...patch } }));
+
+  const scopeOptions = [
+    { value: '', label: '全局（所有项目）' },
+    ...projects.map(p => ({ value: p.id, label: p.name })),
+  ];
+
+  const save = async (s: CodeAgentSkillT) => {
+    const d = drafts[s.id];
+    if (!d) return;
+    if (!d.name.trim()) { setMsg('技能名不能为空'); return; }
+    setMsg('');
+    try {
+      await upsertCodeAgentSkill({
+        id: s.id, name: d.name.trim(), description: d.description.trim(),
+        body: d.body, project_id: d.project_id || null, enabled: d.enabled,
+      });
+      setMsg(`已保存「${d.name.trim()}」`);
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  const doDelete = async (s: CodeAgentSkillT) => {
+    setConfirmDel(null);
+    try { await deleteCodeAgentSkill(s.id); load(); } catch (e) { setMsg(String(e)); }
+  };
+
+  const addSkill = async () => {
+    setMsg('');
+    try {
+      const created = await upsertCodeAgentSkill({
+        name: 'new-skill', description: '一句话描述：编码 agent 何时该用它', body: '# 技能说明\n在此写明步骤与约束。', enabled: true,
+      });
+      setExpanded(prev => new Set(prev).add(created.id));
+      load();
+    } catch (e) { setMsg(String(e)); }
+  };
+
+  return (
+    <div className="set-inner rise">
+      <div className="set-h">编码技能（Skill）</div>
+      <div className="set-desc">
+        把可复用的「做法/手册」注入到编码 agent 的 worktree，让它在实现需求与解冲突时遵循。
+        <b>claude</b> 一等公民——写入 <code>.claude/skills/&lt;name&gt;/SKILL.md</code> 走原生渐进披露
+        （名称+描述常驻、正文按需加载）；<b>codex / opencode</b> 无原生 skill 机制，降级为把技能折叠进 prompt。
+        注入文件在执行结束即清理、并经 git exclude 兜底，<b>绝不会被提交</b>到代码分支。项目还可在仓内
+        手写 <code>.autoforge/skills/&lt;name&gt;/SKILL.md</code>，与这里的全局库取并集（同名时仓内文件优先）。
+      </div>
+
+      {loading ? (
+        <div className="empty"><Icon name="layers" /><div>加载中…</div></div>
+      ) : skills.length === 0 ? (
+        <div className="empty"><Icon name="layers" /><div>还没有技能。新增一个，注入编码 agent 的工作区。</div></div>
+      ) : skills.map(s => {
+        const d = drafts[s.id]; if (!d) return null;
+        const isOpen = expanded.has(s.id);
+        const scopeName = s.project_id ? (projects.find(p => p.id === s.project_id)?.name ?? '指定项目') : '全局';
+        return (
+          <div className="panel" key={s.id} style={{ marginBottom: 12 }}>
+            <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', userSelect: 'none' }}
+              onClick={() => toggleExpand(s.id)}>
+              <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform .15s' }} />
+              <span className="chip" style={{ fontFamily: 'var(--font-mono)' }}>{s.name}</span>
+              <span style={{ fontWeight: 600, color: 'var(--text-2)', fontSize: 'var(--text-control)' }}>{d.description || '（无描述）'}</span>
+              <span className="chip blue" style={{ marginLeft: 'auto' }}>{scopeName}</span>
+              {!d.enabled && <span className="chip" style={{ color: 'var(--text-faint)' }}>已停用</span>}
+            </div>
+            {isOpen && (
+              <div className="cfg-fields" style={{ padding: '12px 14px' }}>
+                <div className="field"><label>技能名</label>
+                  <input value={d.name} onChange={e => setDraft(s.id, { name: e.target.value })} placeholder="race-audit" />
+                  <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>清洗为 [A-Za-z0-9_-]，作目录名 / SKILL.md 的 name。</span>
+                </div>
+                <div className="field"><label>适用范围</label>
+                  <Select value={d.project_id ?? ''} onChange={val => setDraft(s.id, { project_id: val || null })} options={scopeOptions} />
+                </div>
+                <div className="field full"><label>描述（决定 claude 何时按需加载正文，务必精炼准确）</label>
+                  <input value={d.description} onChange={e => setDraft(s.id, { description: e.target.value })} placeholder="审查并发竞态：共享状态、await 持锁、TOCTOU、幂等键" />
+                </div>
+                <div className="field full"><label>正文（SKILL.md，Markdown：写明步骤、清单与约束）</label>
+                  <textarea value={d.body} onChange={e => setDraft(s.id, { body: e.target.value })} rows={10}
+                    style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', resize: 'vertical' }}
+                    placeholder={'# 竞态审查手册\n逐项检查：\n- 共享状态是否有锁\n- 是否在 await 期间持锁\n- 幂等键是否缺失'} />
+                </div>
+                <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Switch on={d.enabled} onToggle={() => setDraft(s.id, { enabled: !d.enabled })} />
+                    <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-2)' }}>启用</span>
+                  </div>
+                  <button className="btn btn-primary btn-sm" onClick={() => save(s)}><Icon name="check" size={13} />保存</button>
+                  <button className="btn btn-sm btn-danger" style={{ marginLeft: 'auto' }} onClick={() => setConfirmDel(s)}><Icon name="trash" size={13} />删除</button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+        <button className="btn" onClick={addSkill}><Icon name="plus" size={14} />新增技能</button>
+        {msg && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{msg}</span>}
+      </div>
+
+      {confirmDel && (
+        <ConfirmModal
+          msg={`确认删除技能「${confirmDel.name}」？`}
+          onOk={() => doDelete(confirmDel)}
+          onCancel={() => setConfirmDel(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 function ConcurrencySettings() {
-  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority' });
+  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, build_slots: 2, cpu_budget_pct: 0, llm_max_concurrency: 4 });
   const [result, setResult] = useState('');
+
+  useEffect(() => {
+    getConcurrencyConfig().then(cfg => setForm(f => ({
+      ...f,
+      max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy,
+      timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor,
+      build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency,
+    }))).catch(() => { });
+  }, []);
 
   const save = async () => {
     const cfg = await updateConcurrencyConfig({
       max_slots: form.max_slots,
       pause_threshold: form.pause_threshold,
       queue_strategy: form.queue_strategy,
+      timeout_min: form.timeout_min,
+      idle_timeout_min: form.idle_timeout_min,
+      max_load_factor: form.max_load_factor,
+      build_slots: form.build_slots,
+      cpu_budget_pct: form.cpu_budget_pct,
+      llm_max_concurrency: form.llm_max_concurrency,
     });
-    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy });
+    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy, timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor, build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency });
     setResult(`${cfg.stage} · ${cfg.active_slots}/${cfg.max_slots} · 待审核 ${cfg.pending_review}`);
   };
 
   return (
     <div className="set-inner rise">
       <div className="set-h">并发与流控</div>
-      <div className="set-desc">控制 Claude Code 执行槽位和审核积压背压阈值。</div>
+      <div className="set-desc">控制代码 Agent 执行槽位、审核积压背压阈值、代码 agent 超时回收与 LLM 出站并发（防服务商限流）。</div>
       <div className="cfg-card">
         <div className="cfg-fields">
           <div className="field"><label>最大并发槽位</label>
@@ -1483,6 +2001,30 @@ function ConcurrencySettings() {
           <div className="field"><label>队列策略</label>
             <Select value={form.queue_strategy} onChange={val => setForm(f => ({ ...f, queue_strategy: val }))}
               options={[{ value: 'priority', label: 'priority' }, { value: 'fifo', label: 'fifo' }, { value: 'oldest', label: 'oldest' }]} />
+          </div>
+          <div className="field"><label>墙钟超时（分钟）</label>
+            <input type="number" min="5" max="180" value={form.timeout_min} onChange={e => setForm(f => ({ ...f, timeout_min: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>单个代码 agent 运行硬上限，到点杀进程组兜底。</span>
+          </div>
+          <div className="field"><label>空闲超时（分钟）</label>
+            <input type="number" min="0" max="60" value={form.idle_timeout_min} onChange={e => setForm(f => ({ ...f, idle_timeout_min: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>连续无输出【且无 CPU 消耗】才判卡死并杀进程组；0=关闭。安静的长构建不会误杀。</span>
+          </div>
+          <div className="field"><label>负载背压（×核数）</label>
+            <input type="number" min="0" max="8" step="0.5" value={form.max_load_factor} onChange={e => setForm(f => ({ ...f, max_load_factor: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>系统负载超过 该值×CPU核数 时暂缓再起新 agent（在已有任务运行时）；0=关闭。压住批量过载。</span>
+          </div>
+          <div className="field"><label>构建池并发</label>
+            <input type="number" min="1" max="16" value={form.build_slots} onChange={e => setForm(f => ({ ...f, build_slots: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>合并门测试任意时刻最多并发编译数，限住批量合并的编译波。全平台。</span>
+          </div>
+          <div className="field"><label>CPU 预算（% × 核数）</label>
+            <input type="number" min="0" max="100" step="5" value={form.cpu_budget_pct} onChange={e => setForm(f => ({ ...f, cpu_budget_pct: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>cgroup 把 agent 自测+门的总 CPU 限到 该%×核数（不禁测试、只限速）；0=关闭。仅 Linux 生效，建议 70~80。</span>
+          </div>
+          <div className="field"><label>LLM 并发上限</label>
+            <input type="number" min="1" max="32" value={form.llm_max_concurrency} onChange={e => setForm(f => ({ ...f, llm_max_concurrency: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>同时打到 LLM 服务商的请求数上限，削平批量任务（如一次分析 50 条需求）的瞬时并发，防 429 限流（另配退避重试）。按服务商配额调整，建议 2~8。</span>
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
@@ -2156,6 +2698,10 @@ function GatingSettings() {
   const [autoPassOn, setAutoPassOn] = useState(false);
   const [autoConflictOn, setAutoConflictOn] = useState(false);
   const [customMsgOn, setCustomMsgOn] = useState(false);
+  const [parallelOn, setParallelOn] = useState(false);
+  // 各面板说明默认收起，点标题区展开，省高度。键：autopass/conflict/custommsg/parallel。
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const toggleExpand = (k: string) => setExpanded(e => ({ ...e, [k]: !e[k] }));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -2164,6 +2710,7 @@ function GatingSettings() {
     getAutoPassEnabled().then(setAutoPassOn).catch(() => {});
     getAutoConflictResolveEnabled().then(setAutoConflictOn).catch(() => {});
     getCustomMergeMessageEnabled().then(setCustomMsgOn).catch(() => {});
+    getParallelPremergeEnabled().then(setParallelOn).catch(() => {});
   };
   useEffect(() => { reload(); }, []);
 
@@ -2188,14 +2735,24 @@ function GatingSettings() {
     finally { setBusy(false); }
   };
 
+  const toggleParallel = async () => {
+    setErr(''); setBusy(true);
+    try { const next = !parallelOn; await setParallelPremergeEnabled(next); setParallelOn(next); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="set-inner rise">
-      <div className="set-h">门控降级</div>
-      <div className="set-desc">全局自动放行策略。启用后低风险变更可在信任达标时跳过代码审核自动合并。</div>
+      <div className="set-h">合并与放行</div>
+      <div className="set-desc">合并环节的策略与自动化：自动放行（门控降级）、冲突自动解决、自定义合并提交信息、合并并行化。</div>
       {err && <div className="chip red" style={{ alignSelf: 'flex-start', marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
       <div className="panel">
         <div className="panel-head">
-          <div className="panel-title"><Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />门控降级（自动放行）</div>
+          <div className="panel-title" onClick={() => toggleExpand('autopass')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.autopass ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="sliders" size={16} style={{ color: 'var(--ember)' }} />门控降级（自动放行）
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className={'chip ' + (autoPassOn ? 'green' : '')}>{autoPassOn ? '已启用' : '已关闭'}</span>
             <button className="btn btn-sm" disabled={busy} onClick={toggle}>
@@ -2203,24 +2760,29 @@ function GatingSettings() {
             </button>
           </div>
         </div>
-        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过代码审核直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
-        </div>
-        {policies.length === 0
-          ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
-          : policies.map(p => (
-            <div key={p.change_class} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 16px', borderTop: '1px solid var(--border)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span className={'chip ' + (p.trust_state === 'auto' ? 'green' : p.trust_state === 'eligible' ? 'amber' : '')}>{p.trust_state}</span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)' }}>{p.change_class}</span>
+        {expanded.autopass && (<>
+          <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+            启用后，低风险(T0/T1)且变更类信任达标（连续 20 次批准、0 退改）的改动将自动跳过代码审核直接合并；T3 硬地板（迁移/auth/支付/依赖）永远人工。任一退改清零重挣。
+          </div>
+          {policies.length === 0
+            ? <div className="empty-compact" style={{ padding: '14px 16px' }}>暂无变更类信任记录</div>
+            : policies.map(p => (
+              <div key={p.change_class} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 16px', borderTop: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className={'chip ' + (p.trust_state === 'auto' ? 'green' : p.trust_state === 'eligible' ? 'amber' : '')}>{p.trust_state}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)' }}>{p.change_class}</span>
+                </div>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>批准连胜 {p.approve_count} · 退改 {p.reject_count}</span>
               </div>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>批准连胜 {p.approve_count} · 退改 {p.reject_count}</span>
-            </div>
-          ))}
+            ))}
+        </>)}
       </div>
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="panel-head">
-          <div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />冲突自动解决（AI）</div>
+          <div className="panel-title" onClick={() => toggleExpand('conflict')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.conflict ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />冲突自动解决（AI）
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className={'chip ' + (autoConflictOn ? 'green' : '')}>{autoConflictOn ? '已启用' : '已关闭'}</span>
             <button className="btn btn-sm" disabled={busy} onClick={toggleConflict}>
@@ -2228,13 +2790,18 @@ function GatingSettings() {
             </button>
           </div>
         </div>
+        {expanded.conflict && (
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
           启用后，合并前自动把 dev 并入分支若发生代码冲突，将直接交由 AI 自动解冲突；解完仍会回到代码审核复审，不直接落 dev。关闭时冲突停在「合并冲突」态，可在审核页手动重试或点 AI 解冲突。
         </div>
+        )}
       </div>
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="panel-head">
-          <div className="panel-title"><Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />自定义合并提交信息</div>
+          <div className="panel-title" onClick={() => toggleExpand('custommsg')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.custommsg ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="merge" size={16} style={{ color: 'var(--ember)' }} />自定义合并提交信息
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className={'chip ' + (customMsgOn ? 'green' : '')}>{customMsgOn ? '已启用' : '已关闭'}</span>
             <button className="btn btn-sm" disabled={busy} onClick={toggleCustomMsg}>
@@ -2242,9 +2809,30 @@ function GatingSettings() {
             </button>
           </div>
         </div>
+        {expanded.custommsg && (
         <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>AutoForge merge: &lt;编号&gt;</code>，审核页不显示输入框。批量审核始终走默认模板。
+          启用后，代码审核页「批准合并」前可编辑本次合并的提交信息（merge --no-ff -m）。关闭时合并统一使用默认模板 <code>&lt;前缀&gt;(&lt;修改模块&gt;): &lt;需求标题&gt; [autoforge #&lt;编号&gt;]</code>（前缀按需求类别取 feat/fix/refactor/chore…），审核页不显示输入框。批量审核始终走默认模板。
         </div>
+        )}
+      </div>
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head">
+          <div className="panel-title" onClick={() => toggleExpand('parallel')} style={{ cursor: 'pointer' }}>
+            <Icon name="chevron" size={14} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: expanded.parallel ? 'none' : 'rotate(-90deg)' }} />
+            <Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />合并并行化（实验）
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className={'chip ' + (parallelOn ? 'green' : '')}>{parallelOn ? '已启用' : '已关闭'}</span>
+            <button className="btn btn-sm" disabled={busy} onClick={toggleParallel}>
+              <Icon name={parallelOn ? 'pause' : 'play'} size={13} />{parallelOn ? '关闭' : '启用'}
+            </button>
+          </div>
+        </div>
+        {expanded.parallel && (
+        <div style={{ padding: '10px 16px', fontSize: 'var(--text-control)', color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
+          启用后，合并拆为「合并前测试（premerge）」与「落地（land）」两段：测试不再占用项目合并锁，同项目多个待合并需求可并行测试（受构建池约束），仅廉价的落地串行执行——批量合并显著提速。落地前会再校验 dev 是否被其它需求推进：未动或改动互不相交则直接落地，相交则自动回退重测。关闭时走原单锁流程，行为不变。
+        </div>
+        )}
       </div>
     </div>
   );
@@ -2380,11 +2968,13 @@ function SelfUpdateSettings() {
     }).catch(() => {});
   }, []);
 
-  const refresh = async (id: string) => {
+  // keepResult: after a pull we re-read status but must NOT wipe the just-set
+  // pull message (the old code cleared it here → failures silently vanished).
+  const refresh = async (id: string, keepResult = false) => {
     if (!id) return;
-    setLoading(true); setResult(null); setSt(null);
+    setLoading(true); if (!keepResult) setResult(null); setSt(null);
     try { setSt(await selfUpdateStatus(id)); }
-    catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
+    catch (e) { if (!keepResult) setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
     finally { setLoading(false); }
   };
   useEffect(() => { refresh(pid); /* eslint-disable-next-line */ }, [pid]);
@@ -2393,7 +2983,7 @@ function SelfUpdateSettings() {
     setConfirm(false); setPulling(true); setResult(null);
     try { setResult(await selfUpdatePull(pid)); }
     catch (e) { setResult({ ok: false, pulled: 0, message: String(e), restart_required: false }); }
-    finally { setPulling(false); refresh(pid); }
+    finally { setPulling(false); refresh(pid, true); }
   };
 
   return (
@@ -2401,7 +2991,7 @@ function SelfUpdateSettings() {
       <div className="set-h">同步更新（自更新）</div>
       <div className="set-desc">
         当 AutoForge 用自身作为项目运行时，交付合并会在隔离 worktree 中完成并<strong>推送到 origin/dev</strong>，不改动正在运行的工作区。
-        在此一键拉取最新代码（仅快进，git 自身会拒绝覆盖未提交改动以防丢失）。
+        在此一键拉取最新代码（优先快进；当本地有自己的提交、与远端分叉时自动改用 rebase 把本地提交重放到最新之上，未提交改动会自动暂存/恢复，冲突则回滚不丢失）。
         <br /><strong>注意</strong>：拉取会改动源码，开发模式将<strong>自动重新编译并重启</strong>，请先确认无未保存/未提交的工作。
       </div>
       <div className="cfg-card">
@@ -2438,13 +3028,24 @@ function SelfUpdateSettings() {
                 <span className="set-nav-badge" style={{ marginLeft: 6 }}>{st.behind}</span>
               )}
             </button>
-            {result && (
+          </div>
+
+          {result && (
+            <div className="field full" style={{
+              flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: '12px 14px', borderRadius: 'var(--radius-sm)',
+              background: result.ok
+                ? 'color-mix(in srgb, var(--green) 12%, transparent)'
+                : 'color-mix(in srgb, var(--red) 12%, transparent)',
+              border: `1px solid color-mix(in srgb, ${result.ok ? 'var(--green)' : 'var(--red)'} 45%, transparent)`,
+            }}>
+              <Icon name={result.ok ? 'check' : 'alert'} size={16}
+                style={{ flexShrink: 0, marginTop: 1, color: result.ok ? 'var(--green-soft)' : 'var(--red)' }} />
               <span style={{ fontSize: 'var(--text-label)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap',
                 lineHeight: 'var(--leading-normal)', color: result.ok ? 'var(--green-soft)' : 'var(--red)' }}>
                 {result.message}
               </span>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -2623,39 +3224,41 @@ function BackupSettings() {
 
 const SET_GROUPS: { group: string; items: { id: string; name: string; ic: string }[] }[] = [
   {
-    group: 'AI 核心', // 搭建智能体的地基（模型 → 能力 → 角色 → 记忆）
+    group: 'AI 核心', // LLM 底座 → 角色/代码 Agent → 能力扩展 → 记忆层
     items: [
       { id: 'llm',         name: 'LLM 配置',     ic: 'brain' },
-      { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
       { id: 'roles',       name: '角色 Agent',   ic: 'bot' },
+      { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
+      { id: 'codeskills',  name: '编码技能',     ic: 'layers' },
+      { id: 'tools',       name: '工具 & MCP',   ic: 'search' },
       { id: 'knowledge',   name: '知识库自成长', ic: 'brain' },
     ],
   },
   {
-    group: '运行与流控',
+    group: '运行与流控', // 供料入口 → 并发控制 → 合并放行 → 安全守卫
     items: [
-      { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
-      { id: 'codeagent',   name: '代码 Agent',   ic: 'code' },
       { id: 'autosupply',  name: '自动供料',     ic: 'refresh' },
-      { id: 'gating',      name: '门控降级',     ic: 'sliders' },
+      { id: 'concurrency', name: '并发与流控',   ic: 'cpu' },
+      { id: 'gating',      name: '合并与放行',   ic: 'sliders' },
       { id: 'security',    name: '安全与权限',   ic: 'shield' },
     ],
   },
   {
-    group: '集成与通知',
+    group: '集成与通知', // 输入：Webhook / 语音 → 输出：通知
     items: [
-      { id: 'asr',         name: '语音录入',     ic: 'mic' },
       { id: 'webhook',     name: 'Webhook 集成', ic: 'zap' },
+      { id: 'asr',         name: '语音录入',     ic: 'mic' },
+      { id: 'miniapp',     name: '小程序预览',   ic: 'box' },
       { id: 'notify',      name: '通知通道',     ic: 'bell' },
     ],
   },
   {
-    group: '系统',
+    group: '系统', // 运维：更新/备份 → 偏好：外观/快捷键 → 关于
     items: [
       { id: 'selfupdate',  name: '同步更新',     ic: 'refresh' },
       { id: 'backup',      name: '配置备份',     ic: 'download' },
-      { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
       { id: 'theme',       name: '主题设置',     ic: 'palette' },
+      { id: 'shortcuts',   name: '快捷键',       ic: 'zap' },
       { id: 'about',       name: '关于 AutoForge', ic: 'box' },
     ],
   },
@@ -2733,17 +3336,19 @@ export default function SettingsPage({
           {sec === 'roles'       && <RolesPage />}
           {sec === 'concurrency' && <ConcurrencySettings />}
           {sec === 'codeagent'   && <CodeAgentSettings />}
+          {sec === 'codeskills'  && <CodeAgentSkillSettings />}
           {sec === 'selfupdate'  && <SelfUpdateSettings />}
           {sec === 'backup'      && <BackupSettings />}
           {sec === 'knowledge'   && <KnowledgeSettings />}
           {sec === 'security'    && <SecuritySettings />}
           {sec === 'asr'         && <AsrSettings />}
+          {sec === 'miniapp'     && <MiniappSettings />}
           {sec === 'autosupply'  && <AutosupplySettings />}
           {sec === 'webhook'     && <WebhookSettings />}
           {sec === 'notify'      && <NotifySettings />}
           {sec === 'gating'      && <GatingSettings />}
           {sec === 'about'       && <AboutSettings />}
-          {!['theme','shortcuts','llm','tools','roles','concurrency','codeagent','selfupdate','backup','knowledge','security','asr','autosupply','webhook','notify','gating','about'].includes(sec) && (
+          {!['theme','shortcuts','llm','tools','roles','concurrency','codeagent','codeskills','selfupdate','backup','knowledge','security','asr','miniapp','autosupply','webhook','notify','gating','about'].includes(sec) && (
             <div className="empty" style={{ height: '100%' }}>
               <Icon name={cur.ic} /><div>{cur.name}</div>
             </div>

@@ -524,9 +524,10 @@ pub async fn create_agent(
         "INSERT INTO agents (
             id, name, name_en, role, color, initial, llm_id, system_prompt,
             role_type, system_kind, capabilities_json, max_concurrency,
-            visible_in_chat, mentionable, enabled, prompt_mode, memory_enabled
+            visible_in_chat, mentionable, enabled, prompt_mode, memory_enabled,
+            code_agent_id
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&payload.name)
@@ -536,7 +537,7 @@ pub async fn create_agent(
     .bind(&initial)
     .bind(&payload.llm_id)
     .bind(&system_prompt)
-    .bind(&role_type)
+    .bind(role_type)
     .bind(&system_kind)
     .bind(&capabilities_json)
     .bind(max_concurrency)
@@ -545,6 +546,7 @@ pub async fn create_agent(
     .bind(enabled)
     .bind(prompt_mode)
     .bind(memory_enabled)
+    .bind(payload.code_agent_id.as_deref().filter(|s| !s.is_empty()))
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -650,6 +652,16 @@ pub async fn update_agent(
         sets.push("memory_enabled=?");
         values.push(AgentUpdateValue::Bool(v));
     }
+    // code_agent_id is Option<Option<String>>: Some(None) / Some("") clears it (back to LLM backend).
+    if let Some(ref ca) = payload.code_agent_id {
+        match ca.as_deref().filter(|s| !s.is_empty()) {
+            Some(v) => {
+                sets.push("code_agent_id=?");
+                values.push(AgentUpdateValue::Text(v.to_string()));
+            }
+            None => sets.push("code_agent_id=NULL"),
+        }
+    }
 
     if sets.is_empty() {
         return sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE id=?")
@@ -720,6 +732,7 @@ pub struct RoleSlot {
     pub group: String,   // orchestration | delivery | pipeline | knowledge
     pub binding: String, // system_kind | forge_role
     pub desc: String,
+    pub usage: String,
     pub color: String,
     pub icon: String,
     pub builtin_prompt: String,
@@ -774,6 +787,7 @@ pub async fn list_role_catalog(state: State<'_, AppState>) -> Result<Vec<RoleSlo
             group: group_str(def.group).to_string(),
             binding: binding.to_string(),
             desc: def.desc.to_string(),
+            usage: def.usage.to_string(),
             color: def.color.to_string(),
             icon: def.icon.to_string(),
             builtin_prompt: def.builtin_prompt.to_string(),
@@ -944,10 +958,200 @@ pub async fn set_role_slot(
     list_role_catalog(state).await
 }
 
+/// 校验某 LLM 配置存在且已启用，否则报错。供默认设定与一键铺满/分级预设前置校验。
+async fn ensure_llm_usable(db: &crate::db::Db, id: &str) -> Result<(), String> {
+    let n = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM llm_configs WHERE id=? AND enabled=1")
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("目标 LLM 配置不存在或已停用".into());
+    }
+    Ok(())
+}
+
+/// 设置全局默认 LLM（角色未显式绑定时回落到此）。`id` 为空串=清除默认。
+/// 复用 `code_agents.is_default` 同款单选范式：先清旧默认，再置新默认。
+#[tauri::command]
+pub async fn set_default_llm(id: String, state: State<'_, AppState>) -> Result<Vec<LlmConfig>, String> {
+    let id = id.trim().to_string();
+    // 先校验目标可用，再动数据库：否则「清旧默认」已生效而「置新默认」因 id 不可用而失败，
+    // 会让系统落到**零默认**配置（原子性/一致性缺陷）。
+    if !id.is_empty() {
+        ensure_llm_usable(&state.db, &id).await?;
+    }
+    // 单事务内「清旧默认 + 置新默认」，保证任一时刻恰有一个默认（或显式传空时零个），
+    // 不会出现中途失败遗留的双默认/零默认。
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE llm_configs SET is_default=0 WHERE is_default=1")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !id.is_empty() {
+        sqlx::query("UPDATE llm_configs SET is_default=1 WHERE id=?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    list_llm_configs(state).await
+}
+
+/// 在事务内确保某注册角色有持有 Agent 并绑定到 `llm_id`：
+/// - 无持有者 → 按注册表默认创建（启用、内置 prompt、`default_chat`）。
+/// - 有持有者 → 取首个为准；`overwrite=true` 或其未绑定 LLM 时改绑并启用；
+///   `overwrite=false` 且已绑定 → 不动（尊重用户既有选择）。
+/// 一键铺满/分级预设共用此核心；不做跨持有者去重（per-kind 去重仍走 set_role_slot）。
+async fn bind_role_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    def: &crate::agents::roles::RoleDef,
+    llm_id: &str,
+    overwrite: bool,
+) -> Result<(), String> {
+    use crate::agents::roles::RoleBinding;
+    let col = match def.binding {
+        RoleBinding::SystemKind => "system_kind",
+        RoleBinding::ForgeRole => "forge_role",
+    };
+    let holder = sqlx::query_as::<_, Agent>(&format!(
+        "SELECT * FROM agents WHERE (',' || COALESCE({col}, '') || ',') LIKE ? ORDER BY created_at LIMIT 1"
+    ))
+    .bind(format!("%,{},%", def.kind))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    match holder {
+        Some(a) => {
+            let bound = !a.llm_id.as_deref().map(str::trim).unwrap_or("").is_empty();
+            if overwrite || !bound {
+                sqlx::query("UPDATE agents SET llm_id=?, enabled=1 WHERE id=?")
+                    .bind(llm_id)
+                    .bind(&a.id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        None => {
+            let id = Uuid::new_v4().to_string();
+            let role_type = match def.binding {
+                RoleBinding::ForgeRole => "business",
+                RoleBinding::SystemKind => "system",
+            };
+            let (sk, fr): (Option<&str>, Option<&str>) = match def.binding {
+                RoleBinding::SystemKind => (Some(def.kind), None),
+                RoleBinding::ForgeRole => (None, Some(def.kind)),
+            };
+            sqlx::query(
+                "INSERT INTO agents (
+                    id, name, name_en, role, color, initial, llm_id, system_prompt,
+                    forge_role, role_type, system_kind, capabilities_json, max_concurrency,
+                    visible_in_chat, mentionable, enabled, prompt_mode
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, 1, ?, ?, 1, 'builtin')",
+            )
+            .bind(&id)
+            .bind(def.name)
+            .bind(def.name_en)
+            .bind(def.desc)
+            .bind(def.color)
+            .bind(def.initial)
+            .bind(llm_id)
+            .bind(fr)
+            .bind(role_type)
+            .bind(sk)
+            .bind(def.default_caps)
+            .bind(def.default_chat)
+            .bind(def.default_chat)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 一键铺满：把同一个 LLM 套用到**所有**内置角色（缺持有者则创建）。
+/// `overwrite=false`（默认）只补未绑定的角色，尊重已有选择；`true` 强制全部改绑。
+#[tauri::command]
+pub async fn bulk_bind_roles(
+    llm_id: String,
+    overwrite: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RoleSlot>, String> {
+    let llm = llm_id.trim();
+    if llm.is_empty() {
+        return Err("请选择要套用的 LLM".into());
+    }
+    ensure_llm_usable(&state.db, llm).await?;
+    let overwrite = overwrite.unwrap_or(false);
+
+    // 与 set_agent_forge_role / apply_role_preset 共用全局 agents 写锁，串行化角色绑定，
+    // 避免并发铺角色基于过期快照重复插入/互相覆盖。
+    let _wlock = crate::state::agents_write_lock().lock().await;
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    for def in crate::agents::roles::registry() {
+        bind_role_in_tx(&mut tx, def, llm, overwrite).await?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    crate::knowledge::refresh_kb_models(&state.db).await;
+    list_role_catalog(state).await
+}
+
+/// 分级预设：重角色（`roles::is_heavy`）配强模型 LLM，轻角色配快模型 LLM，一键铺满。
+/// `overwrite` 语义同 [`bulk_bind_roles`]。
+#[tauri::command]
+pub async fn apply_role_preset(
+    fast_llm_id: String,
+    strong_llm_id: String,
+    overwrite: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RoleSlot>, String> {
+    let fast = fast_llm_id.trim();
+    let strong = strong_llm_id.trim();
+    if fast.is_empty() || strong.is_empty() {
+        return Err("请同时选择快模型与强模型 LLM".into());
+    }
+    ensure_llm_usable(&state.db, fast).await?;
+    ensure_llm_usable(&state.db, strong).await?;
+    let overwrite = overwrite.unwrap_or(false);
+
+    // 与 set_agent_forge_role / bulk_bind_roles 共用全局 agents 写锁（见各自说明）。
+    let _wlock = crate::state::agents_write_lock().lock().await;
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    for def in crate::agents::roles::registry() {
+        let llm = if crate::agents::roles::is_heavy(def.kind) { strong } else { fast };
+        bind_role_in_tx(&mut tx, def, llm, overwrite).await?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    crate::knowledge::refresh_kb_models(&state.db).await;
+    list_role_catalog(state).await
+}
+
 #[tauri::command]
 pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    // 与角色分配共用全局 agents 写锁：避免删除与并发的角色读-改-写交织（删到一半被
+    // 另一调用基于含该 agent 的旧快照写回）。
+    let _wlock = crate::state::agents_write_lock().lock().await;
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM conversation_members WHERE agent_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 清理引用该 agent 的编排记录，否则（foreign_keys=ON）删 agents 会因外键约束直接失败：
+    // - conversation_task_runs.agent_id 是 NOT NULL 外键 → 该 agent 的执行记录必须先删；
+    // - conversation_tasks.planner_agent_id 是可空外键 → 置空，保留任务本身（属于会话，非单 agent）。
+    sqlx::query("DELETE FROM conversation_task_runs WHERE agent_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE conversation_tasks SET planner_agent_id=NULL WHERE planner_agent_id=?")
         .bind(&id)
         .execute(&mut *tx)
         .await
@@ -969,6 +1173,10 @@ pub async fn set_agent_forge_role(
     role: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Agent>, String> {
+    // 全局 agents 写锁：序列化「读快照→算新角色串→写回」，避免并发分配基于过期快照
+    // 互相覆盖（丢角色）。锁跨 await 持有到事务提交。
+    let _wlock = crate::state::agents_write_lock().lock().await;
+
     // Load current state to compute new comma-separated role lists in Rust.
     let holders = sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE forge_role IS NOT NULL")
         .fetch_all(&state.db)
@@ -1051,13 +1259,18 @@ pub fn list_builtin_tools() -> Vec<crate::agents::tools::ToolInfo> {
 
 // ---- 工具：Web 搜索配置（存 app_settings，供 agents/tools/web_search 读取）----
 
-/// 回传给前端的 Web 搜索配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
+/// 回传给前端的 Web 搜索配置。各 key 永不出库到 webview，仅暴露是否已设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchSettings {
     pub provider: String,
     pub endpoint: String,
     pub max_results: u32,
+    /// 旧字段：等价 tavily_key_set（向后兼容，勿删）。
     pub api_key_set: bool,
+    pub tavily_key_set: bool,
+    pub brave_key_set: bool,
+    /// 是否多源并行 fan-out（默认开）。
+    pub multi_source: bool,
     /// 是否默认在搜索后自动抓取前几条结果的正文摘录。
     pub fetch_content: bool,
 }
@@ -1160,10 +1373,24 @@ pub async fn get_web_search_settings(
         .await
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(5);
-    let api_key_set = read_setting(&state, "web_search.api_key")
+    // Tavily key：新键优先，回退旧 web_search.api_key（历史上只有 Tavily 用 key）。
+    let tavily_key_set = read_setting(&state, "web_search.tavily_key")
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || read_setting(&state, "web_search.api_key")
+            .await
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+    let brave_key_set = read_setting(&state, "web_search.brave_key")
         .await
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    // 默认多源开（与后端 WebSearchConfig::load 一致）。
+    let multi_source = read_setting(&state, "web_search.multi_source")
+        .await
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(true);
     let fetch_content = read_setting(&state, "web_search.fetch_content")
         .await
         .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
@@ -1172,18 +1399,24 @@ pub async fn get_web_search_settings(
         provider,
         endpoint,
         max_results,
-        api_key_set,
+        api_key_set: tavily_key_set,
+        tavily_key_set,
+        brave_key_set,
+        multi_source,
         fetch_content,
     })
 }
 
-/// 保存 Web 搜索配置。`api_key` 为 None 时不改动已存的 key（与 LLM 配置一致的语义）。
+/// 保存 Web 搜索配置。各 key 为 None 时不改动已存的 key（与 LLM 配置一致的语义）。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_web_search_settings(
     provider: String,
     endpoint: String,
     max_results: u32,
-    api_key: Option<String>,
+    tavily_key: Option<String>,
+    brave_key: Option<String>,
+    multi_source: bool,
     fetch_content: bool,
     state: State<'_, AppState>,
 ) -> Result<WebSearchSettings, String> {
@@ -1197,13 +1430,24 @@ pub async fn set_web_search_settings(
     .await?;
     write_setting(
         &state,
+        "web_search.multi_source",
+        if multi_source { "1" } else { "0" },
+    )
+    .await?;
+    write_setting(
+        &state,
         "web_search.fetch_content",
         if fetch_content { "1" } else { "0" },
     )
     .await?;
-    if let Some(key) = api_key {
+    // 新 key 走专属键；保留旧 web_search.api_key 不动（读取端已做回退兼容）。
+    if let Some(key) = tavily_key {
         let enc = crate::core::secrets::encrypt_field(key.trim())?;
-        write_setting(&state, "web_search.api_key", &enc).await?;
+        write_setting(&state, "web_search.tavily_key", &enc).await?;
+    }
+    if let Some(key) = brave_key {
+        let enc = crate::core::secrets::encrypt_field(key.trim())?;
+        write_setting(&state, "web_search.brave_key", &enc).await?;
     }
     get_web_search_settings(state).await
 }
@@ -1260,6 +1504,26 @@ pub async fn set_asr_settings(
     get_asr_settings(state).await
 }
 
+// ---- 微信开发者工具 CLI 路径（小程序预览档位 2：编译后自动用开发者工具打开产物）----
+
+/// 微信开发者工具 CLI 可执行文件路径（如 macOS 的
+/// `/Applications/wechatwebdevtools.app/Contents/MacOS/cli`、Windows 的 `cli.bat`）。
+/// 留空 = 仅档位 1（编译产物 + 手动打开），不自动拉起。存 app_settings 明文（非密钥）。
+#[tauri::command]
+pub async fn get_miniapp_devtools_path(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(read_setting(&state, "miniapp.devtools_cli_path")
+        .await
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn set_miniapp_devtools_path(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    write_setting(&state, "miniapp.devtools_cli_path", path.trim()).await
+}
+
 // ---- 工厂自喂料（autosupply）配置（存 app_settings，供调度器读取）----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1269,6 +1533,8 @@ pub struct AutosupplySettings {
     pub scan_enabled: bool,
     pub proposer_enabled: bool,
     pub max_per_run: i64,
+    pub proposer_max_per_run: i64,
+    pub min_severity: String,
     pub analyze_enabled: bool,
     pub triage_enabled: bool,
 }
@@ -1284,6 +1550,8 @@ pub async fn get_autosupply_settings(
         scan_enabled: cfg.scan_enabled,
         proposer_enabled: cfg.proposer_enabled,
         max_per_run: cfg.max_per_run as i64,
+        proposer_max_per_run: cfg.proposer_max_per_run as i64,
+        min_severity: cfg.min_severity,
         analyze_enabled: cfg.analyze_enabled,
         triage_enabled: cfg.triage_enabled,
     })
@@ -1297,15 +1565,26 @@ pub async fn set_autosupply_settings(
     scan_enabled: bool,
     proposer_enabled: bool,
     max_per_run: i64,
+    proposer_max_per_run: i64,
+    min_severity: String,
     analyze_enabled: bool,
     triage_enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<AutosupplySettings, String> {
+    // 严重度门槛白名单校验，非法值退回 low（不过滤）。
+    let min_sev = match min_severity.trim().to_ascii_lowercase().as_str() {
+        "critical" => "critical",
+        "high" => "high",
+        "medium" => "medium",
+        _ => "low",
+    };
     write_setting(&state, "autosupply.enabled", if enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.interval_min", &interval_min.max(5).to_string()).await?;
     write_setting(&state, "autosupply.scan_enabled", if scan_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.proposer_enabled", if proposer_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.max_per_run", &max_per_run.clamp(1, 200).to_string()).await?;
+    write_setting(&state, "autosupply.proposer_max_per_run", &proposer_max_per_run.clamp(1, 50).to_string()).await?;
+    write_setting(&state, "autosupply.min_severity", min_sev).await?;
     write_setting(&state, "autosupply.analyze_enabled", if analyze_enabled { "1" } else { "0" }).await?;
     write_setting(&state, "autosupply.triage_enabled", if triage_enabled { "1" } else { "0" }).await?;
     get_autosupply_settings(state).await

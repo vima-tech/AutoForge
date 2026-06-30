@@ -1,27 +1,40 @@
+use crate::commands::attachments_common::{
+    attachment_path_from_rel, sanitize_file_name, validate_attachment, MAX_ATTACHMENT_BYTES,
+};
 use crate::intake::{gateway, IntakeMode, IntakePayload};
 use crate::models::issue::{CreateIssue, Issue, IssueAnalysis};
+use crate::models::issue_attachment::{IssueAttachment, IssueAttachmentUpload};
 use crate::models::job::JobPayload;
 use crate::state::AppState;
+use base64::{engine::general_purpose, Engine as _};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use tauri::{AppHandle, State};
+use uuid::Uuid;
 
 #[tauri::command]
 pub async fn list_issues(
     project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Issue>, String> {
+    // 严重度优先排序（修复优先级倒挂），同级按时间倒序。
     if let Some(pid) = project_id {
-        sqlx::query_as::<_, Issue>(
-            "SELECT * FROM issues WHERE project_id=? ORDER BY created_at DESC",
-        )
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues WHERE project_id=?{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
         .bind(&pid)
         .fetch_all(&state.db)
         .await
         .map_err(|e| e.to_string())
     } else {
-        sqlx::query_as::<_, Issue>("SELECT * FROM issues ORDER BY created_at DESC")
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| e.to_string())
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -42,21 +55,31 @@ pub struct IssuePage {
     pub total: i64,
 }
 
+/// 分页查询需求的过滤参数聚合体，收拢 list_issues_page 的多个筛选字段，
+/// 使 Tauri command 签名保持在 clippy::too_many_arguments 上限（7）内。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListIssuesQuery {
+    pub project_id: Option<String>,
+    pub status: Option<String>,
+    pub search: Option<String>,
+    pub exclude_merged: Option<bool>,
+    pub limit: i64,
+    pub offset: i64,
+    pub sort_asc: Option<bool>,
+}
+
 /// 分页查询需求：按项目 + 状态 + 关键字（标题/编号）过滤，按 updated_at 倒序。
 /// status 为空或 "all" 表示不过滤状态；search 为空表示不过滤关键字。
 /// exclude_merged 为 true 时排除「已合并」需求（与功能审计页「显示已合并需求」开关共享，默认隐藏）；
 /// 当显式按 merged 状态筛选时该排除自然失效（status 优先）。
 #[tauri::command]
 pub async fn list_issues_page(
-    project_id: Option<String>,
-    status: Option<String>,
-    search: Option<String>,
-    exclude_merged: Option<bool>,
-    limit: i64,
-    offset: i64,
+    query: ListIssuesQuery,
     state: State<'_, AppState>,
 ) -> Result<IssuePage, String> {
     use sqlx::{QueryBuilder, Sqlite};
+    let ListIssuesQuery { project_id, status, search, exclude_merged, limit, offset, sort_asc } = query;
     let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
     let status = status.filter(|s| !s.is_empty() && s != "all");
@@ -112,7 +135,15 @@ pub async fn list_issues_page(
                 .push_bind(l)
                 .push(")");
         }
-        qb.push(" ORDER BY updated_at DESC LIMIT ")
+        // 「严重度优先」排序：critical/high 永远浮在最前（修复优先级倒挂），同级再按
+        // 创建时间（updated_at 会随执行/重分析变动，跨页不稳定）。
+        // 默认正序：同严重度下旧需求置前，避免问题积压长期无人处理。
+        qb.push(crate::models::issue::SEVERITY_ORDER_PREFIX)
+            .push(if sort_asc.unwrap_or(true) {
+                "created_at ASC LIMIT "
+            } else {
+                "created_at DESC LIMIT "
+            })
             .push_bind(limit)
             .push(" OFFSET ")
             .push_bind(offset);
@@ -157,11 +188,280 @@ pub async fn list_issues_by_statuses(
     for s in &statuses {
         sep.push_bind(s);
     }
-    qb.push(") ORDER BY created_at DESC");
+    qb.push(")")
+        .push(crate::models::issue::SEVERITY_ORDER_PREFIX)
+        .push("created_at DESC");
     qb.build_query_as::<Issue>()
         .fetch_all(&state.db)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 跨项目「待审核需求」计数：按 project_id 分组统计 pending_issue_review 数量。
+/// 用于功能审计页项目列表的需求待审徽标——只取计数，避免全量加载 issues 行。
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct ProjectIssueReviewCount {
+    pub project_id: String,
+    pub count: i64,
+}
+
+#[tauri::command]
+pub async fn count_pending_issue_reviews(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectIssueReviewCount>, String> {
+    sqlx::query_as::<_, ProjectIssueReviewCount>(
+        "SELECT project_id, COUNT(*) AS count FROM issues \
+         WHERE status = 'pending_issue_review' GROUP BY project_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+// ── 总账导出（全量 / 按状态类型多选）────────────────────────────────────────
+// 「全量需求总账」页的导出：可全量导出，或多选状态类型只导其中几类；
+// 支持 CSV / Excel(xlsx)，xlsx 可「按类型分表」（每个状态一个工作表）。
+// 写入系统下载目录并在文件管理器中定位，沿用 export_bulk_template 的落盘模式。
+
+/// 状态码 → 中文标签（与前端 LEDGER_STATUS_LABEL 对齐；缺省回落原始状态码）。
+fn issue_status_label(status: &str) -> &str {
+    match status {
+        "triage" => "待整理",
+        "pending_analysis" => "分析中",
+        "analysis_failed" => "分析失败",
+        "pending_issue_review" => "需求审核",
+        "pending_execution" => "待编码",
+        "executing" => "编码中",
+        "pending_code_review" => "代码审核",
+        "pending_merge" => "待合并",
+        "merge_testing" => "合并中",
+        "merge_ready" => "待落地",
+        "merged" => "已合并",
+        "reverting" => "撤销中",
+        "reverted" => "已撤销",
+        "rejected" => "已拒绝",
+        "deferred" => "暂不处置",
+        "merge_failed" => "合并失败",
+        "merge_conflict" => "合并冲突",
+        "execution_failed" => "执行失败",
+        "no_change_needed" => "无需改动",
+        other => other,
+    }
+}
+
+/// 导出列头（与导出行字段顺序一致）。
+const EXPORT_HEADERS: [&str; 9] = [
+    "编号", "标题", "描述", "状态", "分类", "严重度", "来源", "创建时间", "更新时间",
+];
+
+/// 取一条需求的导出行（与 EXPORT_HEADERS 顺序对应）。
+fn issue_export_row(i: &Issue) -> [String; 9] {
+    [
+        i.id.clone(),
+        i.title.clone(),
+        i.description.clone(),
+        issue_status_label(&i.status).to_string(),
+        i.category.clone(),
+        i.severity.clone(),
+        i.source_type.clone(),
+        i.created_at.clone(),
+        i.updated_at.clone(),
+    ]
+}
+
+/// CSV 单元格转义：含逗号/引号/换行的值用双引号包裹并转义内部引号。
+fn csv_escape(v: &str) -> String {
+    if v.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
+    }
+}
+
+/// 构建 CSV 字节（带 UTF-8 BOM，Excel 打开不乱码）。
+fn issues_export_csv(issues: &[Issue]) -> Vec<u8> {
+    let mut s = String::new();
+    s.push_str(&EXPORT_HEADERS.join(","));
+    s.push('\n');
+    for i in issues {
+        let row = issue_export_row(i);
+        let line: Vec<String> = row.iter().map(|c| csv_escape(c)).collect();
+        s.push_str(&line.join(","));
+        s.push('\n');
+    }
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(s.as_bytes());
+    bytes
+}
+
+/// 构建 xlsx 字节。split_by_type=true 时按状态分表（每个状态一个工作表），
+/// 否则全部写入单个「需求」工作表（含状态列）。
+fn issues_export_xlsx(issues: &[Issue], split_by_type: bool) -> Result<Vec<u8>, String> {
+    use rust_xlsxwriter::{Format, Workbook};
+    let mut workbook = Workbook::new();
+    let header_fmt = Format::new().set_bold().set_background_color(0xE8772E);
+
+    // 把若干行写进一个工作表（含表头）。
+    let write_sheet = |workbook: &mut Workbook, name: &str, rows: &[&Issue]| -> Result<(), String> {
+        // 工作表名 ≤31 字符且禁含 []:*?/\\，做一次净化。
+        let mut safe: String = name.chars().filter(|c| !"[]:*?/\\".contains(*c)).collect();
+        if safe.chars().count() > 31 {
+            safe = safe.chars().take(31).collect();
+        }
+        if safe.is_empty() {
+            safe = "需求".to_string();
+        }
+        let sheet = workbook
+            .add_worksheet()
+            .set_name(&safe)
+            .map_err(|e| e.to_string())?;
+        for (col, h) in EXPORT_HEADERS.iter().enumerate() {
+            sheet
+                .write_string_with_format(0, col as u16, *h, &header_fmt)
+                .map_err(|e| e.to_string())?;
+        }
+        for (r, issue) in rows.iter().enumerate() {
+            let row = issue_export_row(issue);
+            for (col, v) in row.iter().enumerate() {
+                sheet
+                    .write_string(r as u32 + 1, col as u16, v)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        sheet.set_column_width(0, 22).ok();   // 编号
+        sheet.set_column_width(1, 40).ok();   // 标题
+        sheet.set_column_width(2, 60).ok();   // 描述
+        sheet.set_column_width(3, 12).ok();   // 状态
+        sheet.set_column_width(7, 20).ok();   // 创建时间
+        sheet.set_column_width(8, 20).ok();   // 更新时间
+        Ok(())
+    };
+
+    if split_by_type {
+        // 按状态分组，保持稳定顺序（首次出现的先后）。
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<&Issue>> =
+            std::collections::HashMap::new();
+        for i in issues {
+            if !groups.contains_key(&i.status) {
+                order.push(i.status.clone());
+            }
+            groups.entry(i.status.clone()).or_default().push(i);
+        }
+        if order.is_empty() {
+            // 无数据也产一张空表，避免无工作表导致 xlsx 非法。
+            write_sheet(&mut workbook, "需求", &[])?;
+        }
+        for st in &order {
+            let rows = groups.get(st).map(|v| v.as_slice()).unwrap_or(&[]);
+            write_sheet(&mut workbook, issue_status_label(st), rows)?;
+        }
+    } else {
+        let rows: Vec<&Issue> = issues.iter().collect();
+        write_sheet(&mut workbook, "需求", &rows)?;
+    }
+
+    workbook.save_to_buffer().map_err(|e| e.to_string())
+}
+
+/// 导出参数：项目 + 状态类型多选（空=全量）+ 格式 + 是否按类型分表。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportIssuesQuery {
+    pub project_id: String,
+    /// 选中的状态类型；为空表示全量导出（不按状态过滤）。
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// "csv" | "xlsx"
+    pub format: String,
+    /// 仅 xlsx 生效：每个状态类型导出为独立工作表。
+    #[serde(default)]
+    pub split_by_type: bool,
+}
+
+/// 导出结果：落盘路径 + 导出条数。
+#[derive(serde::Serialize)]
+pub struct IssueExportResult {
+    pub path: String,
+    pub count: i64,
+}
+
+/// 导出总账需求到系统下载目录（CSV / xlsx），返回文件路径与条数。
+#[tauri::command]
+pub async fn export_issues(
+    query: ExportIssuesQuery,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<IssueExportResult, String> {
+    use sqlx::{QueryBuilder, Sqlite};
+    use tauri::Manager;
+    use tauri_plugin_opener::OpenerExt;
+
+    let ExportIssuesQuery { project_id, statuses, format, split_by_type } = query;
+    let fmt = format.to_lowercase();
+    if fmt != "csv" && fmt != "xlsx" {
+        return Err(format!("不支持的导出格式: {}，请使用 csv / xlsx", format));
+    }
+
+    // 拉取需求（按创建时间正序，与总账一致的稳定排序）。
+    let issues: Vec<Issue> = {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT * FROM issues WHERE project_id = ");
+        qb.push_bind(&project_id);
+        if !statuses.is_empty() {
+            qb.push(" AND status IN (");
+            let mut sep = qb.separated(", ");
+            for s in &statuses {
+                sep.push_bind(s);
+            }
+            qb.push(")");
+        }
+        qb.push(" ORDER BY created_at ASC");
+        qb.build_query_as::<Issue>()
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let count = issues.len() as i64;
+
+    // 文件名前缀用项目 slug（文件名安全）；查不到则回退 autoforge。
+    let prefix: String = sqlx::query_scalar::<_, String>("SELECT slug FROM projects WHERE id = ?")
+        .bind(&project_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "autoforge".to_string());
+
+    // 文件名：项目名 + 类型 + 时间戳避免覆盖。
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let (file_name, bytes) = if fmt == "csv" {
+        (
+            format!("{}-需求总账-{}.csv", prefix, stamp),
+            issues_export_csv(&issues),
+        )
+    } else {
+        (
+            format!("{}-需求总账-{}.xlsx", prefix, stamp),
+            issues_export_xlsx(&issues, split_by_type)?,
+        )
+    };
+
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().temp_dir())
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dest = dir.join(&file_name);
+    tokio::fs::write(&dest, &bytes)
+        .await
+        .map_err(|e| format!("写入导出文件失败: {}", e))?;
+
+    let dest_str = dest.to_string_lossy().to_string();
+    let _ = app.opener().reveal_item_in_dir(&dest_str);
+
+    Ok(IssueExportResult { path: dest_str, count })
 }
 
 /// 需求标题（轻量），按 id 批量取，用于变更请求列表解析标题，
@@ -251,9 +551,12 @@ pub async fn submit_issue(
 
 /// Re-run requirement analysis for an issue whose analysis failed (or is stuck at
 /// review 1). Resets the issue to `pending_analysis` and re-enqueues the analysis
-/// job. Re-enqueuing reuses the existing idempotency row (incrementing its attempt
-/// counter) and still re-dispatches the work, so a transient LLM failure recovers
-/// in one click instead of leaving the issue on a dead-end.
+/// job under a UNIQUE idempotency key (`analysis:<id>:retry:<uuid>`). The stable
+/// `analysis:<id>` key would silently de-duplicate against an already-`completed`
+/// job row — `enqueue` only re-dispatches a `failed` row — leaving the issue parked
+/// at `pending_analysis` forever. A unique key always dispatches, so a transient LLM
+/// failure (or a re-analysis of an already-analyzed issue) recovers in one click.
+/// The status-guarded UPDATE above already idempotently blocks a double-click.
 #[tauri::command]
 pub async fn retry_analysis(
     issue_id: String,
@@ -275,7 +578,7 @@ pub async fn retry_analysis(
         &state.db,
         &state.job_tx,
         "analysis",
-        &format!("analysis:{}", issue_id),
+        &format!("analysis:{}:retry:{}", issue_id, uuid::Uuid::new_v4()),
         JobPayload::Analysis {
             issue_id: issue_id.clone(),
         },
@@ -318,7 +621,9 @@ pub async fn reanalyze_with_feedback(
         &state.db,
         &state.job_tx,
         "analysis",
-        &format!("analysis:{}", issue_id),
+        // 唯一 key：稳定的 analysis:<id> 会被 enqueue 按已 completed 的旧 job 行去重而
+        // 不再派发，需求会永远停在 pending_analysis。带意见重评必须真正重跑。
+        &format!("analysis:{}:retry:{}", issue_id, uuid::Uuid::new_v4()),
         JobPayload::Analysis {
             issue_id: issue_id.clone(),
         },
@@ -326,6 +631,104 @@ pub async fn reanalyze_with_feedback(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 「暂不处置」：把待审核 / 分析失败的需求搁置为 `deferred`。
+///
+/// 搁置态是临时停泊，不进入流水线、不能直接编码——这类需求很可能因项目演进发生变化，
+/// 重新启用时只能走「重新分析」（见 `reactivate_issue`）。仅允许从「待需求审核」「分析失败」
+/// 「分析中」三种尚未落地的需求侧状态进入，避免与运行中/已落地的下游产物脱节。
+#[tauri::command]
+pub async fn defer_issue(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let updated = sqlx::query(
+        "UPDATE issues SET status='deferred', updated_at=datetime('now')
+         WHERE id=? AND status IN ('pending_issue_review', 'analysis_failed', 'pending_analysis')",
+    )
+    .bind(&issue_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if updated.rows_affected() == 0 {
+        return Err("仅「待需求审核」「分析失败」「分析中」状态的需求可暂不处置".to_string());
+    }
+    Ok(())
+}
+
+/// 重新启用被「拒绝」或「暂不处置」的需求。
+///
+/// - `mode="reanalyze"`：从 `rejected` / `deferred` 回到 `pending_analysis` 并重新入队分析。
+///   搁置需求**只能**走这条路——项目可能已演进，必须重判而非直接复用旧结论。
+/// - `mode="review"`：仅 `rejected` 可用，且必须已有分析结果，直接退回 `pending_issue_review`
+///   省去重跑分析。搁置需求显式拒绝此模式。
+///
+/// 重新分析复用 `analysis:<id>:retry:<uuid>` 唯一幂等键，规避稳定键被旧 completed job 去重。
+#[tauri::command]
+pub async fn reactivate_issue(
+    issue_id: String,
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM issues WHERE id=?")
+        .bind(&issue_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(status) = status else {
+        return Err("需求不存在".to_string());
+    };
+    if status != "rejected" && status != "deferred" {
+        return Err("仅「已拒绝」或「暂不处置」状态的需求可重新启用".to_string());
+    }
+
+    match mode.as_str() {
+        "reanalyze" => {
+            sqlx::query(
+                "UPDATE issues SET status='pending_analysis', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(&issue_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            crate::tasks::runner::enqueue(
+                &state.db,
+                &state.job_tx,
+                "analysis",
+                &format!("analysis:{}:retry:{}", issue_id, uuid::Uuid::new_v4()),
+                JobPayload::Analysis {
+                    issue_id: issue_id.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "review" => {
+            if status != "rejected" {
+                return Err("「暂不处置」的需求只能重新分析，不能直接退回需求审核".to_string());
+            }
+            let has_analysis: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM issue_analyses WHERE issue_id=? LIMIT 1")
+                    .bind(&issue_id)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if has_analysis.is_none() {
+                return Err("该需求尚无分析结果，请改用「重新分析」".to_string());
+            }
+            sqlx::query(
+                "UPDATE issues SET status='pending_issue_review', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(&issue_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        _ => Err("未知的重新启用模式".to_string()),
+    }
 }
 
 /// 列出某 CR 的测试遥测记录（review_2 合并前自动测试结果）。
@@ -360,4 +763,314 @@ pub async fn update_issue_acceptance(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ── 需求附件（issue_attachments）──────────────────────────────────────────────
+// 镜像会议室附件（conversations.rs::import_attachment），存储基目录用
+// attachments_base()/issues/<issue_id>/，复用 attachments_common 的安全白名单。
+// 图片附件可经 supports_vision 的分析 Agent 内联识别（tasks/analysis.rs）。
+
+async fn load_issue_attachment(
+    db: &crate::db::Db,
+    attachment_id: &str,
+) -> Result<IssueAttachment, String> {
+    sqlx::query_as::<_, IssueAttachment>("SELECT * FROM issue_attachments WHERE id=?")
+        .bind(attachment_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "附件不存在".to_string())
+}
+
+#[tauri::command]
+pub async fn import_issue_attachment(
+    payload: IssueAttachmentUpload,
+    state: State<'_, AppState>,
+) -> Result<IssueAttachment, String> {
+    let issue_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM issues WHERE id=?")
+        .bind(&payload.issue_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if issue_exists.is_none() {
+        return Err(format!("issue {} not found", payload.issue_id));
+    }
+
+    if payload.data_base64.len() > (MAX_ATTACHMENT_BYTES * 4 / 3 + 16) {
+        return Err("附件超过 10 MB 上限".to_string());
+    }
+
+    let bytes = general_purpose::STANDARD
+        .decode(payload.data_base64.as_bytes())
+        .map_err(|_| "附件内容不是有效的 base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("附件不能为空".to_string());
+    }
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err("附件超过 10 MB 上限".to_string());
+    }
+
+    let clean_name = sanitize_file_name(&payload.file_name);
+    let policy = validate_attachment(&clean_name, payload.mime_hint.as_str(), &bytes)?;
+    let attachment_id = Uuid::new_v4().to_string();
+    let stored_name = format!("{}.{}", attachment_id, policy.ext);
+    // rel_path 含 `issues/` 段，使 attachment_path_from_rel（= attachments_base()/rel_path）
+    // 与下方落盘目录一致。
+    let rel_path = format!("issues/{}/{}", payload.issue_id, stored_name);
+    let issue_dir = PathBuf::from(crate::state::attachments_base())
+        .join("issues")
+        .join(&payload.issue_id);
+    let file_path = issue_dir.join(&stored_name);
+
+    tokio::fs::create_dir_all(&issue_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::fs::write(&file_path, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let insert_result = sqlx::query(
+        "INSERT INTO issue_attachments
+         (id, issue_id, original_name, stored_name, rel_path, mime, kind, size_bytes, sha256)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&attachment_id)
+    .bind(&payload.issue_id)
+    .bind(&clean_name)
+    .bind(&stored_name)
+    .bind(&rel_path)
+    .bind(policy.mime)
+    .bind(policy.kind)
+    .bind(bytes.len() as i64)
+    .bind(&sha256)
+    .execute(&state.db)
+    .await;
+
+    if let Err(e) = insert_result {
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return Err(e.to_string());
+    }
+
+    load_issue_attachment(&state.db, &attachment_id).await
+}
+
+#[tauri::command]
+pub async fn list_issue_attachments(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<IssueAttachment>, String> {
+    sqlx::query_as::<_, IssueAttachment>(
+        "SELECT * FROM issue_attachments WHERE issue_id=? ORDER BY created_at ASC",
+    )
+    .bind(&issue_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn issue_attachment_data_url(
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let attachment = load_issue_attachment(&state.db, &attachment_id).await?;
+    if attachment.kind != "image" {
+        return Err("只有图片附件支持内联预览".to_string());
+    }
+    if attachment.size_bytes as usize > MAX_ATTACHMENT_BYTES {
+        return Err("图片超过预览大小上限".to_string());
+    }
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
+    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    Ok(format!(
+        "data:{};base64,{}",
+        attachment.mime,
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command]
+pub async fn open_issue_attachment(
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let attachment = load_issue_attachment(&state.db, &attachment_id).await?;
+    let path = attachment_path_from_rel(&attachment.rel_path)?;
+    if !path.exists() {
+        return Err("附件文件不存在或已被移除".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+
+    cmd.arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开附件：{}", e))
+}
+
+#[tauri::command]
+pub async fn delete_issue_attachment(
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let attachment = load_issue_attachment(&state.db, &attachment_id).await?;
+    if let Ok(path) = attachment_path_from_rel(&attachment.rel_path) {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    sqlx::query("DELETE FROM issue_attachments WHERE id=?")
+        .bind(&attachment_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── 需求全链路生命周期追溯（#101/#108/#131）────────────────────────────────────
+// 把一条需求从录入→分析→需求审核→编码→代码审核→合并/撤销散落在多张表里的关键节点
+// 聚合成一条按时间排序的时间线，供审核页「溯源时间线 / 生命线」面板下钻展示。
+
+/// 生命周期时间线上的一个事件。
+#[derive(serde::Serialize)]
+pub struct LifecycleEvent {
+    /// ISO 时间戳（datetime('now') 文本，可直接字典序排序）。
+    pub at: String,
+    /// 事件类别：created / analyzed / decision / cr_created / cr_approved / worktree / merged。
+    pub kind: String,
+    /// 一句话标签（中文，给人看）。
+    pub label: String,
+    /// 补充明细（可空）。
+    pub detail: String,
+}
+
+/// 聚合某需求的全链路生命周期事件（按时间升序）。纯只读、跨表 UNION 后在 Rust 里排序。
+#[tauri::command]
+pub async fn get_issue_lifecycle(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<LifecycleEvent>, String> {
+    let db = &state.db;
+    let mut events: Vec<LifecycleEvent> = Vec::new();
+
+    // 1) 需求录入。
+    if let Some((title, status, created)) =
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT title, status, created_at FROM issues WHERE id=?",
+        )
+        .bind(&issue_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "created".into(),
+            label: "需求录入".into(),
+            detail: format!("{}（当前状态：{}）", title, status),
+        });
+    }
+
+    // 2) 需求分析（每次分析一行）。
+    for (created, auth) in sqlx::query_as::<_, (String, f64)>(
+        "SELECT created_at, authenticity_score FROM issue_analyses WHERE issue_id=? ORDER BY created_at",
+    )
+    .bind(&issue_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    {
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "analyzed".into(),
+            label: "需求分析完成".into(),
+            detail: format!("真实性评分 {:.2}", auth),
+        });
+    }
+
+    // 3) 人工审核决策（review_1 / review_2）。
+    for (created, stage, decision, sugg) in sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT created_at, stage, decision, suggestions FROM admin_decisions WHERE issue_id=? ORDER BY created_at",
+    )
+    .bind(&issue_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    {
+        let stage_label = match stage.as_str() {
+            "review_1" => "需求审核",
+            "review_2" => "代码审核",
+            other => other,
+        };
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "decision".into(),
+            label: format!("{}：{}", stage_label, decision),
+            detail: sugg.unwrap_or_default(),
+        });
+    }
+
+    // 4) 变更请求创建 / 通过。
+    for (cr_id, status, created, approved) in
+        sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT id, status, created_at, approved_at FROM change_requests WHERE issue_id=? ORDER BY created_at",
+        )
+        .bind(&issue_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+    {
+        events.push(LifecycleEvent {
+            at: created,
+            kind: "cr_created".into(),
+            label: "创建变更请求".into(),
+            detail: format!("CR {}（{}）", &cr_id[..cr_id.len().min(8)], status),
+        });
+        if let Some(a) = approved.filter(|s| !s.trim().is_empty()) {
+            events.push(LifecycleEvent {
+                at: a,
+                kind: "cr_approved".into(),
+                label: "代码审核通过".into(),
+                detail: format!("CR {}", &cr_id[..cr_id.len().min(8)]),
+            });
+        }
+        // 5) worktree 执行 / 合并提交。
+        for (created_w, merge_commit, wstatus) in
+            sqlx::query_as::<_, (String, Option<String>, String)>(
+                "SELECT created_at, merge_commit, status FROM worktree_sessions WHERE change_request_id=? ORDER BY created_at",
+            )
+            .bind(&cr_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default()
+        {
+            events.push(LifecycleEvent {
+                at: created_w,
+                kind: "worktree".into(),
+                label: "编码执行".into(),
+                detail: format!("worktree {}", wstatus),
+            });
+            if let Some(c) = merge_commit.filter(|s| !s.trim().is_empty()) {
+                events.push(LifecycleEvent {
+                    at: String::new(), // 合并时间用 CR 的 updated 不易取，置空排末尾
+                    kind: "merged".into(),
+                    label: "已合并到主干".into(),
+                    detail: format!("提交 {}", &c[..c.len().min(10)]),
+                });
+            }
+        }
+    }
+
+    // 时间升序；空时间戳（合并提交）排到最后。
+    events.sort_by(|a, b| match (a.at.is_empty(), b.at.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.at.cmp(&b.at),
+    });
+    Ok(events)
 }

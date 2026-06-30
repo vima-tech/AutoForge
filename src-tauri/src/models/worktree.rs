@@ -16,10 +16,19 @@ pub struct WorktreeSession {
     /// dev 之后独立前进也不会污染本 CR 的 diff（旧 session 为 NULL 时回退到
     /// 对 target_branch 的实时 diff）。
     pub base_commit: Option<String>,
+    /// 合并到 dev 时产生的 squash 提交 SHA，作为「撤销该需求改动」的 revert 对象。
+    /// 合并成功后 `git rev-parse HEAD` 回填；旧 session 为 NULL → 撤销入口置灰降级。
+    pub merge_commit: Option<String>,
     /// 合并前自动 merge dev 入分支时若冲突，记录冲突文件路径（JSON 数组）。
     pub conflict_files: Option<String>,
     /// 冲突时带冲突标记的快照（供审核页三方视图与 AI 解冲突 agent 输入）。
     pub conflict_diff: Option<String>,
+    /// 合并并行化：premerge 阶段测试所基于的 dev 提交 SHA。land 阶段据此判断 dev 是否在
+    /// 「测试后、落地前」被兄弟 CR 推进，决定直落 / 独立直落 / 重叠补测（见 merge::revalidate）。
+    /// 旧 session 或走 legacy 单锁路径时为 NULL。
+    pub tested_dev_sha: Option<String>,
+    /// premerge 阶段（测试门 + 安全门）通过的时间戳。
+    pub premerge_at: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
 }

@@ -7,7 +7,8 @@ use crate::tasks::runner::{enqueue, JobSender};
 use tauri::AppHandle;
 use uuid::Uuid;
 
-/// 统一需求接收网关：去重、安全检查、入库、入队分析
+/// 统一需求接收网关：去重、安全检查、入库、入队分析。
+/// 薄包装，丢弃「是否新建」标志，兼容既有调用方。
 pub async fn receive(
     db: &Db,
     job_tx: &JobSender,
@@ -15,6 +16,21 @@ pub async fn receive(
     payload: IntakePayload,
     mode: IntakeMode,
 ) -> Result<Issue, String> {
+    receive_with_status(db, job_tx, app, payload, mode)
+        .await
+        .map(|(issue, _created)| issue)
+}
+
+/// 同 [`receive`]，但额外返回 `created`：仅当**真正 INSERT 了一条全新条目**时为 `true`。
+/// 命中既有活跃条目（去重）或返回既有已拒绝条目（Triage 不复活）时为 `false`。
+/// 自喂料据此**只对新条目计预算/计入待整理**，避免重复条目占满 `max_per_run`、饿死 proposer。
+pub async fn receive_with_status(
+    db: &Db,
+    job_tx: &JobSender,
+    app: &AppHandle,
+    payload: IntakePayload,
+    mode: IntakeMode,
+) -> Result<(Issue, bool), String> {
     if security::has_obvious_injection(&payload.title) {
         return Err("标题包含可疑内容，提交被拒绝".to_string());
     }
@@ -48,14 +64,26 @@ pub async fn receive(
 
     if let Some((dup_id, dup_status)) = existing {
         if dup_status != "rejected" {
-            // 活跃需求：真正的重复，返回已存在的条目。
-            return sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
+            // 活跃需求：真正的重复，返回已存在的条目（created=false，不计预算）。
+            let issue = sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
                 .bind(&dup_id)
                 .fetch_one(db)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())?;
+            return Ok((issue, false));
         }
-        // 已拒绝：复活为本次提交的初始状态，刷新内容与时间戳，重新进入活跃池。
+        // 已拒绝且为 Triage（自喂料）来源：人工已明确否决过该指纹，**不复活**——
+        // 否则扫描器每轮都会把被拒条目重新刷回待整理池（噪音复发）。直接返回既有
+        // 已拒绝条目（created=false），由自喂料跳过、不计预算、不计入待整理。
+        if mode == IntakeMode::Triage {
+            let issue = sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
+                .bind(&dup_id)
+                .fetch_one(db)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok((issue, false));
+        }
+        // 已拒绝且为 Flow（用户明确重新提出）：复活为本次提交的初始状态，刷新内容与时间戳，重新进入活跃池。
         sqlx::query(
             "UPDATE issues
              SET status=?, title=?, description=?, category=?, severity=?,
@@ -100,7 +128,38 @@ pub async fn receive(
             },
         );
 
-        return Ok(issue);
+        // 复活既有条目（非全新行）→ created=false。
+        return Ok((issue, false));
+    }
+
+    // 近似去重（仅机器生成的 Triage 来源，绝不作用于用户的 Flow 提交——用户的明确需求
+    // 不能被模糊匹配静默吞掉）：精确指纹未命中时，proposer/scanner 常换个措辞重提同一问题，
+    // 精确哈希抓不住。这里对同项目内**活跃**（非终态）需求的标题做字符 bigram Jaccard 相似度，
+    // 超过保守阈值即判为重复，返回既有条目（created=false → 不计预算、不淹没队列）。
+    if mode == IntakeMode::Triage {
+        const SIM_THRESHOLD: f64 = 0.72;
+        let incoming = security::title_shingles(&title);
+        if !incoming.is_empty() {
+            let candidates: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, title FROM issues
+                 WHERE project_id=?
+                   AND status NOT IN ('merged','rejected','reverted','deferred','no_change_needed')",
+            )
+            .bind(&payload.project_id)
+            .fetch_all(db)
+            .await
+            .map_err(|e| e.to_string())?;
+            for (cid, ctitle) in candidates {
+                if security::jaccard(&incoming, &security::title_shingles(&ctitle)) >= SIM_THRESHOLD {
+                    let issue = sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
+                        .bind(&cid)
+                        .fetch_one(db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok((issue, false));
+                }
+            }
+        }
     }
 
     let id = Uuid::new_v4().to_string();
@@ -152,5 +211,6 @@ pub async fn receive(
         },
     );
 
-    Ok(issue)
+    // 全新 INSERT → created=true（自喂料据此计预算/计入待整理）。
+    Ok((issue, true))
 }

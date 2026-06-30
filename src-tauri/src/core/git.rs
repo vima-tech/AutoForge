@@ -96,30 +96,24 @@ impl GitProxy {
                     return deny("force/destructive push is not allowed");
                 }
             }
-            "branch" => {
-                if rest.iter().any(|a| *a == "-D" || *a == "-d" || *a == "--delete") {
-                    // Every non-flag operand must be an autoforge/* branch.
-                    let bad = rest[1..]
-                        .iter()
-                        .filter(|a| !a.starts_with('-'))
-                        .any(|a| !a.starts_with("autoforge/"));
-                    if bad {
-                        return deny("branch delete only allowed for autoforge/* branches");
-                    }
+            "branch" if rest.iter().any(|a| *a == "-D" || *a == "-d" || *a == "--delete") => {
+                // Every non-flag operand must be an autoforge/* branch.
+                let bad = rest[1..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .any(|a| !a.starts_with("autoforge/"));
+                if bad {
+                    return deny("branch delete only allowed for autoforge/* branches");
                 }
             }
             "symbolic-ref" | "update-ref" | "fast-import" | "filter-branch" | "daemon" => {
                 return deny("forbidden git subcommand");
             }
-            "remote" => {
-                if rest.get(1) == Some(&"set-url") || rest.get(1) == Some(&"add") {
-                    return deny("modifying remotes is not allowed");
-                }
+            "remote" if rest.get(1) == Some(&"set-url") || rest.get(1) == Some(&"add") => {
+                return deny("modifying remotes is not allowed");
             }
-            "config" => {
-                if rest.iter().any(|a| *a == "--global" || *a == "--system") {
-                    return deny("config --global/--system is not allowed");
-                }
+            "config" if rest.iter().any(|a| *a == "--global" || *a == "--system") => {
+                return deny("config --global/--system is not allowed");
             }
             _ => {}
         }
@@ -170,5 +164,51 @@ impl GitProxy {
             return Err(anyhow!("git {:?} failed ({}): {}", args, code, stderr));
         }
         Ok(stdout.trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy() -> GitProxy {
+        GitProxy::new("/tmp")
+    }
+
+    fn allowed(args: &[&str]) -> bool {
+        proxy().check_args(args).is_ok()
+    }
+
+    #[test]
+    fn branch_delete_guard_semantics() {
+        // Deleting a non-autoforge branch is denied.
+        assert!(!allowed(&["branch", "-D", "main"]));
+        assert!(!allowed(&["branch", "--delete", "feature/x"]));
+        // Deleting an autoforge/* branch is allowed.
+        assert!(allowed(&["branch", "-d", "autoforge/abc"]));
+        // No delete flag => guard does not match, falls through to Ok.
+        assert!(allowed(&["branch", "main"]));
+        assert!(allowed(&["branch", "--list"]));
+    }
+
+    #[test]
+    fn remote_guard_semantics() {
+        // Mutating remotes is denied.
+        assert!(!allowed(&["remote", "set-url", "origin", "https://x"]));
+        assert!(!allowed(&["remote", "add", "origin", "https://x"]));
+        // Read-only remote ops fall through to Ok.
+        assert!(allowed(&["remote", "get-url", "origin"]));
+        assert!(allowed(&["remote", "-v"]));
+        assert!(allowed(&["remote"]));
+    }
+
+    #[test]
+    fn config_guard_semantics() {
+        // Global/system config writes are denied.
+        assert!(!allowed(&["config", "--global", "user.name", "x"]));
+        assert!(!allowed(&["config", "--system", "core.editor", "vim"]));
+        // Local config falls through to Ok.
+        assert!(allowed(&["config", "user.name", "x"]));
+        assert!(allowed(&["config", "--local", "user.email", "x@y"]));
     }
 }

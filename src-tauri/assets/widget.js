@@ -55,7 +55,9 @@
     submit.disabled = true; msg.textContent = '提交中…';
     var headers = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = 'Bearer ' + token;
-    fetch(endpoint + '/webhook/issues', {
+    // src=widget：标记匿名反馈来源，webhook 端据此强制落入「待整理池」（不自动烧 AI 预算），
+    // 即便此处用的是项目 flow token。query 参数不触发额外 CORS 预检头。
+    fetch(endpoint + '/webhook/issues?src=widget', {
       method: 'POST',
       headers: headers,
       body: JSON.stringify({
@@ -68,8 +70,19 @@
       })
     }).then(function (r) {
       submit.disabled = false;
-      if (r.ok) { msg.textContent = '已提交，谢谢！'; title.value = ''; desc.value = ''; setTimeout(close, 900); }
-      else { msg.textContent = '提交失败（' + r.status + '）'; }
+      if (!r.ok) { msg.textContent = '提交失败（' + r.status + '）'; return; }
+      title.value = ''; desc.value = '';
+      // 反馈闭环：拿回 issue id，给出「查看进度」回执链接（/feedback?id=…），可随时回查处理状态。
+      r.json().then(function (issue) {
+        var id = issue && issue.id;
+        if (id) {
+          msg.innerHTML = '已提交，谢谢！<a href="' + endpoint + '/feedback?id=' +
+            encodeURIComponent(id) + '" target="_blank" rel="noopener" style="margin-left:6px;color:#e8772e;text-decoration:underline;">查看进度</a>';
+        } else {
+          msg.textContent = '已提交，谢谢！';
+          setTimeout(close, 900);
+        }
+      }).catch(function () { msg.textContent = '已提交，谢谢！'; setTimeout(close, 900); });
     }).catch(function () { submit.disabled = false; msg.textContent = '网络错误'; });
   });
 })();

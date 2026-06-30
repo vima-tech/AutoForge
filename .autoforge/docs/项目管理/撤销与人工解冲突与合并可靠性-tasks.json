@@ -1,0 +1,244 @@
+{
+  "meta": {
+    "title": "稳定撤销 issue 改动 + 人工解冲突器 + 合并可靠性加固 任务清单",
+    "plan_ref": ".autoforge/docs/待实现功能/AutoForge-撤销与人工解冲突与合并可靠性-功能提案.md",
+    "created": "2026-06-20",
+    "status": "✅ 主体已实现（2026-06-21；cargo test 114 passed、cargo build/​npm run build 通过、tsc 零错、新文件 conflicts.rs/revert.rs clippy 零告警）。已落地：P0-1 squash 合并由仓库先行完成、本轮补 merge_commit 列(迁移0058)+SHA 回填；P0-2 state::cr_lock per-CR 锁 + ai_resolve 状态复核；P0-3 enqueue 仅对新建/failed 才 dispatch（幂等键不再重复执行）；P1 撤销全链（CrReverted 事件 + JobPayload::Revert + tasks/revert.rs 双路径 git revert + revert_change_request 原子门 merged→reverting + Audit 撤销按钮/确认弹窗，含 2 个 revert 单测）；P2 解冲突器（merge.rs 抽 finalize_resolution/materialize_conflict/list_unmerged，commands/conflicts.rs 三命令 get_conflict_detail/resolve_conflict_manually/open_conflict_workspace + 段解析 3 单测，Audit ConflictResolver 逐 hunk 决策 UI + 外部 IDE 兜底，sync 防御性 merge --abort 清残留）；P3-4(L2) worktree 缺失 merge_failed 守卫。【取舍/未做】P3-1(M2)：squash + Phase1 dev-sync + merge_lock 下 land 阶段冲突实际不可达，写它=死代码，故不做；P3-2(M3)：『非冲突 merge 失败当 clean 放行』为推测性、改动有回归风险（worktree 未提交态合并语义），暂留并标注；P3-3(L1)：内存 pending_review 计数漂移仅影响 Dashboard 显示（准入用 DB COUNT），修复需把 ConcurrencyManager 侵入式穿参进 ai_resolve/finalize，性价比低暂缓。",
+    "decisions": [
+      "合并方式采纳 git merge --squash（spec testing.md:11/CLAUDE.md:205 已更新）：land_on_dev 改 squash + 显式 commit -m，每 CR 在 dev 压成一个普通提交；分支清理改 branch -D",
+      "撤销 = git revert <sha>（squash 是普通提交，无需 -m 1）；撤销单元为 worktree_sessions.merge_commit（迁移 0058 新列）",
+      "撤销/解冲突去重靠原子状态门（merged→reverting / merge_conflict→resolving_conflict），不靠 enqueue 幂等键（M1：enqueue 无条件 tx.send，幂等键只防重复行不防重复执行）",
+      "冲突态按需物化（MERGE_HEAD 幂等重建，不 abort）；三方真源走 git show :1/:2/:3（base/ours/theirs）",
+      "AI/人工/外部三路共享 finalize_resolution() 尾段（提交→run_and_gate→pending_code_review/merge_failed）",
+      "per-CR 互斥锁覆盖所有写 worktree 的冲突操作 + merge::run（H2 根治同 worktree 无锁并发）",
+      "冲突 MVP：撤销/解冲突撞冲突只 abort+如实上报，不自动改写结果",
+      "撤销保留 issue/CR 历史与 diff 快照，置 reverted 终态；旧 CR 无 merge_commit → 前端置灰降级",
+      "解冲突器主方向 B（逐 hunk 决策）+ C（外部 IDE 兜底）；不做 A（Monaco 全编辑器）"
+    ],
+    "migration_note": "下一序号 0058（0057=code_agents 已占用）。worktree_sessions 加可空列 merge_commit TEXT。状态值 reverting/reverted/resolving_conflict 为字符串，无需迁移；解冲突器按需物化，无需新表。",
+    "global_constraints": [
+      "迁移仅追加不改已有；下一序号 0058",
+      "新增 command 四步：commands/<mod>.rs → mod.rs 导出 → lib.rs invoke_handler 注册 → services/index.ts 封装；前端禁直接 invoke",
+      "业务逻辑零 Tauri 类型（铁律#1）：tasks/revert.rs、core、新 finalize/materialize 不出现 AppHandle/State/tauri::*（事件发射例外，只走 event::emit）",
+      "command 保持薄包装：取 state → 调纯 async fn → 返回（铁律#3）",
+      "事件一律加到 AppEvent enum 经 event::emit 发，不发裸 JSON、不直接 app.emit（铁律#2）",
+      "所有 git 操作走 GitProxy；撤销/解冲突在自管路径隔离 worktree + push origin/dev，绝不碰主工作树",
+      "agent/外部输出回灌前过 core/security::has_obvious_injection()",
+      "进程启动走 core/platform（打开 worktree 用 platform open，禁裸 Command）",
+      "前端只用 src/index.css CSS 变量，禁硬编码色值/px；图标走 <Icon/>；下拉用 proj-select+mention-pop，禁原生 select；每屏 ≤1 主按钮；弹窗遮罩 inset:var(--win-gutter) + 不点遮罩关闭，关闭只走 ✕/Esc",
+      "涉及 IPC/进程/文件的功能须在 npm run tauri:dev 完整环境验证（testing.md）"
+    ],
+    "verify_default": "cargo build (src-tauri) 通过 + cargo test --lib 全绿 + 新文件 clippy 零告警 + npm run build 通过 + npm run tauri:dev 手动走查",
+    "execution_order": "P0-1..3（基座，解锁 P1/P2）→ P1-1..4（撤销）→ P2-1..4（解冲突器）→ P3-1..4（加固）；标 depends_on 的须前置完成"
+  },
+  "phases": [
+    {
+      "id": "P0",
+      "name": "合并可靠性基座（H1/H2/M1，撤销与解冲突的共同前提）",
+      "goal": "squash 合并 + 记录提交 SHA + per-CR 锁 + 去重门，根治正确性缺陷",
+      "tasks": [
+        {
+          "id": "P0-1",
+          "title": "[H1+L4] land_on_dev 改 squash + commit + 记录 merge_commit",
+          "intent": "合并方式对齐 spec，并补上撤销地基（提交 SHA）",
+          "desc": "迁移 0058_worktree_merge_commit.sql：ALTER TABLE worktree_sessions ADD COLUMN merge_commit TEXT。models/worktree.rs WorktreeSession 加 merge_commit: Option<String>。merge.rs land_on_dev 两路径改 merge --squash <branch> + 显式 commit -m <merge_msg>（in-place 在 dev 上 commit；自管在隔离 worktree commit 后 push HEAD:dev）；成功后 git rev-parse HEAD 取 squash 提交 SHA，land_on_dev 返回 Ok(String)。run() 成功分支 UPDATE worktree_sessions SET merge_commit=? WHERE id=?。分支清理用 branch -D（squash 不标记已合并）。",
+          "creates": ["src-tauri/migrations/0058_worktree_merge_commit.sql"],
+          "edits": ["src-tauri/src/models/worktree.rs", "src-tauri/src/tasks/merge.rs"],
+          "depends_on": [],
+          "acceptance": "合并产出单个普通提交；merge_commit 落库非空；既有 merge 单测调整后通过",
+          "verify": "cargo test --lib（merge tests）；tauri:dev 跑一个 CR 合并，查 dev 上为单提交 + DB merge_commit 有值",
+          "ref": "merge.rs:23-132 land_on_dev、:42-48 in-place no-ff、:91-98 isolated no-ff、:704 run 成功；testing.md:11/CLAUDE.md:205 squash 规格"
+        },
+        {
+          "id": "P0-2",
+          "title": "[H2] 新增 per-CR 互斥锁，覆盖 merge::run 与所有 ai_resolve 入口",
+          "intent": "根治同一 CR worktree 上的无锁并发 git 操作",
+          "desc": "state.rs 仿 merge_lock 加 cr_lock(cr_id)->Arc<Mutex<()>>（OnceLock+HashMap）。merge::run 在持 merge_lock 后再持本 CR 的 cr_lock。ai_resolve_conflict（自动 spawn 与手动命令两入口）入口持 cr_lock。命令入口加状态门：仅 merge_conflict 可触发解冲突，触发即原子 UPDATE status='resolving_conflict' WHERE id=? AND status='merge_conflict'，rows_affected==0 拒绝（防重入/双击）。",
+          "creates": [],
+          "edits": ["src-tauri/src/state.rs", "src-tauri/src/tasks/merge.rs", "src-tauri/src/commands/change_requests.rs"],
+          "depends_on": [],
+          "acceptance": "并发 retry + ai_resolve 不再同时写同一 worktree；双击 AI 解冲突第二次被状态门拒绝",
+          "verify": "cargo build；tauri:dev 制造冲突后快速连点「AI 解冲突」「重试」，观察无 index.lock 报错、无双跑",
+          "ref": "merge.rs:515 自动 spawn、change_requests.rs:351-365 ai_resolve_merge_conflict、state.rs:31-42 merge_lock 模板"
+        },
+        {
+          "id": "P0-3",
+          "title": "[M1] enqueue 不重复 dispatch；危险命令统一原子状态门",
+          "intent": "幂等键真正生效，撤销/合并不被重复执行",
+          "desc": "runner.rs enqueue：INSERT OR IGNORE 后查现状态，仅当行新建或状态为 pending/failed 时才 tx.send；已 running/completed 的同 key 跳过发送（返回既有 id 不再 dispatch）。注：retry 用唯一 uuid key 仍每次新建，故 retry 的去重靠 P0-2/P1 的状态门而非 enqueue。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/runner.rs"],
+          "depends_on": [],
+          "acceptance": "对已完成 key 重复 enqueue 不再二次 dispatch；现有 merge/execution 流程行为不变",
+          "verify": "cargo test --lib；针对 enqueue 加单测：同 key 两次，第二次不发消息",
+          "ref": "runner.rs:210-247 enqueue（:239 无条件 tx.send）、change_requests.rs:336-346 retry_merge"
+        }
+      ]
+    },
+    {
+      "id": "P1",
+      "name": "稳定撤销 issue 改动（git revert squash 提交）",
+      "goal": "merged CR 一键撤销，复用安全合并管道，留审计痕迹",
+      "tasks": [
+        {
+          "id": "P1-1",
+          "title": "新增 reverted 状态 + CrReverted 事件",
+          "intent": "撤销终态与事件出口就位",
+          "desc": "core/event.rs 加 AppEvent::CrReverted{cr_id,project_id} 并加入 cr_id() 匹配；notification.rs::from_event 加一条收件箱草稿。状态值 reverting（瞬态）/reverted（终态）为字符串，前端 Audit.tsx STATUS_LABELS/颜色补登记。",
+          "creates": [],
+          "edits": ["src-tauri/src/core/event.rs", "src-tauri/src/commands/notifications.rs", "src/pages/Audit.tsx"],
+          "depends_on": [],
+          "acceptance": "cargo build；CrReverted 可发可订阅；前端识别 reverted 态标签",
+          "verify": "cargo build + npm run build",
+          "ref": "event.rs:8-93 AppEvent、:98-111 cr_id()、Audit.tsx:55-77 状态标签表"
+        },
+        {
+          "id": "P1-2",
+          "title": "tasks/revert.rs：revert_on_dev 双路径 + 状态门",
+          "intent": "撤销核心逻辑，镜像 land_on_dev",
+          "desc": "JobPayload::Revert{change_request_id}（models/job.rs）+ runner.rs dispatch 到 tasks::revert::run。tasks/revert.rs run(db,tx,app,cr_id)：载入 latest session/cr/project → 校验 session.merge_commit 非空 → 持 merge_lock+cr_lock → 探测 dev_is_live（同 merge.rs:628-634）→ revert_on_dev：in-place（checkout dev + git revert --no-edit <sha>）/ 自管（origin/dev 隔离 worktree + revert + push HEAD:dev）→ 成功置 CR/issue=reverted + emit CrReverted + notify；冲突 git revert --abort 还原 + 回 merged + report_content 写「撤不干净：后续改动依赖此需求」+ emit。",
+          "creates": ["src-tauri/src/tasks/revert.rs"],
+          "edits": ["src-tauri/src/models/job.rs", "src-tauri/src/tasks/runner.rs", "src-tauri/src/tasks/mod.rs"],
+          "depends_on": ["P0-1", "P0-2"],
+          "acceptance": "revert 单测通过；自管路径隔离 push 不碰主工作树",
+          "verify": "cargo test --lib（revert tests：建仓 squash 合并取 SHA → revert → 断言改动被撤；冲突用例断言 abort 还原）",
+          "ref": "merge.rs:23-132 land_on_dev 模板、:628-634 dev_is_live、worktree_sessions.merge_commit(P0-1)"
+        },
+        {
+          "id": "P1-3",
+          "title": "命令 revert_change_request + 注册 + 服务封装",
+          "intent": "IPC 入口（薄包装 + 原子状态门）",
+          "desc": "commands/change_requests.rs 加 revert_change_request(cr_id,state)：原子 UPDATE change_requests SET status='reverting' WHERE id=? AND status='merged'，rows_affected==0 拒绝（已撤/非 merged/旧无 SHA）；通过则入队 Revert job。lib.rs invoke_handler 注册；capabilities/main.json 声明；services/index.ts 加 revertChangeRequest(crId)。",
+          "creates": [],
+          "edits": ["src-tauri/src/commands/change_requests.rs", "src-tauri/src/lib.rs", "src-tauri/capabilities/main.json", "src/services/index.ts"],
+          "depends_on": ["P1-2"],
+          "acceptance": "重复点击撤销第二次被状态门拒绝；非 merged CR 拒绝",
+          "verify": "tauri:dev 调用一次成功、二次拒绝",
+          "ref": "change_requests.rs:317-347 retry_merge 模板、:10 invoke 注册风格"
+        },
+        {
+          "id": "P1-4",
+          "title": "Audit.tsx 撤销入口 + 二次确认 + 事件刷新",
+          "intent": "已合并 CR 详情可一键撤销",
+          "desc": "merged 态 CR 详情底部加「撤销此需求改动」.btn-danger + 二次确认弹窗（遮罩 inset:var(--win-gutter)、不点遮罩关闭、✕/Esc）。无 merge_commit 旧 CR 置灰 + 提示「该需求合并早于撤销功能，无法一键撤销」（需 get_worktree_session 返回 merge_commit）。订阅 CrReverted 刷新列表。",
+          "creates": [],
+          "edits": ["src/pages/Audit.tsx", "src/services/index.ts"],
+          "depends_on": ["P1-1", "P1-3"],
+          "acceptance": "撤销动线可走通；旧 CR 置灰；撤销后列表/状态实时刷新",
+          "verify": "tauri:dev 走查撤销 + 旧 CR 置灰 + 事件刷新",
+          "ref": "Audit.tsx:1476 conflict state、:2297 merge_conflict 渲染分支（弹窗/按钮样式参考）"
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "name": "人工解冲突器（B 逐 hunk 决策 + C 外部 IDE 兜底）",
+      "goal": "应用内逐 hunk 三方决策解决冲突，结构性大冲突甩外部 IDE",
+      "tasks": [
+        {
+          "id": "P2-1",
+          "title": "merge.rs 抽 finalize_resolution() + materialize_conflict()",
+          "intent": "AI/人工/外部三路共享尾段；冲突按需幂等物化",
+          "desc": "把 ai_resolve_conflict 的提交→校验无标记→commit→run_and_gate→回 pending_code_review/merge_failed 尾段（merge.rs:335-410）抽成 finalize_resolution(db,tx,app,session,cr,issue)。materialize_conflict(worktree,dev_ref)：git rev-parse -q --verify MERGE_HEAD 存在则用现态，否则重跑 merge 重建冲突（不 abort）；rerere 自动解掉则返回「无冲突可直接提交」。ai_resolve_conflict 改调二者，行为不变。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs"],
+          "depends_on": ["P0-2"],
+          "acceptance": "AI 解冲突路径行为零变化；materialize 幂等（重复打开不报错）",
+          "verify": "cargo test --lib；tauri:dev AI 解冲突回归",
+          "ref": "merge.rs:222-411 ai_resolve_conflict、:264-283 重建 merge、:335-410 尾段"
+        },
+        {
+          "id": "P2-2",
+          "title": "commands/conflicts.rs：get_conflict_detail（三方有序段）",
+          "intent": "三方真源结构化供前端渲染",
+          "desc": "新模块 conflicts.rs。get_conflict_detail(cr_id) → materialize_conflict → git diff --name-only --diff-filter=U 列文件 → 每文件读盘切有序段：{type:'context',lines}|{type:'conflict',ours,theirs,base?}（base 取 git show :1:<f>，缺失=add/add）；标记 binary（git 检测）/delete_side（modify/delete）。返回 ConflictDetail{files:[{path,segments,binary,delete_side}]}。四步注册。",
+          "creates": ["src-tauri/src/commands/conflicts.rs"],
+          "edits": ["src-tauri/src/commands/mod.rs", "src-tauri/src/lib.rs", "src-tauri/capabilities/main.json", "src/services/index.ts"],
+          "depends_on": ["P2-1"],
+          "acceptance": "造冲突后返回正确段结构；add/add、binary、modify/delete 各有标记",
+          "verify": "cargo test --lib（conflicts tests：造各类冲突断言段结构）",
+          "ref": "merge.rs:193-204 diff-filter=U、commands/change_requests.rs:283-313 MergeConflictView 风格"
+        },
+        {
+          "id": "P2-3",
+          "title": "commands/conflicts.rs：resolve_conflict_manually + open_conflict_workspace",
+          "intent": "应用内 B 与外部 C 两入口，共用提交尾段",
+          "desc": "resolve_conflict_manually(cr_id, files: Option<Map<path,content>>)：状态门（merge_conflict→resolving_conflict）→ 持 cr_lock → files 有值（B）先写盘，None（C 已改盘）跳过 → finalize_resolution；长任务后台 spawn。open_conflict_workspace(cr_id)：materialize_conflict + core/platform 打开 worktree_path。四步注册 + services 封装。",
+          "creates": [],
+          "edits": ["src-tauri/src/commands/conflicts.rs", "src-tauri/src/lib.rs", "src-tauri/capabilities/main.json", "src/services/index.ts"],
+          "depends_on": ["P2-2"],
+          "acceptance": "B/C 两路均能提交解决、回代码审核；仍有标记则维持 merge_conflict 报错",
+          "verify": "cargo test --lib（manual resolve 断言提交后无标记、回 pending_code_review）",
+          "ref": "merge.rs finalize_resolution(P2-1)、merge.rs:336-347 标记校验、core/platform open"
+        },
+        {
+          "id": "P2-4",
+          "title": "Audit.tsx ConflictResolver 面板",
+          "intent": "逐 hunk 决策三方 UI + 外部兜底",
+          "desc": "替换 merge_conflict 分支的只读 <details>（Audit.tsx:2315-2330）。左：冲突文件切换列表（每文件 已解/总）；右：逐 hunk 卡片两列「dev（传入）/本分支（你的）」复用 .diff-hunk+code-bg（Audit.tsx:114-137），决策按钮 采用本分支/dev/两者保留/手动编辑（手动展 var(--bg-3) textarea），per-hunk 选择存 state；底 确认解决并复审（.btn-primary，全决策后可点）→ 拼整文件 → resolveConflictManually(files)；并列 AI 解冲突 / 在外部编辑器打开 / 我已在外部解决·复审（resolveConflictManually(null)）。binary/delete_side 特殊渲染。全 DESIGN token。",
+          "creates": [],
+          "edits": ["src/pages/Audit.tsx"],
+          "depends_on": ["P2-2", "P2-3"],
+          "acceptance": "逐 hunk 决策可完成并提交；外部 IDE 打开 + 回写复审可走通",
+          "verify": "tauri:dev 走查三路（应用内/AI/外部）+ binary/delete 边界",
+          "ref": "Audit.tsx:114-137 parseDiff/diff-hunk、:2297-2330 merge_conflict 现状"
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "name": "审计余项加固（M2/M3/L1/L2）",
+      "goal": "合并状态机剩余健壮性缺口收口",
+      "tasks": [
+        {
+          "id": "P3-1",
+          "title": "[M2] land 阶段冲突归一到 merge_conflict 通道",
+          "intent": "land 冲突也能用三方解决器，而非只 merge_failed+重试",
+          "desc": "land_on_dev 冲突时捕获 conflict_files/conflict_diff 并置 merge_conflict（与 Phase 1 一致），复用 P2 解决器 UI，不再只写 report_content+merge_failed。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs"],
+          "depends_on": ["P2-1"],
+          "acceptance": "land 阶段冲突进入 merge_conflict 并可三方解决",
+          "verify": "cargo test --lib；构造 land 冲突场景",
+          "ref": "merge.rs:657-694 land 失败分支"
+        },
+        {
+          "id": "P3-2",
+          "title": "[M3] sync_dev_into_worktree 区分 nothing-to-merge 与真失败",
+          "intent": "非冲突 merge 失败不再被当 clean 放行",
+          "desc": "merge.rs:205-207 当前 merge 非零且无 unmerged 即当 Clean。改为仅「Already up to date / nothing to commit」类放行，其他非零（脏树/磁盘满/merge 进行中）置错误态阻断，避免未集成 dev 就测试并 land。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs"],
+          "depends_on": [],
+          "acceptance": "真失败被阻断；正常无可并仍放行",
+          "verify": "cargo test --lib（补 dirty-tree 失败用例）",
+          "ref": "merge.rs:191-208 sync_dev_into_worktree 非零分支"
+        },
+        {
+          "id": "P3-3",
+          "title": "[L1] 回流 pending_code_review 补 transition_to_pending_review",
+          "intent": "修内存计数漂移（显示层）",
+          "desc": "ai_resolve_conflict / 任何把 CR 从非 review 态改回 pending_code_review 的路径，补 concurrency.transition_to_pending_review()，与人审 release_pending_review 配平。注：准入控制用 DB live COUNT（runner.rs:166-169），此为 Dashboard 显示修正。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs"],
+          "depends_on": [],
+          "acceptance": "回流后 Dashboard pending_review 计数与 DB 一致",
+          "verify": "tauri:dev 观察 Dashboard 计数",
+          "ref": "merge.rs:396 回 pending_code_review、concurrency.rs:52-62、runner.rs:92-94 transition"
+        },
+        {
+          "id": "P3-4",
+          "title": "[L2] retry/merge 前校验 worktree 存在或重建",
+          "intent": "避免在 repo_path 错误路径上跑测试",
+          "desc": "merge::run / retry 前若 worktree 不存在则重建（worktree add 回 base_commit/branch）或拒绝，避免 run_and_gate 回退 repo_path 在主仓库而非 CR 分支上跑测试却仍 land。",
+          "creates": [],
+          "edits": ["src-tauri/src/tasks/merge.rs", "src-tauri/src/commands/change_requests.rs"],
+          "depends_on": [],
+          "acceptance": "worktree 缺失时不在错误路径测试",
+          "verify": "cargo test --lib；构造 worktree 缺失场景",
+          "ref": "testing.rs:86-90 回退 repo_path、merge.rs:415-421 载入 session"
+        }
+      ]
+    }
+  ]
+}

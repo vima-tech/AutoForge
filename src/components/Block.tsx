@@ -3,7 +3,7 @@ import Icon from './Icon';
 import Markdown from './Markdown';
 import { highlightText } from './highlight';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, decideIssueDraft, openAttachment, writeWorkspaceFile } from '../services';
+import { attachmentDataUrl, decideIssueDraft, openAttachment, writeWorkspaceFile, undoWorkspaceFile } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -34,11 +34,12 @@ function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: s
   const [saveErr, setSaveErr] = useState('');
   const tokens = tokenize(code);
 
-  const handleSave = async (subfolder: 'docs' | 'specs') => {
+  const handleSave = async (subfolder: 'docs' | 'specs' | 'deliverables') => {
     if (!projectId || saving) return;
     const ext = lang || 'txt';
     const ts = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
-    const filename = `${subfolder === 'docs' ? 'doc' : 'spec'}_${ts}.${ext}`;
+    const prefix = subfolder === 'docs' ? 'doc' : subfolder === 'specs' ? 'spec' : 'deliverable';
+    const filename = `${prefix}_${ts}.${ext}`;
     const relPath = `${subfolder}/${filename}`;
     setSaving(true); setSaveErr('');
     try {
@@ -63,6 +64,9 @@ function CodeBlock({ lang, code, projectId, highlight }: { lang: string; code: s
               </button>
               <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} disabled={saving} onClick={() => handleSave('specs')} title="存入 .autoforge/specs/">
                 <Icon name="folder" size={10} />specs
+              </button>
+              <button className="btn btn-sm" style={{ padding: '1px 7px', fontSize: 'var(--text-micro)' }} disabled={saving} onClick={() => handleSave('deliverables')} title="存入 .autoforge/deliverables/">
+                <Icon name="folder" size={10} />deliverables
               </button>
             </>
           )}
@@ -107,7 +111,7 @@ function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: 
     finally { setDeciding(''); }
   };
 
-  const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs') => {
+  const handleSaveToWorkspace = async (subfolder: 'docs' | 'specs' | 'deliverables') => {
     if (!effectiveProjectId || saving) return;
     const slug = b.title
       .toLowerCase()
@@ -175,6 +179,9 @@ function ArtifactBlock({ b, projectId, highlight, messageId, blockIndex }: { b: 
             <button className="btn btn-sm" disabled={saving} onClick={() => handleSaveToWorkspace('specs')} title="存入 .autoforge/specs/">
               <Icon name="folder" size={12} />存入 specs
             </button>
+            <button className="btn btn-sm" disabled={saving} onClick={() => handleSaveToWorkspace('deliverables')} title="存入 .autoforge/deliverables/">
+              <Icon name="folder" size={12} />存入 deliverables
+            </button>
           </>
         )}
         {saveErr && <span style={{ fontSize: 'var(--text-caption)', color: 'var(--red)' }}>{saveErr}</span>}
@@ -193,25 +200,44 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function FileWrittenBlock({ b, highlight }: { b: Extract<BlockType, { t: 'file_written' }>; highlight?: string }) {
+function FileWrittenBlock({ b, highlight, projectId }: { b: Extract<BlockType, { t: 'file_written' }>; highlight?: string; projectId?: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [undone, setUndone] = useState(false);
+  const [undoing, setUndoing] = useState(false);
+
+  const undo = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!projectId || undoing || undone) return;
+    if (!confirm(`撤销并删除 AI 写入的文件 .autoforge/${b.path}？`)) return;
+    setUndoing(true);
+    try { await undoWorkspaceFile(projectId, b.path); setUndone(true); }
+    catch { /* 失败保持原状，用户可重试 */ }
+    finally { setUndoing(false); }
+  };
+
   return (
     <div className="file-written" style={{
-      border: `1px solid ${b.error ? 'var(--red)' : 'var(--ember)'}`,
+      border: `1px solid ${b.error || undone ? 'var(--red)' : 'var(--ember)'}`,
       borderRadius: 10, overflow: 'hidden',
-      background: b.error ? 'color-mix(in srgb, var(--red) 8%, transparent)' : 'var(--ember-tint)',
-      fontSize: 'var(--text-control)',
+      background: b.error ? 'color-mix(in srgb, var(--red) 8%, transparent)' : undone ? 'var(--bg-3)' : 'var(--ember-tint)',
+      fontSize: 'var(--text-control)', opacity: undone ? 0.6 : 1,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer' }}
         onClick={() => setExpanded(v => !v)}>
         <Icon name={b.error ? 'alert' : 'file'} size={14} style={{ color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }} />
-        <span style={{ color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <span style={{ color: 'var(--text-3)', fontSize: 'var(--text-caption)', fontFamily: 'var(--font-mono)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textDecoration: undone ? 'line-through' : 'none' }}>
           .autoforge/{b.path}
         </span>
-        <span style={{ fontSize: 'var(--text-caption)', color: b.error ? 'var(--red)' : 'var(--ember)', flexShrink: 0 }}>
-          {b.error ? '写入失败' : `${formatBytes(b.size_bytes)} 已写入`}
+        <span style={{ fontSize: 'var(--text-caption)', color: b.error ? 'var(--red)' : undone ? 'var(--text-3)' : 'var(--ember)', flexShrink: 0 }}>
+          {undone ? '已撤销' : b.error ? '写入失败' : `${formatBytes(b.size_bytes)} 已写入`}
         </span>
-        <Icon name={expanded ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+        {/* 撤销按钮：仅写入成功、绑定项目、未撤销时可用 */}
+        {!b.error && !undone && projectId && (
+          <button className="icon-btn" title="撤销此文件写入（删除）" onClick={undo} disabled={undoing} style={{ flexShrink: 0 }}>
+            <Icon name="trash" size={13} />
+          </button>
+        )}
+        <Icon name="chevron" size={12} style={{ color: 'var(--text-3)', flexShrink: 0, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }} />
       </div>
       {expanded && b.preview && (
         <pre style={{ margin: 0, padding: '0 12px 10px', fontSize: 'var(--text-label)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: '1px solid var(--border)' }}>
@@ -277,6 +303,15 @@ export default function Block({ b, projectId, highlight, messageId, blockIndex }
     </div>
   );
   if (b.t === 'artifact') return <ArtifactBlock b={b} projectId={projectId} highlight={highlight} messageId={messageId} blockIndex={blockIndex} />;
-  if (b.t === 'file_written') return <FileWrittenBlock b={b} highlight={highlight} />;
+  if (b.t === 'file_written') return <FileWrittenBlock b={b} highlight={highlight} projectId={projectId} />;
+  if (b.t === 'ws_ref') return (
+    <div className="att" style={{ borderColor: 'var(--ember)', background: 'var(--ember-tint)' }}>
+      <div className="att-ic" style={{ background: 'var(--ember)' }}><Icon name="folder" size={18} /></div>
+      <div style={{ minWidth: 0 }}>
+        <div className="att-name">{highlightText(b.name, highlight)}</div>
+        <div className="att-meta" style={{ fontFamily: 'var(--font-mono)' }}>引用 · .autoforge/{highlightText(b.path, highlight)}</div>
+      </div>
+    </div>
+  );
   return null;
 }

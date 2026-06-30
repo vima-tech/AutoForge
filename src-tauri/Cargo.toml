@@ -26,7 +26,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", 
 # Innate 自成长知识层：以 in-process SDK 依赖嵌入（lib 名 innate_core）。
 # 0.1.11 起 rusqlite 对齐 libsqlite3-sys 0.30，与 sqlx 共用一份 sqlite，无 links 冲突。
 # 0.1.12 新增直觉层 appraise critic（纯增量，现有 recall/record/add API 不变）。
-innate = "0.1.12"
+innate = "0.1.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -40,7 +40,7 @@ hmac = "0.12"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 regex = "1"
-reqwest = { version = "0.13", features = ["json", "multipart"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 # 实时 ASR：后端 WebSocket 代理对接阿里 DashScope 流式识别（native-tls 复用系统 openssl）。
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 # 会议录音内置解码（纯 Rust，零系统依赖）：浏览器 WebView 解不出某格式时后端兜底。
@@ -74,6 +74,11 @@ rust_xlsxwriter = "0.79"
 # 版本与 wry 锁定的 webkit2gtk 一致（4.1 / soup3），避免 ABI 冲突。
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "=2.0.2", features = ["v2_4"] }
+
+# 进程组回收（core/reaper.rs）：对独立进程组的 code agent 整组发 SIGKILL，
+# 回收 claude + 其 ripgrep/构建子进程树。仅 unix 需要（windows 走 taskkill /T）。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.dev]
 incremental = true

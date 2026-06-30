@@ -43,6 +43,8 @@ pub struct RoleDef {
     pub icon: &'static str,
     pub initial: &'static str,
     pub desc: &'static str,
+    /// 使用位置：该角色 LLM 在产品里被实际调用的场景（一句话，供配置页一目了然展示）。
+    pub usage: &'static str,
     /// 默认是否允许进入群聊 / 私聊（仍可被用户在角色卡覆盖）
     pub default_chat: bool,
     /// 仅需绑定 LLM（无内置提示词参与文本生成）。知识层角色（如 kb_distill）置 true，
@@ -56,6 +58,17 @@ pub fn registry() -> &'static [RoleDef] {
 
 pub fn find(kind: &str) -> Option<&'static RoleDef> {
     ROLE_REGISTRY.iter().find(|r| r.kind == kind)
+}
+
+/// 「重」角色：质量/风险敏感、值得用强模型的角色（需求分析、风险分级、安全审查、
+/// 工程提议、测试、原型、部署、知识蒸馏）。供「分级预设」一键配置区分快/强模型。
+/// 其余角色（编排/整理/文档/物料等）视为「轻」，配快模型即可。集中在此单一真源，
+/// 便于与 `code_agents` 的 fast/strong 分级语义对齐。
+pub fn is_heavy(kind: &str) -> bool {
+    matches!(
+        kind,
+        "analysis" | "grader" | "security" | "proposer" | "test" | "prototype" | "deploy" | "kb_distill"
+    )
 }
 
 /// 内置基线提示词（无该角色则 None）。
@@ -95,7 +108,7 @@ pub fn compose_system_prompt(kind: Option<&str>, mode: &str, agent_prompt: &str)
 // 仅注入到会议室里产出自由 Markdown 的对话 Agent（run_agent_for_step），让发言条理
 // 清晰、简洁准确。**不要**注入到有严格输出契约的系统角色（grader 只输出 T0/security
 // 输出 JSON/doc_writer 输出 JSON 等）——那会破坏其结构化输出。
-pub const OUTPUT_FORMAT_GUIDE: &str = "## 输出规范（务必遵守）\n- 简洁准确：直接回答问题，先给结论再展开；不堆砌套话、客套与自我重复。掌握多少确定信息就说多少，不确定的标注「待确认」，绝不臆造事实、数据或接口。\n- 条理清晰：内容超过三五句时用结构化 Markdown 组织——用 `##`/`###` 小标题分节，要点用无序列表（`- `），步骤/排序用有序列表，并列对比信息用表格；关键结论或「一句话总结」前置。\n- 规范 Markdown：术语/路径/标识用行内 `代码`，多行代码用带语言标注的代码块；用 **加粗** 标关键词而非整段加粗；引用用 `>`。标题从 `##` 起，不要用 `#` 一级标题。\n- 篇幅匹配：简单问题一两句话答完即可，不必强行套用分节模板；只有复杂问题才展开多节。\n- 聚焦主题：只回答与当前任务相关的内容，不跑题、不输出与问题无关的背景铺陈。";
+pub const OUTPUT_FORMAT_GUIDE: &str = "## 输出规范（务必遵守）\n- 简洁准确：直接回答问题，先给结论再展开；不堆砌套话、客套与自我重复。掌握多少确定信息就说多少，不确定的标注「待确认」，绝不臆造事实、数据或接口。\n- 条理清晰：内容超过三五句时用结构化 Markdown 组织——用 `##`/`###` 小标题分节，要点用无序列表（`- `），步骤/排序用有序列表，并列对比信息用表格；关键结论或「一句话总结」前置。\n- 规范 Markdown：术语/路径/标识用行内 `代码`，多行代码用带语言标注的代码块；用 **加粗** 标关键词而非整段加粗；引用用 `>`。标题从 `##` 起，不要用 `#` 一级标题。\n- 篇幅匹配：简单问题一两句话答完即可，不必强行套用分节模板；只有复杂问题才展开多节。\n- 聚焦主题：只回答与当前任务相关的内容，不跑题、不输出与问题无关的背景铺陈。\n- 工具即用即调：若需查看项目代码或检索资料，**必须在本回合直接调用**对应工具（如 `read_project_file` / `search_project_code` / `list_project_files`）后再作答；严禁只写「让我先看看…」之类的意图声明就结束。没有可用工具时，基于已知信息直接作答，不要假称要去查看。";
 
 // ── 内置基线提示词 ────────────────────────────────────────────────────────────
 
@@ -117,11 +130,15 @@ const PROMPT_SECURITY: &str = "你是 AutoForge 的安全审计 Agent。审查�
 
 const PROMPT_PROTOTYPE: &str = "你是世界级产品设计与设计系统专家，精通 Google Labs design.md 规范与现代 UI 工程。你的产出是可直接粘贴进设计工具（OpenDesign / Stitch / Claude Design）生成高保真界面的完整设计提示词。\n\n提示词必须包含并展开：\n- 设计目标与产品气质（隐喻、关键词）。\n- 设计 token：配色（HEX + 语义角色）、字体与字号阶梯(px)、行高、间距尺度、圆角、阴影、层级。\n- 布局与栅格、响应式断点。\n- 逐屏(Screens & States)：信息架构、组件层级、交互与状态（空/加载/错误/极端数据）。\n- 组件规范与无障碍要点。\n\n要求：一切视觉量值给出**具体数值或 token 名**，不用含糊形容词；若提供了 DESIGN.md 则复用其 token 与隐喻保持一致；使用中文。只输出设计提示词本体，不要前言、结语或解释。";
 
+const PROMPT_CODE_REVIEWER: &str = "你是 AutoForge 的代码预审官（code_reviewer）。在人工代码审核之前，基于本次变更的 diff 与对应需求，产出一份让审核者**几分钟内抓住重点**的预审摘要。不替代人审，只做减负。\n\n输出结构化 Markdown，分节：\n- **一句话总结**：这次改动做了什么。\n- **关键改动**：按文件/模块列出实质性逻辑改动（跳过格式、import、纯重命名）。\n- **风险点**：可能出问题的地方——并发、错误处理、边界、数据/接口契约、安全、回滚难度；没有就写「未见明显风险」。\n- **重点审查建议**：审核者应优先盯哪几处、验证什么。\n- **与需求的吻合度**：是否完整实现了需求、有无遗漏或越界。\n\n只基于给定 diff 与需求判断，不臆造未出现的改动；信息不足处标注「待人工确认」。务实、有信息密度，不堆套话。";
+
+const PROMPT_RELEASE_NOTES: &str = "你是 AutoForge 的发布说明官（release_notes）。一条需求合并后，依据其标题、描述与代码 diff，生成**面向用户/团队**的变更说明（changelog 条目），让非作者也能看懂这次交付带来了什么。\n\n输出 JSON 对象，结构严格如下：\n{\"kind\":\"feature|fix|improvement|refactor|chore\",\"headline\":\"一句话变更标题（用户视角，动词开头）\",\"body\":\"Markdown 要点：本次变更的用户可感知价值、行为变化、需要注意的兼容性/迁移事项（如有）\"}\n\n要求：用业务语言而非实现术语描述价值；只写本次 diff 真实包含的变化，不夸大、不臆造；纯内部重构无用户可感变化时 kind 取 refactor 并如实说明。只输出 JSON，不要 Markdown 代码围栏或解释。";
+
 const PROMPT_DEPLOY: &str = "你是 AutoForge 的发布工程师。依据项目技术栈与目标环境，生成可直接执行的部署脚本。\n\n脚本要求：\n- 使用 bash，开头设 `set -euo pipefail`；幂等、可重复执行。\n- 覆盖：依赖安装、构建、（如适用）数据库迁移、发布或重启服务、健康检查与失败回滚提示。\n- 用变量集中关键参数（环境、分支、目标目录/服务名），加必要注释。\n- 避免破坏性操作（不无条件删库、不强制覆盖未备份数据）；危险步骤前做存在性或备份校验。\n\n只输出脚本本体（纯 bash），不要 Markdown 代码围栏、不要任何解释或前后缀。";
 
 const PROMPT_TRIAGE: &str = "你是 AutoForge 的需求整理 Agent（triage）。把用户随手记录的零散、口语化的「念头」整理成一条结构清晰、可进入流水线的正经需求。\n\n输入是一段未经整理的原始文本。请输出**严格 JSON**（不要 Markdown、不要任何解释文字），字段：\n- title: 简洁需求标题（≤30 字）\n- category: 从 Feature / Bug / Improvement / Debt 中选最贴切的一个\n- severity: 从 critical / high / medium / low 中选\n- description: 把原始想法补全为清晰需求描述（背景、期望行为、必要约束）\n- clarity_score: 0~1 的小数，原始输入的可执行清晰度（越接近 1 越清晰、可直接实现）\n- needs_clarification: 布尔；若信息不足、应向提出者追问澄清而非擅自猜测范围，则为 true\n- missing_info: 字符串数组；列出为可执行所缺失的关键信息点（无则空数组）\n- duplicate_of: 字符串或 null；疑似与已有需求重复时填线索，否则 null\n- is_noise: 布尔；若原文是无意义、空洞、无法形成需求的内容则为 true\n\n红线：信息不足时**宁可 needs_clarification=true 也不要擅自编造范围**。只输出一个 JSON 对象。";
 
-const PROMPT_PROPOSER: &str = "你是 AutoForge 的工程提议 Agent（proposer）。基于项目代码现状，主动发现值得做的改进，为软件工厂持续供料。\n\n以**工程视角为主**：找具体的代码缺陷、技术债、健壮性缺口、规范违背、缺失的错误处理等；每条工程类提议**必须带 file:line 证据**（指明具体文件与行号或符号），无证据的空泛建议一律不要。\n\n也可附带**少量**高优先级、强烈建议的新功能提议（标 kind=feature 并说明理由）。\n\n请输出**严格 JSON 数组**（不要 Markdown、不要解释），每个元素字段：\n- title: 简洁标题\n- kind: \"engineering\" 或 \"feature\"\n- category: Feature / Bug / Improvement / Debt\n- severity: critical / high / medium / low\n- rationale: 为什么值得做（简述价值/动机）\n- evidence: 证据数组；engineering 类必填，每项为对象 {\"file\":\"相对路径\",\"line\":行号整数,\"note\":\"该处的问题\"}；feature 类可为空数组 []\n- impact: 影响面（一句话）\n- effort: 估算工作量，取 S / M / L\n- description: 详细说明\n\n只输出 JSON 数组。宁缺毋滥，绝不为凑数编造证据。";
+const PROMPT_PROPOSER: &str = "你是 AutoForge 的**资深代码审计师**（proposer），不是 linter。你的任务是发现 linter / 编译器**发现不了**的深层、高价值问题，为软件工厂供给真正值得做的需求。\n\n## 铁律：只要深水区，不要皮毛\n严禁提交以下「皮毛」问题（它们已由 clippy/eslint/ruff 等工具覆盖，重复提交视为失败）：\n- 代码风格、格式、命名、import 整理、`needless_return` 之类 lint；\n- 单纯「加个注释」「补个文档」「改个变量名」；\n- 没有具体危害、只是『可以更优雅』的泛泛重构。\n\n## 定向猎杀清单（按此逐项审，每条都问『这里能不能被攻破/出错』）\n1. **并发与竞态**：共享状态无锁/锁粒度错误、`await` 持锁、TOCTOU、任务取消/重入、幂等键缺失导致重复执行。\n2. **错误处理与边界**：被吞掉的 `Result`/`unwrap`/`expect`、错误路径未回滚状态、超时/重试缺失、部分失败留下脏数据。\n3. **资源泄漏**：未释放的句柄/进程/连接、孤儿子进程、无界增长的缓存/通道、文件描述符泄漏。\n4. **安全信任边界**：外部输入未过滤、路径越界（`..`）、命令注入、SQL 拼接、密钥明文落库/日志、权限绕过、SSRF。\n5. **API/数据契约违背**：前后端类型不一致、迁移与模型漂移、序列化字段错配、状态机非法跃迁。\n6. **架构漂移**：违反项目既定不变量与分层约束（见下）、本应单一入口却被旁路、抽象层被击穿。\n7. **关键路径缺测试**：合并/审核/支付/鉴权等高危逻辑无测试覆盖。\n8. **性能热点**：N+1 查询、热路径上的同步阻塞/克隆/全表扫描、不必要的串行化。\n\n## 锚定本项目不变量（违反即为高价值缺陷，优先上报）\n- 业务逻辑不得依赖 Tauri 类型；事件只走 `event::emit`；`#[tauri::command]` 须为薄包装。\n- 所有 git 操作必经 `GitProxy`；合并唯一入口是 `review_2` 的 approved 分支。\n- Agent 写文件仅限 `.autoforge/docs|specs`，禁止 `..` 越界；外部需求必经 `has_obvious_injection`。\n- 密钥必经 `secrets::encrypt_field`/`decrypt`，禁止明文落库或写进前端/配置。\n- 迁移文件不可改、只能新增；前端禁止直接 `invoke`（须走 services 层）、禁止硬编码颜色/字号。\n\n## 工作方式\n你有读码/检索/读规格的工具——**务必先用它们核实**再下结论：用 `search_project_code` 定位可疑模式（如 `unwrap()`、`.await` 附近的锁、`format!(\"...{}\", sql)`），用 `read_project_file` 读上下文确认，用 `read_spec`/`list_specs` 对照规格。**每条 engineering 提议必须带真实 file:line 证据**——证据来自你实际读到的代码，绝不臆造行号。\n\n## 输出（严格 JSON 数组，不要 Markdown、不要解释）\n每个元素字段：\n- title: 简洁标题（点明问题本质，非泛泛）\n- kind: \"engineering\" 或 \"feature\"\n- category: Feature / Bug / Improvement / Debt\n- severity: critical / high / medium / low（按真实危害评，宁可少而准）\n- rationale: 为什么值得做——**说清触发条件与后果链**（什么情况下会出什么事）\n- evidence: 证据数组；engineering 必填，每项 {\"file\":\"相对路径\",\"line\":行号整数,\"note\":\"该处的问题\"}；feature 可为 []\n- impact: 影响面（一句话）\n- effort: S / M / L\n- description: 详细说明（含修复方向）\n\n只输出 JSON 数组。**宁缺毋滥**：与其凑十条皮毛，不如给三条真问题；没有带证据的深层问题就返回 []。";
 
 pub const PROMPT_MEETING: &str = "你是 AutoForge 的会议纪要官（meeting）。输入是一段会议录音的**自动转写文本**——可能口语化、有口头禅与噪声、不区分说话人、偶有识别错字。请基于它完成两件事：\n1) 提炼一份结构清晰的**会议纪要**（Markdown）；\n2) 从会议讨论中**拆解出可进入需求流水线的需求条目**（一条会议通常对应多条需求）。\n\n请输出**严格 JSON**（不要 Markdown 代码围栏、不要任何解释文字），结构如下：\n{\n  \"summary_md\": \"会议纪要正文（Markdown，从 ## 级标题起）。建议含：会议主题、关键讨论点、达成的决策、待办/风险、悬而未决的问题。忠于转写内容，不臆造未提及的结论。\",\n  \"issues\": [\n    {\n      \"title\": \"简洁需求标题（≤30 字）\",\n      \"category\": \"从 Feature / Bug / Improvement / Debt 中选最贴切的一个\",\n      \"severity\": \"从 critical / high / medium / low 中选\",\n      \"description\": \"把会议中讨论到的该项需求补全为清晰描述：背景、期望行为、必要约束；必要时标注「待确认」。\"\n    }\n  ]\n}\n\n原则：只提炼会议**真实讨论到**的内容，绝不编造需求或决策；闲聊、寒暄、与产品无关的内容不要拆成需求；若会议未涉及任何可执行需求，issues 返回空数组。只输出一个 JSON 对象。";
 
@@ -131,53 +148,59 @@ pub static ROLE_REGISTRY: &[RoleDef] = &[
     // ── 群聊编排 ──
     RoleDef { kind: "planner", name: "调度器", name_en: "Planner", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_PLANNER, default_caps: "[\"planning\",\"routing\",\"orchestration\"]", color: "#6f7d91", icon: "layers", initial: "调",
-        desc: "解析群聊自然语言请求，生成多 Agent 并发/串行编排计划", default_chat: false, llm_only: false },
+        desc: "解析群聊自然语言请求，生成多 Agent 并发/串行编排计划", usage: "会议室 · 群聊任务编排（生成执行计划）", default_chat: false, llm_only: false },
     RoleDef { kind: "summarizer", name: "总结器", name_en: "Summarizer", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SUMMARIZER, default_caps: "[\"summarizing\",\"synthesis\",\"adjudication\"]", color: "#5a8a6f", icon: "quote", initial: "结",
-        desc: "综合多个 Agent 的发言，形成结论、裁决和下一步建议", default_chat: false, llm_only: false },
+        desc: "综合多个 Agent 的发言，形成结论、裁决和下一步建议", usage: "会议室 · 多 Agent 讨论后的总结裁决步骤", default_chat: false, llm_only: false },
     RoleDef { kind: "doc_writer", name: "文档生成器", name_en: "Doc Writer", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_DOC_WRITER, default_caps: "[\"documentation\",\"prd\",\"adr\",\"spec\"]", color: "#7a6faa", icon: "file", initial: "文",
-        desc: "把讨论结果整理成 PRD、ADR、测试计划等文档产物", default_chat: false, llm_only: false },
+        desc: "把讨论结果整理成 PRD、ADR、测试计划等文档产物", usage: "会议室 · 生成文档产物（PRD/ADR/测试计划）", default_chat: false, llm_only: false },
     RoleDef { kind: "context_compressor", name: "上下文压缩器", name_en: "Context Compressor", group: RoleGroup::Orchestration, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_CONTEXT_COMPRESSOR, default_caps: "[\"compression\",\"summarization\",\"context_management\"]", color: "#6f8a9a", icon: "layers", initial: "压",
-        desc: "压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度", default_chat: false, llm_only: false },
+        desc: "压缩长对话和附件摘要，控制后续 Agent 的上下文质量与长度", usage: "会议室 · 历史超阈值时自动压缩上下文", default_chat: false, llm_only: false },
     // ── 交付与项目 ──
     RoleDef { kind: "grader", name: "风险分级器", name_en: "Grader", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_GRADER, default_caps: "[\"risk\",\"grading\"]", color: "#e0a32e", icon: "sliders", initial: "级",
-        desc: "代码实现后给 diff 评 T0–T3 风险等级，决定能否门控降级自动放行", default_chat: false, llm_only: false },
+        desc: "代码实现后给 diff 评 T0–T3 风险等级，决定能否门控降级自动放行", usage: "代码审核 · 合并门控前给 diff 评级", default_chat: false, llm_only: false },
     RoleDef { kind: "security", name: "安全审查", name_en: "Security", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SECURITY, default_caps: "[\"security\",\"audit\"]", color: "#4f9d6b", icon: "shield", initial: "安",
-        desc: "合并后审查改动的安全风险，高危发现自动回填为需求", default_chat: false, llm_only: false },
+        desc: "合并后审查改动的安全风险，高危发现自动回填为需求", usage: "合并后 · 安全审计（高危发现回填需求）", default_chat: false, llm_only: false },
     RoleDef { kind: "prototype", name: "设计原型师", name_en: "Design Prototyper", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_PROTOTYPE, default_caps: "[\"design\",\"prototype\"]", color: "#7a6faa", icon: "palette", initial: "原",
-        desc: "交付·设计阶段，为设计工具生成原型设计提示词", default_chat: false, llm_only: false },
+        desc: "交付·设计阶段，为设计工具生成原型设计提示词", usage: "交付 · 设计阶段生成原型提示词", default_chat: false, llm_only: false },
     RoleDef { kind: "deploy", name: "部署官", name_en: "Deployer", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_DEPLOY, default_caps: "[\"deploy\",\"release\"]", color: "#4f8ed1", icon: "cloudUpload", initial: "部",
-        desc: "交付·部署阶段，按目标环境生成部署脚本", default_chat: false, llm_only: false },
+        desc: "交付·部署阶段，按目标环境生成部署脚本", usage: "交付 · 部署阶段生成部署脚本", default_chat: false, llm_only: false },
     RoleDef { kind: "material_ai", name: "物料助手", name_en: "Material AI", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_MATERIAL_AI, default_caps: "[\"materials\",\"semantic_search\",\"organizing\"]", color: "#b97842", icon: "folder", initial: "物",
-        desc: "驱动物料库 AI 搜索与 AI 整理", default_chat: false, llm_only: false },
+        desc: "驱动物料库 AI 搜索与 AI 整理", usage: "项目 · 物料库 AI 搜索与整理", default_chat: false, llm_only: false },
     RoleDef { kind: "spec_writer", name: "规格生成器", name_en: "Spec Writer", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SPEC_WRITER, default_caps: "[\"spec\",\"technical_constraints\"]", color: "#4f8ed1", icon: "file", initial: "规",
-        desc: "驱动项目规格页 AI 一键生成技术约束", default_chat: false, llm_only: false },
+        desc: "驱动项目规格页 AI 一键生成技术约束", usage: "项目 · 规格页 AI 一键生成", default_chat: false, llm_only: false },
     // ── 需求流水线（forge_role）──
     RoleDef { kind: "analysis", name: "需求分析师", name_en: "Analyst", group: RoleGroup::Pipeline, binding: RoleBinding::ForgeRole,
         builtin_prompt: crate::agents::analysis::SYSTEM_PROMPT, default_caps: "[\"analysis\",\"triage\"]", color: "#8b7ad8", icon: "search", initial: "析",
-        desc: "需求审核 前评估真实性、可行性、优先级，产出结构化实现计划", default_chat: true, llm_only: false },
+        desc: "需求审核 前评估真实性、可行性、优先级，产出结构化实现计划", usage: "需求审核 · 需求分析 ＋ 审核页 · 变更摘要（合并分析）＋ 群聊/私聊", default_chat: true, llm_only: false },
     RoleDef { kind: "test", name: "测试工程师", name_en: "Test Engineer", group: RoleGroup::Pipeline, binding: RoleBinding::ForgeRole,
         builtin_prompt: PROMPT_TEST, default_caps: "[\"testing\",\"qa\"]", color: "#4f9d6b", icon: "flask", initial: "测",
-        desc: "设计测试用例、诊断测试失败根因（合并后被动响应 + 主动巡检）", default_chat: true, llm_only: false },
+        desc: "设计测试用例、诊断测试失败根因（合并后被动响应 + 主动巡检）", usage: "合并后 · 测试设计与失败诊断 ＋ 主动巡检 ＋ 群聊/私聊", default_chat: true, llm_only: false },
     RoleDef { kind: "triage", name: "需求整理员", name_en: "Triage", group: RoleGroup::Pipeline, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_TRIAGE, default_caps: "[\"triage\",\"normalization\"]", color: "#b97842", icon: "inbox", initial: "理",
-        desc: "把待整理池的零散念头炼成结构清晰的正经需求（补全/分类/去噪）", default_chat: false, llm_only: false },
+        desc: "把待整理池的零散念头炼成结构清晰的正经需求（补全/分类/去噪）", usage: "需求 · 待整理池念头精炼入库", default_chat: false, llm_only: false },
     RoleDef { kind: "proposer", name: "工程提议官", name_en: "Proposer", group: RoleGroup::Pipeline, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_PROPOSER, default_caps: "[\"proposal\",\"audit\"]", color: "#e0a32e", icon: "search", initial: "提",
-        desc: "基于代码现状主动提议改进（工程视角带 file:line 证据），为工厂自动供料", default_chat: false, llm_only: false },
+        desc: "基于代码现状主动提议改进（工程视角带 file:line 证据），为工厂自动供料", usage: "自动供料 · 周期性主动提议改进", default_chat: false, llm_only: false },
     RoleDef { kind: "meeting", name: "会议纪要官", name_en: "Meeting Scribe", group: RoleGroup::Pipeline, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_MEETING, default_caps: "[\"meeting\",\"triage\"]", color: "#3f86c4", icon: "mic", initial: "会",
-        desc: "把会议录音转写提炼成纪要，并拆解出多条可进入流水线的需求", default_chat: false, llm_only: false },
+        desc: "把会议录音转写提炼成纪要，并拆解出多条可进入流水线的需求", usage: "会议录音上传 · 转写提炼纪要并拆需求", default_chat: false, llm_only: false },
+    RoleDef { kind: "code_reviewer", name: "代码预审官", name_en: "Code Reviewer", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
+        builtin_prompt: PROMPT_CODE_REVIEWER, default_caps: "[\"code_review\",\"summary\"]", color: "#4f8ed1", icon: "search", initial: "审",
+        desc: "代码实现后、人工代码审核前，对 diff 生成 AI 预审摘要（改了什么/风险点/重点看哪）", usage: "代码审核 · 进入待审时生成 AI 预审摘要", default_chat: false, llm_only: false },
+    RoleDef { kind: "release_notes", name: "发布说明官", name_en: "Release Notes", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
+        builtin_prompt: PROMPT_RELEASE_NOTES, default_caps: "[\"release_notes\",\"changelog\"]", color: "#5a8a6f", icon: "file", initial: "发",
+        desc: "需求合并后，依据其 diff 与需求自动生成面向用户的变更说明（changelog 条目）", usage: "合并后 · 生成发布说明 / changelog", default_chat: false, llm_only: false },
     // ── 知识层（Innate 自成长）──
     RoleDef { kind: "kb_distill", name: "蒸馏 LLM", name_en: "Distiller", group: RoleGroup::Knowledge, binding: RoleBinding::SystemKind,
         builtin_prompt: "", default_caps: "[\"distillation\",\"knowledge\"]", color: "#b97842", icon: "brain", initial: "蒸",
-        desc: "Innate 自成长用来蒸馏经验（evolve）的生成模型；仅绑定 LLM，进程内生效、不写任何全局文件", default_chat: false, llm_only: true },
+        desc: "Innate 自成长用来蒸馏经验（evolve）的生成模型；仅绑定 LLM，进程内生效、不写任何全局文件", usage: "Innate 自成长 · 经验蒸馏（evolve）", default_chat: false, llm_only: true },
 ];

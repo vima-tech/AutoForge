@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// 需求列表的统一「严重度优先」排序片段（SQL 片段，紧跟在 `WHERE …` 之后拼接）。
+///
+/// 修复「优先级倒挂」：历史上所有列表一律 `ORDER BY created_at`，于是一条 `critical`
+/// 缺陷会被当天新建的一堆 `medium` 功能压在最底，淹没在噪音里。改为**先按严重度降序**，
+/// 同级再按时间——让 critical/high 永远浮在最前。各调用点在此片段后追加 `created_at`
+/// 方向与 `LIMIT/OFFSET`。
+///
+/// 注意末尾的逗号：使用方紧跟 `created_at ASC|DESC ...`。
+pub const SEVERITY_ORDER_PREFIX: &str =
+    " ORDER BY (CASE severity WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END) DESC, ";
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Issue {
     pub id: String,
@@ -29,6 +40,12 @@ pub struct Issue {
     /// 需求审核 管理员补充意见（一次性）：提交后需求带此意见重新分析，被分析任务消费后清空。
     #[sqlx(default)]
     pub review_feedback: Option<String>,
+    /// 该需求是否由「恢复需求」从已撤销态重回队列（1=是）。用于队列里的小 dot 标识。
+    #[sqlx(default)]
+    pub restored_from_revert: i64,
+    /// 会议室「立即编码」幂等键（前端 UUID），唯一索引防重复创建。
+    #[sqlx(default)]
+    pub client_request_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

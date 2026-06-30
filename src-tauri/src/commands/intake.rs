@@ -463,17 +463,20 @@ pub async fn list_triage_issues(
     project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Issue>, String> {
+    // 严重度优先排序（修复优先级倒挂）：待整理池里 critical/high 浮在最前。
     let res = if let Some(pid) = project_id {
-        sqlx::query_as::<_, Issue>(
-            "SELECT * FROM issues WHERE status='triage' AND project_id=? ORDER BY created_at DESC",
-        )
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues WHERE status='triage' AND project_id=?{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
         .bind(pid)
         .fetch_all(&state.db)
         .await
     } else {
-        sqlx::query_as::<_, Issue>(
-            "SELECT * FROM issues WHERE status='triage' ORDER BY created_at DESC",
-        )
+        sqlx::query_as::<_, Issue>(&format!(
+            "SELECT * FROM issues WHERE status='triage'{}created_at DESC",
+            crate::models::issue::SEVERITY_ORDER_PREFIX
+        ))
         .fetch_all(&state.db)
         .await
     };
@@ -542,7 +545,10 @@ pub async fn refine_triage(
         .await
         .map_err(|e| e.to_string())?;
 
-        let idem = format!("analysis:{}", id);
+        // 唯一 key：若该碎片此前已被分析过（重新整理/再分流），稳定的 analysis:<id> 会
+        // 被 enqueue 按已 completed 的旧 job 行去重而不派发，需求卡死在 pending_analysis。
+        // 批量精炼后必须真正重跑分析，故每次都用唯一 key 强制派发。
+        let idem = format!("analysis:{}:refine:{}", id, uuid::Uuid::new_v4());
         let _ = crate::tasks::runner::enqueue(
             &state.db,
             &state.job_tx,
@@ -609,7 +615,7 @@ pub async fn reject_issues(
             }
             // 运行中 / 已落地：不允许拒绝，避免脱节。
             "executing" | "building" | "running" | "pending_execution" | "pending_merge"
-            | "merged" => {
+            | "merge_testing" | "merge_ready" | "merged" => {
                 r.skipped += 1;
             }
             // 已拒绝：幂等跳过。

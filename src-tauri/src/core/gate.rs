@@ -89,6 +89,35 @@ pub async fn set_custom_merge_message_enabled(db: &Db, on: bool) -> Result<(), s
     Ok(())
 }
 
+/// Global switch: split merge into a parallel `premerge` (Phase1 dev-sync + tests +
+/// security, NO merge_lock) and a serial `land` (merge_lock). When ON, same-project
+/// CRs test in parallel (bounded by `build_pool`) and only the cheap land serializes.
+/// OFF by default → the legacy single-lock `merge::run` path runs unchanged.
+/// Co-located with the other merge-pipeline flags.
+pub async fn parallel_premerge_enabled(db: &Db) -> bool {
+    sqlx::query_as::<_, (String,)>(
+        "SELECT value FROM app_settings WHERE key='parallel_premerge_enabled'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(v,)| v == "1" || v.eq_ignore_ascii_case("true"))
+    .unwrap_or(false)
+}
+
+pub async fn set_parallel_premerge_enabled(db: &Db, on: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('parallel_premerge_enabled', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+    )
+    .bind(if on { "1" } else { "0" })
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Whether a graded change may skip human review 2.
 /// Requires: globally enabled, tier T0/T1 (never T2/T3), and the class is `auto`.
 pub async fn should_auto_pass(db: &Db, tier: &str, change_class: &str) -> bool {

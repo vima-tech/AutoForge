@@ -8,6 +8,7 @@ import Dashboard from './pages/Dashboard';
 import ConversationsPage from './pages/Conversations';
 import AuditPage from './pages/Audit';
 import ProjectsPage from './pages/Projects';
+import BlueprintPage from './pages/Blueprint';
 import DeliveryPage from './pages/Delivery';
 import SettingsPage from './pages/Settings';
 import TracePage from './pages/Trace';
@@ -18,7 +19,7 @@ import { getSystemHealth, getSystemResources, checkClaudeAuth, getBadgeCounts, u
 import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseResMonitor, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
 import { triggerVoiceInput } from './lib/voiceInput';
 
-type Page = 'home' | 'chat' | 'projects' | 'delivery' | 'audit' | 'trace' | 'settings';
+type Page = 'home' | 'chat' | 'projects' | 'blueprint' | 'delivery' | 'audit' | 'trace' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
@@ -106,6 +107,7 @@ const NAV: { id: Page; name: string; ic: string }[] = [
   { id: 'home',     name: '主页',     ic: 'home' },
   { id: 'chat',     name: '会议室',   ic: 'chat' },
   { id: 'projects', name: '项目管理', ic: 'box' },
+  { id: 'blueprint', name: '孵化台', ic: 'layers' },
   { id: 'delivery', name: '交付流水线', ic: 'package' },
   { id: 'audit',    name: '功能审计', ic: 'audit' },
 ];
@@ -124,7 +126,7 @@ export default function App() {
   const [notifUnread, setNotifUnread] = useState(0);
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
-    return saved && (['home', 'chat', 'projects', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
+    return saved && (['home', 'chat', 'projects', 'blueprint', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
@@ -148,6 +150,13 @@ export default function App() {
     setAuditStage({ projectId, stage });
     setPage('audit');
     sessionStorage.setItem('AutoForge:page', 'audit');
+  }, []);
+  // 跨页跳转：Projects 的「项目蓝图」按钮 → 蓝图页并选中该项目。
+  const [blueprintTarget, setBlueprintTarget] = useState<{ projectId: string } | null>(null);
+  const goToBlueprint = useCallback((projectId: string) => {
+    setBlueprintTarget({ projectId });
+    setPage('blueprint');
+    sessionStorage.setItem('AutoForge:page', 'blueprint');
   }, []);
 
   // 通知收件箱跳转：切到目标页；若带 ref（CR/需求），解析为 { projectId, issueId }
@@ -307,7 +316,7 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
-  // Single consolidated listener for all AutoForge://event traffic.
+  // Single consolidated listener for all autoforge://event traffic.
   // Three separate listen() calls were previously registered here — each event
   // fired all three handlers simultaneously, causing 5+ concurrent IPC calls
   // (including a Rust check_auth() that spawns 2 subprocesses every time).
@@ -348,7 +357,7 @@ export default function App() {
     };
 
     let unlisten: (() => void) | undefined;
-    listen<Record<string, unknown>>('AutoForge://event', e => {
+    listen<Record<string, unknown>>('autoforge://event', e => {
       const ev = e.payload as {
         type?: string; issue_title?: string; stage?: number;
         cr_id?: string; iteration?: number; status?: string; summary?: string;
@@ -509,7 +518,8 @@ export default function App() {
 
         {page === 'home'     && <Dashboard onOpenInAudit={goToAudit} onOpenStage={goToAuditStage} />}
         {page === 'chat'     && <ConversationsPage />}
-        {page === 'projects' && <ProjectsPage />}
+        {page === 'projects' && <ProjectsPage onOpenBlueprint={goToBlueprint} />}
+        {page === 'blueprint' && <BlueprintPage target={blueprintTarget} onTargetConsumed={() => setBlueprintTarget(null)} onOpenAudit={(projectId, issueId) => goToAudit({ projectId, issueId })} />}
         {page === 'delivery' && <DeliveryPage />}
         {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} openLedger={auditOpenLedger} onLedgerConsumed={() => setAuditOpenLedger(false)} stageTarget={auditStage} onStageConsumed={() => setAuditStage(null)} />}
         {page === 'trace'    && <TracePage />}

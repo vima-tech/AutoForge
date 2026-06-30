@@ -4,6 +4,7 @@ use crate::models::job::JobPayload;
 use crate::tasks::runner::{enqueue, JobSender};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -102,10 +103,43 @@ pub async fn run_and_gate(
     .await?;
 
     let checks = configured_checks(crate::commands::run_config::effective_config(&project).as_deref());
+
+    // 测试在 CR 的 worktree 里跑，而 gitignore 的 node_modules/target 不随 worktree 创建。
+    // 跑命令前幂等软链依赖缓存，否则 `npx tsc --noEmit` 等命令因缺 node_modules 退化为联网
+    // 抓占位假包而失败。覆盖旧 worktree（创建时未软链的）；test_path==repo 时自动跳过。
+    // 与 execution 一致：worktree（≠主仓）优先软链「远程 dev 依赖缓存」，使测试用的依赖与
+    // 编码时一致（同为 origin/dev 那套）；失败回退下方软链主仓。
+    if test_path != project.repo_path {
+        if let Some(shared_nm) =
+            crate::core::dep_cache::ensure_shared_node_modules(std::path::Path::new(&test_path))
+                .await
+        {
+            crate::core::dep_cache::link_into_worktree(
+                &shared_nm,
+                std::path::Path::new(&test_path),
+            );
+        }
+    }
+    crate::core::stack::link_dep_caches(
+        std::path::Path::new(&project.repo_path),
+        std::path::Path::new(&test_path),
+    );
+
+    // 构建池：占一个全局许可再跑编译/测试，限制跨项目/CR 的并发编译数，避免批量合并时
+    // 多个 rustc/tsc 同时把 CPU/内存打满。持有至本 CR 全部 check 跑完后随作用域释放。
+    let build_pool = crate::state::build_pool();
+    let _build_permit = build_pool.acquire().await;
+
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
         results.push(run_check(&test_path, name, command, timeout).await);
     }
+
+    // 差量安全门（diff 驱动）：security(cargo audit)只针对**本 CR 的 diff**——如果本次改动没碰过
+    // 依赖锁文件，依赖树就是从基线继承来的、非本次引入，直接放行；只有改了依赖、且相对 fork 点
+    // **新引入**了 advisory 才阻断。项目本来就有/上游的 advisory 不在合并门处理（交周期巡检按
+    // 项目维度发现），避免拿「不是这次引入的版本」卡合并。见 demote_preexisting_security。
+    demote_preexisting_security(&mut results, &test_path, &project.branch_dev).await;
 
     let failed = results.iter().filter(|r| !r.ok).collect::<Vec<_>>();
     let status = if failed.is_empty() {
@@ -262,6 +296,196 @@ pub async fn run_and_gate(
     Ok(failed.is_empty())
 }
 
+/// 差量安全门（diff 驱动）：把 security(cargo audit)从「审计整棵依赖树」改成「只查本次 diff」。
+///
+/// 合并前测试只对**本 CR 实际改动**的依赖负责：
+/// 1. 本 CR 的 diff（fork..HEAD）若**没碰过依赖锁文件** → 依赖树是从基线继承来的、非本次引入
+///    → 直接放行（不拿「不是这次引入的版本」卡合并）。这是绝大多数功能改动的情况。
+/// 2. 若 diff **改动了**依赖锁文件 → 审计当前 lock，只对相对 fork 点**新引入**的 advisory 阻断；
+///    fork 点既有的（CR 从更早的 dev 切出而带的旧版、或 dev 并行修复/引入的）不计入。
+///
+/// 项目本来就有/上游的 advisory 一律不在合并门处理——那是「项目维度」的债，应由周期巡检（scanner）
+/// 发现并登记，而不是在每个 CR 合并时反复纠缠。仅处理 `cargo audit` 命令；拿不到 git 信息时按
+/// 用户优先级「不卡合并」放行。
+async fn demote_preexisting_security(results: &mut [CheckResult], worktree: &str, branch_dev: &str) {
+    for r in results.iter_mut() {
+        if r.name != "security" || r.ok || !r.command.contains("cargo audit") {
+            continue;
+        }
+        let lock = audit_file_arg(&r.command).unwrap_or_else(|| "Cargo.lock".to_string());
+        let git = crate::core::git::GitProxy::new(worktree);
+        // fork 点：CR 分支 HEAD 与 dev 的合并基（拿不到则回退 dev tip）。
+        let fork = git
+            .run(&["merge-base", "HEAD", branch_dev])
+            .await
+            .ok()
+            .filter(|(c, _, _)| *c == 0)
+            .map(|(_, o, _)| o.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| branch_dev.to_string());
+
+        // 本 CR 的 diff 是否改动了依赖锁文件？`git diff --quiet`：有差异 exit!=0、无差异 exit==0。
+        let touched_deps = match git.run(&["diff", "--quiet", &fork, "HEAD", "--", &lock]).await {
+            Ok((code, _, _)) => code != 0,
+            Err(_) => false, // 拿不到 diff → 视为未改动，按「不卡合并」放行。
+        };
+        if !touched_deps {
+            mark_security_pass(r, "本次改动未改动依赖锁文件，依赖树继承自基线、非本次引入，放行合并。");
+            continue;
+        }
+
+        // CR 确实改了依赖 → 审计当前 vs fork 点，只对本次新引入的 advisory 阻断。
+        // 当前集跑不出来（缺工具/DB/解析失败）→ 保留原失败、不误放行。
+        let Some(cur) = cargo_audit_vuln_ids(worktree, &lock).await else {
+            continue;
+        };
+        let base = vuln_ids_for_ref(worktree, &git, &fork, &lock).await;
+        let mut new_ids: Vec<String> = cur.iter().filter(|id| !base.contains(*id)).cloned().collect();
+        new_ids.sort();
+        if new_ids.is_empty() {
+            mark_security_pass(r, "本次改动调整了依赖但未新引入漏洞，放行合并。");
+        } else {
+            r.stderr = format!("本次改动新引入依赖漏洞（阻断合并）：{}", new_ids.join(", "));
+        }
+    }
+}
+
+/// 把一个 security 检查结果改判为通过，并写入说明（供报告/遥测）。
+fn mark_security_pass(r: &mut CheckResult, reason: &str) {
+    r.ok = true;
+    r.code = 0;
+    r.stdout = format!("差量安全门：{reason}");
+    r.stderr.clear();
+}
+
+/// 解析 cargo audit 命令里的 `--file <path>`（lockfile 路径）；无则 None（用默认 Cargo.lock）。
+fn audit_file_arg(command: &str) -> Option<String> {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    toks.iter()
+        .position(|t| *t == "--file")
+        .and_then(|i| toks.get(i + 1))
+        .map(|s| s.to_string())
+}
+
+/// 在 `cwd` 内跑 `cargo audit --no-fetch --file <lock_path> --json`，返回 vulnerability 的
+/// advisory id 集（应用 cwd 下 .cargo/audit.toml 的忽略规则）。工具/DB 缺失或解析失败 → None。
+async fn cargo_audit_vuln_ids(cwd: &str, lock_path: &str) -> Option<HashSet<String>> {
+    let cmd = format!("cargo audit --no-fetch --file {} --json", lock_path);
+    let mut c = crate::core::platform::shell(&cmd);
+    c.current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = c.output().await.ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let list = v.get("vulnerabilities")?.get("list")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|it| it.get("advisory")?.get("id")?.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// 某 git ref 的同名 lock 的 advisory 集：`git show <ref>:<lock>` 取出内容写临时文件后在 worktree
+/// 内审计（套用同一 .cargo/audit.toml 忽略规则）。worktree 与主仓库共享对象库，可 show 任意 sha。
+/// 拿不到（show 失败/空/写盘失败）→ 空集，按「不卡合并」放行。
+async fn vuln_ids_for_ref(
+    worktree: &str,
+    git: &crate::core::git::GitProxy,
+    git_ref: &str,
+    lock_rel: &str,
+) -> HashSet<String> {
+    let spec = format!("{}:{}", git_ref, lock_rel);
+    let content = match git.run(&["show", &spec]).await {
+        Ok((0, out, _)) if !out.trim().is_empty() => out,
+        _ => return HashSet::new(),
+    };
+    let tmp = std::env::temp_dir().join(format!("af-baseline-{}.lock", Uuid::new_v4()));
+    if std::fs::write(&tmp, content.as_bytes()).is_err() {
+        return HashSet::new();
+    }
+    let ids = cargo_audit_vuln_ids(worktree, &tmp.to_string_lossy())
+        .await
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    ids
+}
+
+/// 从某 CR 最近一次合并门测试会话提取失败详情，组装成可读 Markdown 回写到 worktree
+/// `report_content`，供审核页「合并失败原因」展示真正有用的测试输出——否则该字段仍是
+/// 编码 Agent 的实现摘要（「## 改动摘要」），对诊断合并失败毫无帮助。
+///
+/// 仅应在测试失败导致 merge_failed / merge_conflict 时调用；找不到失败会话则不动
+/// `report_content`（保留原实现摘要）。与安全门 / 落地失败写 `report_content` 的现有
+/// 模式一致。best-effort，任何 DB 错误都静默吞掉、不影响闸口结果。
+pub(crate) async fn persist_test_failure_report(db: &Db, cr_id: &str) {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT summary, results_json FROM test_sessions
+         WHERE change_request_id=? AND trigger='pre_merge' AND status='failed'
+         ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(cr_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let Some((summary, results_json)) = row else {
+        return;
+    };
+
+    // 取字符串尾部 n 个字符（失败信息通常在编译/测试输出末尾）。
+    fn tail_chars(s: &str, n: usize) -> String {
+        let mut v: Vec<char> = s.chars().rev().take(n).collect();
+        v.reverse();
+        v.into_iter().collect()
+    }
+
+    let mut body = String::new();
+    if let Some(checks) = results_json
+        .as_deref()
+        .and_then(|rj| serde_json::from_str::<serde_json::Value>(rj).ok())
+        .and_then(|v| v.get("checks").and_then(|c| c.as_array()).cloned())
+    {
+        for c in &checks {
+            if c.get("ok").and_then(|b| b.as_bool()).unwrap_or(true) {
+                continue;
+            }
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("check");
+            let command = c.get("command").and_then(|x| x.as_str()).unwrap_or("");
+            let code = c
+                .get("code")
+                .and_then(|x| x.as_i64())
+                .map(|c| format!("　退出码：{}", c))
+                .unwrap_or_default();
+            let stderr = c.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
+            let stdout = c.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
+            let out = if stderr.trim().is_empty() { stdout } else { stderr };
+            let tail = tail_chars(out, 2000);
+            let tail = if tail.trim().is_empty() {
+                "(无输出)".to_string()
+            } else {
+                tail.trim().to_string()
+            };
+            body.push_str(&format!(
+                "### `{}`\n\n命令：`{}`{}\n\n```\n{}\n```\n\n",
+                name, command, code, tail
+            ));
+        }
+    }
+    if body.is_empty() {
+        body.push_str("（未捕获到具体检查输出，请查看测试会话或执行日志。）\n");
+    }
+    let report = format!("## 合并前测试失败\n\n{}，已阻断合并。\n\n{}", summary, body);
+
+    let _ = sqlx::query(
+        "UPDATE worktree_sessions SET report_content=?
+         WHERE id=(SELECT id FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1)",
+    )
+    .bind(&report)
+    .bind(cr_id)
+    .execute(db)
+    .await;
+}
+
 pub(crate) fn configured_checks(config_yaml: Option<&str>) -> Vec<(String, String, u64)> {
     let Some(raw) = config_yaml else {
         return Vec::new();
@@ -310,10 +534,33 @@ pub(crate) async fn run_check(
     let mut cmd = crate::core::platform::shell(&command);
     cmd.current_dir(repo_path)
         // Killed if this future is dropped (e.g. on timeout) instead of leaking.
-        .kill_on_drop(true);
-    // Own process group so a timeout can be reaped (cross-platform helper).
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Own process group so a timeout can reap the whole tree (cross-platform helper).
     crate::core::platform::detach_process_group(&mut cmd);
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult {
+                name,
+                command,
+                ok: false,
+                code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            }
+        }
+    };
+    // pgid == child pid（detach 后）。纳入 CPU 预算（Linux 且启用时），让门的 rustc/tsc
+    // 也受总预算约束；超时再据此整组回收。
+    let pgid = child.id();
+    if let Some(p) = pgid {
+        crate::core::cpubudget::attach(p);
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
     match output {
         Ok(Ok(output)) => {
@@ -335,13 +582,50 @@ pub(crate) async fn run_check(
             stdout: String::new(),
             stderr: e.to_string(),
         },
-        Err(_) => CheckResult {
-            name,
-            command,
-            ok: false,
-            code: -1,
-            stdout: String::new(),
-            stderr: format!("timeout after {}s", timeout_secs),
-        },
+        Err(_) => {
+            // 超时：SIGKILL 整个进程组（sh + cargo/tsc 子进程），不留孤儿。
+            if let Some(p) = pgid {
+                crate::core::reaper::kill_group(p);
+            }
+            CheckResult {
+                name,
+                command,
+                ok: false,
+                code: -1,
+                stdout: String::new(),
+                stderr: format!("timeout after {}s", timeout_secs),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // run_check 已从 `.output()` 重构为 spawn + cgroup attach + 超时整组真杀；
+    // 这几条覆盖成功取输出 / 失败码 / 超时三条路径，守住重构正确性。
+    #[tokio::test]
+    async fn run_check_captures_success_output() {
+        let r = run_check(".", "echo".into(), "echo af-ok-123".into(), 10).await;
+        assert!(r.ok, "echo should succeed: {}", r.stderr);
+        assert_eq!(r.code, 0);
+        assert!(r.stdout.contains("af-ok-123"), "stdout={}", r.stdout);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_reports_failure_code() {
+        let r = run_check(".", "exit3".into(), "exit 3".into(), 10).await;
+        assert!(!r.ok);
+        assert_eq!(r.code, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_times_out_and_reaps() {
+        let r = run_check(".", "sleep".into(), "sleep 30".into(), 1).await;
+        assert!(!r.ok);
+        assert!(r.stderr.contains("timeout"), "stderr={}", r.stderr);
     }
 }

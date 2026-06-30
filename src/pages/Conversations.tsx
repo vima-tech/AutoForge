@@ -5,20 +5,24 @@ import { Avatar, MeAvatar } from '../components/Avatar';
 import { useOperator } from '../operator';
 import { primeAgents } from '../agents-store';
 import Block from '../components/Block';
+import Markdown from '../components/Markdown';
+import RoundAvatarStack, { type RoundNav } from '../components/RoundAvatarStack';
 import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
   listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
+  draftCodingBrief, draftCodingBriefDetailed, draftCodingBriefStream, startConversationCoding,
   archiveConversation, listConversationArchives, getConversationArchive,
   searchConversationArchives, deleteConversationArchive,
   listProjectFiles, addConversationProjectContext, removeConversationProjectContext,
-  listProjects, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, ensureWorkspaceDirs,
+  listProjects, listWorkspaceFiles, writeWorkspaceFile, ensureWorkspaceDirs,
   runConversationCommand, INNATE_SENDER, submitIssue, getAsrSettings,
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
   type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
+  type CodingBrief,
 } from '../services';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
@@ -37,6 +41,13 @@ interface PendingAttachment {
   id: string;
   file: File;
   mode: 'file' | 'image';
+}
+
+// 工作区文件引用：点击上下文面板的工作区文件后，作为附件引用暂存到输入框上方。
+// path 是相对 .autoforge/ 的路径（如 docs/prd.md），发送时随消息携带，后端按需读取内容。
+interface WorkspaceRef {
+  path: string;
+  name: string;
 }
 
 // ── 输入框草稿：按会话窗口隔离、跨页面切换不丢失 ──
@@ -85,6 +96,28 @@ function clearComposerDraft(convId: string) {
 // 群聊 @快捷指令：`@所有人` 展开为全部可点名成员，让大家一起讨论并尽快达成一致。
 const ALL_MENTION_ID = '__all__';
 type MentionItem = { kind: 'all' } | { kind: 'agent'; agent: Agent };
+
+// 内置「编码 Agent」虚拟成员：与后端 orchestration.rs 的 BUILTIN_CODE_AGENT_ID 同值。
+// 它不入库，仅在「绑定了项目的群聊」里作为可 @ 成员出现，被 @ 时由后端用当前系统默认
+// 编码 Agent（设置→编码 Agent 里选的默认）只读跑仓库作答。改这个值需两端同步。
+const BUILTIN_CODE_AGENT_ID = '__builtin_code_agent__';
+// 合成其前端 Agent 对象，供 @ 候选列表与消息作者/头像查表渲染。mentionable/visible_in_chat
+// 置 false 使其**不混入**成员选择器/快速添加等通用 `agents.filter(...)` 列表（它不是可手动
+// 增删的成员）；@ 候选由 members memo 显式追加，不受这两个开关影响。
+function builtinCodeAgent(): Agent {
+  return {
+    id: BUILTIN_CODE_AGENT_ID,
+    name: '编码 Agent', name_en: 'CodeAgent',
+    role: '只读读项目真实代码答疑',
+    color: 'var(--ember)', initial: '码', llm_id: null,
+    system_prompt: '', forge_role: null,
+    role_type: 'system', system_kind: null,
+    capabilities_json: '[]', max_concurrency: 1,
+    visible_in_chat: false, mentionable: false, enabled: true,
+    prompt_mode: 'builtin', memory_enabled: false,
+    code_agent_id: BUILTIN_CODE_AGENT_ID, created_at: '',
+  };
+}
 
 // Innate 知识库斜杠命令：在私聊/群聊里手动触发记忆存储、召回、进化与状态查看。
 interface SlashCommand { name: ConvCommandName; usage: string; desc: string; icon: string; }
@@ -264,6 +297,11 @@ function contextAttachmentBlock(a: ConversationAttachment): BlockType {
   return { t: 'file', id: a.id, name: a.original_name, meta, color: '#e0a32e', mime: a.mime, size: a.size_bytes };
 }
 
+// 工作区文件引用块：消息携带 .autoforge/ 相对路径，后端在构建 Agent 提示时按需读取内容。
+function workspaceRefBlock(r: WorkspaceRef): BlockType {
+  return { t: 'ws_ref', path: r.path, name: r.name };
+}
+
 function convPreview(c: Conversation): string {
   if (!c.last_message) return '暂无消息';
   try {
@@ -393,6 +431,10 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
         ? <MeAvatar size={36} />
         : isInnate
             ? <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Innate 知识库"><Icon name="brain" size={20} /></div>
+        : isGroup
+            // 群聊里 agent 头像不在每条消息上重复显示——统一由左上角堆叠按发言序展示。
+            // 保留 36px 占位维持消息缩进，让堆叠浮在这条头像列里。
+            ? <div className="av" style={{ width: 36, height: 36, visibility: 'hidden' }} />
         : a ? <Avatar agent={a} size={36} />
             : <div className="av" style={{ width: 36, height: 36, background: '#888', fontSize: 'var(--text-body)' }}>?</div>}
       <div className="msg-body">
@@ -435,13 +477,370 @@ function MessageRow({ m, agents, isGroup, highlighted, searchTerm, rowRef, onBub
   );
 }
 
-function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, busy }: {
+// 把结构化的 CodingBrief 组装成人性化、可读、可编辑的 Markdown 工单。
+// 这是提交给编码 Agent 的需求正文，也是「预览」标签渲染的内容。
+function formatBriefMarkdown(b: CodingBrief): string {
+  const parts: string[] = [];
+  if (b.functional_points.length > 0) {
+    parts.push('## 功能点\n' + b.functional_points.map(p => `- ${p}`).join('\n'));
+  }
+  if (b.involved_modules.length > 0) {
+    parts.push('## 涉及模块\n' + b.involved_modules.map(m => `- \`${m}\``).join('\n'));
+  }
+  if (b.constraints.length > 0) {
+    parts.push('## 关键约束\n' + b.constraints.map(c => `- ${c}`).join('\n'));
+  }
+  if (b.acceptance_criteria.length > 0) {
+    parts.push('## 验收要点\n' + b.acceptance_criteria.map(a => `- ${a}`).join('\n'));
+  }
+  // 解析失败兜底：直接给原文，至少不丢内容。
+  if (parts.length === 0) return b.raw_text.trim();
+  return parts.join('\n\n');
+}
+
+// 会议室「立即编码」确认弹窗：自动梳理讨论 → 展示思考过程 → 操作者可编辑确认 → 创建需求+CR。
+// 跳过需求审核闸（操作者点「立即编码」即需求侧决策），代码审核仍是合并前唯一闸门。
+// 遵守 DESIGN：inset:var(--win-gutter)、不点遮罩关闭、仅 ✕/Esc、每屏 ≤1 个 btn-primary。
+function CodeNowModal({ conversationId, onClose, onError }: {
+  conversationId: string;
+  onClose: () => void;
+  onError: (message: string) => void;
+}) {
+  const [title, setTitle] = useState('');
+  const [brief, setBrief] = useState('');
+  const [drafting, setDrafting] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [done, setDone] = useState<string | null>(null);
+  const [briefData, setBriefData] = useState<CodingBrief | null>(null);
+  const [thinkLog, setThinkLog] = useState('');
+  const [elapsed, setElapsed] = useState(0);
+  const [viewMode, setViewMode] = useState<'preview' | 'edit'>('preview');
+  const [showThink, setShowThink] = useState(false);
+  const thinkLogRef = useRef<HTMLDivElement>(null);
+  // 组件卸载标记：避免流式 promise 在弹窗已关闭后还 setState（取消后仍「运行中」的根因之一）。
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // 存活标记：挂载置 true、卸载置 false。
+  // ⚠️ 必须在 mount 时重置为 true，不能只在 cleanup 里置 false：React 18 StrictMode（dev）会
+  // mount→卸载(置 false)→**重挂载**，而 useRef 跨这次模拟重挂载是同一对象。若不在 body 里重置，
+  // 重挂载后 aliveRef 永远停在 false，导致 handleDraft 的 promise resolve 后被 `!aliveRef` 拦截，
+  // 既不填表也不 setDrafting(false) → 文本已全出、计时器却永涨、弹窗毫无变化（即本 bug 症状）。
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  // 思考日志增长时自动滚到底部
+  useEffect(() => {
+    if (thinkLogRef.current) {
+      thinkLogRef.current.scrollTop = thinkLogRef.current.scrollHeight;
+    }
+  }, [thinkLog]);
+
+  // 等待计时：每秒 +1，让「连接 AI」阶段始终有可见进展，不再像冻结
+  useEffect(() => {
+    if (!drafting) return;
+    const t = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [drafting]);
+
+  // 弹窗打开：先订阅流式增量事件（避免竞态丢失开头），再启动梳理。
+  // ⚠️ 必须用 .then 而非 async/await：React 18 StrictMode（开发模式）会 mount→unmount→mount，
+  // 若在 `await listen` 解析前 cleanup 已跑，旧写法因 unlisten 仍为 null 而漏取消订阅，导致
+  // 两个监听器同时存活、每个 chunk 被累加两次（界面表现为「每个字都重复」）。此处一旦 cleanup
+  // 已执行（disposed）就立刻取消刚解析出的订阅，保证任何时刻只有一个监听器、handleDraft 只触发一次。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    listen<{ type: string; conversation_id?: string; chunk?: string }>(
+      'autoforge://event',
+      (e) => {
+        const p = e.payload;
+        if (p?.type === 'coding_brief_chunk' && p.conversation_id === conversationId && p.chunk) {
+          setThinkLog(prev => prev + p.chunk);
+        }
+      },
+    ).then(fn => {
+      if (disposed) { fn(); return; }  // cleanup 已先跑：立即退订，杜绝泄漏/重复
+      unlisten = fn;
+      handleDraft();                    // 订阅就绪后再启动，避免丢失开头增量
+    });
+    return () => { disposed = true; if (unlisten) unlisten(); };
+  }, [conversationId]);
+
+  // AI 梳理：流式调用，实时显示思考过程，完成后组装人性化工单并填表
+  const handleDraft = async () => {
+    setDrafting(true);
+    setThinkLog('');
+    setElapsed(0);
+    try {
+      const codingBrief = await draftCodingBriefStream(conversationId);
+      if (!aliveRef.current) return;
+      setBriefData(codingBrief);
+      setTitle(codingBrief.title);
+      setBrief(formatBriefMarkdown(codingBrief));
+      setViewMode('preview');
+    } catch (e) {
+      if (aliveRef.current) onError(`梳理功能点失败：${String(e)}`);
+    } finally {
+      if (aliveRef.current) setDrafting(false);
+    }
+  };
+
+  const handleStart = async () => {
+    if (!title.trim() || !brief.trim()) { onError('请填写需求标题与功能点'); return; }
+    setSubmitting(true);
+    try {
+      const cr = await startConversationCoding({
+        conversation_id: conversationId,
+        title: title.trim(),
+        brief: brief.trim(),
+        client_request_id: crypto.randomUUID(),
+      });
+      setDone(cr.id);
+      setTimeout(onClose, 1600);
+    } catch (e) {
+      onError(`创建编码任务失败：${String(e)}`);
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
+      <div style={{ width: 540, maxWidth: '92vw', background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderRadius: 18, boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 12 }}>
+          <Icon name="zap" size={20} style={{ color: 'var(--ember)' }} />
+          <div>
+            <div className="eyebrow" style={{ fontSize: 'var(--text-section)' }}><span className="cn">立即编码</span></div>
+            <div style={{ fontSize: 'var(--text-control)', color: 'var(--text-3)', marginTop: 4 }}>据本次讨论创建需求并直接交编码 Agent 实现（跳过需求审核，仍走代码审核）</div>
+          </div>
+          <button className="icon-btn" style={{ marginLeft: 'auto' }} onClick={onClose}><Icon name="x" size={18} /></button>
+        </div>
+
+        {done ? (
+          <div style={{ padding: '28px 20px', textAlign: 'center' }}>
+            <Icon name="check" size={28} style={{ color: 'var(--green)' }} />
+            <div style={{ marginTop: 10, fontSize: 'var(--text-body)', color: 'var(--text)' }}>已创建需求并开始编码</div>
+            <div style={{ marginTop: 6, fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>CR {done}</div>
+            <div style={{ marginTop: 6, fontSize: 'var(--text-caption)', color: 'var(--text-3)' }}>进度与代码审核请见「变更审核」页</div>
+          </div>
+        ) : (
+          <>
+            {/* 梳理中：实时流式思考日志 */}
+            {drafting ? (
+              <div style={{ padding: '18px 20px' }}>
+                {/* 标题行 + 计时，让等待始终有可见进展 */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                  <Icon name="brain" size={22} style={{ color: 'var(--ember)', animation: 'pulse 2s ease-in-out infinite' }} />
+                  <div style={{ fontSize: 'var(--text-body)', color: 'var(--text)', fontWeight: 500 }}>
+                    {thinkLog ? 'AI 正在梳理讨论' : '正在连接 AI 并收集上下文'}
+                  </div>
+                  <span style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                    {elapsed}s
+                  </span>
+                  <Icon name="refresh" size={14} className="spin" style={{ color: 'var(--text-3)' }} />
+                </div>
+
+                {/* 流式思考日志 */}
+                <div
+                  ref={thinkLogRef}
+                  style={{
+                    height: 280,
+                    overflowY: 'auto',
+                    padding: 14,
+                    background: 'var(--code-bg)',
+                    borderRadius: 'var(--radius)',
+                    border: '1px solid var(--border)',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 'var(--text-caption)',
+                    lineHeight: 'var(--leading-relaxed)',
+                    color: 'var(--text-2)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {thinkLog || (
+                    <span style={{ color: 'var(--text-faint)' }}>
+                      正在收集会议室讨论与项目上下文，随后 AI 开始逐字生成…
+                    </span>
+                  )}
+                  {thinkLog && (
+                    <span style={{
+                      display: 'inline-block',
+                      width: 7,
+                      height: 14,
+                      marginLeft: 2,
+                      background: 'var(--ember)',
+                      verticalAlign: 'text-bottom',
+                      animation: 'pulse 1s steps(2) infinite',
+                    }} />
+                  )}
+                </div>
+
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', marginTop: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Icon name="layers" size={13} />
+                  <span>分析需求 · 识别关键模块 · 评估风险等级</span>
+                </div>
+              </div>
+            ) : (
+              <div style={{ padding: '16px 20px' }}>
+                {/* 梳理结果摘要 */}
+                {briefData && (
+                  <div style={{ marginBottom: 14, padding: 12, background: 'var(--bg-3)', borderRadius: 'var(--radius)', borderLeft: `3px solid var(--ember)` }}>
+                    <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+                      {briefData.requirement_type && (
+                        <span className="chip" style={{ fontSize: 'var(--text-caption)' }}>{briefData.requirement_type}</span>
+                      )}
+                      {briefData.risk_level && (
+                        <span className="chip" style={{
+                          fontSize: 'var(--text-caption)',
+                          background: briefData.risk_level === '高' ? 'var(--red-tint)' : briefData.risk_level === '中' ? 'var(--amber-tint)' : 'var(--green-tint)',
+                          color: briefData.risk_level === '高' ? 'var(--red-soft)' : briefData.risk_level === '中' ? 'var(--amber-soft)' : 'var(--green-soft)',
+                        }}>
+                          风险：{briefData.risk_level}
+                        </span>
+                      )}
+                      {briefData.involved_modules.length > 0 && (
+                        <span className="chip" style={{ fontSize: 'var(--text-caption)' }}>📁 {briefData.involved_modules.length} 模块</span>
+                      )}
+                      {briefData.constraints.length > 0 && (
+                        <span className="chip" style={{ fontSize: 'var(--text-caption)' }}>⚡ {briefData.constraints.length} 约束</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="field" style={{ marginBottom: 14 }}>
+                  <label>需求标题</label>
+                  <input value={title} onChange={e => setTitle(e.target.value)} placeholder="一句话描述要实现的需求" disabled={submitting} />
+                </div>
+
+                {/* 需求工单：预览（渲染 Markdown，人性化）/ 编辑（纯文本，可改） */}
+                <div className="field" style={{ marginBottom: 6 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span>需求工单</span>
+                    <div className="seg" style={{ marginLeft: 'auto' }}>
+                      <button
+                        type="button"
+                        className={viewMode === 'preview' ? 'on' : ''}
+                        onClick={() => setViewMode('preview')}
+                        disabled={submitting}
+                      >预览</button>
+                      <button
+                        type="button"
+                        className={viewMode === 'edit' ? 'on' : ''}
+                        onClick={() => setViewMode('edit')}
+                        disabled={submitting}
+                      >编辑</button>
+                    </div>
+                  </label>
+                  {viewMode === 'preview' ? (
+                    <div
+                      onClick={() => !submitting && setViewMode('edit')}
+                      title="点击编辑"
+                      style={{
+                        minHeight: 180,
+                        maxHeight: 320,
+                        overflowY: 'auto',
+                        padding: '12px 14px',
+                        background: 'var(--bg-3)',
+                        border: '1px solid var(--border-strong)',
+                        borderRadius: 9,
+                        cursor: submitting ? 'default' : 'text',
+                      }}
+                    >
+                      {brief.trim()
+                        ? <Markdown md={brief} />
+                        : <span style={{ color: 'var(--text-faint)', fontSize: 'var(--text-control)' }}>暂无内容，点此切换到编辑填写</span>}
+                    </div>
+                  ) : (
+                    <textarea
+                      value={brief}
+                      onChange={e => setBrief(e.target.value)}
+                      placeholder="要实现的功能点、涉及模块/文件范围、关键约束、验收要点。支持 Markdown，可自由编辑后切回预览确认。"
+                      disabled={submitting}
+                      autoFocus
+                      style={{ minHeight: 180, resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-control)', lineHeight: 'var(--leading-normal)' }}
+                    />
+                  )}
+                </div>
+
+                {/* 可折叠：回看 AI 的原始思考过程（即便上游缓冲、token 一次性涌来也能复查） */}
+                {thinkLog.trim() && (
+                  <div style={{ marginTop: 10 }}>
+                    <button
+                      type="button"
+                      onClick={() => setShowThink(v => !v)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'var(--text-3)', fontSize: 'var(--text-caption)' }}
+                    >
+                      <Icon name={showThink ? 'chevron-down' : 'chevron-right'} size={13} />
+                      <span>AI 思考过程</span>
+                    </button>
+                    {showThink && (
+                      <div style={{
+                        marginTop: 8,
+                        maxHeight: 200,
+                        overflowY: 'auto',
+                        padding: 12,
+                        background: 'var(--code-bg)',
+                        borderRadius: 'var(--radius)',
+                        border: '1px solid var(--border)',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 'var(--text-caption)',
+                        lineHeight: 'var(--leading-relaxed)',
+                        color: 'var(--text-3)',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}>
+                        {thinkLog}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
+                  <Icon name="layers" size={13} />
+                  <span>将自动附带最近会话快照与项目上下文文档作为编码背景</span>
+                </div>
+              </div>
+            )}
+
+            <div style={{ padding: '14px 20px 18px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
+              {/* 重新梳理：结果不满意时一键重跑，无需关弹窗重开（梳理中禁用） */}
+              {!drafting && briefData && (
+                <button className="btn btn-ghost btn-sm" onClick={handleDraft} disabled={submitting} title="据当前讨论重新梳理需求">
+                  <Icon name="refresh" size={14} />
+                  <span>重新梳理</span>
+                </button>
+              )}
+              <button className="btn" style={{ marginLeft: 'auto' }} onClick={onClose} disabled={submitting}>取消</button>
+              <button className="btn btn-primary" onClick={handleStart} disabled={submitting || drafting || !title.trim() || !brief.trim()}>
+                {submitting ? <Icon name="refresh" size={15} className="spin" /> : <Icon name="zap" size={15} />}
+                <span>{submitting ? '创建中…' : '创建需求并开始编码'}</span>
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, wsRefs, onRemoveWsRef, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
   onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
   onCompress: (mode: 'summary' | 'conclusion') => Promise<boolean>;
   onError: (message: string) => void;
   quote: QuoteDraft | null;
   onClearQuote: () => void;
+  wsRefs: WorkspaceRef[];
+  onRemoveWsRef: (path: string) => void;
   busy?: boolean;
 }) {
   const [text, setText] = useState('');
@@ -466,6 +865,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const [asrRecording, setAsrRecording] = useState(false);
   // 点击后到麦克风/后端就绪前的过渡态，用于立刻给出「连接中…」反馈，消除点击空窗。
   const [asrStarting, setAsrStarting] = useState(false);
+  // 会议室「立即编码」确认弹窗开关（仅绑定项目的群聊可用）。
+  const [codeNowOpen, setCodeNowOpen] = useState(false);
+  // 工作区文件下拉菜单开关
+  const [showWsRefMenu, setShowWsRefMenu] = useState(false);
+  const wsRefMenuRef = useRef<HTMLDivElement>(null);
+  // 快捷操作（总结/结论/待办/立即编码）下拉菜单开关
+  const [showQuickMenu, setShowQuickMenu] = useState(false);
+  const quickMenuRef = useRef<HTMLDivElement>(null);
   const asrRef = useRef<RealtimeAsr | null>(null);
   const asrNodeRef = useRef<Text | null>(null);
   const asrCommittedRef = useRef('');
@@ -473,10 +880,14 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
   const isG = conv.conv_type === 'group';
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const members  = useMemo(
-    () => isG
-      ? conv.members.map(id => agentMap[id]).filter((a): a is Agent => !!a && a.mentionable && a.enabled)
-      : [],
-    [isG, conv.members, agentMap],
+    () => {
+      if (!isG) return [];
+      const list = conv.members.map(id => agentMap[id]).filter((a): a is Agent => !!a && a.mentionable && a.enabled);
+      // 绑定了项目的群聊：把内置「编码 Agent」显式追加为可 @ 成员（不受其 mentionable=false 影响）。
+      if (conv.project_id) list.push(builtinCodeAgent());
+      return list;
+    },
+    [isG, conv.members, conv.project_id, agentMap],
   );
   // 下拉候选：成员超过 1 人时，置顶一个「@所有人」选项。
   const mentionItems = useMemo<MentionItem[]>(() => {
@@ -521,6 +932,42 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
       document.removeEventListener('keydown', closeOnEscape);
     };
   }, [showAttachmentPicker]);
+
+  useEffect(() => {
+    if (!showWsRefMenu) return;
+    const closeOnOutside = (e: PointerEvent) => {
+      if (!(e.target instanceof Node)) return;
+      if (wsRefMenuRef.current?.contains(e.target)) return;
+      setShowWsRefMenu(false);
+    };
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowWsRefMenu(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [showWsRefMenu]);
+
+  useEffect(() => {
+    if (!showQuickMenu) return;
+    const closeOnOutside = (e: PointerEvent) => {
+      if (!(e.target instanceof Node)) return;
+      if (quickMenuRef.current?.contains(e.target)) return;
+      setShowQuickMenu(false);
+    };
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowQuickMenu(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [showQuickMenu]);
 
   const editorText = () => (editorRef.current?.innerText ?? '').replace(/\u00a0/g, ' ');
 
@@ -880,8 +1327,13 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const ids = Array.from(editor.querySelectorAll<HTMLElement>('.mention-tag'))
       .map(node => node.dataset.agentId)
       .filter((id): id is string => !!id);
-    // `@所有人` 展开为当前全部可点名成员。
-    const expanded = ids.flatMap(id => (id === ALL_MENTION_ID ? members.map(m => m.id) : [id]));
+    // `@所有人` 展开为当前全部可点名成员，但**排除内置「编码 Agent」**——它是重型 CLI，
+    // 只应被显式单独 @，不随广播一起触发，避免误烧 token。
+    const expanded = ids.flatMap(id =>
+      id === ALL_MENTION_ID
+        ? members.map(m => m.id).filter(mid => mid !== BUILTIN_CODE_AGENT_ID)
+        : [id],
+    );
     return Array.from(new Set(expanded));
   };
 
@@ -930,7 +1382,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const pendingItems = [...pending];
     const refs = contextRefs();
     const mentions = mentionedAgentIds();
-    if (!outgoing && pendingItems.length === 0 && refs.length === 0) return;
+    if (!outgoing && pendingItems.length === 0 && refs.length === 0 && wsRefs.length === 0) return;
     if (asrRef.current) void stopAsr();
     setText('');
     setPending([]);
@@ -1054,6 +1506,13 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
 
   return (
     <div ref={composerRef} className="composer">
+      {codeNowOpen && (
+        <CodeNowModal
+          conversationId={conv.id}
+          onClose={() => setCodeNowOpen(false)}
+          onError={onError}
+        />
+      )}
       <div className="composer-tools">
         <input ref={fileInputRef} type="file" multiple accept={FILE_ACCEPT} hidden onChange={pickFiles('file')} />
         <input ref={imageInputRef} type="file" multiple accept={IMAGE_ACCEPT} hidden onChange={pickFiles('image')} />
@@ -1096,31 +1555,68 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
           <span>会议室上下文附件</span>
           <b>{contextAttachments.length}</b>
         </button>
-        {isG && QUICK_PROMPTS.map(q => {
-          const running = quickState?.phase === 'run' && quickState.label === q.label;
-          const done = quickState?.phase === 'done' && quickState.label === q.label;
-          const runLabel = q.compress === 'conclusion' ? '正在收敛…' : '正在总结…';
+        {isG && (() => {
+          // 当前是否有快捷操作在运行/刚完成，用于在收起的触发按钮上回显状态。
+          const active = quickState?.phase === 'run';
+          const doneNow = quickState?.phase === 'done';
+          const runLabel = quickState?.label === '形成结论' ? '正在收敛…' : '正在总结…';
           return (
-            <button
-              key={q.label}
-              type="button"
-              className={'composer-quick-tag' + (running ? ' active' : '') + (done ? ' done' : '')}
-              title={q.compress
-                ? (q.compress === 'conclusion' ? '收敛结论并压缩上下文（历史消息移出后续上下文）' : '总结内容并压缩上下文（历史消息移出后续上下文）')
-                : q.prompt}
-              disabled={busy}
-              onMouseDown={e => e.preventDefault()}
-              onClick={() => handleQuick(q)}
-            >
-              {running
-                ? <Icon name="refresh" size={13} className="spin" />
-                : done
-                  ? <Icon name="check" size={13} />
-                  : <Icon name={q.icon} size={13} />}
-              <span>{running ? runLabel : done ? '已完成' : q.label}</span>
-            </button>
+            <div ref={quickMenuRef} style={{ position: 'relative' }}>
+              <button
+                type="button"
+                className={'composer-quick-tag' + (active ? ' active' : '') + (doneNow ? ' done' : '')}
+                title="快捷操作：总结内容 / 形成结论 / 列出待办 / 立即编码"
+                disabled={busy}
+                onMouseDown={e => e.preventDefault()}
+                onClick={() => setShowQuickMenu(v => !v)}
+              >
+                {active
+                  ? <Icon name="refresh" size={13} className="spin" />
+                  : doneNow
+                    ? <Icon name="check" size={13} />
+                    : <Icon name="zap" size={13} />}
+                <span>{active ? runLabel : doneNow ? '已完成' : '快捷操作'}</span>
+                <Icon name="chevron" size={12} style={{ opacity: 0.6 }} />
+              </button>
+              {showQuickMenu && (
+                <div className="mention-pop" style={{ bottom: '100%', marginBottom: 4 }}>
+                  <div className="mention-pop-label">快捷操作</div>
+                  {QUICK_PROMPTS.map(q => (
+                    <div
+                      key={q.label}
+                      className="mention-row"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => { setShowQuickMenu(false); void handleQuick(q); }}
+                      title={q.compress
+                        ? (q.compress === 'conclusion' ? '收敛结论并压缩上下文（历史消息移出后续上下文）' : '总结内容并压缩上下文（历史消息移出后续上下文）')
+                        : q.prompt}
+                    >
+                      <div className="attachment-row-ic"><Icon name={q.icon} size={15} /></div>
+                      <div style={{ minWidth: 0 }}>
+                        <div className="nm">{q.label}</div>
+                        {q.compress && <div className="rl">同时压缩上下文</div>}
+                      </div>
+                    </div>
+                  ))}
+                  {conv.project_id && (
+                    <div
+                      className="mention-row"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => { setShowQuickMenu(false); setCodeNowOpen(true); }}
+                      title="据本次讨论梳理功能点，自动创建需求并立即开始编码（跳过需求审核，仍走代码审核）"
+                    >
+                      <div className="attachment-row-ic"><Icon name="zap" size={15} /></div>
+                      <div style={{ minWidth: 0 }}>
+                        <div className="nm">立即编码</div>
+                        <div className="rl">梳理功能点并跳过需求审核直接编码</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           );
-        })}
+        })()}
         {pending.map(item => (
           <div key={item.id} className="composer-pending-item">
             <Icon name={item.mode === 'image' ? 'image' : 'file'} size={15} />
@@ -1131,6 +1627,44 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             </button>
           </div>
         ))}
+        {wsRefs.length > 0 && (
+          <div ref={wsRefMenuRef} style={{ position: 'relative' }}>
+            <button
+              type="button"
+              className="composer-quick-tag"
+              title={`已引用 ${wsRefs.length} 个工作区文件`}
+              disabled={busy}
+              onClick={() => setShowWsRefMenu(!showWsRefMenu)}
+              style={{ borderColor: 'var(--ember)', color: 'var(--ember)' }}
+            >
+              <Icon name="folder" size={13} />
+              <span>引用 {wsRefs.length}</span>
+            </button>
+            {showWsRefMenu && (
+              <div className="mention-pop" style={{ right: 0, left: 'auto', bottom: '100%', marginBottom: 4 }}>
+                <div className="mention-pop-label">已引用的工作区文件</div>
+                {wsRefs.map(ref => (
+                  <div key={ref.path} className="mention-row" style={{ cursor: 'auto' }}>
+                    <Icon name="folder" size={12} style={{ color: 'var(--ember)', marginRight: 4 }} />
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div className="nm">{ref.name}</div>
+                      <div className="rl" style={{ fontSize: 'var(--text-caption)' }}>{ref.path}</div>
+                    </div>
+                    <button
+                      className="icon-btn"
+                      style={{ width: 24, height: 24, marginRight: -8 }}
+                      title="移除引用"
+                      disabled={busy}
+                      onClick={() => onRemoveWsRef(ref.path)}
+                    >
+                      <Icon name="x" size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <div style={{ marginLeft: 'auto', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', paddingRight: 4 }}>
           {isG ? '群聊共享上下文' : 'Enter 发送'}
         </div>
@@ -1223,7 +1757,7 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             insertPlainText(e.clipboardData.getData('text/plain'));
           }}
         />
-        <button className="send-btn" disabled={(!text.trim() && pending.length === 0) || busy} onClick={send}>
+        <button className="send-btn" disabled={(!text.trim() && pending.length === 0 && wsRefs.length === 0) || busy} onClick={send}>
           <Icon name="send" size={18} />
         </button>
       </div>
@@ -1469,8 +2003,8 @@ function EditGroupModal({ conversation, projects, onClose, onSave }: {
 }
 
 // 只读归档消息行：用快照里去规范化的发言人信息渲染，不依赖 live agents，无右键菜单/编辑。
-function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
-  m: ArchivedMessage; agents: Agent[]; isGroup: boolean; projectId?: string;
+function ArchiveMessageRow({ m, agents, isGroup, projectId, highlight }: {
+  m: ArchivedMessage; agents: Agent[]; isGroup: boolean; projectId?: string; highlight?: string;
 }) {
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.id, a])), [agents]);
   const liveAgent = !m.is_me && !m.is_innate && m.from_agent ? agentMap[m.from_agent] : null;
@@ -1509,7 +2043,7 @@ function ArchiveMessageRow({ m, agents, isGroup, projectId }: {
           </div>
         )}
         <div ref={bubbleRef} className={'bubble' + (longDoc ? ' doc' : '')} style={m.excluded_from_context ? { opacity: 0.45, outline: '1.5px dashed var(--border-strong)', outlineOffset: 2 } : undefined}>
-          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} />)}
+          {blocks.map((b, i) => <Block key={i} b={b} projectId={projectId} highlight={highlight} />)}
         </div>
         {quote && (
           <div className="bubble-quote" title={`${quote.author}: ${quote.text}`}>
@@ -1536,6 +2070,8 @@ function ArchiveBrowser({ agents, projects, onClose }: {
   const [confirmDelete, setConfirmDelete] = useState<ConversationArchiveSummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
+  const [expanded, setExpanded] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   const refreshList = useCallback(async () => {
     try { setSummaries(await listConversationArchives()); }
@@ -1582,6 +2118,15 @@ function ArchiveBrowser({ agents, projects, onClose }: {
   };
 
   const searching = q.trim().length > 0;
+  // 选中归档加载完且有搜索词时，自动滚动到右侧正文第一个高亮命中处。
+  useEffect(() => {
+    if (loading || !searching || messages.length === 0) return;
+    const t = setTimeout(() => {
+      bodyRef.current?.querySelector('.search-mark')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
+    return () => clearTimeout(t);
+  }, [loading, searching, messages, q]);
+
   const rows: (ConversationArchiveSummary & { match_count?: number; snippet?: string })[] =
     searching ? hits : summaries;
   const projectName = (s: ConversationArchiveSummary) =>
@@ -1590,13 +2135,16 @@ function ArchiveBrowser({ agents, projects, onClose }: {
 
   return (
     <div style={{ position: 'fixed', inset: 'var(--win-gutter,0)', borderRadius: 14, background: 'rgba(0,0,0,.5)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 240 }}>
-      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-strong)', borderRadius: 14, width: 'min(980px, 92vw)', height: 'min(680px, 88vh)', display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: 'var(--shadow-lg)' }} onClick={e => e.stopPropagation()}>
+      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-strong)', borderRadius: 14, width: expanded ? '100%' : 'min(1180px, 94vw)', height: expanded ? '100%' : 'min(820px, 92vh)', display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: 'var(--shadow-lg)', transition: 'width .16s, height .16s' }} onClick={e => e.stopPropagation()}>
         <div className="panel-head" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '13px 16px', borderBottom: '1px solid var(--border)' }}>
           <Icon name="inbox" size={18} style={{ color: 'var(--ember)' }} />
           <div style={{ flex: 1 }}>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: 'var(--text-section)', fontWeight: 700 }}>归档区</div>
             <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>READ-ONLY · 只读快照检索与回顾</div>
           </div>
+          <button className="icon-btn" title={expanded ? '还原窗口' : '放大窗口 · 沉浸阅读'} onClick={() => setExpanded(e => !e)}>
+            <Icon name={expanded ? 'minimize' : 'maximize'} size={16} />
+          </button>
           <button className="icon-btn" title="关闭" onClick={onClose}><Icon name="x" size={16} /></button>
         </div>
         {err && <div style={{ padding: '6px 16px', color: 'var(--red)', fontSize: 'var(--text-label)' }}>{err}</div>}
@@ -1660,11 +2208,11 @@ function ArchiveBrowser({ agents, projects, onClose }: {
                     <Icon name="trash" size={14} /> 彻底删除
                   </button>
                 </div>
-                <div className="msgs scroll" style={{ flex: 1 }}>
+                <div ref={bodyRef} className="msgs scroll" style={{ flex: 1 }}>
                   {loading
                     ? <div className="empty" style={{ color: 'var(--text-3)', padding: 30 }}>加载中…</div>
                     : messages.map((m, i) => (
-                        <ArchiveMessageRow key={i} m={m} agents={agents} isGroup={isGroupMeta} projectId={selectedMeta.project_id ?? undefined} />
+                        <ArchiveMessageRow key={i} m={m} agents={agents} isGroup={isGroupMeta} projectId={selectedMeta.project_id ?? undefined} highlight={searching ? q.trim() : ''} />
                       ))}
                 </div>
               </>
@@ -1728,10 +2276,19 @@ export default function ConversationsPage() {
   const [idCopied,       setIdCopied]       = useState(false);
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
-  const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs'>('docs');
-  const [wsFileContent,  setWsFileContent]  = useState<{ path: string; content: string } | null>(null);
+  const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs' | 'deliverables'>('docs');
+  const [wsRefs,         setWsRefs]         = useState<WorkspaceRef[]>([]);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
+  // 当前正在看的气泡对应的 agent（跨越视口顶边的那条消息的作者）→ 在堆叠里高亮其边框，
+  // 充当「黏性标题」指示当前段落属于谁。
+  const [currentAgentId, setCurrentAgentId] = useState<string | null>(null);
+  // 堆叠作用域：以「我的发言」分段，当前滚动位置所在那一段里发过言的 agent——按**发言先后**排序的有序数组
+  // （非成员名单顺序）。即「只显示到我最近一次发言为止」：最新一轮几个 agent 回复就显示这几个，
+  // 顺序与对话流一致。群聊里消息行不再各自显示头像，统一由此堆叠展示（currentAgentId 高亮当前）。
+  const [segmentAgents, setSegmentAgents] = useState<string[]>([]);
+  // 本段起始处「我的发言」消息 id——堆叠顶部的「我」按钮据此跳转回本轮我的提问。
+  const [segmentStartId, setSegmentStartId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<string | null>(null);
   const [showArchive,    setShowArchive]    = useState(false);
@@ -1740,6 +2297,9 @@ export default function ConversationsPage() {
   // 任务活动态：驱动「正在思考」气泡 + 顶部状态条；running 常驻，done/error 短暂闪现后自动清除。
   const [activity,       setActivity]       = useState<{ phase: 'running' | 'done' | 'error'; label: string } | null>(null);
   const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 实时活动流：会议室 Agent 回复时的真实思考过程，按 run_id 分流（并行步骤里多个 Agent 同时发言）。
+  // text=回复正文逐字累积；actions=Agent 的工具动作（检索代码/读文件…）。done 事件撤下卡片。
+  const [thinking, setThinking] = useState<Record<string, { agentId: string; agentName: string; actions: string[]; text: string }>>({});
   // 发送回执：刚发出的「我」消息短暂显示「已送达」。
   const [justSentId,     setJustSentId]     = useState('');
   const sentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1782,17 +2342,55 @@ export default function ConversationsPage() {
   const searchInputRef  = useRef<HTMLInputElement>(null);
   const messageRefs     = useRef<Record<string, HTMLDivElement | null>>({});
 
+  // 实时活动流的 token 节流缓冲：LLM 每秒可吐数十个 token，逐个 setState 会按 token 频率
+  // 重渲整条消息列表 + 重解析思考气泡的 Markdown，长会话下明显卡顿。改为把增量先攒进 ref，
+  // 每 ~60ms 合并一次提交，渲染频率封顶 ~16fps，与流畅可读性兼得。tool/done 事件低频，仍即时处理。
+  const thinkBuf   = useRef<Record<string, { agentId: string; agentName: string; text: string }>>({});
+  const thinkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushThink = useCallback(() => {
+    thinkTimer.current = null;
+    const buf = thinkBuf.current;
+    thinkBuf.current = {};
+    const rids = Object.keys(buf);
+    if (rids.length === 0) return;
+    setThinking(t => {
+      const next = { ...t };
+      for (const rid of rids) {
+        const b = buf[rid];
+        const cur = next[rid] || { agentId: b.agentId, agentName: b.agentName, actions: [], text: '' };
+        next[rid] = { ...cur, agentName: cur.agentName || b.agentName, text: cur.text + b.text };
+      }
+      return next;
+    });
+  }, []);
+  useEffect(() => () => { if (thinkTimer.current) clearTimeout(thinkTimer.current); }, []);
+  // 是否贴在底部附近（用户没有上滚看历史）。仅贴底时才自动跟随，避免上滚阅读 / 点头像跳转时被拽回底部。
+  const atBottomRef = useRef(true);
+  // 思考卡片随流式输出 / 工具调用加载而增高时，自动跟随到底（内容向上顿动），免去手动反复下滚；
+  // 用 useLayoutEffect 在绘制前贴底、无闪动；不贴底（在看历史）则不打扰。
+  useLayoutEffect(() => {
+    if (atBottomRef.current && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [thinking]);
+
   // Ref keeps the event listener closure up-to-date without re-registering it.
   const activeRef = useRef(active);
   activeRef.current = active;
+  // 供滚动可见性计算读取最新 msgs，避免把 msgs 进 useCallback 依赖反复重建监听。
+  const msgsRef = useRef(msgs);
+  msgsRef.current = msgs;
 
   // ── Stable data-fetching callbacks ─────────────────────────────────────────
 
   const loadConvs = useCallback(async () => {
     const [cs, as, ps] = await Promise.all([listConversations(), listAgents(), listProjects()]);
     setConvs(cs);
-    setAgents(as);
-    primeAgents(as);  // 同步全局 Agent store（Markdown @提及 / Avatar 查表的真源）
+    // 把内置「编码 Agent」并入列表：让所有由页面 `agents` 派生的 agentMap（消息作者名/头像、
+    // @提及解析）都能查到它；其 mentionable/visible_in_chat=false 故不会混入成员选择器。
+    const withBuiltin = [...as, builtinCodeAgent()];
+    setAgents(withBuiltin);
+    primeAgents(withBuiltin);  // 同步全局 Agent store（Markdown @提及 / Avatar 查表的真源）
     setProjects(ps);
     // Keep the current/persisted conversation if it still exists; otherwise fall back
     // to the first group conversation (groups listed before directs in the UI).
@@ -1841,7 +2439,7 @@ export default function ConversationsPage() {
     // 恢复在途任务指示：切换会话或重新进入会议室页时，若该会话仍有 running 的后台任务，
     // 重新点亮「正在思考」气泡——后台任务本就 detached 持续执行，这里让前端忠实反映它。
     listConversationTasks(active).then(tasks => {
-      if (alive && tasks[0]?.status === 'running') flashActivity('running', 'Agent 正在思考…');
+      if (alive && tasks[0]?.status === 'running') flashActivity('running', '调度器安排任务中…');
     }).catch(() => {});
 
     const readTimer = setTimeout(() => {
@@ -1862,7 +2460,16 @@ export default function ConversationsPage() {
     setBubbleMenu(null);
     setEditGroup(null);
     setActivity(null);
+    setThinking({});
+    setCurrentAgentId(null);
+    setSegmentAgents([]);
+    setSegmentStartId(null);
+    visKeyRef.current = '';
+    atBottomRef.current = true; // 新会话默认贴底跟随
+    thinkBuf.current = {};
+    if (thinkTimer.current) { clearTimeout(thinkTimer.current); thinkTimer.current = null; }
     setJustSentId('');
+    setWsRefs([]);
   }, [active]);
 
   // 4. Auto-focus search input when panel opens.
@@ -1881,14 +2488,37 @@ export default function ConversationsPage() {
     let unlisten: (() => void) | undefined;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    listen<unknown>('AutoForge://event', e => {
-      const ev = e.payload as { type?: string; conversation_id?: string; status?: string };
+    listen<unknown>('autoforge://event', e => {
+      const ev = e.payload as { type?: string; conversation_id?: string; status?: string; run_id?: string; agent_id?: string; agent_name?: string; kind?: string; text?: string };
+      // 实时活动流：高频思考增量，仅更新本地态、不触发消息重载，且不进 300ms 去抖。
+      if (ev?.type === 'agent_thinking') {
+        if (!activeRef.current || ev.conversation_id !== activeRef.current) return;
+        const rid = ev.run_id || '';
+        if (ev.kind === 'done') {
+          delete thinkBuf.current[rid]; // 丢弃未提交的残余 token（正式消息即将落地）
+          setThinking(t => { if (!(rid in t)) return t; const n = { ...t }; delete n[rid]; return n; });
+          return;
+        }
+        if (ev.kind === 'tool') {
+          // 工具动作低频，即时提交（与 token 文本是独立 UI 区，无需保序）。
+          setThinking(t => {
+            const cur = t[rid] || { agentId: ev.agent_id || '', agentName: ev.agent_name || '', actions: [], text: '' };
+            return { ...t, [rid]: { ...cur, agentName: cur.agentName || ev.agent_name || '', actions: [...cur.actions, ev.text || ''] } };
+          });
+          return;
+        }
+        // token：攒进缓冲，按 ~60ms 节流合并提交（见 flushThink）。
+        const b = thinkBuf.current[rid] || { agentId: ev.agent_id || '', agentName: ev.agent_name || '', text: '' };
+        thinkBuf.current[rid] = { ...b, text: b.text + (ev.text || '') };
+        if (!thinkTimer.current) thinkTimer.current = setTimeout(flushThink, 60);
+        return;
+      }
       if (ev?.type !== 'message_received' && ev?.type !== 'conversation_task_updated') return;
       // 活动态立即更新（不进 300ms 去抖），让顶部状态条 / 思考气泡尽快反映后端进度。
       if (ev.type === 'conversation_task_updated' && !!activeRef.current && ev.conversation_id === activeRef.current) {
-        if (ev.status === 'running') flashActivity('running', 'Agent 正在思考…');
-        else if (ev.status === 'completed') flashActivity('done', '已完成');
-        else if (ev.status === 'failed') flashActivity('error', '处理失败');
+        if (ev.status === 'running') flashActivity('running', '调度器安排任务中…');
+        else if (ev.status === 'completed') { flashActivity('done', '已完成'); thinkBuf.current = {}; setThinking({}); }
+        else if (ev.status === 'failed') { flashActivity('error', '处理失败'); thinkBuf.current = {}; setThinking({}); }
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
@@ -1918,7 +2548,7 @@ export default function ConversationsPage() {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [loadConvs, loadMsgs, flashActivity]); // stable callbacks — this effect runs once
+  }, [loadConvs, loadMsgs, flashActivity, flushThink]); // stable callbacks — this effect runs once
 
   // 6. Close panels when clicking outside the header actions area.
   useEffect(() => {
@@ -1946,7 +2576,7 @@ export default function ConversationsPage() {
 
   // Load project files + workspace files when context panel opens for a project-linked group chat
   useEffect(() => {
-    if (!showContext) { setProjectFiles([]); setWorkspaceFiles([]); setWsFileContent(null); return; }
+    if (!showContext) { setProjectFiles([]); setWorkspaceFiles([]); return; }
     const c = convs.find(c => c.id === active);
     if (!c?.project_id) { setProjectFiles([]); setWorkspaceFiles([]); return; }
     const pid = c.project_id;
@@ -2009,6 +2639,85 @@ export default function ConversationsPage() {
     setActiveSearchId(id);
     messageRefs.current[id]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   };
+
+  // 把某条消息对齐到消息区顶端并短暂高亮（堆叠头像 / 「我」按钮点击复用）。
+  const jumpToMsgStart = (tid: string) => {
+    setActiveSearchId(tid);
+    messageRefs.current[tid]?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    setTimeout(() => setActiveSearchId(cur => (cur === tid ? null : cur)), 1800);
+  };
+  // 左侧「轮次刻度尺 + 悬浮目录」(RoundAvatarStack) 所需数据：所有轮次(我的发言)及其预览文本，
+  // 每轮挂上该轮所有 agent 回复(子列表)。单遍扫描 msgs，以「我的发言」为界切轮；文本在此算好，组件不感知 msgs/msgText。
+  const stackRounds: RoundNav[] = [];
+  for (const m of msgs) {
+    if (m.id.startsWith('typing-')) continue;       // 跳过流式占位
+    if (!m.from_agent) {
+      stackRounds.push({ id: m.id, text: msgText(m).trim(), replies: [] });
+    } else if (stackRounds.length > 0) {            // agent 回复挂到当前轮
+      const ag = agentMap[m.from_agent];
+      if (ag) stackRounds[stackRounds.length - 1].replies.push({ msgId: m.id, agent: ag, text: msgText(m).trim() });
+    }
+  }
+  const curRoundIdx = segmentStartId ? stackRounds.findIndex(r => r.id === segmentStartId) : -1;
+
+  // 计算当前视口内可见发言的 agent 集合（供堆叠去重）。按消息 DOM 顺序遍历，越过视口下沿即停。
+  // 用 getBoundingClientRect 对照滚动容器视口，rAF 节流，仅在滚动/消息变化时触发。
+  const visKeyRef = useRef('');
+  const visRafRef = useRef<number | null>(null);
+  const recomputeVisibleAgents = useCallback(() => {
+    visRafRef.current = null;
+    const sc = scrollRef.current;
+    if (!sc) return;
+    // 顺带更新「是否贴底」：滚动回调驱动，供流式自动跟随判定（上滚看历史时不跟随）。
+    atBottomRef.current = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120;
+    const scRect = sc.getBoundingClientRect();
+    const msgs = msgsRef.current;
+    let current: string | null = null;  // 跨越视口顶边的那条消息 = 当前正在看的气泡
+    let currentIdx = -1;
+    let firstVisIdx = -1;
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      const el = messageRefs.current[m.id];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top > scRect.bottom) break;     // 之后的消息都在视口下方
+      if (r.bottom < scRect.top) continue;  // 整行都在视口上方
+      if (firstVisIdx < 0) firstVisIdx = i; // 第一条与视口相交的消息（兜底「当前」）
+      // 跨越视口顶边（行顶在视口顶之上、行底在视口顶之下）= 当前正在阅读的气泡。
+      if (r.top <= scRect.top + 1 && r.bottom > scRect.top) { current = m.from_agent || null; currentIdx = i; }
+    }
+    if (currentIdx < 0 && firstVisIdx >= 0) { currentIdx = firstVisIdx; current = msgs[firstVisIdx].from_agent || null; }
+    // 以「我的发言」(from_agent 为空) 为界，求当前位置所在那一段里发过言的 agent 集合（堆叠作用域）。
+    const seg = new Set<string>();
+    let segStartId: string | null = null;
+    if (currentIdx >= 0) {
+      let start = currentIdx;
+      while (start > 0 && msgs[start].from_agent) start--; // 回退到本段起始的「我的发言」或开头
+      if (msgs[start] && !msgs[start].from_agent) segStartId = msgs[start].id; // 本段起始「我的发言」
+      for (let i = start; i < msgs.length; i++) {
+        if (i > start && !msgs[i].from_agent) break;       // 下一条「我的发言」= 段结束
+        if (msgs[i].from_agent) seg.add(msgs[i].from_agent!);
+      }
+    }
+    const segArr = [...seg]; // Set 保留插入顺序 = 发言先后顺序
+    // key 用有序 join（非排序），以便「成员相同但顺序变化」也能触发更新。
+    const key = segArr.join(',') + '|' + (current ?? '') + '|' + (segStartId ?? '');
+    if (key !== visKeyRef.current) {
+      visKeyRef.current = key;
+      setCurrentAgentId(current);
+      setSegmentAgents(segArr);
+      setSegmentStartId(segStartId);
+    }
+  }, []);
+  const scheduleVisible = useCallback(() => {
+    if (visRafRef.current == null) visRafRef.current = requestAnimationFrame(recomputeVisibleAgents);
+  }, [recomputeVisibleAgents]);
+  // 消息变化（加载/新消息/滚到底）后重算；卸载时取消挂起的 rAF。
+  useEffect(() => {
+    const t = setTimeout(scheduleVisible, 80);
+    return () => clearTimeout(t);
+  }, [msgs, scheduleVisible]);
+  useEffect(() => () => { if (visRafRef.current != null) cancelAnimationFrame(visRafRef.current); }, []);
 
   const openBubbleMenu = (e: React.MouseEvent, message: Message, author: string) => {
     e.preventDefault();
@@ -2107,6 +2816,7 @@ export default function ConversationsPage() {
     mentionedAgentIds: string[],
   ) => {
     if (!conv || sending) return false;
+    const stagedWsRefs = wsRefs;
     setSending(true);
     setLoadError('');
     try {
@@ -2131,6 +2841,11 @@ export default function ConversationsPage() {
         blocks.push(contextAttachmentBlock(attachment));
       }
 
+      // 工作区文件引用：随消息携带 .autoforge/ 相对路径，后端构建提示时按需读取内容。
+      for (const ref of stagedWsRefs) {
+        blocks.push(workspaceRefBlock(ref));
+      }
+
       if (quoteDraft) {
         blocks.push({
           t: 'quote_ref',
@@ -2146,6 +2861,7 @@ export default function ConversationsPage() {
       setMsgs(ms => [...ms, m]);
       markSent(m.id);
       setQuoteDraft(null);
+      setWsRefs([]);
       loadConvs().catch(() => {});
       if (attachments.length > 0) loadContextAttachments(conv.id).catch(() => {});
       setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, 50);
@@ -2164,7 +2880,7 @@ export default function ConversationsPage() {
         return true;
       }
 
-      const shouldStartTask = text.trim().length > 0 || contextRefs.length > 0 || attachments.length > 0;
+      const shouldStartTask = text.trim().length > 0 || contextRefs.length > 0 || attachments.length > 0 || stagedWsRefs.length > 0;
       if (shouldStartTask) {
         const directAgentIds = conv.conv_type === 'direct'
           ? conv.members.filter(id => {
@@ -2173,7 +2889,7 @@ export default function ConversationsPage() {
             }).slice(0, 1)
           : [];
         // 乐观置为「思考中」：让用户立刻知道 Agent 已收到并开始处理，无需等后端 running 事件。
-        flashActivity('running', 'Agent 正在思考…');
+        flashActivity('running', '调度器安排任务中…');
         await startConversationTask({
           conversation_id: conv.id,
           trigger_message_id: m.id,
@@ -2229,7 +2945,7 @@ export default function ConversationsPage() {
       setConvs(cs => cs.map(c => c.id === updated.id ? updated : c));
       setEditGroup(null);
       setShowContext(false);
-      setWsFileContent(null);
+      setWsRefs([]);
       if (active === updated.id) {
         loadContextAttachments(updated.id).catch(() => {});
       }
@@ -2304,7 +3020,17 @@ export default function ConversationsPage() {
       <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} collapsed={listCollapsed} onToggleCollapse={toggleList} />
 
       {conv ? (
-        <div className="content">
+        <div className="content" style={{ position: 'relative' }}>
+          {/* 左侧「对话轮次刻度尺 + 悬浮目录」(独立组件)：默认只见极简刻度尺；
+              hover 弹出目录——标题=我的发言，子列表=该轮所有 agent 回复(hover 标题展开)，点击跳转。 */}
+          {conv.conv_type === 'group' && (
+            <RoundAvatarStack
+              key={conv.id}
+              rounds={stackRounds}
+              currentRoundIndex={curRoundIdx}
+              onJump={jumpToMsgStart}
+            />
+          )}
           {/* ── Chat header ── */}
           <div className="chat-head">
             {listCollapsed && (
@@ -2488,8 +3214,8 @@ export default function ConversationsPage() {
                         <Icon name="folder" size={12} style={{ color: 'var(--ember)' }} />
                         工作区文件
                         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-                          {(['docs', 'specs'] as const).map(tab => (
-                            <button key={tab} onClick={() => { setWorkspaceTab(tab); setWsFileContent(null); }}
+                          {(['docs', 'specs', 'deliverables'] as const).map(tab => (
+                            <button key={tab} onClick={() => setWorkspaceTab(tab)}
                               className="btn btn-sm"
                               style={{ padding: '1px 8px', fontSize: 'var(--text-micro)', background: workspaceTab === tab ? 'var(--ember)' : undefined, color: workspaceTab === tab ? '#fff' : undefined }}>
                               {tab}
@@ -2497,22 +3223,7 @@ export default function ConversationsPage() {
                           ))}
                         </div>
                       </div>
-                      {/* File viewer */}
-                      {wsFileContent && (
-                        <div style={{ margin: '4px 8px 4px', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
-                          <div style={{ padding: '6px 10px', background: 'var(--bg-3)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 'var(--text-caption)' }}>
-                            <Icon name="file" size={11} style={{ color: 'var(--ember)' }} />
-                            <span style={{ fontFamily: 'var(--font-mono)', flex: 1, color: 'var(--text-2)' }}>.autoforge/{wsFileContent.path}</span>
-                            <button className="icon-btn" style={{ width: 20, height: 20 }} onClick={() => setWsFileContent(null)}>
-                              <Icon name="x" size={11} />
-                            </button>
-                          </div>
-                          <pre style={{ margin: 0, padding: '8px 10px', fontSize: 'var(--text-caption)', lineHeight: 'var(--leading-relaxed)', color: 'var(--text-2)', maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                            {wsFileContent.content}
-                          </pre>
-                        </div>
-                      )}
-                      {/* File list */}
+                      {/* File list：点击即把文件作为附件引用暂存到输入框上方，发送时随消息携带 */}
                       {workspaceFiles.filter(f => f.subfolder === workspaceTab).length === 0 ? (
                         <div className="empty-compact" style={{ padding: '8px 8px' }}>
                           .autoforge/{workspaceTab}/ 暂无文件
@@ -2521,16 +3232,14 @@ export default function ConversationsPage() {
                           </span>
                         </div>
                       ) : (
-                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => (
+                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => {
+                          const referenced = wsRefs.some(r => r.path === f.rel_path);
+                          return (
                           <div key={f.rel_path} className="mention-row" style={{ cursor: 'pointer' }}
-                            onClick={() => {
-                              if (wsFileContent?.path === f.rel_path) { setWsFileContent(null); return; }
-                              if (conv.project_id) {
-                                readWorkspaceFile(conv.project_id, f.rel_path)
-                                  .then(content => setWsFileContent({ path: f.rel_path, content }))
-                                  .catch(err => setLoadError(String(err)));
-                              }
-                            }}>
+                            title={referenced ? '点击取消引用' : '点击引用到输入框'}
+                            onClick={() => setWsRefs(refs => referenced
+                              ? refs.filter(r => r.path !== f.rel_path)
+                              : [...refs, { path: f.rel_path, name: f.name }])}>
                             <div className="cfg-logo" style={{ width: 28, height: 28, background: 'var(--ember)', flexShrink: 0 }}>
                               <Icon name="file" size={13} />
                             </div>
@@ -2538,9 +3247,10 @@ export default function ConversationsPage() {
                               <div className="nm">{f.name}</div>
                               <div className="rl" style={{ fontSize: 'var(--text-caption)' }}>{f.modified_at} · {(f.size_bytes / 1024).toFixed(1)} KB</div>
                             </div>
-                            <Icon name={wsFileContent?.path === f.rel_path ? 'chevronUp' : 'chevronDown'} size={12} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                            <Icon name={referenced ? 'check' : 'plus'} size={13}
+                              style={{ color: referenced ? 'var(--ember)' : 'var(--text-3)', flexShrink: 0 }} />
                           </div>
-                        ))
+                        ); })
                       )}
                       <div style={{ height: 1, background: 'var(--border)', margin: '4px 0 2px' }} />
 
@@ -2590,7 +3300,7 @@ export default function ConversationsPage() {
                         </div>
                       ))}
                       <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', padding: '4px 8px 8px' }}>
-                        只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/ 和 .autoforge/specs/
+                        只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/、.autoforge/specs/ 和 .autoforge/deliverables/
                       </div>
                     </>
                   )}
@@ -2630,7 +3340,7 @@ export default function ConversationsPage() {
           </div>
 
           {/* ── Messages ── */}
-          <div className="msgs scroll" ref={scrollRef}>
+          <div className="msgs scroll" ref={scrollRef} onScroll={scheduleVisible}>
             {msgs.map((m, i) => (
               <MessageRow
                 key={m.id ?? i}
@@ -2645,7 +3355,64 @@ export default function ConversationsPage() {
                 receipt={m.id === justSentId}
               />
             ))}
-            {activity?.phase === 'running' && (
+            {/* 实时活动流：每个正在发言的 Agent 一张卡片，显示其工具动作 + 逐字流入的回复正文 */}
+            {Object.entries(thinking).map(([rid, t]) => {
+              const ta = agentMap[t.agentId];
+              const accent = ta?.color || 'var(--ember)';
+              return (
+              <div key={rid} className="msg rise">
+                {/* 工作中头像：bot 图标 + 向外扩散的 ember 脉冲环，传达「正在锻造」的活感 */}
+                <div style={{ position: 'relative', width: 36, height: 36, flex: 'none' }}>
+                  <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Icon name="bot" size={20} />
+                  </div>
+                  <span style={{ position: 'absolute', inset: 0, borderRadius: 13, border: '1.5px solid var(--ember)', animation: 'pulse-ring 1.9s ease-out infinite', pointerEvents: 'none' }} />
+                </div>
+                <div className="msg-body">
+                  <div className="typing-cap" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: 99, background: 'var(--ember)', animation: 'pulse 1.4s ease-in-out infinite', flex: 'none' }} />
+                    <span style={{ color: accent, fontWeight: 600 }}>{t.agentName || 'Agent'}</span>
+                    <span>正在工作…</span>
+                  </div>
+                  {(() => {
+                    // 工具动作 + 流式正文拍平成行，只取最后三行；包进带 ember 左轴 + 顶部流光的「控制台」面板，
+                    // 最新一行更亮，营造正在处理的活感（最新内容始终在底部可见）。
+                    const lines = [
+                      ...t.actions.map(s => ({ mono: true, s })),
+                      ...(t.text ? t.text.split('\n').map(s => ({ mono: false, s })) : []),
+                    ].filter(l => l.s.trim());
+                    const tail = lines.slice(-3);
+                    if (tail.length === 0) return <div className="bubble typing-bubble"><div className="typing"><i /><i /><i /></div></div>;
+                    return (
+                      <div style={{
+                        position: 'relative', overflow: 'hidden', maxWidth: '90%',
+                        display: 'flex', flexDirection: 'column', gap: 2, lineHeight: 'var(--leading-normal)',
+                        background: 'var(--bg-2)', borderLeft: '2px solid var(--ember)',
+                        borderRadius: '4px 10px 10px 4px', padding: '7px 12px', boxShadow: 'var(--shadow-sm)',
+                      }}>
+                        {/* 顶部 ember 流光：表示正在处理 */}
+                        <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, overflow: 'hidden' }}>
+                          <span style={{ position: 'absolute', inset: 0, background: 'linear-gradient(90deg, transparent, var(--ember), transparent)', transform: 'translateX(-100%)', animation: 'skel-sweep 1.5s ease-in-out infinite' }} />
+                        </span>
+                        {tail.map((l, i) => (
+                          <div key={i} style={{
+                            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                            color: i === tail.length - 1 ? 'var(--text-2)' : 'var(--text-faint)',
+                            fontFamily: l.mono ? 'var(--font-mono)' : 'var(--font-sans)',
+                            fontSize: l.mono ? 'var(--text-caption)' : 'var(--text-control)',
+                          }}>
+                            {l.s}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+              );
+            })}
+            {/* 任务已启动但尚无 Agent 开始流式（规划阶段）时，仍显示一个等待气泡 */}
+            {activity?.phase === 'running' && Object.keys(thinking).length === 0 && (
               <div className="msg rise">
                 <div className="av" style={{ width: 36, height: 36, background: 'var(--ember-tint-strong)', color: 'var(--ember-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <Icon name="bot" size={20} />
@@ -2658,6 +3425,28 @@ export default function ConversationsPage() {
             )}
           </div>
 
+          {/* 右下角滚动控制：回到顶部 / 回到底部。0 高度锚点 + 绝对定位悬浮，自动贴在消息区底部之上 */}
+          <div style={{ position: 'relative', height: 0, pointerEvents: 'none' }}>
+            <div style={{ position: 'absolute', right: 16, bottom: 12, display: 'flex', flexDirection: 'column', gap: 8, pointerEvents: 'auto', zIndex: 7 }}>
+              <button
+                className="icon-btn"
+                title="回到顶部"
+                onClick={() => scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+                style={{ background: 'var(--bg-2)', boxShadow: 'var(--shadow)' }}
+              >
+                <Icon name="arrowUp" size={16} />
+              </button>
+              <button
+                className="icon-btn"
+                title="回到底部"
+                onClick={() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })}
+                style={{ background: 'var(--bg-2)', boxShadow: 'var(--shadow)' }}
+              >
+                <Icon name="arrowDown" size={16} />
+              </button>
+            </div>
+          </div>
+
           {activity && (
             <div className={'chat-activity ' + activity.phase}>
               {activity.phase === 'running'
@@ -2665,7 +3454,8 @@ export default function ConversationsPage() {
                 : activity.phase === 'done'
                   ? <Icon name="check" size={13} />
                   : <Icon name="alert" size={13} />}
-              <span>{activity.label}</span>
+              {/* running 阶段实时反映真实进度：有 Agent 流式中 → 协作中；否则仍是调度安排。 */}
+              <span>{activity.phase === 'running' && Object.keys(thinking).length > 0 ? '智能体协作生成中…' : activity.label}</span>
             </div>
           )}
 
@@ -2689,6 +3479,8 @@ export default function ConversationsPage() {
             onError={setLoadError}
             quote={quoteDraft}
             onClearQuote={() => setQuoteDraft(null)}
+            wsRefs={wsRefs}
+            onRemoveWsRef={(path) => setWsRefs(refs => refs.filter(r => r.path !== path))}
             busy={sending}
           />
         </div>
