@@ -8,7 +8,8 @@
 //!
 //! 纯 Rust：每个工具只持有项目根目录 `repo_root`，不碰 db、不引用任何 Tauri 类型。
 //! 路径一律经 [`resolve_within`] 限定在仓库内，杜绝 `..` / 符号链接越界。
-//! 返回内容是不可信外部输入，由 [`super::ToolRegistry::invoke`] 统一过注入闸 + 截断。
+//! 返回内容是项目自有源码（半可信，与喂给编码 Agent 的源码同源），故 `reads_local_source=true`：
+//! 由 [`super::ToolRegistry::invoke`] 仅做截断、**豁免注入闸**——否则审计自身安全代码会被误杀。
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -213,6 +214,11 @@ impl Tool for ListProjectFilesTool {
         )
     }
 
+    /// 读的是本仓库自有源码（半可信）→ 豁免注册表的注入闸，仅截断不丢弃。
+    fn reads_local_source(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value) -> Result<String> {
         let subdir = args.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
         let files = collect_scope(&self.root, subdir)?;
@@ -273,6 +279,11 @@ impl Tool for ReadProjectFileTool {
                 "required": ["path"]
             }),
         )
+    }
+
+    /// 读的是本仓库自有源码（半可信）→ 豁免注册表的注入闸，仅截断不丢弃。
+    fn reads_local_source(&self) -> bool {
+        true
     }
 
     async fn call(&self, args: Value) -> Result<String> {
@@ -377,6 +388,11 @@ impl Tool for SearchProjectCodeTool {
                 "required": ["query"]
             }),
         )
+    }
+
+    /// 读的是本仓库自有源码（半可信）→ 豁免注册表的注入闸，仅截断不丢弃。
+    fn reads_local_source(&self) -> bool {
+        true
     }
 
     async fn call(&self, args: Value) -> Result<String> {
