@@ -600,26 +600,30 @@ function AutosupplySettings() {
 }
 
 function ToolsSettings() {
-  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false, fetch_content: false });
-  const [apiKey, setApiKey] = useState('');
+  const [ws, setWs] = useState<WebSearchSettings>({ provider: '', endpoint: '', max_results: 5, api_key_set: false, tavily_key_set: false, brave_key_set: false, multi_source: true, fetch_content: false });
+  const [tavilyKey, setTavilyKey] = useState('');
+  const [braveKey, setBraveKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [open, setOpen] = useState(false); // 默认折叠，节省高度
 
   useEffect(() => { getWebSearchSettings().then(setWs).catch(e => setStatus(String(e))); }, []);
 
-  // 生效 provider：未配置/配置不全一律退回免 Key 的 DuckDuckGo，故默认始终可用。
-  const eff = ws.provider || 'duckduckgo';
-  const enabled =
-    eff === 'duckduckgo' ||
-    (eff === 'tavily' && (ws.api_key_set || apiKey.trim().length > 0)) ||
-    (eff === 'searxng' && ws.endpoint.trim().length > 0);
+  // DuckDuckGo 始终兜底，故联网搜索始终可用；强源数量决定多源 fan-out 的广度。
+  const tavilyOn = ws.tavily_key_set || tavilyKey.trim().length > 0;
+  const braveOn = ws.brave_key_set || braveKey.trim().length > 0;
+  const searxOn = ws.endpoint.trim().length > 0;
+  const premiumCount = [tavilyOn, braveOn, searxOn].filter(Boolean).length;
 
   const save = async () => {
     setBusy(true);
     try {
-      const r = await setWebSearchSettings(ws.provider || 'duckduckgo', ws.endpoint, ws.max_results, apiKey.trim() || undefined, ws.fetch_content);
-      setWs(r); setApiKey(''); setStatus('已保存');
+      const r = await setWebSearchSettings({
+        provider: ws.provider || 'duckduckgo', endpoint: ws.endpoint, max_results: ws.max_results,
+        tavily_key: tavilyKey.trim() || undefined, brave_key: braveKey.trim() || undefined,
+        multi_source: ws.multi_source, fetch_content: ws.fetch_content,
+      });
+      setWs(r); setTavilyKey(''); setBraveKey(''); setStatus('已保存');
     } catch (e) { setStatus(String(e)); }
     finally { setBusy(false); }
   };
@@ -629,46 +633,56 @@ function ToolsSettings() {
       <div className="set-h">工具 & MCP</div>
       <div className="set-desc">为 Agent 启用外部工具。工具结果视为不可信外部输入，回灌上下文前自动过安全过滤。仅 OpenAI 兼容 / Anthropic 接口规范的 LLM 支持工具调用。</div>
 
-      <div className="cfg-card" style={{ borderColor: enabled ? 'var(--ember-tint-strong)' : undefined }}>
+      <div className="cfg-card" style={{ borderColor: 'var(--ember-tint-strong)' }}>
         <div className="cfg-top" style={{ gap: 10, cursor: 'pointer', userSelect: 'none' }} onClick={() => setOpen(o => !o)}>
           <div className="cfg-logo" style={{ background: 'var(--ember)', width: 28, height: 28 }}><Icon name="search" size={15} /></div>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search</span>
+            <div className="cfg-name cfg-name-line"><span className="cfg-name-text">联网搜索 · web_search / deep_research</span>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginLeft: 6 }}>TOOL</span>
             </div>
-            <div className="cfg-sub">原生免 Key 联网搜索（DuckDuckGo），可选搜索后自动读取正文</div>
+            <div className="cfg-sub">多源并行检索（DuckDuckGo{premiumCount > 0 ? ` + ${premiumCount} 强源` : ''}）· 深度研究 · 可选自动读取正文</div>
           </div>
-          <span className={'chip ' + (enabled ? 'green' : 'amber')} style={{ flexShrink: 0 }}>{enabled ? '已启用' : '未启用'}</span>
+          <span className="chip green" style={{ flexShrink: 0 }}>{ws.multi_source && premiumCount > 0 ? '多源并行' : '已启用'}</span>
           <Icon name={open ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
         </div>
 
         {open && (
         <div className="cfg-fields rise" style={{ marginTop: 14 }}>
-          <div className="field"><label>搜索 Provider</label>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <button type="button" className={`switch${ws.multi_source ? ' on' : ''}`} role="switch" aria-checked={ws.multi_source}
+              onClick={() => setWs(w => ({ ...w, multi_source: !w.multi_source }))}><i /></button>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--text-control)' }}>多源并行检索</div>
+              <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>开启后每次查询并行打所有已配置的源（DDG 永远兜底），跨源去重并按相关性重排；关闭则只用下方首选源。</div>
+            </div>
+          </div>
+          <div className="field"><label>首选源（多源关闭时生效）</label>
             <Select value={ws.provider || 'duckduckgo'} onChange={val => setWs(w => ({ ...w, provider: val }))}
               options={[
                 { value: 'duckduckgo', label: 'DuckDuckGo（免 Key · 默认）' },
                 { value: 'searxng', label: 'SearXNG（自托管，无需 Key）' },
                 { value: 'tavily', label: 'Tavily（需 API Key）' },
+                { value: 'brave', label: 'Brave（需 API Key）' },
               ]} />
           </div>
           <div className="field"><label>返回结果数</label>
             <input type="number" min="1" max="10" value={ws.max_results}
               onChange={e => setWs(w => ({ ...w, max_results: Math.max(1, Math.min(10, Number(e.target.value) || 5)) }))} />
           </div>
-          {ws.provider === 'searxng' && (
-            <div className="field full"><label>SearXNG Endpoint</label>
-              <input type="text" className="mono" value={ws.endpoint} placeholder="https://searx.example.com"
-                onChange={e => setWs(w => ({ ...w, endpoint: e.target.value }))} />
-            </div>
-          )}
-          {ws.provider === 'tavily' && (
-            <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Tavily API Key</label>
-              <input type="password" className="mono" value={apiKey}
-                placeholder={ws.api_key_set ? '已设置（留空则不修改）' : 'tvly-...'}
-                onChange={e => setApiKey(e.target.value)} />
-            </div>
-          )}
+          <div className="field full"><label>SearXNG Endpoint（可选，自托管免 Key）</label>
+            <input type="text" className="mono" value={ws.endpoint} placeholder="https://searx.example.com"
+              onChange={e => setWs(w => ({ ...w, endpoint: e.target.value }))} />
+          </div>
+          <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Tavily API Key（可选，advanced 深度 + 摘要）</label>
+            <input type="password" className="mono" value={tavilyKey}
+              placeholder={ws.tavily_key_set ? '已设置（留空则不修改）' : 'tvly-...'}
+              onChange={e => setTavilyKey(e.target.value)} />
+          </div>
+          <div className="field full"><label><Icon name="key" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Brave Search API Key（可选，独立索引）</label>
+            <input type="password" className="mono" value={braveKey}
+              placeholder={ws.brave_key_set ? '已设置（留空则不修改）' : 'BSA...'}
+              onChange={e => setBraveKey(e.target.value)} />
+          </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button type="button" className={`switch${ws.fetch_content ? ' on' : ''}`} role="switch" aria-checked={ws.fetch_content}
               onClick={() => setWs(w => ({ ...w, fetch_content: !w.fetch_content }))}><i /></button>
@@ -683,7 +697,9 @@ function ToolsSettings() {
           </div>
           <div className="field full">
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
-              默认走 DuckDuckGo，无需任何配置即可联网搜索。需在「角色 Agent / 自定义 Agent」能力中勾选 web_search / web_fetch 的 Agent 才会实际调用对应工具。
+              默认走 DuckDuckGo，无需任何配置即可联网搜索；配置 Tavily/Brave/SearXNG 后多源并行提升质量。
+              <b>deep_research</b> 会自动拆解子问题、多源调研、精读多个来源并综合为带引用的简报（需在 Agent 能力中勾选）。
+              需在「角色 Agent / 自定义 Agent」能力中勾选 web_search / web_fetch / deep_research 的 Agent 才会实际调用对应工具。
             </span>
           </div>
         </div>

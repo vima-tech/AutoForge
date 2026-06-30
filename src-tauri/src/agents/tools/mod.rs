@@ -18,6 +18,7 @@ use crate::core::security::{has_obvious_injection, safe_truncate};
 
 pub mod code_intel;
 pub mod code_scan;
+pub mod deep_research;
 pub mod mcp;
 pub mod memory;
 pub mod specs;
@@ -214,6 +215,7 @@ pub fn builtin_catalog() -> Vec<Box<dyn BuiltinTool>> {
     vec![
         Box::new(web_search::WebSearchFactory),
         Box::new(web_fetch::WebFetchFactory),
+        Box::new(deep_research::DeepResearchFactory),
         Box::new(code_scan::CodeScanFactory::Read),
         Box::new(code_scan::CodeScanFactory::Search),
         Box::new(code_scan::CodeScanFactory::List),

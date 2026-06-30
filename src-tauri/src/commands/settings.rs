@@ -1214,13 +1214,18 @@ pub fn list_builtin_tools() -> Vec<crate::agents::tools::ToolInfo> {
 
 // ---- 工具：Web 搜索配置（存 app_settings，供 agents/tools/web_search 读取）----
 
-/// 回传给前端的 Web 搜索配置。`api_key` 永不出库到 webview，仅暴露是否已设置。
+/// 回传给前端的 Web 搜索配置。各 key 永不出库到 webview，仅暴露是否已设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchSettings {
     pub provider: String,
     pub endpoint: String,
     pub max_results: u32,
+    /// 旧字段：等价 tavily_key_set（向后兼容，勿删）。
     pub api_key_set: bool,
+    pub tavily_key_set: bool,
+    pub brave_key_set: bool,
+    /// 是否多源并行 fan-out（默认开）。
+    pub multi_source: bool,
     /// 是否默认在搜索后自动抓取前几条结果的正文摘录。
     pub fetch_content: bool,
 }
@@ -1323,10 +1328,24 @@ pub async fn get_web_search_settings(
         .await
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(5);
-    let api_key_set = read_setting(&state, "web_search.api_key")
+    // Tavily key：新键优先，回退旧 web_search.api_key（历史上只有 Tavily 用 key）。
+    let tavily_key_set = read_setting(&state, "web_search.tavily_key")
+        .await
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || read_setting(&state, "web_search.api_key")
+            .await
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+    let brave_key_set = read_setting(&state, "web_search.brave_key")
         .await
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    // 默认多源开（与后端 WebSearchConfig::load 一致）。
+    let multi_source = read_setting(&state, "web_search.multi_source")
+        .await
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(true);
     let fetch_content = read_setting(&state, "web_search.fetch_content")
         .await
         .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
@@ -1335,18 +1354,24 @@ pub async fn get_web_search_settings(
         provider,
         endpoint,
         max_results,
-        api_key_set,
+        api_key_set: tavily_key_set,
+        tavily_key_set,
+        brave_key_set,
+        multi_source,
         fetch_content,
     })
 }
 
-/// 保存 Web 搜索配置。`api_key` 为 None 时不改动已存的 key（与 LLM 配置一致的语义）。
+/// 保存 Web 搜索配置。各 key 为 None 时不改动已存的 key（与 LLM 配置一致的语义）。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_web_search_settings(
     provider: String,
     endpoint: String,
     max_results: u32,
-    api_key: Option<String>,
+    tavily_key: Option<String>,
+    brave_key: Option<String>,
+    multi_source: bool,
     fetch_content: bool,
     state: State<'_, AppState>,
 ) -> Result<WebSearchSettings, String> {
@@ -1360,13 +1385,24 @@ pub async fn set_web_search_settings(
     .await?;
     write_setting(
         &state,
+        "web_search.multi_source",
+        if multi_source { "1" } else { "0" },
+    )
+    .await?;
+    write_setting(
+        &state,
         "web_search.fetch_content",
         if fetch_content { "1" } else { "0" },
     )
     .await?;
-    if let Some(key) = api_key {
+    // 新 key 走专属键；保留旧 web_search.api_key 不动（读取端已做回退兼容）。
+    if let Some(key) = tavily_key {
         let enc = crate::core::secrets::encrypt_field(key.trim())?;
-        write_setting(&state, "web_search.api_key", &enc).await?;
+        write_setting(&state, "web_search.tavily_key", &enc).await?;
+    }
+    if let Some(key) = brave_key {
+        let enc = crate::core::secrets::encrypt_field(key.trim())?;
+        write_setting(&state, "web_search.brave_key", &enc).await?;
     }
     get_web_search_settings(state).await
 }

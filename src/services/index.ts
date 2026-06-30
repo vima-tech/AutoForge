@@ -908,13 +908,20 @@ export const updateLlmConfig = (id: string, payload: Partial<{
 
 // ── Settings — Web 搜索工具 ───────────────────────────────────────────────────
 export interface WebSearchSettings {
-  provider: string; endpoint: string; max_results: number; api_key_set: boolean; fetch_content: boolean;
+  provider: string; endpoint: string; max_results: number;
+  api_key_set: boolean; tavily_key_set: boolean; brave_key_set: boolean;
+  multi_source: boolean; fetch_content: boolean;
 }
 export const getWebSearchSettings = () =>
   ipc<WebSearchSettings>('get_web_search_settings');
-export const setWebSearchSettings = (
-  provider: string, endpoint: string, max_results: number, api_key?: string, fetch_content = false,
-) => ipc<WebSearchSettings>('set_web_search_settings', { provider, endpoint, maxResults: max_results, apiKey: api_key, fetchContent: fetch_content });
+export const setWebSearchSettings = (args: {
+  provider: string; endpoint: string; max_results: number;
+  tavily_key?: string; brave_key?: string; multi_source: boolean; fetch_content: boolean;
+}) => ipc<WebSearchSettings>('set_web_search_settings', {
+  provider: args.provider, endpoint: args.endpoint, maxResults: args.max_results,
+  tavilyKey: args.tavily_key, braveKey: args.brave_key,
+  multiSource: args.multi_source, fetchContent: args.fetch_content,
+});
 
 // ── 操作者身份卡（rail-me）────────────────────────────────────────────────────
 export interface OperatorProfile {
