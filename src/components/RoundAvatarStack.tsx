@@ -1,153 +1,201 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Avatar, MeAvatar } from './Avatar';
+import { Avatar } from './Avatar';
 import type { Agent } from '../services';
 
 /**
- * 会议室左侧「对话轮次标尺 + 发言者头像堆叠」。
+ * 会议室左侧「对话轮次刻度尺 + 悬浮目录」。
  *
- * 垂直居中悬浮在消息区左侧，自上而下：
- *   之前轮次的刻度横线 → 「我」按钮(当前轮) → 当前轮发言者头像(按发言序) → 之后轮次的刻度横线。
+ * 默认态：只悬浮一条极简的竖向刻度尺（每轮一根刻度），清爽不抢视线。
+ * hover 刻度尺 → 右侧弹出一个目录面板（TOC）：
+ *   - 每一项标题 = 那一轮「我的发言」；
+ *   - 标题下挂该轮**所有 agent 回复**的子列表，默认收起；
+ *   - hover 某条标题 → 展开它的子列表，点子项快速跳到该 agent 的那条发言。
  *
  * 设计要点：
- * - 数据解耦：父级把每一轮的预览文本(`rounds[].text`)与当前段发言者(`agents`)算好传入，
+ * - 数据解耦：父级把每一轮的预览文本与该轮回复(`rounds[].replies`)算好传入，
  *   本组件不感知 `msgs`/`msgText`，只负责呈现与交互。
- * - 命中区连续：项间距由各按钮内边距提供、容器 `gap:0`，鼠标在整列内移动 hover 不丢。
- * - 零位移/零缩放：hover 不做位移或放大特效（只切换刻度/头像描边颜色与投影），鼠标稳定、选中精准不抖。
- * - hover 内容/名称气泡为实底面板，自带描边+阴影，无需虚化背景；离开留 100ms 意图缓冲防闪。
+ * - 零位移/零缩放：hover 不做位移或放大特效，靠颜色/投影/展开切换，鼠标稳定、选中精准不抖。
+ * - 离开留 120ms 意图缓冲：从刻度尺移到面板、或在面板内移动都不闪。
  */
 
-export interface RoundInfo {
-  /** 该轮起始「我的发言」消息 id（点击跳转目标） */
-  id: string;
-  /** 该轮我的发言文本（hover 预览，已压缩/裁剪由父级决定，这里原样展示） */
+/** 一轮里某个 agent 的回复（子列表项）。 */
+export interface ReplyNav {
+  /** 该 agent 在这一轮的发言消息 id（点击跳转目标）。 */
+  msgId: string;
+  /** 发言者（用于头像 / 名称 / 颜色）。 */
+  agent: Agent;
+  /** 该条回复的预览文本（已由父级裁剪/压缩，这里原样展示）。 */
   text: string;
 }
 
-interface Props {
-  /** 全部轮次（=「我的发言」），按时间先后。 */
-  rounds: RoundInfo[];
-  /** 当前滚动位置所在轮的下标；-1 表示位于首条发言之前。 */
-  currentRoundIndex: number;
-  /** 当前段发言者（已解析为 Agent，按发言先后）。 */
-  agents: Agent[];
-  /** 当前正在阅读的气泡作者 id → 彩色高亮其头像边框。 */
-  currentAgentId: string | null;
-  /** 跳到某条消息（轮次起始 / 我的发言）。 */
-  onJump: (messageId: string) => void;
-  /** 跳到该 agent 在「当前所示轮次」内的发言。 */
-  onJumpAgent: (agentId: string) => void;
+/** 一轮对话（=「我的发言」+ 该轮所有 agent 回复）。 */
+export interface RoundNav {
+  /** 该轮起始「我的发言」消息 id（点击跳转目标）。 */
+  id: string;
+  /** 该轮我的发言预览文本。 */
+  text: string;
+  /** 该轮所有 agent 回复，按发言先后。 */
+  replies: ReplyNav[];
 }
 
-const ME = '__me__';
+// 兼容旧引用名。
+export type RoundInfo = RoundNav;
+
+interface Props {
+  /** 全部轮次（=「我的发言」），按时间先后。 */
+  rounds: RoundNav[];
+  /** 当前滚动位置所在轮的下标；-1 表示位于首条发言之前。 */
+  currentRoundIndex: number;
+  /** 跳到某条消息（我的发言 / 某 agent 回复）。 */
+  onJump: (messageId: string) => void;
+}
+
+const AV = 18;
+
 const PANEL: React.CSSProperties = {
-  width: 'max-content', maxWidth: 280, maxHeight: 200, overflowY: 'auto',
-  background: 'var(--bg-2)', border: '1px solid var(--border-strong)', borderLeft: '2px solid var(--ember)',
-  borderRadius: 10, padding: '8px 12px', boxShadow: 'var(--shadow)', textAlign: 'left',
-  fontSize: 'var(--text-control)', color: 'var(--text)', lineHeight: 'var(--leading-normal)',
-  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-};
-const PILL: React.CSSProperties = {
-  fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)',
-  background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 8,
-  padding: '3px 9px', whiteSpace: 'nowrap', boxShadow: 'var(--shadow)',
-};
-// 头像外环：当前作者 ember 彩色，其余同宽灰色；hover 仅加大投影（不影响布局）。
-const ring = (current: boolean, hovered: boolean): string =>
-  `0 0 0 2px ${current ? 'var(--ember)' : 'var(--border-strong)'}, ${hovered ? 'var(--shadow)' : 'var(--shadow-sm)'}`;
-
-const btnBase: React.CSSProperties = {
-  pointerEvents: 'auto', position: 'relative', border: 0, background: 'transparent',
-  cursor: 'pointer', display: 'flex', gap: 7,
+  width: 280, maxHeight: '60vh', overflowY: 'auto',
+  background: 'var(--bg-2)', border: '1px solid var(--border-strong)',
+  borderRadius: 12, padding: 6, boxShadow: 'var(--shadow-lg)',
+  display: 'flex', flexDirection: 'column', gap: 2,
 };
 
-// 头像统一尺寸（精致小号）。
-const AV = 26;
+const KICKER: React.CSSProperties = {
+  fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', letterSpacing: '.14em',
+  textTransform: 'uppercase', color: 'var(--text-faint)', padding: '4px 8px 6px',
+};
 
-export default function RoundAvatarStack({
-  rounds, currentRoundIndex, agents, currentAgentId, onJump, onJumpAgent,
-}: Props) {
-  const [hover, setHover] = useState<string | null>(null);
+const rowBtn: React.CSSProperties = {
+  width: '100%', textAlign: 'left', border: 0, background: 'transparent',
+  cursor: 'pointer', borderRadius: 9, padding: '7px 9px',
+  display: 'flex', alignItems: 'center', gap: 8,
+  fontSize: 'var(--text-control)', color: 'var(--text)',
+  transition: 'background .12s ease',
+};
+
+const clamp1: React.CSSProperties = {
+  display: '-webkit-box', WebkitLineClamp: 1, WebkitBoxOrient: 'vertical',
+  overflow: 'hidden', wordBreak: 'break-word', flex: 1, minWidth: 0,
+};
+const clamp2: React.CSSProperties = { ...clamp1, WebkitLineClamp: 2 };
+
+export default function RoundAvatarStack({ rounds, currentRoundIndex, onJump }: Props) {
+  const [open, setOpen] = useState(false);          // 面板是否展开（hover 刻度尺/面板）
+  const [hoverRound, setHoverRound] = useState<string | null>(null); // 当前展开子列表的轮 id
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const enter = (id: string) => {
-    if (timer.current) { clearTimeout(timer.current); timer.current = null; }
-    setHover(id);
-  };
+
+  const enter = () => { if (timer.current) { clearTimeout(timer.current); timer.current = null; } setOpen(true); };
   const leave = () => {
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => { setHover(null); timer.current = null; }, 100);
+    timer.current = setTimeout(() => { setOpen(false); setHoverRound(null); timer.current = null; }, 120);
   };
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
 
-  if (rounds.length === 0 && agents.length === 0) return null;
-
-  const prevRounds = currentRoundIndex > 0 ? rounds.slice(0, currentRoundIndex) : [];
-  const nextRounds = rounds.slice(currentRoundIndex + 1); // currentRoundIndex=-1 → 全部
-  const currentRound = currentRoundIndex >= 0 ? rounds[currentRoundIndex] : undefined;
-
-  // 一根「轮次刻度横线」：hover 显示那一轮我的发言、点击跳到那一轮。
-  const tick = (r: RoundInfo) => {
-    const h = hover === r.id;
-    return (
-      <button
-        key={r.id} onMouseEnter={() => enter(r.id)} onMouseLeave={leave} onClick={() => onJump(r.id)}
-        style={{ ...btnBase, alignItems: 'center', padding: '5px 0', zIndex: h ? 60 : 1 }}
-      >
-        <span style={{ display: 'flex', width: AV, justifyContent: 'center' }}>
-          <span style={{
-            width: 16, height: 2, borderRadius: 2,
-            background: h ? 'var(--ember)' : 'var(--border-strong)',
-            transition: 'background .14s ease',
-          }} />
-        </span>
-        {h && <div className="scroll" style={PANEL}>{r.text || '（无文本内容）'}</div>}
-      </button>
-    );
-  };
+  if (rounds.length === 0) return null;
 
   return (
-    <div style={{
-      position: 'absolute',
-      // 锚定左上角：紧贴 chat-head(60px) 下方一点；窗口够宽时退进左侧留白槽、与气泡拉开间距
-      //（窄屏自动收回贴左、不越界）。不再垂直居中——精致地待在角落，不占据页面中部。
-      left: 'max(12px, calc((100% - var(--thread-max)) / 2 - 42px))',
-      top: 74,
-      zIndex: 6, display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
-      gap: 0, pointerEvents: 'none',
-    }}>
-      {prevRounds.map(tick)}
-
-      {currentRound && (() => {
-        const h = hover === ME;
-        return (
-          <button
-            onMouseEnter={() => enter(ME)} onMouseLeave={leave} onClick={() => onJump(currentRound.id)}
-            style={{ ...btnBase, alignItems: 'flex-start', padding: '4px 0', zIndex: h ? 60 : 2 }}
-          >
-            <span style={{ display: 'block', borderRadius: 9, lineHeight: 0, boxShadow: ring(false, h), transition: 'box-shadow .16s ease' }}>
-              <MeAvatar size={AV} />
+    <div
+      style={{
+        position: 'absolute',
+        // 锚定左上角：紧贴 chat-head 下方一点；窗口够宽时退进左侧留白槽、与气泡拉开间距。
+        left: 'max(12px, calc((100% - var(--thread-max)) / 2 - 42px))',
+        top: 74, zIndex: 6,
+        display: 'flex', alignItems: 'flex-start', gap: 10,
+        pointerEvents: 'none',
+      }}
+    >
+      {/* 刻度尺：默认唯一可见物。每轮一根刻度，当前轮 ember 高亮。 */}
+      <div
+        onMouseEnter={enter} onMouseLeave={leave}
+        style={{
+          pointerEvents: 'auto', display: 'flex', flexDirection: 'column',
+          gap: 6, padding: '4px 6px', cursor: 'pointer',
+        }}
+      >
+        {rounds.map((r, i) => {
+          const cur = i === currentRoundIndex;
+          const hot = open && (hoverRound === r.id || (hoverRound === null && cur));
+          return (
+            <span key={r.id} style={{ display: 'flex', width: 18, justifyContent: 'center' }}>
+              <span style={{
+                width: cur ? 18 : 14, height: 2, borderRadius: 2,
+                background: cur || hot ? 'var(--ember)' : 'var(--border-strong)',
+                transition: 'background .14s ease, width .14s ease',
+              }} />
             </span>
-            {h && <div className="scroll" style={PANEL}>{currentRound.text || '（无文本内容）'}</div>}
-          </button>
-        );
-      })()}
+          );
+        })}
+      </div>
 
-      {agents.map(a => {
-        const h = hover === a.id;
-        const cur = currentAgentId === a.id;
-        return (
-          <button
-            key={a.id} onMouseEnter={() => enter(a.id)} onMouseLeave={leave} onClick={() => onJumpAgent(a.id)}
-            style={{ ...btnBase, alignItems: 'center', padding: '4px 0', zIndex: h ? 60 : cur ? 50 : 1 }}
-          >
-            <span style={{ display: 'block', borderRadius: 9, lineHeight: 0, boxShadow: ring(cur, h), transition: 'box-shadow .16s ease' }}>
-              <Avatar agent={a} size={AV} />
-            </span>
-            {h && <span style={{ ...PILL, color: a.color || 'var(--text)' }}>{a.name}</span>}
-          </button>
-        );
-      })}
+      {/* hover 目录面板：标题=我的发言，子列表=该轮所有 agent 回复（默认收起，hover 标题展开）。 */}
+      {open && (
+        <div className="scroll" style={PANEL} onMouseEnter={enter} onMouseLeave={leave}>
+          <div style={KICKER}>对话目录 · {rounds.length} 轮</div>
+          {rounds.map((r, i) => {
+            const cur = i === currentRoundIndex;
+            const expanded = hoverRound === r.id;
+            return (
+              <div
+                key={r.id}
+                onMouseEnter={() => setHoverRound(r.id)}
+                style={{ display: 'flex', flexDirection: 'column' }}
+              >
+                {/* 轮标题：我的发言 */}
+                <button
+                  onClick={() => onJump(r.id)}
+                  style={{
+                    ...rowBtn,
+                    background: cur ? 'var(--ember-tint)' : expanded ? 'var(--surface-hover)' : 'transparent',
+                  }}
+                >
+                  <span style={{
+                    width: 6, height: 6, borderRadius: 99, flexShrink: 0,
+                    background: cur ? 'var(--ember)' : 'var(--border-strong)',
+                  }} />
+                  <span style={clamp1}>{r.text || '（无文本内容）'}</span>
+                  {r.replies.length > 0 && (
+                    <span style={{
+                      fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)',
+                      color: 'var(--text-faint)', flexShrink: 0,
+                    }}>{r.replies.length}</span>
+                  )}
+                </button>
 
-      {nextRounds.map(tick)}
+                {/* 子列表：该轮所有 agent 回复，hover 标题才展开。 */}
+                {expanded && r.replies.length > 0 && (
+                  <div style={{
+                    display: 'flex', flexDirection: 'column', gap: 1,
+                    margin: '1px 0 3px', paddingLeft: 10,
+                    borderLeft: '1px solid var(--border)', marginLeft: 12,
+                  }}>
+                    {r.replies.map(rep => (
+                      <button
+                        key={rep.msgId}
+                        onClick={() => onJump(rep.msgId)}
+                        style={{ ...rowBtn, padding: '5px 8px', alignItems: 'flex-start' }}
+                        onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface-hover)'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                      >
+                        <span style={{ flexShrink: 0, marginTop: 1 }}><Avatar agent={rep.agent} size={AV} /></span>
+                        <span style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0, flex: 1 }}>
+                          <span style={{
+                            fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)',
+                            color: rep.agent.color || 'var(--text-2)', whiteSpace: 'nowrap',
+                            overflow: 'hidden', textOverflow: 'ellipsis',
+                          }}>{rep.agent.name}</span>
+                          <span style={{
+                            ...clamp2, fontSize: 'var(--text-caption)', color: 'var(--text-3)',
+                            lineHeight: 'var(--leading-normal)',
+                          }}>{rep.text || '（无文本内容）'}</span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

@@ -6,7 +6,7 @@ import { useOperator } from '../operator';
 import { primeAgents } from '../agents-store';
 import Block from '../components/Block';
 import Markdown from '../components/Markdown';
-import RoundAvatarStack from '../components/RoundAvatarStack';
+import RoundAvatarStack, { type RoundNav } from '../components/RoundAvatarStack';
 import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
@@ -2612,24 +2612,19 @@ export default function ConversationsPage() {
     messageRefs.current[tid]?.scrollIntoView({ block: 'start', behavior: 'smooth' });
     setTimeout(() => setActiveSearchId(cur => (cur === tid ? null : cur)), 1800);
   };
-  // 在「当前堆叠所示那一轮」(从 segmentStartId 起、到下一条我的发言之前) 内找该 agent 的首条发言。
-  // 关键：不是全局最近一条——堆叠显示的是这一轮，点击就应落在这一轮该 agent 的发言，
-  // 而非它在更晚轮次的发言（否则会跳到与堆叠不对应的另一轮）。
-  const agentMsgInRound = (agentId: string): Message | undefined => {
-    const startIdx = segmentStartId ? msgs.findIndex(m => m.id === segmentStartId) : 0;
-    const from = startIdx >= 0 ? startIdx : 0;
-    for (let i = from; i < msgs.length; i++) {
-      if (i > from && !msgs[i].from_agent) break; // 下一条我的发言 = 本轮结束
-      if (msgs[i].from_agent === agentId && !msgs[i].id.startsWith('typing-')) return msgs[i];
+  // 左侧「轮次刻度尺 + 悬浮目录」(RoundAvatarStack) 所需数据：所有轮次(我的发言)及其预览文本，
+  // 每轮挂上该轮所有 agent 回复(子列表)。单遍扫描 msgs，以「我的发言」为界切轮；文本在此算好，组件不感知 msgs/msgText。
+  const stackRounds: RoundNav[] = [];
+  for (const m of msgs) {
+    if (m.id.startsWith('typing-')) continue;       // 跳过流式占位
+    if (!m.from_agent) {
+      stackRounds.push({ id: m.id, text: msgText(m).trim(), replies: [] });
+    } else if (stackRounds.length > 0) {            // agent 回复挂到当前轮
+      const ag = agentMap[m.from_agent];
+      if (ag) stackRounds[stackRounds.length - 1].replies.push({ msgId: m.id, agent: ag, text: msgText(m).trim() });
     }
-  };
-  const jumpToAgentInRound = (agentId: string) => { const m = agentMsgInRound(agentId); if (m) jumpToMsgStart(m.id); };
-  // 左侧「轮次标尺 + 头像堆叠」(RoundAvatarStack) 所需数据：所有轮次(我的发言)及其预览文本、
-  // 当前所在轮下标、当前段发言者(解析为 Agent，按发言序)。文本在此算好，组件不感知 msgs/msgText。
-  const roundStarts = msgs.filter(m => !m.from_agent && !m.id.startsWith('typing-'));
-  const stackRounds = roundStarts.map(m => ({ id: m.id, text: msgText(m).trim() }));
-  const curRoundIdx = segmentStartId ? roundStarts.findIndex(r => r.id === segmentStartId) : -1;
-  const stackAgents = segmentAgents.map(id => agentMap[id]).filter((a): a is Agent => !!a);
+  }
+  const curRoundIdx = segmentStartId ? stackRounds.findIndex(r => r.id === segmentStartId) : -1;
 
   // 计算当前视口内可见发言的 agent 集合（供堆叠去重）。按消息 DOM 顺序遍历，越过视口下沿即停。
   // 用 getBoundingClientRect 对照滚动容器视口，rAF 节流，仅在滚动/消息变化时触发。
@@ -2992,17 +2987,14 @@ export default function ConversationsPage() {
 
       {conv ? (
         <div className="content" style={{ position: 'relative' }}>
-          {/* 左侧「对话轮次标尺 + 发言者头像堆叠」(独立组件)：上方刻度=之前轮次、当前轮的「我」+发言者、
-              下方刻度=之后轮次；hover 显示该轮我的发言/agent 名，点击跳到对应轮次/发言。 */}
+          {/* 左侧「对话轮次刻度尺 + 悬浮目录」(独立组件)：默认只见极简刻度尺；
+              hover 弹出目录——标题=我的发言，子列表=该轮所有 agent 回复(hover 标题展开)，点击跳转。 */}
           {conv.conv_type === 'group' && (
             <RoundAvatarStack
               key={conv.id}
               rounds={stackRounds}
               currentRoundIndex={curRoundIdx}
-              agents={stackAgents}
-              currentAgentId={currentAgentId}
               onJump={jumpToMsgStart}
-              onJumpAgent={jumpToAgentInRound}
             />
           )}
           {/* ── Chat header ── */}
