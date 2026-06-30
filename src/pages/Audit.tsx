@@ -2957,6 +2957,18 @@ export default function AuditPage({ target, onTargetConsumed, openLedger, onLedg
     if (tab === 'logs' && liveLog.length > 0 && liveAutoScroll) liveEndRef.current?.scrollIntoView({ block: 'end' });
   }, [liveLog, tab, liveAutoScroll]);
 
+  // 进入编码阶段（executing）自动切到「执行日志」tab，方便实时看 Agent 进度：
+  // 选中正在执行的 CR、或当前 CR 状态刚变为 executing 时切换。用 ref 记上次 (id,status)，
+  // 仅在「切到该 CR」或「状态刚变为 executing」时切一次，避免执行期间用户手动切走后被反复拉回。
+  const selCrStatus = crs.find(c => c.id === activeCr)?.status;
+  const prevExecRef = useRef<{ id: string; status?: string }>({ id: '' });
+  useEffect(() => {
+    const prev = prevExecRef.current;
+    const enteredExec = selCrStatus === 'executing' && (prev.id !== activeCr || prev.status !== 'executing');
+    prevExecRef.current = { id: activeCr, status: selCrStatus };
+    if (enteredExec) setTab('logs');
+  }, [activeCr, selCrStatus]);
+
   const doReview = async (decision: 'approved' | 'revision' | 'rejected') => {
     if (!activeCr || submitting) return;
     setSubmitting(true);
