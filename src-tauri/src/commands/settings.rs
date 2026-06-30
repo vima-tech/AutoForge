@@ -946,6 +946,167 @@ pub async fn set_role_slot(
     list_role_catalog(state).await
 }
 
+/// 校验某 LLM 配置存在且已启用，否则报错。供默认设定与一键铺满/分级预设前置校验。
+async fn ensure_llm_usable(db: &crate::db::Db, id: &str) -> Result<(), String> {
+    let n = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM llm_configs WHERE id=? AND enabled=1")
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("目标 LLM 配置不存在或已停用".into());
+    }
+    Ok(())
+}
+
+/// 设置全局默认 LLM（角色未显式绑定时回落到此）。`id` 为空串=清除默认。
+/// 复用 `code_agents.is_default` 同款单选范式：先清旧默认，再置新默认。
+#[tauri::command]
+pub async fn set_default_llm(id: String, state: State<'_, AppState>) -> Result<Vec<LlmConfig>, String> {
+    let id = id.trim().to_string();
+    sqlx::query("UPDATE llm_configs SET is_default=0 WHERE is_default=1")
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !id.is_empty() {
+        ensure_llm_usable(&state.db, &id).await?;
+        sqlx::query("UPDATE llm_configs SET is_default=1 WHERE id=?")
+            .bind(&id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    list_llm_configs(state).await
+}
+
+/// 在事务内确保某注册角色有持有 Agent 并绑定到 `llm_id`：
+/// - 无持有者 → 按注册表默认创建（启用、内置 prompt、`default_chat`）。
+/// - 有持有者 → 取首个为准；`overwrite=true` 或其未绑定 LLM 时改绑并启用；
+///   `overwrite=false` 且已绑定 → 不动（尊重用户既有选择）。
+/// 一键铺满/分级预设共用此核心；不做跨持有者去重（per-kind 去重仍走 set_role_slot）。
+async fn bind_role_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    def: &crate::agents::roles::RoleDef,
+    llm_id: &str,
+    overwrite: bool,
+) -> Result<(), String> {
+    use crate::agents::roles::RoleBinding;
+    let col = match def.binding {
+        RoleBinding::SystemKind => "system_kind",
+        RoleBinding::ForgeRole => "forge_role",
+    };
+    let holder = sqlx::query_as::<_, Agent>(&format!(
+        "SELECT * FROM agents WHERE (',' || COALESCE({col}, '') || ',') LIKE ? ORDER BY created_at LIMIT 1"
+    ))
+    .bind(format!("%,{},%", def.kind))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    match holder {
+        Some(a) => {
+            let bound = !a.llm_id.as_deref().map(str::trim).unwrap_or("").is_empty();
+            if overwrite || !bound {
+                sqlx::query("UPDATE agents SET llm_id=?, enabled=1 WHERE id=?")
+                    .bind(llm_id)
+                    .bind(&a.id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        None => {
+            let id = Uuid::new_v4().to_string();
+            let role_type = match def.binding {
+                RoleBinding::ForgeRole => "business",
+                RoleBinding::SystemKind => "system",
+            };
+            let (sk, fr): (Option<&str>, Option<&str>) = match def.binding {
+                RoleBinding::SystemKind => (Some(def.kind), None),
+                RoleBinding::ForgeRole => (None, Some(def.kind)),
+            };
+            sqlx::query(
+                "INSERT INTO agents (
+                    id, name, name_en, role, color, initial, llm_id, system_prompt,
+                    forge_role, role_type, system_kind, capabilities_json, max_concurrency,
+                    visible_in_chat, mentionable, enabled, prompt_mode
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, 1, ?, ?, 1, 'builtin')",
+            )
+            .bind(&id)
+            .bind(def.name)
+            .bind(def.name_en)
+            .bind(def.desc)
+            .bind(def.color)
+            .bind(def.initial)
+            .bind(llm_id)
+            .bind(fr)
+            .bind(role_type)
+            .bind(sk)
+            .bind(def.default_caps)
+            .bind(def.default_chat)
+            .bind(def.default_chat)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 一键铺满：把同一个 LLM 套用到**所有**内置角色（缺持有者则创建）。
+/// `overwrite=false`（默认）只补未绑定的角色，尊重已有选择；`true` 强制全部改绑。
+#[tauri::command]
+pub async fn bulk_bind_roles(
+    llm_id: String,
+    overwrite: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RoleSlot>, String> {
+    let llm = llm_id.trim();
+    if llm.is_empty() {
+        return Err("请选择要套用的 LLM".into());
+    }
+    ensure_llm_usable(&state.db, llm).await?;
+    let overwrite = overwrite.unwrap_or(false);
+
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    for def in crate::agents::roles::registry() {
+        bind_role_in_tx(&mut tx, def, llm, overwrite).await?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    crate::knowledge::refresh_kb_models(&state.db).await;
+    list_role_catalog(state).await
+}
+
+/// 分级预设：重角色（`roles::is_heavy`）配强模型 LLM，轻角色配快模型 LLM，一键铺满。
+/// `overwrite` 语义同 [`bulk_bind_roles`]。
+#[tauri::command]
+pub async fn apply_role_preset(
+    fast_llm_id: String,
+    strong_llm_id: String,
+    overwrite: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RoleSlot>, String> {
+    let fast = fast_llm_id.trim();
+    let strong = strong_llm_id.trim();
+    if fast.is_empty() || strong.is_empty() {
+        return Err("请同时选择快模型与强模型 LLM".into());
+    }
+    ensure_llm_usable(&state.db, fast).await?;
+    ensure_llm_usable(&state.db, strong).await?;
+    let overwrite = overwrite.unwrap_or(false);
+
+    let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;
+    for def in crate::agents::roles::registry() {
+        let llm = if crate::agents::roles::is_heavy(def.kind) { strong } else { fast };
+        bind_role_in_tx(&mut tx, def, llm, overwrite).await?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    crate::knowledge::refresh_kb_models(&state.db).await;
+    list_role_catalog(state).await
+}
+
 #[tauri::command]
 pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut tx = state.db.begin().await.map_err(|e| e.to_string())?;

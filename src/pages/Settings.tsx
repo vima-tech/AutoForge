@@ -15,7 +15,8 @@ import {
   type ThemeMode, type ThemeSelection, type RailMode, type QuickCaptureShortcut, type ShortcutCombo,
 } from '../theme';
 import {
-  listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection,
+  listLlmConfigs, createLlmConfig, updateLlmConfig, deleteLlmConfig, testLlmConnection, setDefaultLlm,
+  bulkBindRoles, applyRolePreset,
   listAgents, createAgent, updateAgent, deleteAgent,
   listRoleCatalog, setRoleSlot,
   getSystemHealth, checkClaudeAuth, updateConcurrencyConfig, getConcurrencyConfig,
@@ -177,6 +178,12 @@ function LLMSettings() {
     setConfigs(cs => cs.map(c => c.id === id ? updated : c));
   };
 
+  // 设为/取消全局默认 LLM：未显式绑定 LLM 的角色会回落到它，漏配不再致命。
+  const makeDefault = async (id: string, cur: boolean) => {
+    const next = await setDefaultLlm(cur ? '' : id);
+    setConfigs(next);
+  };
+
   const testConn = async (id: string) => {
     setTesting(id);
     setTestResult(r => { const n = { ...r }; delete n[id]; return n; });
@@ -237,6 +244,7 @@ function LLMSettings() {
                 <div className="cfg-name">{v('name')}</div>
                 <div className="cfg-sub">{API_SPEC_LABEL[v('api_spec')] ?? v('api_spec')} · {v('model')}</div>
               </div>
+              {c.is_default && <span className="chip ember" title="未显式绑定 LLM 的角色会回落到此默认配置">★ 默认</span>}
               <span className={'chip ' + (c.enabled ? 'green' : '')}>{c.enabled ? '● 已启用' : '未启用'}</span>
               <Icon name={exp === c.id ? 'chevDown' : 'chevRight'} size={18} style={{ color: 'var(--text-3)', marginLeft: 4 }} />
             </div>
@@ -284,6 +292,10 @@ function LLMSettings() {
                     <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>启用此连接</span>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button className="btn btn-sm btn-danger" onClick={() => setConfirmDel(c.id)}><Icon name="trash" size={13} />删除</button>
+                      <button className="btn btn-sm" onClick={() => makeDefault(c.id, c.is_default)} disabled={!c.enabled}
+                        title={c.enabled ? '设为全局默认 LLM：未绑定 LLM 的角色自动回落到它' : '启用后才能设为默认'}>
+                        <Icon name="star" size={13} />{c.is_default ? '取消默认' : '设为默认'}
+                      </button>
                       <button className="btn btn-sm" onClick={() => testConn(c.id)} disabled={testing === c.id}>
                         <Icon name="zap" size={13} />{testing === c.id ? '测试中…' : '测试连接'}
                       </button>
@@ -1372,6 +1384,93 @@ function EmbeddingConfigCard() {
   );
 }
 
+// 一键配置：把所有系统角色一次性绑定到 LLM，免去逐角色展开下拉。
+// uniform=全部同一模型；tiered=重角色配强模型、轻角色配快模型（与编码 Agent 的快/强分级同构）。
+function OneClickRolesCard({ llms, onApplied, onError }: {
+  llms: LlmRef[];
+  onApplied: (next: RoleSlot[]) => void;
+  onError: (msg: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<'uniform' | 'tiered'>('uniform');
+  const [uniLlm, setUniLlm] = useState('');
+  const [fastLlm, setFastLlm] = useState('');
+  const [strongLlm, setStrongLlm] = useState('');
+  const [overwrite, setOverwrite] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [okMsg, setOkMsg] = useState('');
+
+  // 仅可用（已启用）的 LLM 才能作为绑定目标。
+  const opts = llms.filter(l => l.enabled).map(l => ({ value: l.id, label: l.name }));
+  const canRun = mode === 'uniform' ? !!uniLlm : (!!fastLlm && !!strongLlm);
+
+  const run = async () => {
+    setBusy(true); onError(''); setOkMsg('');
+    try {
+      const next = mode === 'uniform'
+        ? await bulkBindRoles(uniLlm, overwrite)
+        : await applyRolePreset(fastLlm, strongLlm, overwrite);
+      onApplied(next);
+      setOkMsg(overwrite ? '已强制套用到全部角色' : '已套用到所有未配置角色');
+      setTimeout(() => setOkMsg(''), 2800);
+    } catch (e) { onError(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <div className="panel-head" onClick={() => setOpen(v => !v)} style={{ cursor: 'pointer' }}>
+        <div className="panel-title"><Icon name="zap" size={16} style={{ color: 'var(--ember)' }} />一键配置 · 铺满所有角色</div>
+        <Icon name={open ? 'chevDown' : 'chevRight'} size={16} style={{ color: 'var(--text-3)' }} />
+      </div>
+      {open && (
+        <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {opts.length === 0 ? (
+            <div className="chip amber"><Icon name="alert" size={12} />请先在「LLM 配置」添加并启用至少一个 LLM</div>
+          ) : (
+            <>
+              <div className="seg" style={{ alignSelf: 'flex-start' }}>
+                <button className={mode === 'uniform' ? 'on' : ''} onClick={() => setMode('uniform')}>全部同一模型</button>
+                <button className={mode === 'tiered' ? 'on' : ''} onClick={() => setMode('tiered')}>分级 · 快/强</button>
+              </div>
+              {mode === 'uniform' ? (
+                <div className="field full">
+                  <label>套用到全部角色的 LLM</label>
+                  <Select value={uniLlm} onChange={setUniLlm} options={opts} placeholder="选择一个 LLM" />
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  <div className="field">
+                    <label>快模型 · 轻角色</label>
+                    <Select value={fastLlm} onChange={setFastLlm} options={opts} placeholder="编排/整理/文档…" />
+                  </div>
+                  <div className="field">
+                    <label>强模型 · 重角色</label>
+                    <Select value={strongLlm} onChange={setStrongLlm} options={opts} placeholder="分析/安全/分级…" />
+                  </div>
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Switch on={overwrite} onToggle={() => setOverwrite(v => !v)} />
+                <span style={{ fontSize: 'var(--text-control)', color: 'var(--text-2)', flex: 1 }}>
+                  覆盖已绑定的角色{overwrite ? '（强制全部改绑）' : '（默认只补未配置的角色）'}
+                </span>
+                <button className="btn btn-primary btn-sm" onClick={run} disabled={!canRun || busy}>
+                  <Icon name="zap" size={13} />{busy ? '套用中…' : '铺满所有角色'}
+                </button>
+              </div>
+              {okMsg && <div className="chip green" style={{ alignSelf: 'flex-start' }}><Icon name="check" size={12} />{okMsg}</div>}
+              <div style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', lineHeight: 'var(--leading-normal)' }}>
+                提示：在「LLM 配置」给某个 LLM 点「设为默认」后，未显式绑定 LLM 的角色会自动回落到它——即便漏配也不会让对应链路失效。
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   const [slots, setSlots] = useState<RoleSlot[]>([]);
   const [llms, setLlms] = useState<LlmRef[]>([]);
@@ -1395,6 +1494,11 @@ function RoleCardsSection({ onChanged }: { onChanged: () => void }) {
   return (
     <div>
       {err && <div className="chip red" style={{ marginBottom: 12 }}><Icon name="alert" size={12} />{err}</div>}
+      <OneClickRolesCard
+        llms={llms}
+        onApplied={next => { setSlots(next); void refreshAgents(); onChanged(); }}
+        onError={setErr}
+      />
       {ROLE_GROUPS.map(g => {
         const rows = slots.filter(s => s.group === g.id);
         if (rows.length === 0) return null;

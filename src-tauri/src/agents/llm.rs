@@ -476,6 +476,87 @@ async fn run_agent_text_with_tools_inner(
     }
 }
 
+/// 全局默认 LLM 的 id（`is_default=1` 且 `enabled=1`）；未设置则 `None`。
+/// 复用 `code_agents.is_default` 同款单选范式（命令层保证至多一个）。
+pub async fn default_llm_id(db: &crate::db::Db) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT id FROM llm_configs WHERE is_default=1 AND enabled=1 LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 若 `agent` 未绑定（或绑定空串）LLM，则回落全局默认 LLM。已绑定 / 无默认时原样返回。
+/// 无副作用、不落库——「漏配某角色」时让其仍能用默认 LLM 跑，而非硬挂。
+/// 供 system_kind 角色与 forge_role（analysis/test）解析共用。
+pub async fn with_default_llm(db: &crate::db::Db, mut agent: Agent) -> Agent {
+    let unbound = agent
+        .llm_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
+    if unbound {
+        if let Some(id) = default_llm_id(db).await {
+            agent.llm_id = Some(id);
+        }
+    }
+    agent
+}
+
+/// 按注册表为某 `system_kind` 合成一个临时（不落库）持有 Agent，绑定到给定 LLM。
+/// 用于「该角色根本没有持有者、但已设全局默认 LLM」——使对应产品链路不因漏配而硬挂。
+/// 注册表无该 kind 时返回 `None`。
+fn synth_role_agent(system_kind: &str, llm_id: String) -> Option<Agent> {
+    let def = crate::agents::roles::find(system_kind)?;
+    Some(Agent {
+        id: format!("role-synth:{system_kind}"),
+        name: def.name.to_string(),
+        name_en: def.name_en.to_string(),
+        role: def.desc.to_string(),
+        color: def.color.to_string(),
+        initial: def.initial.to_string(),
+        llm_id: Some(llm_id),
+        system_prompt: String::new(),
+        forge_role: None,
+        role_type: "system".to_string(),
+        system_kind: Some(def.kind.to_string()),
+        capabilities_json: def.default_caps.to_string(),
+        max_concurrency: 1,
+        visible_in_chat: false,
+        mentionable: false,
+        enabled: true,
+        prompt_mode: "builtin".to_string(),
+        memory_enabled: true,
+        created_at: String::new(),
+    })
+}
+
+/// 解析某 `system_kind` 角色的执行 Agent：
+/// 1) 取启用的持有者；其 `llm_id` 为空则回落全局默认 LLM；
+/// 2) 无持有者但已设全局默认 LLM → 按注册表合成临时 Agent（不落库）；
+/// 3) 无持有者且无默认 → `None`（调用方回落原报错）。
+async fn resolve_system_role_agent(db: &crate::db::Db, system_kind: &str) -> Option<Agent> {
+    let holder = sqlx::query_as::<_, Agent>(
+        "SELECT * FROM agents
+         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
+           AND enabled=1
+         ORDER BY created_at
+         LIMIT 1",
+    )
+    .bind(format!("%,{},%", system_kind))
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match holder {
+        Some(a) => Some(with_default_llm(db, a).await),
+        None => synth_role_agent(system_kind, default_llm_id(db).await?),
+    }
+}
+
 pub async fn run_system_role_text(
     db: &crate::db::Db,
     system_kind: &str,
@@ -506,21 +587,17 @@ pub async fn run_system_role_text_traced(
     project_id: Option<&str>,
     recall_query: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    let agent = sqlx::query_as::<_, Agent>(
-        "SELECT * FROM agents
-         WHERE (',' || COALESCE(system_kind, '') || ',') LIKE ?
-           AND enabled=1
-         ORDER BY created_at
-         LIMIT 1",
-    )
-    .bind(format!("%,{},%", system_kind))
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| anyhow!("未配置系统角色 Agent: {}", system_kind))?;
+    // 解析持有者（含「未绑定→默认 LLM」回落与「无持有者→注册表合成」），见 resolve_system_role_agent。
+    let agent = resolve_system_role_agent(db, system_kind).await.ok_or_else(|| {
+        anyhow!(
+            "未配置系统角色 Agent: {}（请在「设置 → 角色」绑定 LLM，或设置一个全局默认 LLM 兜底）",
+            system_kind
+        )
+    })?;
 
     let Some(llm_id) = &agent.llm_id else {
         return Err(anyhow!(
-            "系统角色 Agent「{}」未绑定 LLM，请在角色指派/Agent 配置中选择可用 LLM",
+            "系统角色 Agent「{}」未绑定 LLM，且未设置全局默认 LLM；请在角色指派/Agent 配置中选择可用 LLM，或在 LLM 列表设一个默认",
             agent.name
         ));
     };

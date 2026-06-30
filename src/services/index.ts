@@ -38,7 +38,7 @@ export interface LlmConfig {
   id: string; name: string; model: string;
   endpoint: string; api_key: string; ctx_window: string;
   temperature: number; enabled: boolean; api_spec: ApiSpec;
-  supports_vision: boolean; created_at: string;
+  supports_vision: boolean; is_default: boolean; created_at: string;
 }
 /** 接口规范（wire spec）：决定文本生成路由与工具调用格式。目前仅支持两种。 */
 export type ApiSpec = 'openai' | 'anthropic';
@@ -1067,6 +1067,16 @@ export const setRoleSlot = (kind: string, payload: {
   visible_in_chat?: boolean; mentionable?: boolean; memory_enabled?: boolean;
   capabilities_json?: string;
 }) => ipc<RoleSlot[]>('set_role_slot', { kind, payload });
+
+// 一键配置：降低角色 Agent 配置门槛。
+/** 设置全局默认 LLM（角色未显式绑定时回落到此）；传空串=清除默认。返回刷新后的 LLM 列表。 */
+export const setDefaultLlm = (id: string) => ipc<LlmConfig[]>('set_default_llm', { id });
+/** 一键铺满：把同一个 LLM 套用到所有内置角色。overwrite=false 只补未绑定的角色。 */
+export const bulkBindRoles = (llmId: string, overwrite = false) =>
+  ipc<RoleSlot[]>('bulk_bind_roles', { llmId, overwrite });
+/** 分级预设：重角色配强模型、轻角色配快模型，一键铺满。 */
+export const applyRolePreset = (fastLlmId: string, strongLlmId: string, overwrite = false) =>
+  ipc<RoleSlot[]>('apply_role_preset', { fastLlmId, strongLlmId, overwrite });
 
 // 内置工具目录：驱动 Agent 能力开关的动态渲染（新增后端工具自动出现，无需改前端）。
 export interface BuiltinToolInfo { name: string; label: string; needs_project: boolean; }

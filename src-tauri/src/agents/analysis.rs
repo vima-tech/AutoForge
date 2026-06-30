@@ -591,7 +591,7 @@ fn list_dirs_depth2(root: &str) -> String {
 /// Resolve the agent holding the `analysis` forge role (comma-separated field).
 /// Returns the first enabled match by creation order, or None if unassigned.
 async fn resolve_analysis_agent(db: &crate::db::Db) -> Option<crate::models::agent::Agent> {
-    sqlx::query_as::<_, crate::models::agent::Agent>(
+    let holder = sqlx::query_as::<_, crate::models::agent::Agent>(
         "SELECT * FROM agents
          WHERE (',' || COALESCE(forge_role, '') || ',') LIKE '%,analysis,%'
            AND enabled=1
@@ -601,7 +601,9 @@ async fn resolve_analysis_agent(db: &crate::db::Db) -> Option<crate::models::age
     .fetch_optional(db)
     .await
     .ok()
-    .flatten()
+    .flatten()?;
+    // 未绑定 LLM 时回落全局默认 LLM（治本：漏配不致命）。
+    Some(crate::agents::llm::with_default_llm(db, holder).await)
 }
 
 pub async fn analyze(

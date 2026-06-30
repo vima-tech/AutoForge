@@ -60,6 +60,17 @@ pub fn find(kind: &str) -> Option<&'static RoleDef> {
     ROLE_REGISTRY.iter().find(|r| r.kind == kind)
 }
 
+/// 「重」角色：质量/风险敏感、值得用强模型的角色（需求分析、风险分级、安全审查、
+/// 工程提议、测试、原型、部署、知识蒸馏）。供「分级预设」一键配置区分快/强模型。
+/// 其余角色（编排/整理/文档/物料等）视为「轻」，配快模型即可。集中在此单一真源，
+/// 便于与 `code_agents` 的 fast/strong 分级语义对齐。
+pub fn is_heavy(kind: &str) -> bool {
+    matches!(
+        kind,
+        "analysis" | "grader" | "security" | "proposer" | "test" | "prototype" | "deploy" | "kb_distill"
+    )
+}
+
 /// 内置基线提示词（无该角色则 None）。
 pub fn builtin_prompt(kind: &str) -> Option<&'static str> {
     find(kind).map(|r| r.builtin_prompt)

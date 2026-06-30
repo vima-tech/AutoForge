@@ -207,7 +207,7 @@ fn baseline(checks: &[CheckInput]) -> TestReport {
 
 /// 解析 forge_role 含 `test` 且 enabled 的首个 agent（按创建序）。
 async fn resolve_test_agent(db: &Db) -> Option<crate::models::agent::Agent> {
-    sqlx::query_as::<_, crate::models::agent::Agent>(
+    let holder = sqlx::query_as::<_, crate::models::agent::Agent>(
         "SELECT * FROM agents
          WHERE (',' || COALESCE(forge_role, '') || ',') LIKE '%,test,%'
            AND enabled=1
@@ -217,7 +217,9 @@ async fn resolve_test_agent(db: &Db) -> Option<crate::models::agent::Agent> {
     .fetch_optional(db)
     .await
     .ok()
-    .flatten()
+    .flatten()?;
+    // 未绑定 LLM 时回落全局默认 LLM（治本：漏配不致命）。
+    Some(crate::agents::llm::with_default_llm(db, holder).await)
 }
 
 /// 产出并落库一次测试的结构化报告。**best-effort**：失败只记日志，绝不阻断测试闸口。
