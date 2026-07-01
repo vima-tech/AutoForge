@@ -39,6 +39,9 @@ pub struct TableSource {
     pub id_col: &'static str,
     /// 生成标题的 SQL 表达式（可含别名 `t.`，如 `t.title` / `substr(t.content_json,1,80)`）。
     pub title_sql: &'static str,
+    /// 生成预览片段的 SQL 表达式；`""` = 默认按 `substr(t.<content_col>,1,200)`。
+    /// JSON 正文（如会议室 content_json）可覆盖为 `json_extract(...)` 取可读文本。
+    pub preview_sql: &'static str,
     /// 懒取正文的列（显式点名 → 密钥列天然不被取）。
     pub content_col: &'static str,
     /// 排序时间列。
@@ -69,6 +72,7 @@ impl TableSource {
             table,
             id_col: "id",
             title_sql,
+            preview_sql: "",
             content_col,
             time_col: "created_at",
             stage: "",
@@ -97,6 +101,10 @@ impl TableSource {
     }
     const fn extra(mut self, w: &'static str) -> Self {
         self.extra_where = w;
+        self
+    }
+    const fn preview(mut self, s: &'static str) -> Self {
+        self.preview_sql = s;
         self
     }
 }
@@ -163,12 +171,23 @@ pub static SOURCES: &[TableSource] = &[
     TableSource::new(
         sk::CHAT_MESSAGE,
         "messages",
-        "substr(t.content_json,1,80)",
+        // content_json=[{"t":"md","md":"…"}]（quote_ref 用 text、code 用 code）：取首块可读文本，
+        // 逐个键回落，最后回落原始 JSON 截断。
+        "COALESCE(NULLIF(json_extract(t.content_json,'$[0].md'),''), \
+                  NULLIF(json_extract(t.content_json,'$[0].text'),''), \
+                  NULLIF(json_extract(t.content_json,'$[0].code'),''), \
+                  substr(t.content_json,1,80))",
         "content_json",
         "messages t JOIN conversations c ON c.id = t.conversation_id",
         "c.project_id",
     )
     .stage("chat")
+    .preview(
+        "COALESCE(NULLIF(json_extract(t.content_json,'$[0].md'),''), \
+                  NULLIF(json_extract(t.content_json,'$[0].text'),''), \
+                  NULLIF(json_extract(t.content_json,'$[0].code'),''), \
+                  substr(t.content_json,1,200))",
+    )
     .extra("c.deleted_at IS NULL"),
     // —— Agent 任务输出；经 conversation_tasks→conversations 两跳，大体量保尾 ——
     TableSource::new(
@@ -429,18 +448,26 @@ impl SourceProvider for DbTableProvider {
         } else {
             format!("WHERE {}", conds.join(" AND "))
         };
+        // 预览表达式：默认取正文列前 200 字，JSON 正文来源可覆盖为 json_extract。
+        let preview_expr = if s.preview_sql.is_empty() {
+            format!("substr(t.{},1,200)", s.content_col)
+        } else {
+            s.preview_sql.to_string()
+        };
         // 标识符类字段全部是静态字面量；运行时值走 bind。
         let sql = format!(
-            "SELECT CAST(t.{id} AS TEXT) AS sid, {title} AS title, \
+            "SELECT CAST(t.{id} AS TEXT) AS sid, {title} AS title, {preview} AS preview, \
                     COALESCE(length(t.{content}), 0) AS sz, t.{time} AS ts \
              FROM {from} {where_sql} ORDER BY t.{time} DESC LIMIT ?",
             id = s.id_col,
             title = s.title_sql,
+            preview = preview_expr,
             content = s.content_col,
             time = s.time_col,
             from = s.scope_from,
         );
-        let mut q = sqlx::query_as::<_, (String, Option<String>, i64, Option<String>)>(&sql);
+        let mut q =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, i64, Option<String>)>(&sql);
         if !s.scope_project.is_empty() {
             q = q.bind(project_id);
         }
@@ -449,14 +476,16 @@ impl SourceProvider for DbTableProvider {
 
         Ok(rows
             .into_iter()
-            .map(|(sid, title, sz, ts)| {
+            .map(|(sid, title, preview, sz, ts)| {
                 let ts = ts.unwrap_or_default();
+                let title = clean_title(title.as_deref().unwrap_or(""));
                 ContextItem {
                     id: stable_id(s.kind, &sid),
                     project_id: project_id.to_string(),
                     source_kind: s.kind.to_string(),
                     source_id: sid.clone(),
-                    title: clean_title(title.as_deref().unwrap_or("")),
+                    preview: clean_preview(preview.as_deref().unwrap_or(""), &title),
+                    title,
                     origin_stage: s.stage.to_string(),
                     origin_actor: String::new(),
                     content_ref: format!("lazy:{}:{}", s.kind, sid),
@@ -553,6 +582,8 @@ impl SourceProvider for WorkspaceFileProvider {
                 project_id: project_id.to_string(),
                 source_kind: self.0.kind.to_string(),
                 source_id: rel.clone(),
+                // 预览用相对路径，区分不同目录下的同名文件（title 仅文件名）。
+                preview: rel.clone(),
                 title,
                 origin_stage: self.0.stage.to_string(),
                 origin_actor: String::new(),
@@ -624,6 +655,26 @@ fn clean_title(raw: &str) -> String {
         format!("{}…", trimmed.chars().take(79).collect::<String>())
     } else if trimmed.is_empty() {
         "（无标题）".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 预览片段清洗：折叠空白/控制符、截断到 160 字。空或与标题重复时回落空串（前端不渲染）。
+fn clean_preview(raw: &str, title: &str) -> String {
+    let collapsed: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() || trimmed == title || title.starts_with(trimmed) {
+        return String::new();
+    }
+    if trimmed.chars().count() > 160 {
+        format!("{}…", trimmed.chars().take(159).collect::<String>())
     } else {
         trimmed.to_string()
     }
@@ -838,5 +889,21 @@ mod tests {
         let items = prov.enumerate(&db, "p1", None, 100).await.unwrap();
         assert_eq!(items.len(), 1, "软删会话的消息不出现");
         assert_eq!(items[0].source_id, "m1");
+        // 标题从 content_json 首块提取可读文本，而非原始 JSON。
+        assert_eq!(items[0].title, "你好");
+    }
+
+    /// 预览片段：DB 来源取正文前若干字，且与标题重复时回落空串。
+    #[tokio::test]
+    async fn db_provider_fills_preview_snippet() {
+        let db = pool().await;
+        sqlx::query("INSERT INTO issues VALUES ('i1','p1','登录页','需要一个带记住我的登录页面','2026-01-01')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let src = SOURCES.iter().find(|s| s.kind == sk::ISSUE).unwrap();
+        let items = DbTableProvider(src).enumerate(&db, "p1", None, 100).await.unwrap();
+        assert_eq!(items[0].title, "登录页");
+        assert_eq!(items[0].preview, "需要一个带记住我的登录页面", "预览取 description 正文");
     }
 }

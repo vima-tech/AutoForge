@@ -45,6 +45,36 @@ export const KIND_LABELS: Record<string, string> = {
 
 export const kindLabel = (k: string) => KIND_LABELS[k] ?? k;
 
+/** 产生阶段人可读名（与后端 `origin_stage` 对齐）。 */
+const STAGE_LABELS: Record<string, string> = {
+  requirement: '需求', design: '设计', chat: '会议', coding: '编码', review: '审核', ops: '运维',
+};
+const stageLabel = (s: string) => STAGE_LABELS[s] ?? s;
+
+/** 相对时间（刚刚 / N分钟前 / N小时前 / N天前 / 日期）。入参为后端 UTC "YYYY-MM-DD HH:MM:SS"。 */
+function relTime(raw: string): string {
+  if (!raw) return '';
+  // 后端时间是 UTC 但无时区后缀，补 'Z' 让 Date 正确解析。
+  const iso = raw.includes('T') ? raw : raw.replace(' ', 'T') + (raw.endsWith('Z') ? '' : 'Z');
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '';
+  const diff = Date.now() - t;
+  const m = Math.floor(diff / 60000), h = Math.floor(diff / 3600000), d = Math.floor(diff / 86400000);
+  if (diff < 60000) return '刚刚';
+  if (m < 60) return `${m}分钟前`;
+  if (h < 24) return `${h}小时前`;
+  if (d < 30) return `${d}天前`;
+  return new Date(t).toLocaleDateString();
+}
+
+/** 体积（B / KB / MB）。 */
+function formatBytes(n: number): string {
+  if (!n || n <= 0) return '';
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / 1048576).toFixed(1)}MB`;
+}
+
 type Placement = 'up' | 'down';
 
 interface Props {
@@ -161,17 +191,36 @@ export default function ContextPicker({
               暂无可引用条目（基质随写入逐步填充）
             </div>
           )}
-          {filtered.map(it => (
-            <div key={it.id} className="mention-row" onClick={() => pick(it)}>
-              <span className="chip" style={{ flexShrink: 0 }}>{kindLabel(it.source_kind)}</span>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div className="nm" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {it.title || it.id}
+          {filtered.map(it => {
+            // 元信息行：相对时间 · 阶段 · 体积 · 预览片段（各段有值才显示）。
+            const meta = [relTime(it.created_at), stageLabel(it.origin_stage), formatBytes(it.size_hint)]
+              .filter(Boolean).join(' · ');
+            return (
+              <div key={it.id} className="mention-row" onClick={() => pick(it)} style={{ alignItems: 'flex-start' }}>
+                <span className="chip" style={{ flexShrink: 0, marginTop: 1 }}>{kindLabel(it.source_kind)}</span>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="nm" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {it.title || it.id}
+                  </div>
+                  {(meta || it.preview) && (
+                    <div
+                      className="rl"
+                      style={{
+                        fontFamily: 'var(--font-mono)', overflow: 'hidden',
+                        textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1,
+                      }}
+                    >
+                      {meta}
+                      {it.preview && (
+                        <span style={{ color: 'var(--text-faint)' }}>{meta ? ' · ' : ''}{it.preview}</span>
+                      )}
+                    </div>
+                  )}
                 </div>
+                {it.trust === 'external_untrusted' && <span className="chip amber" style={{ flexShrink: 0, marginTop: 1 }}>外部</span>}
               </div>
-              {it.trust === 'external_untrusted' && <span className="chip amber" style={{ flexShrink: 0 }}>外部</span>}
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

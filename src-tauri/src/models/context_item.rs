@@ -17,6 +17,10 @@ pub struct ContextItem {
     pub source_id: String,
     /// 人可读标题。
     pub title: String,
+    /// 正文预览片段（列表区分用）：由 `enumerate` 便宜 `substr`/`json_extract` 生成；
+    /// 缓存叠加层 / id 反构条目无此列，`#[sqlx(default)]` 回落空串（前端自动隐藏）。
+    #[sqlx(default)]
+    pub preview: String,
     /// 产生阶段：requirement / design / chat / coding / review / ops。
     pub origin_stage: String,
     /// 产生者：user / agent-id / system。

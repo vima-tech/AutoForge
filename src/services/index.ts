@@ -1704,6 +1704,8 @@ export interface ContextItem {
   source_kind: string;
   source_id: string;
   title: string;
+  /** 正文预览片段（列表区分用；可能为空，前端隐藏）。 */
+  preview: string;
   origin_stage: string;
   origin_actor: string;
   content_ref: string;
