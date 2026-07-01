@@ -10,7 +10,7 @@ import RoundAvatarStack, { type RoundNav } from '../components/RoundAvatarStack'
 import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
-  listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation, softDeleteConversation,
+  listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation, softDeleteMessage,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
   draftCodingBrief, draftCodingBriefDetailed, draftCodingBriefStream, startConversationCoding,
@@ -317,20 +317,15 @@ function convPreview(c: Conversation): string {
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
-function ConvItem({ c, active, agentMap, onSelect, onContextMenu }: {
+function ConvItem({ c, active, agentMap, onSelect }: {
   c: Conversation; active: string;
   agentMap: Record<string, Agent>; onSelect: (id: string) => void;
-  onContextMenu?: (e: React.MouseEvent, c: Conversation) => void;
 }) {
   const isG = c.conv_type === 'group';
   const a = isG ? null : agentMap[c.members[0]];
   const t = isG ? (c.name ?? '群聊') : (a?.name ?? 'Agent');
   return (
-    <div
-      className={'conv-item' + (active === c.id ? ' active' : '')}
-      onClick={() => onSelect(c.id)}
-      onContextMenu={e => onContextMenu?.(e, c)}
-    >
+    <div className={'conv-item' + (active === c.id ? ' active' : '')} onClick={() => onSelect(c.id)}>
       {isG
         ? <div className="av sq" style={{ width: 46, height: 46, background: c.color, fontSize: 'var(--text-heading)' }}>{c.initial ?? c.name?.[0] ?? '群'}</div>
         : a ? <Avatar agent={a} size={46} status={c.unread > 0 ? 'online' : undefined} />
@@ -359,11 +354,10 @@ function ConvItem({ c, active, agentMap, onSelect, onContextMenu }: {
   );
 }
 
-function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive, collapsed, onToggleCollapse, onContextMenu }: {
+function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive, collapsed, onToggleCollapse }: {
   convs: Conversation[]; agents: Agent[];
   active: string; onSelect: (id: string) => void; onNew: () => void; onOpenArchive: () => void;
   collapsed: boolean; onToggleCollapse: () => void;
-  onContextMenu?: (e: React.MouseEvent, c: Conversation) => void;
 }) {
   const [q, setQ] = useState('');
   const chatAgents = useMemo(() => agents.filter(a => a.visible_in_chat && a.enabled), [agents]);
@@ -400,9 +394,9 @@ function ConvList({ convs, agents, active, onSelect, onNew, onOpenArchive, colla
       </div>
       <div className="list-body scroll">
         <div className="list-group-label">群聊 · 需求讨论</div>
-        {groups.filter(match).map(c => <ConvItem key={c.id} c={c} active={active} agentMap={agentMap} onSelect={onSelect} onContextMenu={onContextMenu} />)}
+        {groups.filter(match).map(c => <ConvItem key={c.id} c={c} active={active} agentMap={agentMap} onSelect={onSelect} />)}
         <div className="list-group-label">Agent · 单独会议室</div>
-        {directs.filter(match).map(c => <ConvItem key={c.id} c={c} active={active} agentMap={agentMap} onSelect={onSelect} onContextMenu={onContextMenu} />)}
+        {directs.filter(match).map(c => <ConvItem key={c.id} c={c} active={active} agentMap={agentMap} onSelect={onSelect} />)}
       </div>
     </div>
   );
@@ -2297,9 +2291,6 @@ export default function ConversationsPage() {
   const [segmentStartId, setSegmentStartId] = useState<string | null>(null);
   const [confirmDissolve,setConfirmDissolve]= useState<string | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<string | null>(null);
-  // 左侧对话列表右键菜单 + 软删除确认
-  const [convMenu,       setConvMenu]       = useState<{ x: number; y: number; conv: Conversation } | null>(null);
-  const [confirmDeleteConv, setConfirmDeleteConv] = useState<Conversation | null>(null);
   const [showArchive,    setShowArchive]    = useState(false);
   const [memberError,    setMemberError]    = useState('');
   const [sending,        setSending]        = useState(false);
@@ -2583,18 +2574,6 @@ export default function ConversationsPage() {
     };
   }, [bubbleMenu]);
 
-  useEffect(() => {
-    if (!convMenu) return;
-    const close = () => setConvMenu(null);
-    const closeOnEscape = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
-    document.addEventListener('pointerdown', close);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('pointerdown', close);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [convMenu]);
-
   // Load project files + workspace files when context panel opens for a project-linked group chat
   useEffect(() => {
     if (!showContext) { setProjectFiles([]); setWorkspaceFiles([]); return; }
@@ -2744,7 +2723,7 @@ export default function ConversationsPage() {
     e.preventDefault();
     setBubbleMenu({
       x: Math.min(e.clientX, window.innerWidth - 148),
-      y: Math.min(e.clientY, window.innerHeight - 168),
+      y: Math.min(e.clientY, window.innerHeight - 232),
       message,
       author,
     });
@@ -2806,6 +2785,20 @@ export default function ConversationsPage() {
     try {
       const updated = await toggleMessageContext(id);
       setMsgs(ms => ms.map(m => m.id === id ? { ...m, excluded_from_context: updated.excluded_from_context } : m));
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  };
+
+  // 软删除单条消息：从当前气泡列表移除，后台仅打 deleted_at 标记（保留数据可审计）。
+  const deleteBubbleMessage = async () => {
+    if (!bubbleMenu) return;
+    const id = bubbleMenu.message.id;
+    setBubbleMenu(null);
+    try {
+      await softDeleteMessage(id);
+      setMsgs(ms => ms.filter(m => m.id !== id));
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
     } catch (e) {
       setLoadError(String(e));
     }
@@ -2993,33 +2986,6 @@ export default function ConversationsPage() {
     } catch (e) { setMemberError(String(e)); }
   };
 
-  const openConvMenu = (e: React.MouseEvent, c: Conversation) => {
-    e.preventDefault();
-    const MENU_W = 176, MENU_H = 56;
-    setConvMenu({
-      x: Math.min(e.clientX, window.innerWidth - MENU_W),
-      y: Math.min(e.clientY, window.innerHeight - MENU_H),
-      conv: c,
-    });
-  };
-
-  const deleteConversation = async () => {
-    if (!confirmDeleteConv) return;
-    const id = confirmDeleteConv.id;
-    setMemberError('');
-    try {
-      await softDeleteConversation(id);
-      const remaining = convs.filter(c => c.id !== id);
-      setConvs(remaining);
-      if (active === id) { setActive(remaining[0]?.id ?? ''); setMsgs([]); }
-      setConfirmDeleteConv(null);
-      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
-    } catch (e) {
-      setMemberError(String(e));
-      setConfirmDeleteConv(null);
-    }
-  };
-
   const dissolveGroup = async () => {
     if (!confirmDissolve) return;
     const id = confirmDissolve;
@@ -3065,7 +3031,7 @@ export default function ConversationsPage() {
 
   return (
     <>
-      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} collapsed={listCollapsed} onToggleCollapse={toggleList} onContextMenu={openConvMenu} />
+      <ConvList convs={convs} agents={agents} active={active} onSelect={setActive} onNew={() => setShowNew(true)} onOpenArchive={() => setShowArchive(true)} collapsed={listCollapsed} onToggleCollapse={toggleList} />
 
       {conv ? (
         <div className="content" style={{ position: 'relative' }}>
@@ -3564,21 +3530,7 @@ export default function ConversationsPage() {
           {conv?.project_id && (
             <button onClick={distillBubbleToIssue}><Icon name="inbox" size={14} />沉淀为需求</button>
           )}
-        </div>
-      )}
-      {convMenu && (
-        <div
-          className="bubble-menu"
-          style={{ left: convMenu.x, top: convMenu.y }}
-          onPointerDown={e => e.stopPropagation()}
-          onContextMenu={e => e.preventDefault()}
-        >
-          <button
-            className="danger"
-            onClick={() => { setConfirmDeleteConv(convMenu.conv); setConvMenu(null); }}
-          >
-            <Icon name="trash" size={14} />删除对话
-          </button>
+          <button className="danger" onClick={deleteBubbleMessage}><Icon name="trash" size={14} />删除</button>
         </div>
       )}
       {reader && (
@@ -3627,14 +3579,6 @@ export default function ConversationsPage() {
           okLabel="确认归档"
           onOk={archiveAndClearConversation}
           onCancel={() => setConfirmArchive(null)}
-        />
-      )}
-      {confirmDeleteConv && (
-        <ConfirmModal
-          msg={`确认删除对话「${confirmDeleteConv.conv_type === 'group' ? (confirmDeleteConv.name ?? '群聊') : (agents.find(a => a.id === confirmDeleteConv.members[0])?.name ?? 'Agent')}」？该对话将从列表移除（软删除），消息与成员数据仍保留在后台。`}
-          okLabel="删除对话"
-          onOk={deleteConversation}
-          onCancel={() => setConfirmDeleteConv(null)}
         />
       )}
       {showArchive && (
