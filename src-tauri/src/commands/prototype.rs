@@ -173,11 +173,46 @@ pub(crate) async fn read_doc_refs(
     ctx
 }
 
+/// 读取「改现有页面」选中的仓库页面组件源码，拼成「现有页面基础」块。
+/// 守卫读（read_repo_file，防越界）+ 注入过滤 + 单条/总量封顶。
+async fn read_existing_pages(repo_path: &str, refs: &[String]) -> String {
+    const PER: usize = 6000;
+    const TOTAL: usize = 20000;
+    let mut buf = String::new();
+    let mut used = 0usize;
+    for rel in refs.iter().filter(|r| !r.trim().is_empty()).take(6) {
+        if used >= TOTAL {
+            break;
+        }
+        match crate::commands::project_context::read_repo_file(repo_path, rel.trim()) {
+            Ok(content) if !crate::core::security::has_obvious_injection(&content) => {
+                let budget = (TOTAL - used).min(PER);
+                let slice: String = content.chars().take(budget).collect();
+                used += slice.len();
+                buf.push_str(&format!("\n### 文件：{}\n```\n{}\n```\n", rel.trim(), slice));
+            }
+            _ => { /* 读失败/疑似注入：跳过该文件，不阻断生成 */ }
+        }
+    }
+    buf
+}
+
 #[tauri::command]
 pub async fn list_prototype_prompts(
     project_id: Option<String>,
+    // 给了 draft_id 则只列该大需求的原型（按需求归档；从孵化台跳入时传）。
+    draft_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<PrototypePrompt>, String> {
+    if let Some(did) = draft_id.as_deref().filter(|s| !s.is_empty()) {
+        return sqlx::query_as::<_, PrototypePrompt>(
+            "SELECT * FROM prototype_prompts WHERE draft_id=? ORDER BY created_at DESC LIMIT 200",
+        )
+        .bind(did)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string());
+    }
     match project_id {
         Some(pid) => sqlx::query_as::<_, PrototypePrompt>(
             "SELECT * FROM prototype_prompts WHERE project_id=? ORDER BY created_at DESC LIMIT 200",
@@ -242,6 +277,10 @@ pub async fn generate_prototype_prompt(
     tool_target: Option<String>,
     draft_id: Option<String>,
     doc_refs: Option<Vec<String>>,
+    // 'new'（新页面，默认）/ 'existing'（在现有页面基础上改动）。
+    design_mode: Option<String>,
+    // design_mode='existing' 时选中的现有页面组件仓库相对路径。
+    existing_page_refs: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<PrototypePrompt, String> {
     let project = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
@@ -304,6 +343,22 @@ pub async fn generate_prototype_prompt(
         }
     }
 
+    // 「改现有页面」模式：读选中的现有页面组件源码，作为改动基础前置进 design_ctx，
+    // 并指令模型在其上做增量改动而非从零重设计（新页面模式则不注入，行为不变）。
+    let mode = design_mode.unwrap_or_default();
+    if mode == "existing" {
+        let refs = existing_page_refs.clone().unwrap_or_default();
+        let pages = read_existing_pages(&project.repo_path, &refs).await;
+        if !pages.trim().is_empty() {
+            design_ctx = format!(
+                "# ⚠️ 本次是对【现有页面】的改动，不是新建页面\n\
+                 必须在下面现有页面的基础上做**增量改动**：保持其整体布局、组件层级、交互流与\
+                 视觉风格一致，只针对下方需求描述涉及的部分做修改/新增，不要从零重新设计整个页面。\n\n\
+                 ## 现有页面代码（改动基础，务必延续其结构与风格）\n{pages}\n\n---\n\n{design_ctx}"
+            );
+        }
+    }
+
     let target = tool_target.unwrap_or_else(|| "generic".to_string());
     // 带 draft_id 时从孵化台草稿派生 feature 标题/描述（真实需求，而非「项目名+产品界面」）。
     let (feature_title, feature_desc) = if let Some(did) =
@@ -341,8 +396,8 @@ pub async fn generate_prototype_prompt(
 
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO prototype_prompts (id, project_id, issue_id, tool_target, title, prompt)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO prototype_prompts (id, project_id, issue_id, tool_target, title, prompt, draft_id, design_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project_id)
@@ -350,6 +405,8 @@ pub async fn generate_prototype_prompt(
     .bind(&target)
     .bind(&feature_title)
     .bind(&prompt)
+    .bind(draft_id.as_deref().unwrap_or(""))
+    .bind(&mode)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -960,5 +1017,47 @@ mod tests {
         let ctx = read_doc_refs(&db, "/nonexistent", "p1", &refs).await;
         assert!(ctx.contains("# 需求文档(PRD)") && ctx.contains("登录页 PRD 正文"));
         assert!(ctx.contains("# 技术规格·api") && ctx.contains("接口约束A") && ctx.contains("接口约束B"));
+    }
+
+    /// 原型按需求归档：draft_id 列 + 按 draft_id 过滤（同项目不同需求各自独立列出）。
+    #[tokio::test]
+    async fn prototypes_filter_by_draft() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // 与迁移 0021+0083 同构的最小建表（含 draft_id/design_mode）。
+        sqlx::query(
+            "CREATE TABLE prototype_prompts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+             issue_id TEXT, tool_target TEXT NOT NULL DEFAULT 'generic', title TEXT NOT NULL DEFAULT '',
+             prompt TEXT NOT NULL DEFAULT '', draft_id TEXT NOT NULL DEFAULT '',
+             design_mode TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO prototype_prompts (id, project_id, draft_id, design_mode, title) VALUES
+               ('a','p1','d1','new','登录页'),
+               ('b','p1','d1','existing','登录页改版'),
+               ('c','p1','d2','new','结算页')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // 按需求 d1 过滤 → 2 条；d2 → 1 条。
+        let d1 = sqlx::query_as::<_, PrototypePrompt>("SELECT * FROM prototype_prompts WHERE draft_id=? ORDER BY id")
+            .bind("d1").fetch_all(&db).await.unwrap();
+        assert_eq!(d1.len(), 2, "需求 d1 有两个原型");
+        assert_eq!(d1[1].design_mode, "existing", "design_mode 落库可读");
+        let d2 = sqlx::query_as::<_, PrototypePrompt>("SELECT * FROM prototype_prompts WHERE draft_id=?")
+            .bind("d2").fetch_all(&db).await.unwrap();
+        assert_eq!(d2.len(), 1);
+        // 项目级(不带 draft)仍列全部 3 条。
+        let all = sqlx::query_as::<_, PrototypePrompt>("SELECT * FROM prototype_prompts WHERE project_id=?")
+            .bind("p1").fetch_all(&db).await.unwrap();
+        assert_eq!(all.len(), 3);
     }
 }

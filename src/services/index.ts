@@ -1498,7 +1498,8 @@ export const setSpecInjection = (id: string, injection: SpecInjection) =>
 
 export interface PrototypePrompt {
   id: string; project_id: string; issue_id: string | null;
-  tool_target: string; title: string; prompt: string; created_at: string;
+  tool_target: string; title: string; prompt: string;
+  draft_id: string; design_mode: string; created_at: string;
 }
 export interface SecurityAudit {
   id: string; project_id: string; change_request_id: string | null;
@@ -1521,15 +1522,17 @@ export interface AutoPassPolicy {
 }
 
 // Node 03 — prototype design prompts
-export const listPrototypePrompts = (projectId?: string) =>
-  ipc<PrototypePrompt[]>('list_prototype_prompts', { projectId: projectId ?? null });
+/** 列原型提示词：给 draftId 则只列该大需求的（按需求归档），否则列该项目全部。 */
+export const listPrototypePrompts = (projectId?: string, draftId?: string) =>
+  ipc<PrototypePrompt[]>('list_prototype_prompts', { projectId: projectId ?? null, draftId: draftId ?? null });
 export const generatePrototypePrompt = (
   projectId: string, issueId?: string | null, toolTarget?: string,
-  opts?: { draftId?: string; docRefs?: string[] },
+  opts?: { draftId?: string; docRefs?: string[]; designMode?: string; existingPageRefs?: string[] },
 ) =>
   ipc<PrototypePrompt>('generate_prototype_prompt', {
     projectId, issueId: issueId ?? null, toolTarget: toolTarget ?? null,
     draftId: opts?.draftId ?? null, docRefs: opts?.docRefs ?? null,
+    designMode: opts?.designMode ?? null, existingPageRefs: opts?.existingPageRefs ?? null,
   });
 /** P4：汇总项目可关联的核心文档源（设计契约/需求 PRD/技术规格），供「关联文档」面板勾选。 */
 export interface DocSource {
