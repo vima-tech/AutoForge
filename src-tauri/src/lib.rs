@@ -441,6 +441,7 @@ pub fn run() {
             commands::conversations::add_conversation_member,
             commands::conversations::remove_conversation_member,
             commands::conversations::delete_group_conversation,
+            commands::conversations::soft_delete_conversation,
             commands::conversations::clear_conversation_messages,
             commands::conversation_archives::archive_conversation,
             commands::conversation_archives::list_conversation_archives,

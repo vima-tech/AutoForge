@@ -851,6 +851,8 @@ export const removeConversationMember = (conversationId: string, agentId: string
   ipc<Conversation>('remove_conversation_member', { conversationId, agentId });
 export const deleteGroupConversation = (conversationId: string) =>
   ipc<void>('delete_group_conversation', { conversationId });
+export const softDeleteConversation = (conversationId: string) =>
+  ipc<void>('soft_delete_conversation', { conversationId });
 export const clearConversationMessages = (conversationId: string) =>
   ipc<void>('clear_conversation_messages', { conversationId });
 

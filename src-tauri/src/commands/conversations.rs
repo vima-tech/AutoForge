@@ -23,11 +23,12 @@ pub async fn list_conversations(
     debug!("[cmd] list_conversations start");
     ensure_direct_conversations(&state.db).await?;
 
-    let convs =
-        sqlx::query_as::<_, Conversation>("SELECT * FROM conversations ORDER BY created_at DESC")
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
+    let convs = sqlx::query_as::<_, Conversation>(
+        "SELECT * FROM conversations WHERE deleted_at IS NULL ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     let member_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT conversation_id, agent_id
@@ -575,6 +576,38 @@ pub async fn remove_conversation_member(
         .map_err(|e| e.to_string())?;
 
     conversation_detail(&state.db, conv).await
+}
+
+/// 软删除对话：只把 conversations.deleted_at 打上时间戳，从列表隐藏，保留成员/消息/附件
+/// 等全部数据（可后续恢复或审计）。直聊与群聊均可软删除；幂等（已删除的再删无副作用）。
+#[tauri::command]
+pub async fn soft_delete_conversation(
+    conversation_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let affected = sqlx::query(
+        "UPDATE conversations SET deleted_at = datetime('now')
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(&conversation_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    if affected == 0 {
+        // 已删除视为成功（幂等）；仅当对话根本不存在时报错。
+        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM conversations WHERE id=?")
+            .bind(&conversation_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Err(format!("conversation {} not found", conversation_id));
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

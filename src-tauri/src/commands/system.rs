@@ -370,8 +370,10 @@ pub async fn get_badge_counts(state: State<'_, AppState>) -> Result<BadgeCounts,
     let (chat_unread,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*)
          FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
          LEFT JOIN conversation_reads r ON r.conversation_id = m.conversation_id
          WHERE m.from_agent IS NOT NULL
+           AND c.deleted_at IS NULL
            AND m.created_at > COALESCE(r.read_at, '1970-01-01')",
     )
     .fetch_one(&state.db)
