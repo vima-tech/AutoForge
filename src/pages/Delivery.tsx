@@ -5,9 +5,7 @@ import Select from '../components/Select';
 import Toast, { type ToastData } from '../components/Toast';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
-  listPrototypeDocSources, type DocSource,
   listBlueprintDrafts, type BlueprintDraftSummary,
-  listProjectFiles, type ProjectContextFile,
   openUrl, launchOpenDesign,
   listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
   runProactiveScan, listTestSessions, getWidgetSnippet, getWebhookStatus,
@@ -148,14 +146,6 @@ export default function Delivery({ target, onTargetConsumed }: {
   const [deploys, setDeploys] = useState<Deployment[]>([]);
   const [scans, setScans] = useState<TestSession[]>([]);
   const [toolTarget, setToolTarget] = useState('generic');
-  // P4 关联文档：设计阶段可勾选核心文档源，按选中项生成更准的原型提示词。
-  const [docSources, setDocSources] = useState<DocSource[]>([]);
-  const [pickedDocs, setPickedDocs] = useState<Record<string, boolean>>({});
-  // 新建页面 / 改现有页面：'existing' 时选中的现有页面组件参与生成（在其基础上改动）。
-  const [designMode, setDesignMode] = useState<'new' | 'existing'>('new');
-  const [existingPages, setExistingPages] = useState<string[]>([]);
-  const [repoFiles, setRepoFiles] = useState<ProjectContextFile[]>([]);
-  const [pageFilter, setPageFilter] = useState('');
   const [targetEnv, setTargetEnv] = useState('production');
   const [busy, setBusy] = useState('');
   const [toast, setToast] = useState<ToastData | null>(null);
@@ -243,26 +233,6 @@ export default function Delivery({ target, onTargetConsumed }: {
     }).catch(() => { if (alive) setDrafts([]); });
     return () => { alive = false; };
   }, [stage, projectId]);
-
-  // P4：文档源的稳定 key（design_md 无 ref；其余 kind:ref）。
-  const docRefKey = (d: DocSource) => (d.kind === 'design_md' ? 'design_md' : `${d.kind}:${d.ref}`);
-  // 进入设计阶段时加载可关联的核心文档源（携 draftId 则带出该稿 PRD），按 default_on 初始化勾选。
-  useEffect(() => {
-    if (stage !== 'design' || !projectId) { setDocSources([]); setPickedDocs({}); return; }
-    let alive = true;
-    listPrototypeDocSources(projectId, designDraftId).then(ds => {
-      if (!alive) return;
-      setDocSources(ds);
-      setPickedDocs(Object.fromEntries(ds.map(d => [docRefKey(d), d.default_on])));
-    }).catch(() => { if (alive) { setDocSources([]); setPickedDocs({}); } });
-    return () => { alive = false; };
-  }, [stage, projectId, designDraftId]);
-
-  // 「改现有页面」模式：拉取仓库页面组件供选择（在其基础上生成改动提示词）。
-  useEffect(() => {
-    if (stage !== 'design' || designMode !== 'existing' || !projectId) return;
-    listProjectFiles(projectId).then(setRepoFiles).catch(() => setRepoFiles([]));
-  }, [stage, designMode, projectId]);
 
   const copy = async (text: string) => {
     try {
@@ -427,95 +397,19 @@ export default function Delivery({ target, onTargetConsumed }: {
                 <div style={{ minWidth: 150 }}>
                   <Select className="sm" value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
                 </div>
-                <button className="btn btn-primary btn-sm"
-                  disabled={busy === 'proto' || !designDraftId || (designMode === 'existing' && existingPages.length === 0)}
-                  title={!designDraftId ? '请先选择一个需求' : undefined}
-                  onClick={() => run('proto', () => generatePrototypePrompt(
-                    projectId, null, toolTarget,
-                    {
-                      draftId: designDraftId,
-                      docRefs: docSources.filter(d => pickedDocs[docRefKey(d)]).map(docRefKey),
-                      designMode,
-                      existingPageRefs: designMode === 'existing' ? existingPages : undefined,
-                    },
-                  ))}>
+                <button className="btn btn-primary btn-sm" disabled={busy === 'proto'}
+                  onClick={() => {
+                    // 未选需求：不生成，提示去需求孵化台完善当前需求。
+                    if (!designDraftId) {
+                      setToast({ msg: '请先到「需求孵化台」完善当前需求，再来生成原型设计提示词', tone: 'info' });
+                      return;
+                    }
+                    run('proto', () => generatePrototypePrompt(projectId, null, toolTarget, { draftId: designDraftId }));
+                  }}>
                   <Icon name="zap" size={14} />{busy === 'proto' ? '生成中…' : '生成设计提示词'}
                 </button>
               </div>
             </div>
-            {/* 无孵化台需求：引导用户先去孵化台梳理需求（原型必须对应需求）。 */}
-            {drafts.length === 0 && (
-              <div className="empty-compact" style={{ padding: '16px', borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-                <div>本项目在需求孵化台暂无需求</div>
-                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
-                  原型设计提示词必须对应一个需求，请先到「需求孵化台」梳理一条大需求，再回来生成原型。
-                </div>
-              </div>
-            )}
-            {/* 新建页面 / 改现有页面：改现有则选目标页面组件，在其代码基础上生成改动提示词 */}
-            <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <div className="seg" style={{ alignSelf: 'flex-start' }}>
-                <button className={'seg-btn' + (designMode === 'new' ? ' on' : '')} onClick={() => setDesignMode('new')}>新建页面</button>
-                <button className={'seg-btn' + (designMode === 'existing' ? ' on' : '')} onClick={() => setDesignMode('existing')}>改现有页面</button>
-              </div>
-              {designMode === 'existing' && (
-                <>
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.12em' }}>
-                    选要改动的现有页面组件 —— 在其代码基础上生成改动提示词，保持结构/交互/风格一致
-                  </div>
-                  {existingPages.length > 0 && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                      {existingPages.map(f => (
-                        <button key={f} className="chip ember" style={{ cursor: 'pointer' }} title="移除"
-                          onClick={() => setExistingPages(existingPages.filter(x => x !== f))}>
-                          {f.split('/').pop()} ✕
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  <input value={pageFilter} onChange={e => setPageFilter(e.target.value)}
-                    placeholder="🔍 过滤页面文件（如 Delivery / pages / .tsx）…"
-                    style={{ background: 'var(--bg-3)', border: '1px solid var(--border-strong)', borderRadius: 9, padding: '7px 10px', color: 'var(--text)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-label)', outline: 'none' }} />
-                  <div style={{ maxHeight: 180, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 8 }}>
-                    {repoFiles
-                      .filter(f => /\.(tsx|jsx|vue|svelte|html)$/i.test(f.rel_path)
-                        && (!pageFilter || f.rel_path.toLowerCase().includes(pageFilter.toLowerCase()))
-                        && !existingPages.includes(f.rel_path))
-                      .slice(0, 100)
-                      .map(f => (
-                        <button key={f.rel_path} onClick={() => setExistingPages([...existingPages, f.rel_path])}
-                          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '6px 10px', background: 'transparent', border: 'none', borderBottom: '1px solid var(--border)', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)' }}>
-                          {f.rel_path}
-                        </button>
-                      ))}
-                    {repoFiles.length === 0 && <div className="empty-compact" style={{ padding: 12 }}>仓库无页面文件或未配置 repo_path</div>}
-                  </div>
-                </>
-              )}
-            </div>
-            {/* P4 关联文档面板：勾选核心文档源，据此生成更准的原型提示词 */}
-            {docSources.length > 0 && (
-              <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.12em' }}>
-                  关联文档（据选中项拼上下文，越准越贴合真实需求）
-                </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                  {docSources.map(d => {
-                    const key = docRefKey(d);
-                    const on = !!pickedDocs[key];
-                    return (
-                      <button key={key} type="button"
-                        onClick={() => setPickedDocs(p => ({ ...p, [key]: !on }))}
-                        className={`chip${on ? ' ember' : ''}`}
-                        style={{ cursor: 'pointer', opacity: on ? 1 : 0.55 }}
-                        title={d.summary}>
-                        {on ? '✓ ' : ''}{d.title}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
             {prototypes.length === 0
               ? <div className="empty-compact" style={{ padding: '18px' }}>暂无设计提示词</div>
               : prototypes.map(p => (
