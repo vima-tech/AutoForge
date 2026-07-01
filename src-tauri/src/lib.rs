@@ -336,9 +336,6 @@ pub fn run() {
             commands::context::list_context_items,
             commands::context::assemble_context,
             commands::context::fetch_context_content,
-            commands::context::list_lens_presets,
-            commands::context::assemble_lens,
-            commands::context::save_lens_preset,
             commands::context::cite_context_to_conversation,
             // 统一 dispatch 出口（DUAL_HEAD M2 机制：注册表→单 dispatch，不枚举命令名）
             commands::context::rpc_dispatch,

@@ -5,10 +5,11 @@ import { RealtimeAsr } from '../lib/realtimeAsr';
 import { registerVoiceSurface } from '../lib/voiceInput';
 import {
   startBlueprintDraft, refineBlueprintDraft, patchBlueprintDraft, answerBlueprintQuestion,
-  getBlueprintDraft, applyBlueprintDraft, codeBlueprintDraft, listProjectFiles,
+  getBlueprintDraft, applyBlueprintDraft, codeBlueprintDraft, listProjectFiles, fetchContextContent,
   type Project, type BlueprintDraftView, type BlueprintSpec, type BlueprintTask, type ProjectContextFile,
-  type BlueprintBackend,
+  type BlueprintBackend, type ContextItem,
 } from '../services';
+import ContextPicker, { kindLabel } from './ContextPicker';
 
 /**
  * 项目蓝图工作台（全屏双栏）：左对话流 / 右产物预览（PRD · 规格 · 任务）。
@@ -501,6 +502,20 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                     </div>
                   )}
                 </div>
+                {/* 全量上下文基质：引系统任意信息（需求/日志/trace/规格/.autoforge…）作为起草依据，内联进大需求 */}
+                <ContextPicker
+                  projectId={project.id}
+                  placement="up"
+                  title="引用系统上下文作为起草依据（内联进大需求）"
+                  trigger={<Icon name="layers" size={17} />}
+                  onPick={async (it: ContextItem) => {
+                    try {
+                      const body = await fetchContextContent(it.id, 1200);
+                      const cite = `\n\n【引用 · ${kindLabel(it.source_kind)}：${it.title || it.id}】\n${body}\n`;
+                      setBriefInput(prev => prev + cite);
+                    } catch { /* 取正文失败则忽略 */ }
+                  }}
+                />
                 {/* 本地附件 */}
                 <input ref={attachInputRef} type="file" multiple style={{ display: 'none' }}
                   onChange={e => { const fs = Array.from(e.target.files ?? []); if (fs.length) setAttachFiles(p => [...p, ...fs]); if (attachInputRef.current) attachInputRef.current.value = ''; }} />

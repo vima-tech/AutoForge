@@ -1734,23 +1734,6 @@ export const fetchContextContent = (id: string, maxChars?: number) =>
 export const citeContextToConversation = (conversationId: string, contextItemId: string) =>
   ipc<void>('cite_context_to_conversation', { conversationId, contextItemId });
 
-// ── L4 角色取景框（Lens；基质 §4.3）─────────────────────────────────────
-export interface LensPreset {
-  id: string;
-  name: string;
-  role: string;
-  include: string[];
-  budget_bytes: number;
-}
-/** 列出有效取景框（6 角色台子种子 ∪ 个人预设）。 */
-export const listLensPresets = () => ipc<LensPreset[]>('list_lens_presets');
-/** 按角色取景框装配上下文（角色→默认 include→基质 assemble）。 */
-export const assembleLens = (projectId: string, role: string, refs?: string[]) =>
-  ipc<ContextItem[]>('assemble_lens', { projectId, role, refs });
-/** 保存/更新个人取景框预设（按 id upsert，可覆盖同 id 系统种子）。 */
-export const saveLensPreset = (preset: LensPreset) =>
-  ipc<void>('save_lens_preset', { preset });
-
 /**
  * 统一 dispatch 出口（DUAL_HEAD M2 机制）：经单一 `rpc_dispatch` 命令调用后端命令注册表里
  * 走统一契约的命令。`args` 内层键名须与后端 Args 结构一致（snake_case），因其作为不透明

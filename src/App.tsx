@@ -10,7 +10,6 @@ import AuditPage from './pages/Audit';
 import ProjectsPage from './pages/Projects';
 import BlueprintPage from './pages/Blueprint';
 import DeliveryPage from './pages/Delivery';
-import LensPage from './pages/Lens';
 import SettingsPage from './pages/Settings';
 import TracePage from './pages/Trace';
 import QuickCapture from './components/QuickCapture';
@@ -20,7 +19,7 @@ import { getSystemHealth, getSystemResources, checkClaudeAuth, getBadgeCounts, u
 import { THEME_STORAGE_KEY, RAIL_STORAGE_KEY, QUICK_CAPTURE_SHORTCUT_KEY, VOICE_INPUT_SHORTCUT_KEY, SHORTCUT_CHANGED_EVENT, RES_MONITOR_KEY, RES_MONITOR_CHANGED_EVENT, applyRailMode, oppositeMode, parseRailMode, parseResMonitor, parseTheme, themeIdOf, parseQuickCaptureShortcut, parseVoiceInputShortcut, comboMatchesEvent, formatCombo, type ThemeSelection, type QuickCaptureShortcut } from './theme';
 import { triggerVoiceInput } from './lib/voiceInput';
 
-type Page = 'home' | 'chat' | 'projects' | 'blueprint' | 'delivery' | 'lens' | 'audit' | 'trace' | 'settings';
+type Page = 'home' | 'chat' | 'projects' | 'blueprint' | 'delivery' | 'audit' | 'trace' | 'settings';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 const win = () => getCurrentWindow();
@@ -110,7 +109,6 @@ const NAV: { id: Page; name: string; ic: string }[] = [
   { id: 'projects', name: '项目管理', ic: 'box' },
   { id: 'blueprint', name: '需求孵化台', ic: 'layers' },
   { id: 'delivery', name: '交付流水线', ic: 'package' },
-  { id: 'lens',     name: '取景框',   ic: 'search' },
   { id: 'audit',    name: '功能审计', ic: 'audit' },
 ];
 
@@ -128,7 +126,7 @@ export default function App() {
   const [notifUnread, setNotifUnread] = useState(0);
   const [page,  setPage]  = useState<Page>(() => {
     const saved = sessionStorage.getItem('AutoForge:page') as Page | null;
-    return saved && (['home', 'chat', 'projects', 'blueprint', 'delivery', 'lens', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
+    return saved && (['home', 'chat', 'projects', 'blueprint', 'delivery', 'audit', 'settings'] as string[]).includes(saved) ? saved : 'home';
   });
   const [theme, setTheme] = useState<ThemeSelection>(() => parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const [health, setHealth] = useState<SystemHealth | null>(null);
@@ -530,7 +528,6 @@ export default function App() {
         {page === 'projects' && <ProjectsPage onOpenBlueprint={goToBlueprint} />}
         {page === 'blueprint' && <BlueprintPage target={blueprintTarget} onTargetConsumed={() => setBlueprintTarget(null)} onOpenAudit={(projectId, issueId) => goToAudit({ projectId, issueId })} onOpenDelivery={(projectId, opts) => goToDelivery(projectId, opts)} />}
         {page === 'delivery' && <DeliveryPage target={deliveryTarget} onTargetConsumed={() => setDeliveryTarget(null)} />}
-        {page === 'lens' && <LensPage />}
         {page === 'audit'    && <AuditPage target={auditTarget} onTargetConsumed={() => setAuditTarget(null)} openLedger={auditOpenLedger} onLedgerConsumed={() => setAuditOpenLedger(false)} stageTarget={auditStage} onStageConsumed={() => setAuditStage(null)} />}
         {page === 'trace'    && <TracePage />}
         {page === 'settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}

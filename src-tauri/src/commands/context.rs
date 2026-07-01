@@ -109,39 +109,6 @@ pub async fn cite_context_to_conversation(
     Ok(())
 }
 
-/// 列出有效取景框（系统 6 角色台子种子 ∪ 个人预设；L4 §4.3）。
-#[tauri::command]
-pub async fn list_lens_presets(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::core::lens::LensPreset>, String> {
-    Ok(crate::core::lens::load_presets(&state.db).await)
-}
-
-/// 保存/更新个人取景框预设（挂 app_settings，按 id upsert，可覆盖同 id 系统种子）。
-#[tauri::command]
-pub async fn save_lens_preset(
-    preset: crate::core::lens::LensPreset,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    crate::core::lens::save_preset(&state.db, preset)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// 按角色取景框装配上下文（角色 → 默认 include → 基质 assemble）。
-#[tauri::command]
-pub async fn assemble_lens(
-    project_id: String,
-    role: String,
-    refs: Option<Vec<String>>,
-    state: State<'_, AppState>,
-) -> Result<Vec<ContextItem>, String> {
-    let preset = crate::core::lens::preset_for_role(&role);
-    crate::core::lens::assemble_by_lens(&state.db, &preset, &project_id, refs.unwrap_or_default())
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// 懒取一条上下文条目正文（大体量来源走 G3 尾部摘要；access #2）。`max_chars` 默认 8192。
 #[tauri::command]
 pub async fn fetch_context_content(

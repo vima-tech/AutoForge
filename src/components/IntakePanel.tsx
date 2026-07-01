@@ -5,10 +5,12 @@ import { fmtFull } from '../utils/datetime';
 import {
   getIntakeConfig, updateIntakeConfig, syncGithubIssues, bulkImportIssues,
   bulkImportFile, exportBulkTemplate, submitIssue, importIssueAttachment,
-  getProjectWebhookToken, regenerateProjectWebhookToken, getWebhookStatus,
+  getProjectWebhookToken, regenerateProjectWebhookToken, getWebhookStatus, fetchContextContent,
   type IntakeConfig, type SyncResult, type BulkResult, type WidgetToken, type WebhookStatus,
+  type ContextItem,
 } from '../services';
 import AttachmentBar, { fileToUpload } from './AttachmentBar';
+import ContextPicker, { kindLabel } from './ContextPicker';
 
 // ── Intake helpers ────────────────────────────────────────────────────────────
 
@@ -94,7 +96,23 @@ function ProjectManualTab({ projectId }: { projectId: string }) {
             <input value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} placeholder="简洁描述需求" />
           </div>
           <div className="field full" style={{ margin: 0 }}>
-            <label>详细描述</label>
+            <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span>详细描述</span>
+              <ContextPicker
+                projectId={projectId}
+                placement="down"
+                triggerClassName="btn btn-sm"
+                trigger={<><Icon name="layers" size={12} />引用上下文</>}
+                title="引用系统上下文作为需求依据（内联进描述）"
+                onPick={async (it: ContextItem) => {
+                  try {
+                    const body = await fetchContextContent(it.id, 800);
+                    const cite = `\n\n【引用 · ${kindLabel(it.source_kind)}：${it.title || it.id}】\n${body}\n`;
+                    setForm(f => ({ ...f, description: f.description + cite }));
+                  } catch { /* 取正文失败则忽略 */ }
+                }}
+              />
+            </label>
             <textarea rows={3} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="背景、期望行为、截图说明等" />
           </div>
           <div className="field" style={{ margin: 0 }}>

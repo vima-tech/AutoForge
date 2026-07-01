@@ -33,6 +33,19 @@ pub mod source_kind {
     pub const INCUBATOR_DRAFT: &str = "incubator_draft"; // blueprint_*
     pub const ATTACHMENT: &str = "attachment"; // conversation_attachments
 
+    // —— 全量覆盖新增来源（万物可引 · 实施契约 §5） ——
+    pub const SECURITY_AUDIT: &str = "security_audit"; // security_audits
+    pub const TEST_SESSION: &str = "test_session"; // test_sessions
+    pub const SCAN_FINDING: &str = "scan_finding"; // scan_findings
+    pub const DEPLOYMENT: &str = "deployment"; // deployments
+    pub const DELIVERY_ARTIFACT: &str = "delivery_artifact"; // delivery_artifacts
+    pub const WORKTREE_SESSION: &str = "worktree_session"; // worktree_sessions
+    pub const PROTOTYPE_PROMPT: &str = "prototype_prompt"; // prototype_prompts
+    pub const PROJECT_META: &str = "project_meta"; // .autoforge/claude.md · agents.md
+    pub const CFG_AGENT: &str = "cfg_agent"; // agents（脱敏）
+    pub const CFG_CODE_AGENT: &str = "cfg_code_agent"; // code_agents（脱敏）
+    pub const CFG_MCP: &str = "cfg_mcp"; // mcp_servers（脱敏，仅非密文字段）
+
     // —— 外部不可信来源（trust=external_untrusted，必过注入闸） ——
     pub const MCP_RESULT: &str = "mcp_result";
     pub const WEB_RESULT: &str = "web_result";
@@ -136,14 +149,50 @@ pub async fn deregister(db: &Db, source_kind: &str, source_id: &str) -> Result<(
 }
 
 /// 枚举一个项目的候选上下文条目（只回元数据，不回正文；access #1）。
-/// `kinds` 为空则不按来源类型过滤；结果按产生时间倒序，`limit` 上限。
+/// `kinds` 为空则不按来源类型过滤；结果按产生时间倒序，`limit` 为返回总上限。
+///
+/// **pull 模型**（《全量上下文基质·万物可引》契约 §3）：从数据活查（provider 层枚举全量来源），
+/// 而非只读 `context_index`。`context_index` 仅作可选缓存（现由 register 钩子预热，此处不依赖）。
+/// 总预算 `limit` 摊到各命中来源，避免单一大表淹没其余来源。
 pub async fn list(
     db: &Db,
     project_id: &str,
     kinds: &[&str],
     limit: i64,
 ) -> Result<Vec<ContextItem>> {
-    // 动态 IN 列表：手拼占位符（值仍走 bind，防注入）。
+    use crate::core::context_providers as cp;
+    let repo = project_repo_path(db, project_id).await;
+    let n_sources = if kinds.is_empty() {
+        (cp::SOURCES.len() + cp::FILE_SOURCES.len()) as i64
+    } else {
+        kinds.len() as i64
+    };
+    // 每来源软上限：总预算摊平，但至少 10、至多 limit（单来源筛选时给满）。
+    let per_source = (limit / n_sources.max(1)).clamp(10, limit.max(10));
+    let mut items = cp::enumerate_all(db, project_id, kinds, repo.as_deref(), per_source).await?;
+
+    // 叠加 context_index 缓存（register 钩子预热 / 历史条目）：provider 未覆盖的按 id 补入，
+    // provider 结果优先（活查是真源，缓存仅兜底/加速）。
+    let seen: std::collections::HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+    if let Ok(cached) = list_cached(db, project_id, kinds, limit).await {
+        for c in cached {
+            if !seen.contains(&c.id) {
+                items.push(c);
+            }
+        }
+    }
+    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    items.truncate(limit.max(0) as usize);
+    Ok(items)
+}
+
+/// 只读 `context_index` 缓存（旧 push 路径的查询；现作 [`list`] 的缓存叠加层）。
+async fn list_cached(
+    db: &Db,
+    project_id: &str,
+    kinds: &[&str],
+    limit: i64,
+) -> Result<Vec<ContextItem>> {
     let mut sql = String::from("SELECT * FROM context_index WHERE project_id=?");
     if !kinds.is_empty() {
         sql.push_str(" AND source_kind IN (");
@@ -151,7 +200,6 @@ pub async fn list(
         sql.push(')');
     }
     sql.push_str(" ORDER BY created_at DESC, rowid DESC LIMIT ?");
-
     let mut q = sqlx::query_as::<_, ContextItem>(&sql).bind(project_id);
     for k in kinds {
         q = q.bind(*k);
@@ -160,14 +208,55 @@ pub async fn list(
     Ok(q.fetch_all(db).await?)
 }
 
+/// 解析项目本地仓库路径（文件来源 provider 需要；无仓库则回 None）。
+pub(crate) async fn project_repo_path(db: &Db, project_id: &str) -> Option<String> {
+    sqlx::query_as::<_, (Option<String>,)>("SELECT repo_path FROM projects WHERE id=?")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|(v,)| v)
+        .filter(|s| !s.is_empty())
+}
+
 /// 取单条上下文条目元数据（供显式 ref 定位）。
+///
+/// pull 模型下：先查 `context_index` 缓存（若被 register 预热）；缓存 miss 时从稳定 id
+/// （`<kind>:<source_id>`）**反构最小条目**——只要 kind 是已知 provider 来源即可，
+/// 后续 `fetch_content` 按 kind+source_id 懒取正文。这样显式 ref 无需依赖缓存即可解析。
 pub async fn get(db: &Db, id: &str) -> Result<Option<ContextItem>> {
-    Ok(
-        sqlx::query_as::<_, ContextItem>("SELECT * FROM context_index WHERE id=?")
-            .bind(id)
-            .fetch_optional(db)
-            .await?,
-    )
+    if let Some(item) = sqlx::query_as::<_, ContextItem>("SELECT * FROM context_index WHERE id=?")
+        .bind(id)
+        .fetch_optional(db)
+        .await?
+    {
+        return Ok(Some(item));
+    }
+    // 缓存 miss：从 id 反构（kind:source_id）。kind 不含 ':'，故 split_once 正确。
+    if let Some((kind, source_id)) = id.split_once(':') {
+        let known = crate::core::context_providers::providers()
+            .iter()
+            .any(|p| p.kind() == kind);
+        if known {
+            return Ok(Some(ContextItem {
+                id: id.to_string(),
+                project_id: String::new(),
+                source_kind: kind.to_string(),
+                source_id: source_id.to_string(),
+                title: String::new(),
+                origin_stage: String::new(),
+                origin_actor: String::new(),
+                content_ref: format!("lazy:{kind}:{source_id}"),
+                size_hint: 0,
+                trust: trust::TRUSTED.to_string(),
+                labels: "[]".to_string(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// 一次上下文装配请求（基质设计 §4.2 的动作侧输入）。
@@ -263,11 +352,11 @@ pub async fn assemble(db: &Db, req: &ContextRequest) -> Result<Vec<ContextItem>>
 }
 
 /// 大体量过程信息来源：懒取时只投影「尾部摘要」而非全文（G3，防日志/trace 撑爆预算）。
+/// 单一真源：读 `SOURCES` 声明的 `bulky` 标志（新增大体量来源只需在声明里 `.bulky()`）。
 fn is_bulky(kind: &str) -> bool {
-    matches!(
-        kind,
-        source_kind::CODE_AGENT_LOG | source_kind::LLM_TRACE | source_kind::AGENT_OUTPUT
-    )
+    crate::core::context_providers::SOURCES
+        .iter()
+        .any(|s| s.kind == kind && s.bulky)
 }
 
 /// UTF-8 安全的保尾截断（大日志/trace 的尾部通常是结论/最新状态/改动摘要，比保头有用）。
@@ -342,8 +431,28 @@ pub async fn fetch_content(db: &Db, item: &ContextItem, max_chars: usize) -> Res
             )
             .await?
         }
-        // 未知/无 scheme → 用标题兜底（至少让 Agent 知道有这么一条）。
-        _ => item.title.clone(),
+        // pull 模型统一出口：无旧 scheme（含 `lazy:<kind>:<id>` 与空）→ 按 source_kind + source_id
+        // 派发到 provider 层懒取（覆盖全量新增来源）；provider 未命中再用标题兜底。
+        _ => {
+            let repo = if item.project_id.is_empty() {
+                None
+            } else {
+                project_repo_path(db, &item.project_id).await
+            };
+            // provider 取正文失败/空一律回落标题：缺失或坏掉的单个来源不应让懒取报错。
+            crate::core::context_providers::fetch_kind(
+                db,
+                &item.source_kind,
+                &item.source_id,
+                repo.as_deref(),
+                max_chars,
+            )
+            .await
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| item.title.clone())
+        }
     };
     Ok(if is_bulky(&item.source_kind) {
         keep_tail(&raw, max_chars)

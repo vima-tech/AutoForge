@@ -2,6 +2,7 @@ pub mod asr_realtime;
 pub mod audio_decode;
 pub mod concurrency;
 pub mod context;
+pub mod context_providers;
 pub mod cpubudget;
 pub mod ctx_window;
 pub mod dep_cache;
