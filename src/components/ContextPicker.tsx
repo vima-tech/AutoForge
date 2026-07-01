@@ -68,6 +68,8 @@ export default function ContextPicker({
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState('');
   const [items, setItems] = useState<ContextItem[]>([]);
+  // 全部可选来源（由未筛选那次加载捕获，独立于当前筛选，避免选中某来源后其余选项消失）。
+  const [allKinds, setAllKinds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -75,9 +77,14 @@ export default function ContextPicker({
   useEffect(() => {
     if (!open || !projectId) return;
     setLoading(true);
-    const kinds = kind ? [kind] : (sourceKinds && sourceKinds.length ? sourceKinds : undefined);
+    const restricted = !!(sourceKinds && sourceKinds.length);
+    const kinds = kind ? [kind] : (restricted ? sourceKinds : undefined);
     listContextItems(projectId, kinds, 200)
-      .then(setItems)
+      .then(list => {
+        setItems(list);
+        // 仅在「未按 kind 筛选」的加载上刷新完整来源集合，筛选后不收缩下拉选项。
+        if (!kind && !restricted) setAllKinds(Array.from(new Set(list.map(i => i.source_kind))));
+      })
       .catch(() => setItems([]))
       .finally(() => setLoading(false));
   }, [open, projectId, kind, sourceKinds]);
@@ -96,14 +103,12 @@ export default function ContextPicker({
     return () => document.removeEventListener('mousedown', onDown);
   }, [open]);
 
-  // 可选来源下拉：由实际返回的条目 + 限定集合推导。
+  // 可选来源下拉：限定集合优先，否则用未筛选加载捕获的完整来源集合（选中后不缩水）。
   const kindOptions = useMemo(() => {
-    const base = sourceKinds && sourceKinds.length
-      ? sourceKinds
-      : Array.from(new Set(items.map(i => i.source_kind)));
+    const base = sourceKinds && sourceKinds.length ? sourceKinds : allKinds;
     const opts = base.map(k => ({ value: k, label: kindLabel(k) }));
     return [{ value: '', label: '全部来源' }, ...opts];
-  }, [items, sourceKinds]);
+  }, [allKinds, sourceKinds]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
