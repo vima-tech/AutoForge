@@ -104,15 +104,15 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit, o
         <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
           <span className="en">INCUBATOR</span><span className="cn">· 需求孵化台</span>
         </div>
-        <div style={{ position: 'relative', minWidth: 240, maxWidth: 340 }} ref={projRef}>
+        <div style={{ position: 'relative', minWidth: 200, maxWidth: 300 }} ref={projRef}>
           {active ? (
-            <div className="proj-select" onClick={() => setProjOpen(o => !o)} style={{ cursor: 'pointer' }}>
-              <div className="proj-logo" style={{ background: '#e8772e' }}>{active.name[0]}</div>
+            <div className="proj-select" onClick={() => setProjOpen(o => !o)} style={{ cursor: 'pointer', padding: '5px 10px', gap: 8 }}>
+              <div className="proj-logo" style={{ background: '#e8772e', width: 28, height: 28, fontSize: 'var(--text-label)', borderRadius: 8 }}>{active.name[0]}</div>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="proj-name">{active.name}</div>
-                <div className="proj-meta">{active.description || active.slug}</div>
+                <div className="proj-name" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{active.name}</div>
+                <div className="proj-meta" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{active.description || active.slug}</div>
               </div>
-              <Icon name="chevDown" size={16} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none' }} />
+              <Icon name="chevDown" size={15} style={{ color: 'var(--text-3)', flexShrink: 0, transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none' }} />
             </div>
           ) : (
             <div className="empty-compact" style={{ padding: '8px 10px' }}>{loadingProjects ? '载入项目…' : '暂无项目'}</div>
