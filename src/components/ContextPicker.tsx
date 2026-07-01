@@ -86,7 +86,11 @@ export default function ContextPicker({
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as HTMLElement | null;
+      // 来源下拉（Select）弹层经 portal 挂到 document.body，落在 wrapRef 之外；
+      // 点它的选项不算「点击外部」，否则选来源就会连带关掉整个引用面板。
+      if (t?.closest?.('.csel-pop')) return;
+      if (wrapRef.current && !wrapRef.current.contains(t as Node)) setOpen(false);
     };
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
