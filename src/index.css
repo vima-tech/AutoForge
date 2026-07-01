@@ -954,6 +954,7 @@ button { font-family: inherit; cursor: pointer; }
   font-weight: 800;
   letter-spacing: -.01em;
   color: var(--text-2);
+  margin-left: 10px;
 }
 .rail-wordmark b { color: var(--ember); font-weight: 800; }
 
