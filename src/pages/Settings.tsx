@@ -2037,7 +2037,7 @@ function ConcurrencySettings() {
 }
 
 function KnowledgeSettings() {
-  const [form, setForm] = useState({ evolve_interval_hours: 12, capture_threshold: 8 });
+  const [form, setForm] = useState({ evolve_interval_hours: 12, capture_threshold: 8, archive_learning: true });
   const [result, setResult] = useState('');
 
   useEffect(() => {
@@ -2072,6 +2072,13 @@ function KnowledgeSettings() {
             <input type="number" min="0" max="1000" value={form.capture_threshold}
               onChange={e => setForm(f => ({ ...f, capture_threshold: Number(e.target.value) }))} />
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>累计这么多次捕获后自动进化；0 = 关闭事件触发</span>
+          </div>
+          <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+            <div>
+              <label style={{ marginBottom: 3 }}>归档时学习</label>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>归档会议室时，用蒸馏 LLM 把整段会议提炼成可复用经验存入知识库</span>
+            </div>
+            <Switch on={form.archive_learning} onToggle={() => setForm(f => ({ ...f, archive_learning: !f.archive_learning }))} />
           </div>
           <div className="field full" style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>

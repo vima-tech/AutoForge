@@ -926,7 +926,7 @@ export type ConvCommandName = 'remember' | 'recall' | 'evolve' | 'innate';
 export const runConversationCommand = (payload: {
   conversation_id: string; command: ConvCommandName; arg: string;
 }) => ipc<Message>('run_conversation_command', { payload });
-export interface KnowledgeSettings { evolve_interval_hours: number; capture_threshold: number; }
+export interface KnowledgeSettings { evolve_interval_hours: number; capture_threshold: number; archive_learning: boolean; }
 export const getKnowledgeSettings = () =>
   ipc<KnowledgeSettings>('get_knowledge_settings');
 export const setKnowledgeSettings = (payload: KnowledgeSettings) =>

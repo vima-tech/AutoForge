@@ -105,10 +105,10 @@ fn innate_provider(api_spec: &str) -> Option<&'static str> {
     }
 }
 
-/// Resolve the `llm_configs` row bound to the `kb_distill` role (None if no
-/// holder / no LLM bound).
-async fn resolve_distill_llm(db: &crate::db::Db) -> Option<crate::models::llm_config::LlmConfig> {
-    let agent = sqlx::query_as::<_, crate::models::agent::Agent>(
+/// Resolve the enabled Agent holding the `kb_distill` role (None if no holder).
+/// Shared by the Innate provider config and the archive-learning distiller.
+async fn resolve_distill_agent(db: &crate::db::Db) -> Option<crate::models::agent::Agent> {
+    sqlx::query_as::<_, crate::models::agent::Agent>(
         "SELECT * FROM agents
          WHERE (',' || COALESCE(system_kind, '') || ',') LIKE '%,kb_distill,%'
            AND enabled=1
@@ -117,7 +117,13 @@ async fn resolve_distill_llm(db: &crate::db::Db) -> Option<crate::models::llm_co
     .fetch_optional(db)
     .await
     .ok()
-    .flatten()?;
+    .flatten()
+}
+
+/// Resolve the `llm_configs` row bound to the `kb_distill` role (None if no
+/// holder / no LLM bound).
+async fn resolve_distill_llm(db: &crate::db::Db) -> Option<crate::models::llm_config::LlmConfig> {
+    let agent = resolve_distill_agent(db).await?;
     let llm_id = agent.llm_id?;
     sqlx::query_as::<_, crate::models::llm_config::LlmConfig>(
         "SELECT * FROM llm_configs WHERE id=?",
@@ -634,6 +640,101 @@ pub async fn cmd_evolve(project_id: Option<&str>) -> Result<String, String> {
     Ok(render_value(&report))
 }
 
+// ── Archive-time learning: distil a whole meeting into insights ─────────────
+//
+// innate_core exposes only `add` (write a chunk directly) and `evolve` (distil
+// the episodic_log) — there is no public "ingest raw transcript for
+// distillation" entry. So to *learn* from a finished meeting we run the
+// `kb_distill` role's LLM ourselves to boil the transcript down to a handful of
+// durable, reusable insights, then hand each to Innate via `add`. Best-effort:
+// no distiller / a bad response / nothing worth keeping all yield an empty vec.
+
+/// A distilled meeting insight: `content` = the reusable lesson; `trigger` =
+/// when it applies (drives Innate's trigger vector).
+#[derive(Debug, Clone)]
+pub struct MeetingInsight {
+    pub content: String,
+    pub trigger: String,
+}
+
+const DISTILL_SYSTEM: &str = "你是一名把会议沉淀为长期可复用经验的蒸馏器。给你一段会议逐字记录，\
+请只提炼其中**跨会话、可复用**的procedural知识：达成的决策、约定的规范、踩坑与解决办法、\
+关键结论与取舍理由。忽略寒暄、临时闲聊、一次性事务、无普适价值的细节。\n\n\
+输出**严格的 JSON 数组**，每项形如 {\"content\":\"该条经验（陈述句，自包含，不含‘本次会议’等指代）\",\
+\"trigger\":\"何时该想起它（简短场景描述）\"}。最多 8 条，宁缺毋滥；\
+若整段会议没有值得长期记住的东西，输出空数组 []。除 JSON 外不要输出任何文字。";
+
+/// Distil a labeled meeting transcript into reusable insights using the
+/// `kb_distill` LLM. Returns an empty vec on any failure or when nothing is
+/// worth remembering (caller treats that as "learned nothing", not an error).
+pub async fn distill_meeting(
+    db: &crate::db::Db,
+    title: &str,
+    project_name: Option<&str>,
+    transcript: &str,
+) -> Vec<MeetingInsight> {
+    if transcript.trim().is_empty() {
+        return Vec::new();
+    }
+    let Some(agent) = resolve_distill_agent(db).await else {
+        eprintln!("[innate] 归档学习跳过：未配置 kb_distill 角色");
+        return Vec::new();
+    };
+    // Cap transcript so distillation stays cheap and within context.
+    let clipped: String = transcript.chars().take(16_000).collect();
+    let prompt = format!(
+        "会议标题：{}\n所属项目：{}\n\n=== 会议逐字记录 ===\n{}",
+        title,
+        project_name.unwrap_or("（无绑定项目）"),
+        clipped
+    );
+    let out = match crate::agents::llm::run_agent_text(db, &agent, &prompt, Some(DISTILL_SYSTEM), &[])
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[innate] 归档学习蒸馏失败：{e}");
+            return Vec::new();
+        }
+    };
+    parse_insights(&out)
+}
+
+/// Tolerantly parse the distiller's reply into insights. Extracts the outermost
+/// `[ … ]` (models often wrap JSON in prose / code fences), then keeps items
+/// with a non-empty `content`; a missing `trigger` falls back to the content.
+fn parse_insights(raw: &str) -> Vec<MeetingInsight> {
+    let slice = match (raw.find('['), raw.rfind(']')) {
+        (Some(a), Some(b)) if b > a => &raw[a..=b],
+        _ => return Vec::new(),
+    };
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(slice)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for it in items {
+        let content = it.get("content").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        let trigger = it
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(content);
+        out.push(MeetingInsight {
+            content: content.chars().take(4000).collect(),
+            trigger: trigger.chars().take(300).collect(),
+        });
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
 /// Knowledge-base health summary for a scope (the `/innate` command).
 /// Prepends an embedding-dimension warning when one is active (and surfaces it
 /// even when the mismatch is what made the open fail).
@@ -664,6 +765,47 @@ fn render_value(v: &serde_json::Value) -> String {
 pub fn reset_capture_count(project_id: Option<&str>) {
     if let Some(counts) = CAPTURE_COUNTS.get() {
         counts.lock().unwrap().remove(&scope_key(project_id));
+    }
+}
+
+#[cfg(test)]
+mod distill_tests {
+    use super::parse_insights;
+
+    #[test]
+    fn extracts_array_wrapped_in_prose_and_fences() {
+        let raw = "好的，这是提炼结果：\n```json\n[\
+            {\"content\":\"用 sqlx 而非 rusqlite\",\"trigger\":\"写数据库查询时\"},\
+            {\"content\":\"迁移文件不可改\",\"trigger\":\"改 schema 时\"}\
+            ]\n```\n以上。";
+        let out = parse_insights(raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "用 sqlx 而非 rusqlite");
+        assert_eq!(out[0].trigger, "写数据库查询时");
+    }
+
+    #[test]
+    fn empty_array_yields_nothing() {
+        assert!(parse_insights("[]").is_empty());
+        assert!(parse_insights("没有可记住的内容").is_empty());
+    }
+
+    #[test]
+    fn skips_blank_content_and_falls_back_trigger_to_content() {
+        let raw = "[{\"content\":\"\"},{\"content\":\"保持函数纯粹\"}]";
+        let out = parse_insights(raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, "保持函数纯粹");
+        assert_eq!(out[0].trigger, "保持函数纯粹");
+    }
+
+    #[test]
+    fn caps_at_eight_insights() {
+        let items: Vec<String> = (0..20)
+            .map(|i| format!("{{\"content\":\"c{i}\"}}"))
+            .collect();
+        let raw = format!("[{}]", items.join(","));
+        assert_eq!(parse_insights(&raw).len(), 8);
     }
 }
 

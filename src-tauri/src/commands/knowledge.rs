@@ -26,11 +26,19 @@ pub struct KnowledgeSettings {
     /// Captures per project that trigger an automatic background evolve. `0`
     /// disables the event trigger (timer backstop still applies).
     pub capture_threshold: u32,
+    /// When a meeting room is archived, distil the whole conversation into
+    /// reusable insights and feed them to Innate. Default on.
+    #[serde(default = "default_true")]
+    pub archive_learning: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for KnowledgeSettings {
     fn default() -> Self {
-        Self { evolve_interval_hours: 12, capture_threshold: 8 }
+        Self { evolve_interval_hours: 12, capture_threshold: 8, archive_learning: true }
     }
 }
 
@@ -39,7 +47,8 @@ pub async fn load_knowledge_settings(db: &crate::db::Db) -> KnowledgeSettings {
     let mut s = KnowledgeSettings::default();
     if let Ok(rows) = sqlx::query_as::<_, (String, String)>(
         "SELECT key, value FROM app_settings
-         WHERE key IN ('knowledge.evolve_interval_hours', 'knowledge.capture_threshold')",
+         WHERE key IN ('knowledge.evolve_interval_hours', 'knowledge.capture_threshold',
+                       'knowledge.archive_learning')",
     )
     .fetch_all(db)
     .await
@@ -51,6 +60,9 @@ pub async fn load_knowledge_settings(db: &crate::db::Db) -> KnowledgeSettings {
                 }
                 "knowledge.capture_threshold" => {
                     s.capture_threshold = value.parse().unwrap_or(s.capture_threshold);
+                }
+                "knowledge.archive_learning" => {
+                    s.archive_learning = value != "0" && !value.eq_ignore_ascii_case("false");
                 }
                 _ => {}
             }
@@ -76,6 +88,7 @@ pub async fn set_knowledge_settings(
     for (key, value) in [
         ("knowledge.evolve_interval_hours", interval.to_string()),
         ("knowledge.capture_threshold", threshold.to_string()),
+        ("knowledge.archive_learning", if payload.archive_learning { "1" } else { "0" }.to_string()),
     ] {
         sqlx::query(
             "INSERT INTO app_settings (key, value, updated_at)
@@ -90,7 +103,11 @@ pub async fn set_knowledge_settings(
     }
     // Apply the new threshold to the running process immediately.
     crate::knowledge::set_evolve_threshold(threshold);
-    Ok(KnowledgeSettings { evolve_interval_hours: interval, capture_threshold: threshold })
+    Ok(KnowledgeSettings {
+        evolve_interval_hours: interval,
+        capture_threshold: threshold,
+        archive_learning: payload.archive_learning,
+    })
 }
 
 // ── Embedding 模型配置 ──────────────────────────────────────────────────────
@@ -268,7 +285,7 @@ pub async fn run_conversation_command(
 }
 
 /// Insert a system message authored by Innate and emit the receive event.
-async fn post_innate_message(
+pub(crate) async fn post_innate_message(
     app: &AppHandle,
     db: &crate::db::Db,
     conversation_id: &str,
