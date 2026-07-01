@@ -1,4 +1,3 @@
-use crate::models::issue::Issue;
 use crate::models::project::Project;
 use crate::models::prototype::PrototypePrompt;
 use crate::state::AppState;
@@ -290,15 +289,20 @@ pub async fn generate_prototype_prompt(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    let issue: Option<Issue> = if let Some(iid) = &issue_id {
-        sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
-            .bind(iid)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| e.to_string())?
-    } else {
-        None
-    };
+    // 硬约束：原型提示词必须对应一个孵化台需求（draft）。空 draft_id 直接拒绝，
+    // 且不落库——杜绝生成脱离孵化台需求的「野」提示词（前端也会禁用生成按钮兜住）。
+    let draft_id = draft_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or("原型提示词必须对应一个需求，请先在「需求孵化台」选择或新建一条需求")?;
+    let (draft_title, draft_brief) = sqlx::query_as::<_, (String, String)>(
+        "SELECT title, brief FROM blueprint_drafts WHERE id=?",
+    )
+    .bind(&draft_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("对应的需求不存在（可能已删除），请重新选择")?;
 
     // Pull the project's spec docs as design context (best-effort).
     let specs: String = sqlx::query_as::<_, (String, String)>(
@@ -360,34 +364,13 @@ pub async fn generate_prototype_prompt(
     }
 
     let target = tool_target.unwrap_or_else(|| "generic".to_string());
-    // 带 draft_id 时从孵化台草稿派生 feature 标题/描述（真实需求，而非「项目名+产品界面」）。
-    let (feature_title, feature_desc) = if let Some(did) =
-        draft_id.as_deref().filter(|s| !s.is_empty())
-    {
-        sqlx::query_as::<_, (String, String)>("SELECT title, brief FROM blueprint_drafts WHERE id=?")
-            .bind(did)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .map(|(t, b)| {
-                let title = if t.trim().is_empty() {
-                    format!("{} 界面", project.name)
-                } else {
-                    t
-                };
-                (title, b)
-            })
-            .unwrap_or_else(|| (format!("{} 产品界面", project.name), project.description.clone()))
+    // 从（必选的）孵化台草稿派生 feature 标题/描述（真实需求，而非「项目名+产品界面」）。
+    let feature_title = if draft_title.trim().is_empty() {
+        format!("{} 界面", project.name)
     } else {
-        match &issue {
-            Some(i) => (i.title.clone(), i.description.clone()),
-            None => (
-                format!("{} 产品界面", project.name),
-                project.description.clone(),
-            ),
-        }
+        draft_title
     };
+    let feature_desc = draft_brief;
 
     let heuristic = heuristic_prompt(&project.name, &target, &feature_title, &feature_desc, &design_ctx);
     let prompt = llm_prompt(&state.db, &project.id, &project.name, &target, &feature_title, &feature_desc, &design_ctx)
@@ -405,7 +388,7 @@ pub async fn generate_prototype_prompt(
     .bind(&target)
     .bind(&feature_title)
     .bind(&prompt)
-    .bind(draft_id.as_deref().unwrap_or(""))
+    .bind(&draft_id)
     .bind(&mode)
     .execute(&state.db)
     .await

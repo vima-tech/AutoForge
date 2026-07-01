@@ -108,7 +108,7 @@ const NAV: { id: Page; name: string; ic: string }[] = [
   { id: 'home',     name: '主页',     ic: 'home' },
   { id: 'chat',     name: '会议室',   ic: 'chat' },
   { id: 'projects', name: '项目管理', ic: 'box' },
-  { id: 'blueprint', name: '孵化台', ic: 'layers' },
+  { id: 'blueprint', name: '需求孵化台', ic: 'layers' },
   { id: 'delivery', name: '交付流水线', ic: 'package' },
   { id: 'lens',     name: '取景框',   ic: 'search' },
   { id: 'audit',    name: '功能审计', ic: 'audit' },

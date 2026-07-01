@@ -1687,8 +1687,8 @@ export default function ProjectsPage({ onOpenBlueprint }: { onOpenBlueprint?: (p
                       <Icon name={selectedProject.status === 'active' ? 'pause' : 'play'} size={13} />
                       {selectedProject.status === 'active' ? '停用' : '启用'}
                     </button>
-                    <button className="btn btn-sm" onClick={() => onOpenBlueprint?.(selectedProject.id)} title="到「孵化台」：把大需求改动炼成 PRD / 规格 / 任务并一键编码开发">
-                      <Icon name="layers" size={13} />孵化台
+                    <button className="btn btn-sm" onClick={() => onOpenBlueprint?.(selectedProject.id)} title="到「需求孵化台」：把大需求改动炼成 PRD / 规格 / 任务并一键编码开发">
+                      <Icon name="layers" size={13} />需求孵化台
                     </button>
                     <button className="btn btn-sm" onClick={() => setEditProject(selectedProject)}>
                       <Icon name="edit" size={13} />编辑

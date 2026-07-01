@@ -6,6 +6,7 @@ import Toast, { type ToastData } from '../components/Toast';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
   listPrototypeDocSources, type DocSource,
+  listBlueprintDrafts, type BlueprintDraftSummary,
   listProjectFiles, type ProjectContextFile,
   openUrl, launchOpenDesign,
   listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
@@ -137,7 +138,10 @@ export default function Delivery({ target, onTargetConsumed }: {
 } = {}) {
   const [projects, setProjects] = useState<Project[]>([]);
   // P4 深链携带的草稿 id：设计阶段据此在文档源里带出该稿 PRD 并默认勾选。
+  // 现为「必选」：原型提示词必须对应一个孵化台需求，未选则不能生成。
   const [designDraftId, setDesignDraftId] = useState<string | undefined>(undefined);
+  // 当前项目的孵化台需求列表，供设计阶段的「孵化台需求」选择器使用。
+  const [drafts, setDrafts] = useState<BlueprintDraftSummary[]>([]);
   const [projectId, setProjectId] = useState('');
   const [prototypes, setPrototypes] = useState<PrototypePrompt[]>([]);
   const [audits, setAudits] = useState<SecurityAudit[]>([]);
@@ -226,6 +230,19 @@ export default function Delivery({ target, onTargetConsumed }: {
     onTargetConsumed?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target]);
+
+  // 设计阶段：加载本项目的孵化台需求列表（选择器数据源）。
+  // 当前选择若已不在列表中（切项目/需求被删）则回落第一条；深链带入的 draftId 优先保留。
+  useEffect(() => {
+    if (stage !== 'design' || !projectId) { setDrafts([]); return; }
+    let alive = true;
+    listBlueprintDrafts(projectId).then(ds => {
+      if (!alive) return;
+      setDrafts(ds);
+      setDesignDraftId(cur => (cur && ds.some(d => d.id === cur)) ? cur : ds[0]?.id);
+    }).catch(() => { if (alive) setDrafts([]); });
+    return () => { alive = false; };
+  }, [stage, projectId]);
 
   // P4：文档源的稳定 key（design_md 无 ref；其余 kind:ref）。
   const docRefKey = (d: DocSource) => (d.kind === 'design_md' ? 'design_md' : `${d.kind}:${d.ref}`);
@@ -401,10 +418,18 @@ export default function Delivery({ target, onTargetConsumed }: {
                 <InfoHint text="提示词由项目根目录的 DESIGN.md 与技术规格喂给设计角色生成；仓库内有 DESIGN.md 时质量最佳，缺失时退回通用启发式模板。" />
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {/* 孵化台需求（必选）：每条原型提示词都归属一个孵化台需求。 */}
+                <div style={{ minWidth: 200 }}>
+                  <Select className="sm" value={designDraftId ?? ''} onChange={v => setDesignDraftId(v || undefined)}
+                    placeholder={drafts.length ? '选择需求…' : '暂无需求'}
+                    options={drafts.map(d => ({ value: d.id, label: d.title?.trim() || '未命名需求' }))} />
+                </div>
                 <div style={{ minWidth: 150 }}>
                   <Select className="sm" value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
                 </div>
-                <button className="btn btn-primary btn-sm" disabled={busy === 'proto' || (designMode === 'existing' && existingPages.length === 0)}
+                <button className="btn btn-primary btn-sm"
+                  disabled={busy === 'proto' || !designDraftId || (designMode === 'existing' && existingPages.length === 0)}
+                  title={!designDraftId ? '请先选择一个需求' : undefined}
                   onClick={() => run('proto', () => generatePrototypePrompt(
                     projectId, null, toolTarget,
                     {
@@ -418,6 +443,15 @@ export default function Delivery({ target, onTargetConsumed }: {
                 </button>
               </div>
             </div>
+            {/* 无孵化台需求：引导用户先去孵化台梳理需求（原型必须对应需求）。 */}
+            {drafts.length === 0 && (
+              <div className="empty-compact" style={{ padding: '16px', borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                <div>本项目在需求孵化台暂无需求</div>
+                <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)' }}>
+                  原型设计提示词必须对应一个需求，请先到「需求孵化台」梳理一条大需求，再回来生成原型。
+                </div>
+              </div>
+            )}
             {/* 新建页面 / 改现有页面：改现有则选目标页面组件，在其代码基础上生成改动提示词 */}
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div className="seg" style={{ alignSelf: 'flex-start' }}>

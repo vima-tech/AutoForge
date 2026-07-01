@@ -103,7 +103,7 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit, o
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 20px 12px', flexShrink: 0, borderBottom: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
           <Icon name="layers" size={18} style={{ color: 'var(--ember)' }} />
-          <span style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 'var(--text-heading)' }}>孵化台</span>
+          <span style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 'var(--text-heading)' }}>需求孵化台</span>
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>
             从念头到可交付
           </span>

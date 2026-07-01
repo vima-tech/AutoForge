@@ -328,7 +328,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
             {isNew ? '新需求改动' : (draft?.title || project.name)}
           </div>
           <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', letterSpacing: '.04em' }}>
-            {project.name} · 孵化台
+            {project.name} · 需求孵化台
           </div>
         </div>
         {coding && (
@@ -467,7 +467,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                 </div>
               )}
               <textarea
-                rows={5} value={briefInput} onChange={e => setBriefInput(e.target.value)} autoFocus
+                rows={10} value={briefInput} onChange={e => setBriefInput(e.target.value)} autoFocus
                 onFocus={() => setInputFocused(true)} onBlur={() => setInputFocused(false)}
                 onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && briefInput.trim()) { e.preventDefault(); void doStart(); } }}
                 placeholder="描述这次大需求改动 —— 背景、目标、要支持的能力、约束…越具体越好。"
