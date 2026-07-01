@@ -100,13 +100,9 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit, o
   return (
     <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       {/* 头栏：孵化台标识 + 项目选择器 + 新建需求 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 20px 12px', flexShrink: 0, borderBottom: '1px solid var(--border)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-          <Icon name="layers" size={18} style={{ color: 'var(--ember)' }} />
-          <span style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 'var(--text-heading)' }}>需求孵化台</span>
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>
-            从念头到可交付
-          </span>
+      <div className="audit-top" style={{ height: 56 }}>
+        <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
+          <span className="en">INCUBATOR</span><span className="cn">· 需求孵化台</span>
         </div>
         <div style={{ position: 'relative', minWidth: 240, maxWidth: 340 }} ref={projRef}>
           {active ? (
@@ -135,8 +131,7 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit, o
             </div>
           )}
         </div>
-        <div style={{ flex: 1 }} />
-        <button className="btn btn-primary" disabled={!active} onClick={() => { setIsNew(true); setSelectedDraftId(null); }}>
+        <button className="btn btn-primary btn-sm" style={{ marginLeft: 'auto' }} disabled={!active} onClick={() => { setIsNew(true); setSelectedDraftId(null); }}>
           <Icon name="plus" size={14} />新建需求改动
         </button>
       </div>
