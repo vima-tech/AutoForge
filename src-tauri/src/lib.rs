@@ -332,6 +332,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // 上下文基质只读出口（方法论平台/基质 §4.1）
+            commands::context::list_context_items,
+            commands::context::assemble_context,
+            commands::context::fetch_context_content,
+            commands::context::list_lens_presets,
+            commands::context::assemble_lens,
+            commands::context::save_lens_preset,
+            commands::context::cite_context_to_conversation,
+            // 统一 dispatch 出口（DUAL_HEAD M2 机制：注册表→单 dispatch，不枚举命令名）
+            commands::context::rpc_dispatch,
             commands::projects::list_projects,
             commands::projects::list_active_projects,
             commands::projects::get_project,
@@ -586,6 +596,7 @@ pub fn run() {
             commands::specs::set_spec_injection,
             commands::blueprint::start_blueprint_draft,
             commands::blueprint::refine_blueprint_draft,
+            commands::blueprint::answer_blueprint_question,
             commands::blueprint::patch_blueprint_draft,
             commands::blueprint::get_blueprint_draft,
             commands::blueprint::list_blueprint_drafts,
@@ -600,6 +611,7 @@ pub fn run() {
             commands::deploy::confirm_deploy,
             commands::prototype::list_prototype_prompts,
             commands::prototype::generate_prototype_prompt,
+            commands::prototype::list_prototype_doc_sources,
             commands::prototype::delete_prototype_prompt,
             commands::prototype::update_prototype_prompt,
             commands::prototype::get_opendesign_settings,

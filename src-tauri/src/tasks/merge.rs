@@ -354,7 +354,7 @@ pub(crate) async fn materialize_conflict(wt: &GitProxy, branch_name: &str, branc
 pub(crate) async fn finalize_resolution(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     session: &crate::models::worktree::WorktreeSession,
     cr: &crate::models::change_request::ChangeRequest,
     issue: &crate::models::issue::Issue,
@@ -376,7 +376,7 @@ pub(crate) async fn finalize_resolution(
         let _ = wt.run(&["merge", "--abort"]).await;
         set_status(db, &cr.id, &cr.issue_id, "merge_conflict").await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr.id.clone(),
                 status: "merge_conflict".to_string(),
@@ -403,7 +403,7 @@ pub(crate) async fn finalize_resolution(
         .await;
 
     // Re-run the test gate on the integrated result. Failure blocks (merge_failed).
-    let passed = crate::tasks::testing::run_and_gate(db, tx, app, &cr.id)
+    let passed = crate::tasks::testing::run_and_gate(db, tx, &**sink, &cr.id)
         .await
         .unwrap_or(false);
     if !passed {
@@ -411,7 +411,7 @@ pub(crate) async fn finalize_resolution(
         crate::tasks::testing::persist_test_failure_report(db, &cr.id).await;
         set_status(db, &cr.id, &cr.issue_id, "merge_failed").await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr.id.clone(),
                 status: "merge_failed".to_string(),
@@ -425,7 +425,7 @@ pub(crate) async fn finalize_resolution(
     set_status(db, &cr.id, &cr.issue_id, "pending_code_review").await?;
     crate::core::notify::dispatch(db, "review_needed", &issue.title, "合并冲突已解决，待代码审核 复审").await;
     event::emit(
-        app,
+        sink,
         event::AppEvent::ReviewNeeded {
             cr_id: cr.id.clone(),
             issue_title: issue.title.clone(),
@@ -441,7 +441,7 @@ pub(crate) async fn finalize_resolution(
 pub async fn ai_resolve_conflict(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     cr_id: &str,
 ) -> Result<()> {
     // Serialize with merge::run and any other resolve for this CR (H2: no concurrent
@@ -491,7 +491,7 @@ pub async fn ai_resolve_conflict(
             .ok_or_else(|| anyhow!("issue {} not found", cr.issue_id))?;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "resolving_conflict".to_string(),
@@ -543,13 +543,13 @@ pub async fn ai_resolve_conflict(
         let (log_tx, mut log_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::agents::code_agent::LogChunk>();
         let forward = {
-            let app = app.clone();
+            let sink = sink.clone();
             let cr = cr_id.to_string();
             tokio::spawn(async move {
                 while let Some(c) = log_rx.recv().await {
                     let seq = crate::state::running_log_append(&cr, &c.text);
                     crate::core::event::emit(
-                        &app,
+                        &sink,
                         crate::core::event::AppEvent::CodeAgentLog {
                             cr_id: cr.clone(),
                             phase: "conflict_resolve".to_string(),
@@ -595,7 +595,7 @@ pub async fn ai_resolve_conflict(
 
     // Shared tail: stage / verify markers gone / commit / re-test / route to review 2.
     let commit_msg = format!("AutoForge: AI 解决合并冲突（{} → {}）", dev_ref, session.branch_name);
-    finalize_resolution(db, tx, app, &session, &cr, &issue, &commit_msg)
+    finalize_resolution(db, tx, sink, &session, &cr, &issue, &commit_msg)
         .await
         .map(|_| ())
 }
@@ -693,7 +693,7 @@ pub async fn enqueue_merge_pipeline(db: &Db, tx: &JobSender, cr_id: &str, reason
     let _ = enqueue(db, tx, job, &key, payload).await;
 }
 
-pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+pub async fn run(db: &Db, tx: &JobSender, sink: &std::sync::Arc<dyn crate::core::event::EventSink>, cr_id: &str) -> Result<()> {
     // Load worktree session
     let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
         "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
@@ -730,7 +730,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
             .await;
         set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "merge_failed".to_string(),
@@ -756,7 +756,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     // 触发审核页列表重载、让状态 chip 立刻翻成「合并中」（task_progress 只更新进度 note，不刷状态）。
     set_status(db, cr_id, &cr.issue_id, "merge_testing").await?;
     event::emit(
-        app,
+        sink,
         event::AppEvent::WorktreeUpdate {
             cr_id: cr_id.to_string(),
             status: "merge_testing".to_string(),
@@ -768,22 +768,22 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
     snapshot_cr_diff(db, &session, &cr).await;
 
     // Phase 1 dev-sync + 测试门 + 安全门（仅碰 CR worktree）。任一失败已置态 → 直接返回。
-    match run_premerge_gates(db, tx, app, &session, &cr, &project, cr_id).await? {
+    match run_premerge_gates(db, tx, sink, &session, &cr, &project, cr_id).await? {
         GateResult::Stopped => return Ok(()),
         GateResult::Pass { .. } => {}
     }
 
     // Land on dev（持锁内，串行）。legacy 单锁路径：gate 与 land 同处一把 merge_lock 下。
-    land_core(db, tx, app, &session, &cr, &project, cr_id).await
+    land_core(db, tx, sink, &session, &cr, &project, cr_id).await
 }
 
 /// 合并前阶段（并行）：仅持 `cr_lock`（防解冲突并发写同一 worktree），**不持 merge_lock**，
 /// 故同项目多个 CR 的 premerge 可并行（受 `build_pool` 节流）。跑 Phase1 dev-sync + 测试门 +
 /// 安全门；通过则落 `tested_dev_sha` + 置 `merge_ready` 并入队 Merge(land)。开关关闭时兜底走
 /// legacy `run()`（自带 merge_lock，行为不变）。
-pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+pub async fn premerge_run(db: &Db, tx: &JobSender, sink: &std::sync::Arc<dyn crate::core::event::EventSink>, cr_id: &str) -> Result<()> {
     if !crate::core::gate::parallel_premerge_enabled(db).await {
-        return run(db, tx, app, cr_id).await;
+        return run(db, tx, sink, cr_id).await;
     }
 
     let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
@@ -808,7 +808,7 @@ pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id
             .ok_or_else(|| anyhow!("project {} not found", cr.project_id))?;
 
     if !std::path::Path::new(&session.worktree_path).exists() {
-        return fail_missing_worktree(db, app, &session, &cr, cr_id).await;
+        return fail_missing_worktree(db, sink, &session, &cr, cr_id).await;
     }
 
     // cr_lock ONLY — no merge_lock, so sibling CRs premerge in parallel.
@@ -817,7 +817,7 @@ pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id
 
     set_status(db, cr_id, &cr.issue_id, "merge_testing").await?;
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "premerge".to_string(),
@@ -827,7 +827,7 @@ pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id
 
     snapshot_cr_diff(db, &session, &cr).await;
 
-    let tested_dev_sha = match run_premerge_gates(db, tx, app, &session, &cr, &project, cr_id).await? {
+    let tested_dev_sha = match run_premerge_gates(db, tx, sink, &session, &cr, &project, cr_id).await? {
         GateResult::Stopped => return Ok(()),
         GateResult::Pass { tested_dev_sha } => tested_dev_sha,
     };
@@ -842,7 +842,7 @@ pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id
     .await;
     set_status(db, cr_id, &cr.issue_id, "merge_ready").await?;
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "merge_ready".to_string(),
@@ -867,7 +867,7 @@ pub async fn premerge_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id
 /// 落地阶段（串行）：持 `merge_lock` + `cr_lock`。再校验 dev 是否在「测后落地前」前进（§5），
 /// 据此直落 / 独立直落 / 重叠补测 / 冲突回退；通过则 `land_core` 落地。只在 CR 已 premerge
 /// （`tested_dev_sha` 存在、状态 `merge_ready`）时由派发表路由到此。
-pub async fn land_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+pub async fn land_run(db: &Db, tx: &JobSender, sink: &std::sync::Arc<dyn crate::core::event::EventSink>, cr_id: &str) -> Result<()> {
     let cr = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
         "SELECT * FROM change_requests WHERE id=?",
     )
@@ -910,12 +910,12 @@ pub async fn land_run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &s
     .ok_or_else(|| anyhow!("no worktree session for cr {}", cr_id))?;
 
     if !std::path::Path::new(&session.worktree_path).exists() {
-        return fail_missing_worktree(db, app, &session, &cr, cr_id).await;
+        return fail_missing_worktree(db, sink, &session, &cr, cr_id).await;
     }
 
-    match revalidate(db, tx, app, &session, &cr, &project, cr_id).await? {
+    match revalidate(db, tx, sink, &session, &cr, &project, cr_id).await? {
         Revalidate::Land { verify } => {
-            land_core(db, tx, app, &session, &cr, &project, cr_id).await?;
+            land_core(db, tx, sink, &session, &cr, &project, cr_id).await?;
             // Phase 3 lite：独立改动免重测直落 → 落地后补一发合并后集成测试（在 dev 上跑，
             // worktree 已删故 run_and_gate 回退到仓库路径=dev）。失败由现有机制登记 bug 需求
             // 告警，不自动 revert。无 merge_lock，不阻塞后续 land。
@@ -969,7 +969,7 @@ enum Revalidate {
 async fn revalidate(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     session: &crate::models::worktree::WorktreeSession,
     cr: &crate::models::change_request::ChangeRequest,
     project: &crate::models::project::Project,
@@ -1028,7 +1028,7 @@ async fn revalidate(
             .await;
             set_status(db, cr_id, &cr.issue_id, "merge_conflict").await?;
             event::emit(
-                app,
+                sink,
                 event::AppEvent::MergeConflict {
                     cr_id: cr_id.to_string(),
                     files: files.clone(),
@@ -1036,7 +1036,7 @@ async fn revalidate(
             );
             info!("revalidate dev-sync conflict for cr {} ({} files)", cr_id, files.len());
             if crate::core::gate::auto_conflict_resolve_enabled(db).await {
-                let (db2, tx2, app2, cr2) = (db.clone(), tx.clone(), app.clone(), cr_id.to_string());
+                let (db2, tx2, app2, cr2) = (db.clone(), tx.clone(), sink.clone(), cr_id.to_string());
                 tokio::spawn(async move {
                     if let Err(e) = ai_resolve_conflict(&db2, &tx2, &app2, &cr2).await {
                         info!("AI conflict-resolve failed for {}: {}", cr2, e);
@@ -1160,7 +1160,7 @@ async fn set_status(db: &Db, cr_id: &str, issue_id: &str, status: &str) -> Resul
 /// worktree 缺失的统一收尾：置 merge_failed + 引导重新执行。
 async fn fail_missing_worktree(
     db: &Db,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     session: &crate::models::worktree::WorktreeSession,
     cr: &crate::models::change_request::ChangeRequest,
     cr_id: &str,
@@ -1173,7 +1173,7 @@ async fn fail_missing_worktree(
         .await;
     set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
     event::emit(
-        app,
+        sink,
         event::AppEvent::WorktreeUpdate {
             cr_id: cr_id.to_string(),
             status: "merge_failed".to_string(),
@@ -1194,7 +1194,7 @@ enum GateResult {
 async fn run_premerge_gates(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     session: &crate::models::worktree::WorktreeSession,
     cr: &crate::models::change_request::ChangeRequest,
     project: &crate::models::project::Project,
@@ -1229,7 +1229,7 @@ async fn run_premerge_gates(
             .await;
             set_status(db, cr_id, &cr.issue_id, "merge_conflict").await?;
             event::emit(
-                app,
+                sink,
                 event::AppEvent::MergeConflict {
                     cr_id: cr_id.to_string(),
                     files: files.clone(),
@@ -1241,7 +1241,7 @@ async fn run_premerge_gates(
             if crate::core::gate::auto_conflict_resolve_enabled(db).await {
                 info!("auto conflict-resolve enabled, handing cr {} to AI (background)", cr_id);
                 let (db2, tx2, app2, cr2) =
-                    (db.clone(), tx.clone(), app.clone(), cr_id.to_string());
+                    (db.clone(), tx.clone(), sink.clone(), cr_id.to_string());
                 tokio::spawn(async move {
                     if let Err(e) = ai_resolve_conflict(&db2, &tx2, &app2, &cr2).await {
                         info!("AI conflict-resolve failed for {}: {}", cr2, e);
@@ -1264,7 +1264,7 @@ async fn run_premerge_gates(
         .filter(|s| !s.is_empty());
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "testing".to_string(),
@@ -1273,7 +1273,7 @@ async fn run_premerge_gates(
     );
 
     // Quality gate（spec: testing.md）：失败必须阻断合并。
-    let passed = crate::tasks::testing::run_and_gate(db, tx, app, cr_id).await?;
+    let passed = crate::tasks::testing::run_and_gate(db, tx, &**sink, cr_id).await?;
 
     // D3：CR 级测试遥测。
     let _ = sqlx::query(
@@ -1303,7 +1303,7 @@ async fn run_premerge_gates(
         crate::tasks::testing::persist_test_failure_report(db, cr_id).await;
         set_status(db, cr_id, &cr.issue_id, fail_status).await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: fail_status.to_string(),
@@ -1326,7 +1326,7 @@ async fn run_premerge_gates(
         set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
         crate::core::notify::dispatch(db, "security_high", "安全门拦截合并", cr_id).await;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "merge_failed".to_string(),
@@ -1344,7 +1344,7 @@ async fn run_premerge_gates(
 async fn land_core(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     session: &crate::models::worktree::WorktreeSession,
     cr: &crate::models::change_request::ChangeRequest,
     project: &crate::models::project::Project,
@@ -1362,7 +1362,7 @@ async fn land_core(
     let dev_is_live = !live_branch.is_empty() && live_branch == project.branch_dev;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "merging".to_string(),
@@ -1400,7 +1400,7 @@ async fn land_core(
                 .await;
             set_status(db, cr_id, &cr.issue_id, "merge_failed").await?;
             event::emit(
-                app,
+                sink,
                 event::AppEvent::WorktreeUpdate {
                     cr_id: cr_id.to_string(),
                     status: "merge_failed".to_string(),
@@ -1411,14 +1411,14 @@ async fn land_core(
         }
     };
 
-    finalize_merged(db, tx, app, &git, session, cr, merge_commit).await
+    finalize_merged(db, tx, sink, &git, session, cr, merge_commit).await
 }
 
 /// 落地成功后的统一收尾：删 worktree、置 merged、终止预览、发事件、入队安全审计、Innate 后台沉淀。
 async fn finalize_merged(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     git: &GitProxy,
     session: &crate::models::worktree::WorktreeSession,
     cr: &crate::models::change_request::ChangeRequest,
@@ -1456,7 +1456,7 @@ async fn finalize_merged(
     .await?;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::CrMerged {
             cr_id: cr_id.to_string(),
             project_id: cr.project_id.clone(),

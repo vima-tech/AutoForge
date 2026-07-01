@@ -8,10 +8,11 @@ import { listProjects, listBlueprintDrafts, deleteBlueprintDraft, type Project, 
  * 列表视图（多需求 + 状态）↔ 详情视图（BlueprintStudio 工作台）。每条大需求 = 一个草稿；
  * 编码开发后落为 issue + CR，状态（编码中/待审核/已实现）回链到卡片。
  */
-export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit }: {
+export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit, onOpenDelivery }: {
   target?: { projectId: string } | null;
   onTargetConsumed?: () => void;
   onOpenAudit?: (projectId: string, issueId: string) => void;
+  onOpenDelivery?: (projectId: string, opts?: { stage?: string; draftId?: string }) => void;
 }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -90,6 +91,7 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit }:
         onBack={backToList}
         onChanged={(newId) => { if (newId) { setSelectedDraftId(newId); setIsNew(false); } if (activeId) void loadDrafts(activeId); }}
         onOpenAudit={onOpenAudit}
+        onOpenDelivery={onOpenDelivery}
       />
     );
   }

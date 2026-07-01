@@ -5,6 +5,7 @@ import Select from '../components/Select';
 import Toast, { type ToastData } from '../components/Toast';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
+  listPrototypeDocSources, type DocSource,
   openUrl, launchOpenDesign,
   listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
   runProactiveScan, listTestSessions, getWidgetSnippet, getWebhookStatus,
@@ -129,14 +130,22 @@ function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; 
   );
 }
 
-export default function Delivery() {
+export default function Delivery({ target, onTargetConsumed }: {
+  target?: { projectId: string; stage?: string; draftId?: string } | null;
+  onTargetConsumed?: () => void;
+} = {}) {
   const [projects, setProjects] = useState<Project[]>([]);
+  // P4 深链携带的草稿 id：设计阶段据此在文档源里带出该稿 PRD 并默认勾选。
+  const [designDraftId, setDesignDraftId] = useState<string | undefined>(undefined);
   const [projectId, setProjectId] = useState('');
   const [prototypes, setPrototypes] = useState<PrototypePrompt[]>([]);
   const [audits, setAudits] = useState<SecurityAudit[]>([]);
   const [deploys, setDeploys] = useState<Deployment[]>([]);
   const [scans, setScans] = useState<TestSession[]>([]);
   const [toolTarget, setToolTarget] = useState('generic');
+  // P4 关联文档：设计阶段可勾选核心文档源，按选中项生成更准的原型提示词。
+  const [docSources, setDocSources] = useState<DocSource[]>([]);
+  const [pickedDocs, setPickedDocs] = useState<Record<string, boolean>>({});
   const [targetEnv, setTargetEnv] = useState('production');
   const [busy, setBusy] = useState('');
   const [toast, setToast] = useState<ToastData | null>(null);
@@ -200,6 +209,30 @@ export default function Delivery() {
     catch (e) { showError(String(e)); }
     finally { setBusy(''); }
   };
+
+  // P4 深链消费：孵化台「去原型设计」跳入时预选项目 + 切设计阶段 + 记 draftId（预选 PRD）。
+  useEffect(() => {
+    if (!target) return;
+    setProjectId(target.projectId);
+    if (target.stage) setStage(target.stage as StageId);
+    setDesignDraftId(target.draftId);
+    onTargetConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target]);
+
+  // P4：文档源的稳定 key（design_md 无 ref；其余 kind:ref）。
+  const docRefKey = (d: DocSource) => (d.kind === 'design_md' ? 'design_md' : `${d.kind}:${d.ref}`);
+  // 进入设计阶段时加载可关联的核心文档源（携 draftId 则带出该稿 PRD），按 default_on 初始化勾选。
+  useEffect(() => {
+    if (stage !== 'design' || !projectId) { setDocSources([]); setPickedDocs({}); return; }
+    let alive = true;
+    listPrototypeDocSources(projectId, designDraftId).then(ds => {
+      if (!alive) return;
+      setDocSources(ds);
+      setPickedDocs(Object.fromEntries(ds.map(d => [docRefKey(d), d.default_on])));
+    }).catch(() => { if (alive) { setDocSources([]); setPickedDocs({}); } });
+    return () => { alive = false; };
+  }, [stage, projectId, designDraftId]);
 
   const copy = async (text: string) => {
     try {
@@ -358,11 +391,37 @@ export default function Delivery() {
                   <Select className="sm" value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
                 </div>
                 <button className="btn btn-primary btn-sm" disabled={busy === 'proto'}
-                  onClick={() => run('proto', () => generatePrototypePrompt(projectId, null, toolTarget))}>
+                  onClick={() => run('proto', () => generatePrototypePrompt(
+                    projectId, null, toolTarget,
+                    { draftId: designDraftId, docRefs: docSources.filter(d => pickedDocs[docRefKey(d)]).map(docRefKey) },
+                  ))}>
                   <Icon name="zap" size={14} />{busy === 'proto' ? '生成中…' : '生成设计提示词'}
                 </button>
               </div>
             </div>
+            {/* P4 关联文档面板：勾选核心文档源，据此生成更准的原型提示词 */}
+            {docSources.length > 0 && (
+              <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.12em' }}>
+                  关联文档（据选中项拼上下文，越准越贴合真实需求）
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {docSources.map(d => {
+                    const key = docRefKey(d);
+                    const on = !!pickedDocs[key];
+                    return (
+                      <button key={key} type="button"
+                        onClick={() => setPickedDocs(p => ({ ...p, [key]: !on }))}
+                        className={`chip${on ? ' ember' : ''}`}
+                        style={{ cursor: 'pointer', opacity: on ? 1 : 0.55 }}
+                        title={d.summary}>
+                        {on ? '✓ ' : ''}{d.title}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             {prototypes.length === 0
               ? <div className="empty-compact" style={{ padding: '18px' }}>暂无设计提示词</div>
               : prototypes.map(p => (

@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub async fn run_proactive(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &dyn crate::core::event::EventSink,
     project_id: &str,
     trigger: &str,
 ) -> Result<()> {
@@ -122,7 +122,7 @@ pub async fn run_proactive(
     .await?;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TestCompleted {
             cr_id: String::new(),
             test_session_id: session_id,

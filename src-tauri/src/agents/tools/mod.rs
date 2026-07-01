@@ -18,6 +18,7 @@ use crate::core::security::{has_obvious_injection, safe_truncate};
 
 pub mod code_intel;
 pub mod code_scan;
+pub mod context_recall;
 pub mod deep_research;
 pub mod mcp;
 pub mod memory;
@@ -235,6 +236,7 @@ pub fn builtin_catalog() -> Vec<Box<dyn BuiltinTool>> {
         Box::new(code_scan::CodeScanFactory::List),
         Box::new(specs::SpecToolFactory::List),
         Box::new(specs::SpecToolFactory::Read),
+        Box::new(context_recall::RecallContextFactory),
         Box::new(memory::MemoryToolFactory::Recall),
         Box::new(memory::MemoryToolFactory::Remember),
     ]

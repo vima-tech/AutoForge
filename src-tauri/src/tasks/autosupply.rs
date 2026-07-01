@@ -6,24 +6,23 @@
 //! - proposer 默认关，需显式开启。
 //! - 产物经 `gateway::receive` 落库，复用其去重 + `has_obvious_injection` 过滤。
 
-use crate::core::event::{emit, AppEvent};
+use crate::core::event::{emit, AppEvent, EventSink};
 use crate::db::Db;
 use crate::intake::{gateway, proposer, scanner, IntakeMode};
 use crate::tasks::runner::JobSender;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::AppHandle;
 
 /// RAII 守卫：进入一轮自喂料时置位 + 广播「运行中」，离开（含 panic 提前返回）时
 /// 复位 + 广播「已结束」，确保前端回显不会因异常路径而卡在「运行中」。
 struct RunGuard<'a> {
     running: &'a AtomicBool,
-    app: &'a AppHandle,
+    sink: &'a dyn EventSink,
 }
 
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        emit(self.app, AppEvent::AutosupplyStatus { running: false });
+        emit(self.sink, AppEvent::AutosupplyStatus { running: false });
     }
 }
 
@@ -149,7 +148,7 @@ pub struct CycleStats {
 pub async fn run_cycle(
     db: &Db,
     job_tx: &JobSender,
-    app: &AppHandle,
+    sink: &dyn EventSink,
     cfg: &AutosupplyConfig,
     running: &AtomicBool,
 ) -> CycleStats {
@@ -157,8 +156,8 @@ pub async fn run_cycle(
     if running.swap(true, Ordering::SeqCst) {
         return CycleStats::default();
     }
-    emit(app, AppEvent::AutosupplyStatus { running: true });
-    let _guard = RunGuard { running, app };
+    emit(sink, AppEvent::AutosupplyStatus { running: true });
+    let _guard = RunGuard { running, sink };
 
     let projects = sqlx::query_as::<_, (String, String)>(
         "SELECT id, repo_path FROM projects WHERE status='active'",
@@ -206,7 +205,7 @@ pub async fn run_cycle(
                 }
                 // 安全护栏：永远 Triage。只有真正新建才计预算 + 计入待整理。
                 if let Ok((issue, created)) =
-                    gateway::receive_with_status(db, job_tx, app, p, IntakeMode::Triage).await
+                    gateway::receive_with_status(db, job_tx, sink, p, IntakeMode::Triage).await
                 {
                     if created {
                         stats.scanned += 1;
@@ -230,7 +229,7 @@ pub async fn run_cycle(
                         continue;
                     }
                     if let Ok((issue, created)) =
-                        gateway::receive_with_status(db, job_tx, app, p, IntakeMode::Triage).await
+                        gateway::receive_with_status(db, job_tx, sink, p, IntakeMode::Triage).await
                     {
                         if created {
                             stats.proposed += 1;
@@ -253,7 +252,7 @@ pub async fn run_cycle(
 
     // proposer 健康巡检：连续多轮失败 → 进收件箱提醒（避免深度提议器静默空转无人知）。
     if cfg.proposer_enabled {
-        check_proposer_health(db, app).await;
+        check_proposer_health(db, sink).await;
     }
 
     // 记录本轮运行时间：下次调度据此按真实间隔计算，重启不再清零计时器。
@@ -266,7 +265,7 @@ pub async fn run_cycle(
 /// proposer 健康巡检：最近多次结构化产出全部失败（status=error，多为模型工具调用格式不兼容
 /// 或 proposer 未绑定可用 LLM）→ 发 `AutosupplyDegraded` 进收件箱提醒操作者。
 /// 通知按 thread_key 折叠为一行，不会逐轮刷屏。
-async fn check_proposer_health(db: &Db, app: &AppHandle) {
+async fn check_proposer_health(db: &Db, sink: &dyn EventSink) {
     const WINDOW: i64 = 6; // 巡检最近 6 次 proposer 产出
     const MIN_STREAK: usize = 3; // 至少连续 3 次失败才告警，避免偶发抖动误报
     let rows = sqlx::query_scalar::<_, String>(
@@ -278,7 +277,7 @@ async fn check_proposer_health(db: &Db, app: &AppHandle) {
     .unwrap_or_default();
     if rows.len() >= MIN_STREAK && rows.iter().all(|s| s == "error") {
         emit(
-            app,
+            sink,
             AppEvent::AutosupplyDegraded {
                 reason: "最近多轮结构化产出解析失败（status=error）。常见原因：所选模型的工具调用格式不被支持，或 proposer 角色未绑定可用 LLM。建议改用支持原生 function-calling 的强推理模型。"
                     .to_string(),

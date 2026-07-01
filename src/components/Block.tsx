@@ -3,7 +3,7 @@ import Icon from './Icon';
 import Markdown from './Markdown';
 import { highlightText } from './highlight';
 import type { BlockType } from '../data/mock';
-import { attachmentDataUrl, decideIssueDraft, openAttachment, writeWorkspaceFile, undoWorkspaceFile } from '../services';
+import { attachmentDataUrl, decideIssueDraft, openAttachment, writeWorkspaceFile, undoWorkspaceFile, fetchContextContent } from '../services';
 
 const KW = new Set(['const','let','var','function','return','import','export','from','if','else','for','while','new','await','async','class','def','self','None','True','False','useState','useSearchParams']);
 
@@ -313,5 +313,37 @@ export default function Block({ b, projectId, highlight, messageId, blockIndex }
       </div>
     </div>
   );
+  if (b.t === 'context_ref') return <ContextRefBlock refId={b.ref} kind={b.kind} title={b.title} highlight={highlight} />;
   return null;
+}
+
+/** 上下文基质引用块（G4）：点开走 fetchContextContent 懒取该条目正文。 */
+function ContextRefBlock({ refId, kind, title, highlight }: { refId: string; kind: string; title: string; highlight?: string }) {
+  const [open, setOpen] = useState(false);
+  const [body, setBody] = useState<string | null>(null);
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (next && body === null) {
+      try { setBody(await fetchContextContent(refId, 4000)); }
+      catch { setBody('（读取失败）'); }
+    }
+  };
+  return (
+    <div className="att" style={{ flexDirection: 'column', alignItems: 'stretch', borderColor: 'var(--violet)', background: 'var(--violet-tint)', cursor: 'pointer' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }} onClick={toggle}>
+        <div className="att-ic" style={{ background: 'var(--violet)' }}><Icon name="layers" size={18} /></div>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div className="att-name">{highlightText(title || refId, highlight)}</div>
+          <div className="att-meta" style={{ fontFamily: 'var(--font-mono)' }}>基质引用 · {kind}</div>
+        </div>
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={14} />
+      </div>
+      {open && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-caption)', color: 'var(--text-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 280, overflowY: 'auto' }}>
+          {body ?? '读取中…'}
+        </div>
+      )}
+    </div>
+  );
 }

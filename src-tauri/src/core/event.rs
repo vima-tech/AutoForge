@@ -163,21 +163,57 @@ impl AppEvent {
     }
 }
 
-pub fn emit(app: &AppHandle, event: AppEvent) {
-    let _ = app.emit("autoforge://event", &event);
+/// 事件下沉抽象（后端独立化愿景的关键缝隙）。
+///
+/// 业务层只需持有 `&dyn EventSink` / `&Arc<dyn EventSink>` 即可广播 `AppEvent`，
+/// 无需感知底层是 Tauri `AppHandle`（桌面壳）还是未来的 SSE broadcast（Web 头）。
+/// 把深层业务函数签名里的 `AppHandle` 换成 sink 后，业务代码对传输层彻底无感。
+///
+/// 铁律（对齐 CLAUDE.md）：新增事件只加到 `AppEvent` enum，广播只走本抽象，
+/// 不在业务代码里另起第二种广播方式。
+pub trait EventSink: Send + Sync {
+    /// 广播一个应用事件。实现方负责把它送到各自的传输通道，并顺带处理
+    /// 「有动作价值」事件的持久化副作用（通知收件箱）。
+    fn emit(&self, event: AppEvent);
+}
 
-    // 在传输适配层（本文件是唯一的 Tauri 事件出口）顺手把「有动作价值」的事件
-    // 沉淀进通知收件箱——这样所有 emit 调用点零改动即可获得持久化活动流。
-    // 业务层仍只感知 `event::emit(app, AppEvent)`，不触碰持久化与 Tauri state。
-    if NotificationDraft::from_event(&event).is_some() {
-        if let Some(state) = app.try_state::<crate::state::AppState>() {
-            // 仅在已有 tokio 运行时上下文里 spawn（emit 始终在 Tauri 的 tokio 运行时内被调用）。
-            if tokio::runtime::Handle::try_current().is_ok() {
-                let db = state.db.clone();
-                tokio::spawn(async move {
-                    let _ = crate::commands::notifications::record_notification(&db, &event).await;
-                });
+/// Tauri 桌面壳即事件下沉实现：直接为 `AppHandle` 实现 `EventSink`，于是任何持有
+/// `&AppHandle` 的调用点都能当作 sink 传递（`&AppHandle → &dyn EventSink` 自动 unsize）。
+/// 这是当前唯一的 Tauri 事件出口，广播 + 通知收件箱副作用集中在此一处。
+impl EventSink for AppHandle {
+    fn emit(&self, event: AppEvent) {
+        // 显式走 Tauri 的 `Emitter::emit`，避免与本 trait 的 `emit` 同名递归。
+        let _ = Emitter::emit(self, "autoforge://event", &event);
+
+        // 在传输适配层（本文件是唯一的 Tauri 事件出口）顺手把「有动作价值」的事件
+        // 沉淀进通知收件箱——这样所有 emit 调用点零改动即可获得持久化活动流。
+        // 业务层仍只感知事件广播，不触碰持久化与 Tauri state。
+        if NotificationDraft::from_event(&event).is_some() {
+            if let Some(state) = self.try_state::<crate::state::AppState>() {
+                // 仅在已有 tokio 运行时上下文里 spawn（emit 始终在 Tauri 的 tokio 运行时内被调用）。
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    let db = state.db.clone();
+                    tokio::spawn(async move {
+                        let _ =
+                            crate::commands::notifications::record_notification(&db, &event).await;
+                    });
+                }
             }
         }
     }
+}
+
+/// 让 `Arc<dyn EventSink>`（及 `Arc<AppHandle>` 等）本身也是 `EventSink`，
+/// 使 spawn 到 `'static` 任务里的 sink 可 `.clone()` 后继续广播。
+impl<T: EventSink + ?Sized> EventSink for std::sync::Arc<T> {
+    fn emit(&self, event: AppEvent) {
+        (**self).emit(event);
+    }
+}
+
+/// 兼容/通用出口：泛型化后既接受既有的 `&AppHandle`（全仓约 76 处 `event::emit(app, ev)`
+/// 零改动继续可用），也接受迁移后的 `&dyn EventSink` / `&Arc<dyn EventSink>`。
+/// 迁移一个函数时只需把签名 `app: &AppHandle` 换成 sink，`event::emit(sink, ev)` 调用结构不变。
+pub fn emit<S: EventSink + ?Sized>(sink: &S, event: AppEvent) {
+    sink.emit(event);
 }

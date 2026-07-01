@@ -1928,6 +1928,39 @@ async fn finalize_chat_reply(
     .await
     .map_err(|e| e.to_string())?;
 
+    // 上下文基质登记（基质 §2.2：Agent 历史输出此前仅同任务内累积、跨任务/跨会话不可取）。
+    // 仅**项目绑定**会议室的成功发言投影为 ContextItem（agent_output 源，atr: 读 output_text）。
+    if ok {
+        if let Some((Some(project_id),)) = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT project_id FROM conversations WHERE id=?",
+        )
+        .bind(ctx.conversation_id)
+        .fetch_optional(ctx.db)
+        .await
+        .ok()
+        .flatten()
+        {
+            let cref = format!("atr:{run_id}");
+            let title = format!("会议室发言 · {agent_id}");
+            let _ = crate::core::context::register(
+                ctx.db,
+                crate::core::context::NewContextItem {
+                    project_id: &project_id,
+                    source_kind: crate::core::context::source_kind::AGENT_OUTPUT,
+                    source_id: run_id,
+                    title: &title,
+                    origin_stage: "chat",
+                    origin_actor: agent_id,
+                    content_ref: &cref,
+                    size_hint: text.len() as i64,
+                    trust: crate::core::context::trust::TRUSTED,
+                    labels: "[]",
+                },
+            )
+            .await;
+        }
+    }
+
     event::emit(
         ctx.app,
         event::AppEvent::MessageReceived {

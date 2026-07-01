@@ -99,7 +99,12 @@ pub async fn asr_realtime_start(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let tx = crate::core::asr_realtime::start_session(&state.db, &app, session_id.clone()).await?;
+    let tx = crate::core::asr_realtime::start_session(
+        &state.db,
+        std::sync::Arc::new(app.clone()),
+        session_id.clone(),
+    )
+    .await?;
     state.asr_sessions.lock().await.insert(session_id.clone(), tx);
     Ok(session_id)
 }

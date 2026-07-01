@@ -277,8 +277,10 @@ pub async fn resolve_conflict_manually(
             "AutoForge: 人工解决合并冲突（{} → {}）",
             dev_ref, session.branch_name
         );
+        let sink: std::sync::Arc<dyn crate::core::event::EventSink> =
+            std::sync::Arc::new(app.clone());
         if let Err(e) =
-            crate::tasks::merge::finalize_resolution(&db, &tx, &app, &session, &cr, &issue, &commit_msg)
+            crate::tasks::merge::finalize_resolution(&db, &tx, &sink, &session, &cr, &issue, &commit_msg)
                 .await
         {
             tracing::warn!("resolve_conflict_manually finalize failed for {}: {}", cr_id, e);

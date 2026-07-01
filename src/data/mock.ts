@@ -22,7 +22,10 @@ export type BlockType =
       decided?: 'confirmed' | 'rejected';
       _meta?: { project_id?: string; title?: string; description?: string; category?: string; severity?: string } }
   | { t: 'file_written'; path: string; name: string; preview: string; size_bytes: number; error?: boolean }
-  | { t: 'ws_ref'; path: string; name: string };
+  | { t: 'ws_ref'; path: string; name: string }
+  // 上下文基质引用（G4）：Agent 消息可引用一条基质条目（需求/编码日志/审核意见/草稿…），
+  // 点开走 fetchContextContent 懒取正文。ref=ContextItem.id；kind=source_kind。
+  | { t: 'context_ref'; ref: string; kind: string; title: string };
 
 export interface Message {
   from: string;

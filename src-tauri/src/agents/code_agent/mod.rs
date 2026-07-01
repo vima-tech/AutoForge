@@ -182,6 +182,41 @@ pub async fn log_run(db: &crate::db::Db, input: RunLogInput<'_>) {
         tracing::warn!("code agent run log insert failed: {e}");
         return;
     }
+
+    // 上下文基质登记（基质设计 §2.2 关键缺口：编码 Agent 执行日志此前游离在上下文之外）。
+    // 把本次执行日志投影为 ContextItem，让后续环节/其他 Agent 可引用「上次编码怎么跑的」。
+    // best-effort：查 CR 归属项目后登记；content_ref=clog:<id> 对应 fetch_content 的 clog 读取器。
+    if let Some((project_id,)) =
+        sqlx::query_as::<_, (String,)>("SELECT project_id FROM change_requests WHERE id=?")
+            .bind(input.change_request_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+    {
+        let cref = format!("clog:{id}");
+        let title = format!(
+            "编码执行日志 · {} · {}（exit {}）",
+            input.kind, input.phase, input.exit_code
+        );
+        let _ = crate::core::context::register(
+            db,
+            crate::core::context::NewContextItem {
+                project_id: &project_id,
+                source_kind: crate::core::context::source_kind::CODE_AGENT_LOG,
+                source_id: &id,
+                title: &title,
+                origin_stage: "coding",
+                origin_actor: input.kind,
+                content_ref: &cref,
+                size_hint: stdout_bytes + stderr_bytes,
+                trust: crate::core::context::trust::TRUSTED,
+                labels: "[]",
+            },
+        )
+        .await;
+    }
+
     // 滚动清理：超过保留窗口的日志删除（带索引，开销极低）。
     let _ = sqlx::query("DELETE FROM code_agent_run_logs WHERE created_at < datetime('now', ?)")
         .bind(format!("-{LOG_RETENTION_DAYS} days"))

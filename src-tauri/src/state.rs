@@ -14,6 +14,10 @@ pub struct DevServerHandle {
     pub url: String,
 }
 
+/// 所有字段均为 Clone（Db/JobSender 廉价克隆，其余走 `Arc` 共享底层资源），故整体可
+/// `#[derive(Clone)]`——供 `core::rpc::Ctx` 在 dispatch 边界从托管 state 克隆出 `Arc<AppState>`，
+/// 克隆后各 `Arc` 字段仍指向同一份共享资源（Mutex/信号量/子进程表不分叉）。
+#[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub job_tx: JobSender,

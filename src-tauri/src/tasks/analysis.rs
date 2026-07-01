@@ -1,10 +1,11 @@
-use crate::core::{event, security};
+use crate::core::event::{self, EventSink};
+use crate::core::security;
 use crate::db::Db;
 use anyhow::{anyhow, Result};
 use tracing::{error, info};
 use uuid::Uuid;
 
-pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> {
+pub async fn run(db: &Db, sink: &dyn EventSink, issue_id: &str) -> Result<()> {
     // Load issue
     let issue = sqlx::query_as::<_, crate::models::issue::Issue>("SELECT * FROM issues WHERE id=?")
         .bind(issue_id)
@@ -184,12 +185,9 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
             crate::core::notify::dispatch(db, "analysis_failed", "需求分析失败", &issue.title).await;
             // Reuse AnalysisCompleted so the frontend reloads the issue list and
             // shows the analysis_failed status (no need for a new event variant).
-            event::emit(
-                app,
-                event::AppEvent::AnalysisCompleted {
-                    issue_id: issue.id.clone(),
-                },
-            );
+            sink.emit(event::AppEvent::AnalysisCompleted {
+                issue_id: issue.id.clone(),
+            });
             return Err(anyhow!("analysis failed for issue {}: {}", issue_id, err));
         }
     };
@@ -269,21 +267,15 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, issue_id: &str) -> Result<()> 
     }
 
     // Emit events
-    event::emit(
-        app,
-        event::AppEvent::AnalysisCompleted {
-            issue_id: issue.id.clone(),
-        },
-    );
+    sink.emit(event::AppEvent::AnalysisCompleted {
+        issue_id: issue.id.clone(),
+    });
 
-    event::emit(
-        app,
-        event::AppEvent::ReviewNeeded {
-            cr_id: String::new(),
-            issue_title: issue.title.clone(),
-            stage: 1,
-        },
-    );
+    sink.emit(event::AppEvent::ReviewNeeded {
+        cr_id: String::new(),
+        issue_title: issue.title.clone(),
+        stage: 1,
+    });
 
     info!("analysis completed for issue {}", issue_id);
     Ok(())

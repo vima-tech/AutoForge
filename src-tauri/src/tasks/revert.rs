@@ -1,4 +1,5 @@
-use crate::core::{event, git::GitProxy};
+use crate::core::event::{self, EventSink};
+use crate::core::git::GitProxy;
 use crate::db::Db;
 use crate::state::worktrees_base;
 use anyhow::{anyhow, Result};
@@ -125,7 +126,7 @@ async fn revert_on_dev(
 /// `reverting` (a `merged`-only gate), so a double click can't enqueue twice. On success
 /// the CR/issue become `reverted`; on conflict/failure they are restored to `merged` and
 /// the reason is surfaced for manual handling (撤不干净 = a later change depends on it).
-pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+pub async fn run(db: &Db, sink: &dyn EventSink, cr_id: &str) -> Result<()> {
     let session = sqlx::query_as::<_, crate::models::worktree::WorktreeSession>(
         "SELECT * FROM worktree_sessions WHERE change_request_id=? ORDER BY rowid DESC LIMIT 1",
     )
@@ -151,7 +152,7 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
         Some(sha) if !sha.is_empty() => sha.to_string(),
         _ => {
             // No recorded commit (merged before this feature / empty CR) → restore + report.
-            restore_merged(db, app, cr_id, &cr.issue_id, "该需求无可撤销的合并提交记录（合并早于撤销功能或为空改动）").await;
+            restore_merged(db, sink, cr_id, &cr.issue_id, "该需求无可撤销的合并提交记录（合并早于撤销功能或为空改动）").await;
             return Ok(());
         }
     };
@@ -171,14 +172,11 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
         .unwrap_or_default();
     let dev_is_live = !live_branch.is_empty() && live_branch == project.branch_dev;
 
-    event::emit(
-        app,
-        event::AppEvent::TaskProgress {
-            cr_id: cr_id.to_string(),
-            phase: "reverting".to_string(),
-            note: Some(format!("正在撤销该需求改动（revert {}）…", &merge_commit[..merge_commit.len().min(8)])),
-        },
-    );
+    sink.emit(event::AppEvent::TaskProgress {
+        cr_id: cr_id.to_string(),
+        phase: "reverting".to_string(),
+        note: Some(format!("正在撤销该需求改动（revert {}）…", &merge_commit[..merge_commit.len().min(8)])),
+    });
 
     match revert_on_dev(&git, &project, cr_id, &merge_commit, dev_is_live).await {
         Ok(()) => {
@@ -189,13 +187,10 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
             // 合并 CR：撤销整条 squash 提交即撤销全部成员需求 → 全组置 reverted。
             crate::commands::change_requests::set_cr_issues_status(db, cr_id, "reverted").await?;
             crate::core::notify::dispatch(db, "cr_reverted", "需求改动已撤销", cr_id).await;
-            event::emit(
-                app,
-                event::AppEvent::CrReverted {
-                    cr_id: cr_id.to_string(),
-                    project_id: cr.project_id.clone(),
-                },
-            );
+            sink.emit(event::AppEvent::CrReverted {
+                cr_id: cr_id.to_string(),
+                project_id: cr.project_id.clone(),
+            });
             info!("revert completed for cr {} (revert of {})", cr_id, merge_commit);
             Ok(())
         }
@@ -213,14 +208,14 @@ pub async fn run(db: &Db, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
                 .bind(&session.id)
                 .execute(db)
                 .await;
-            restore_merged(db, app, cr_id, &cr.issue_id, &err.chars().take(300).collect::<String>()).await;
+            restore_merged(db, sink, cr_id, &cr.issue_id, &err.chars().take(300).collect::<String>()).await;
             Ok(())
         }
     }
 }
 
 /// Restore a CR/issue to `merged` after a revert that didn't land, and surface why.
-async fn restore_merged(db: &Db, app: &tauri::AppHandle, cr_id: &str, issue_id: &str, msg: &str) {
+async fn restore_merged(db: &Db, sink: &dyn EventSink, cr_id: &str, issue_id: &str, msg: &str) {
     let _ = sqlx::query("UPDATE change_requests SET status='merged', updated_at=datetime('now') WHERE id=?")
         .bind(cr_id)
         .execute(db)
@@ -228,14 +223,11 @@ async fn restore_merged(db: &Db, app: &tauri::AppHandle, cr_id: &str, issue_id: 
     // 合并 CR：全部成员需求一并回到 merged（revert 没落地）。
     let _ = crate::commands::change_requests::set_cr_issues_status(db, cr_id, "merged").await;
     let _ = issue_id; // 旧单需求参数保留以兼容签名；真源走关联表。
-    event::emit(
-        app,
-        event::AppEvent::WorktreeUpdate {
-            cr_id: cr_id.to_string(),
-            status: "merged".to_string(),
-            message: Some(format!("撤销未完成：{}", msg)),
-        },
-    );
+    sink.emit(event::AppEvent::WorktreeUpdate {
+        cr_id: cr_id.to_string(),
+        status: "merged".to_string(),
+        message: Some(format!("撤销未完成：{}", msg)),
+    });
 }
 
 #[cfg(test)]

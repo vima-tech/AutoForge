@@ -44,8 +44,8 @@ pub(crate) struct CheckResult {
 
 /// Job entry point (kept for the dispatch table). Delegates to `run_and_gate`
 /// and discards the pass/fail result.
-pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
-    run_and_gate(db, tx, app, cr_id).await.map(|_| ())
+pub async fn run(db: &Db, tx: &JobSender, sink: &dyn crate::core::event::EventSink, cr_id: &str) -> Result<()> {
+    run_and_gate(db, tx, sink, cr_id).await.map(|_| ())
 }
 
 /// Run the project's configured checks for a change request.
@@ -58,7 +58,7 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
 pub async fn run_and_gate(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &dyn crate::core::event::EventSink,
     cr_id: &str,
 ) -> Result<bool> {
     let cr = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
@@ -222,7 +222,7 @@ pub async fn run_and_gate(
         )
         .await;
         event::emit(
-            app,
+            sink,
             event::AppEvent::IssueCreated {
                 issue_id,
                 project_id: project.id.clone(),
@@ -248,7 +248,7 @@ pub async fn run_and_gate(
     }
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TestCompleted {
             cr_id: cr_id.to_string(),
             test_session_id: session_id,
