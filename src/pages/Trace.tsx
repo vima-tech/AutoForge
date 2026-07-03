@@ -230,19 +230,14 @@ function AgentOutputsExplorer({ onDrill }: { onDrill: (traceId: string) => void 
             <Select value={role} onChange={setRole} style={{ flex: 1, minWidth: 0 }}
               options={[{ value: '', label: '全部环节' }, ...roles.map(r => ({ value: r, label: r }))]} />
             <div className="seg" style={{ flexShrink: 0 }}>
-              {[['', '全部'], ['ok', 'ok'], ['partial', 'partial'], ['error', 'err']].map(([v, l]) => (
-                <button key={v} className={status === v ? 'on' : ''} onClick={() => setStatus(v)}>{l}</button>
+              {[['', '全部'], ['ok', '成功'], ['partial', '部分'], ['error', '失败']].map(([v, l]) => (
+                <button key={v} className={status === v ? 'on' : ''} onClick={() => setStatus(v)}
+                  title={v === 'partial' ? '部分：批量环节（如 proposer）返回的 JSON 数组里，部分条目解析成功、部分损坏（坏条目已逐条跳过，保留好的）。单产出环节（如 analysis）不会出现此状态。' : undefined}>{l}</button>
               ))}
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', padding: '1px 2px' }}>
             <span>{loading ? '查询中…' : `共 ${rows.length} 条`}</span>
-            {(role || targetId || status) && (
-              <button className="btn btn-ghost btn-sm" style={{ padding: '1px 6px', height: 'auto', fontSize: 'var(--text-micro)', gap: 3 }}
-                onClick={() => { setRole(''); setTargetId(''); setStatus(''); }}>
-                <Icon name="x" size={11} />重置
-              </button>
-            )}
           </div>
         </div>
         <div className="list-body scroll" style={{ flex: 1 }}>
@@ -378,7 +373,7 @@ function SchemaHealth() {
               <div style={{ display: 'flex', gap: 8, padding: 14, flexWrap: 'wrap' }}>
                 <span className="chip">样本 {data.total}</span>
                 <span className="chip green">ok {data.status_ok}</span>
-                <span className="chip amber">partial {data.status_partial}</span>
+                <span className="chip amber" title="部分：批量环节（如 proposer）返回的 JSON 数组里，部分条目解析成功、部分损坏（坏条目已逐条跳过，保留好的）。单产出环节（如 analysis）不会出现此状态。">partial {data.status_partial}</span>
                 <span className="chip red">error {data.status_error}</span>
               </div>
             </div>
@@ -391,7 +386,7 @@ function SchemaHealth() {
                     <div style={{ flex: 1, height: 8, background: 'var(--bg-3)', borderRadius: 'var(--radius-sm)', overflow: 'hidden' }}>
                       <div style={{ width: pct(f.fill_rate), height: '100%', background: barColor(f.fill_rate) }} />
                     </div>
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', flex: '0 0 64px', textAlign: 'right' }}>{pct(f.fill_rate)} · {f.filled}/{f.total}</span>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', color: 'var(--text-3)', flex: '0 0 96px', textAlign: 'right', whiteSpace: 'nowrap' }}>{pct(f.fill_rate)} · {f.filled}/{f.total}</span>
                   </div>
                 ))}
               </div>
