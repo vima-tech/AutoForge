@@ -104,13 +104,13 @@ pub fn run() {
 
             // 合并门构建池 + cgroup CPU 预算：按配置初始化。构建池全平台；CPU 预算仅
             // Linux 且 pct>0 时尝试，失败优雅降级（见 core::cpubudget）。
-            let (build_slots, cpu_budget_pct) = tauri::async_runtime::block_on(async {
+            let (cpu_permits, cpu_budget_pct) = tauri::async_runtime::block_on(async {
                 (
-                    commands::system::load_build_slots(&db).await,
+                    commands::system::load_cpu_permits(&db).await,
                     commands::system::load_cpu_budget_pct(&db).await,
                 )
             });
-            state::init_build_pool(build_slots);
+            core::cpu_permits::init(cpu_permits);
             core::cpubudget::init(cpu_budget_pct);
 
             // 出站 LLM 并发闸：按配置初始化，削平批量任务（如一次分析 50 条需求）打到

@@ -778,7 +778,7 @@ pub async fn run(db: &Db, tx: &JobSender, sink: &std::sync::Arc<dyn crate::core:
 }
 
 /// 合并前阶段（并行）：仅持 `cr_lock`（防解冲突并发写同一 worktree），**不持 merge_lock**，
-/// 故同项目多个 CR 的 premerge 可并行（受 `build_pool` 节流）。跑 Phase1 dev-sync + 测试门 +
+/// 故同项目多个 CR 的 premerge 可并行（受 `core::cpu_permits` 核预算节流）。跑 Phase1 dev-sync + 测试门 +
 /// 安全门；通过则落 `tested_dev_sha` + 置 `merge_ready` 并入队 Merge(land)。开关关闭时兜底走
 /// legacy `run()`（自带 merge_lock，行为不变）。
 pub async fn premerge_run(db: &Db, tx: &JobSender, sink: &std::sync::Arc<dyn crate::core::event::EventSink>, cr_id: &str) -> Result<()> {

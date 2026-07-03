@@ -189,6 +189,24 @@ async fn wait_for_execution_slot(
             continue;
         }
 
+        // 核预算背压（文档 §10）：合并门/巡检的验证队列积压——被阻塞等待核令牌的 check 数
+        // 超过池容量（即 >1× 过载）——时，暂缓再起新 agent：它们最终的 verify 也会排到这条
+        // 队列后面，先放行只会加深积压。与 loadavg 闸同形：仅批内已有 agent 时生效（冷启动
+        // 不挡），且是 throttle+重试而非拒绝，队列消化后自动放行，绝不死锁。loadavg（Linux-
+        // only）测的是即时系统负载，本闸测的是 AutoForge 自身验证门的排队压力，两者互补。
+        if status.active_slots >= 1
+            && crate::core::cpu_permits::queue_depth() > crate::core::cpu_permits::total()
+        {
+            let _ = sqlx::query(
+                "UPDATE job_executions SET status='waiting', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(job_id)
+            .execute(db)
+            .await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
+        }
+
         let (project_id,): (String,) =
             sqlx::query_as("SELECT project_id FROM change_requests WHERE id=?")
                 .bind(cr_id)

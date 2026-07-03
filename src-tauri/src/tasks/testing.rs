@@ -125,14 +125,16 @@ pub async fn run_and_gate(
         std::path::Path::new(&test_path),
     );
 
-    // 构建池：占一个全局许可再跑编译/测试，限制跨项目/CR 的并发编译数，避免批量合并时
-    // 多个 rustc/tsc 同时把 CPU/内存打满。持有至本 CR 全部 check 跑完后随作用域释放。
-    let build_pool = crate::state::build_pool();
-    let _build_permit = build_pool.acquire().await;
-
+    // 相位作用域租约（文档 §4.3）：逐 check 进入计算相时按**权重**借核令牌（tsc=1 / mypy=2 /
+    // pytest·cargo·构建=4），跑完随 lease Drop 归还——把跨 CR/项目同时撞上的验证尖峰排成
+    // 流水线（取代旧 build_pool「整个 CR 全程占 1 permit」的粗粒度）。实际授予令牌数用于把
+    // 子进程扇出封顶（env 途径），与 cgroup 硬兜底互补，让核预算记账诚实。
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
-        results.push(run_check(&test_path, name, command, timeout).await);
+        let weight = crate::core::cpu_permits::weight_of(&name, &command);
+        let lease = crate::core::cpu_permits::acquire(weight).await;
+        results.push(run_check(&test_path, name, command, timeout, lease.granted).await);
+        drop(lease); // 出计算相立刻归还（显式；loop 尾也会 Drop）。
     }
 
     // 差量安全门（diff 驱动）：security(cargo audit)只针对**本 CR 的 diff**——如果本次改动没碰过
@@ -530,9 +532,13 @@ pub(crate) async fn run_check(
     name: String,
     command: String,
     timeout_secs: u64,
+    parallelism: usize,
 ) -> CheckResult {
     let mut cmd = crate::core::platform::shell(&command);
     cmd.current_dir(repo_path)
+        // 子进程扇出封顶（文档 §5.1）：按本 check 实际授予的核令牌数，经环境变量给
+        // rayon/cargo/make/pytest-xdist 施加并行度上限——装了才生效、没装无害，不改命令字符串。
+        .envs(crate::core::cpu_permits::parallelism_env(parallelism))
         // Killed if this future is dropped (e.g. on timeout) instead of leaking.
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
@@ -607,7 +613,7 @@ mod tests {
     // 这几条覆盖成功取输出 / 失败码 / 超时三条路径，守住重构正确性。
     #[tokio::test]
     async fn run_check_captures_success_output() {
-        let r = run_check(".", "echo".into(), "echo af-ok-123".into(), 10).await;
+        let r = run_check(".", "echo".into(), "echo af-ok-123".into(), 10, 1).await;
         assert!(r.ok, "echo should succeed: {}", r.stderr);
         assert_eq!(r.code, 0);
         assert!(r.stdout.contains("af-ok-123"), "stdout={}", r.stdout);
@@ -616,7 +622,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_check_reports_failure_code() {
-        let r = run_check(".", "exit3".into(), "exit 3".into(), 10).await;
+        let r = run_check(".", "exit3".into(), "exit 3".into(), 10, 1).await;
         assert!(!r.ok);
         assert_eq!(r.code, 3);
     }
@@ -624,7 +630,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_check_times_out_and_reaps() {
-        let r = run_check(".", "sleep".into(), "sleep 30".into(), 1).await;
+        let r = run_check(".", "sleep".into(), "sleep 30".into(), 1, 1).await;
         assert!(!r.ok);
         assert!(r.stderr.contains("timeout"), "stderr={}", r.stderr);
     }

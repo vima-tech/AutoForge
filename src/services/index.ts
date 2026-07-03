@@ -267,7 +267,10 @@ export interface ConcurrencyConfig {
   active_slots: number; max_slots: number; pending_review: number;
   pause_threshold: number; stage: string; queue_strategy: string;
   timeout_min: number; idle_timeout_min: number; max_load_factor: number;
-  build_slots: number; cpu_budget_pct: number; llm_max_concurrency: number;
+  cpu_permits: number; cpu_budget_pct: number; llm_max_concurrency: number;
+  // 可观测收敛信号（只读）
+  nproc: number; cpu_permits_available: number; cpu_permits_queue_depth: number;
+  load_avg_1m: number | null; cgroup_throttled_periods: number | null;
 }
 export interface PreviewEnvironment {
   id: string; project_id: string; env_type: string;
@@ -317,7 +320,7 @@ export const getConcurrencyConfig = () => ipc<ConcurrencyConfig>('get_concurrenc
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
   timeout_min: number; idle_timeout_min: number; max_load_factor: number;
-  build_slots: number; cpu_budget_pct: number; llm_max_concurrency: number;
+  cpu_permits: number; cpu_budget_pct: number; llm_max_concurrency: number;
 }>) => ipc<ConcurrencyConfig>('update_concurrency_config', { payload });
 export const listPreviewEnvironments = (projectId?: string, status?: string) =>
   ipc<PreviewEnvironment[]>('list_preview_environments', {

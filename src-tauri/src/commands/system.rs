@@ -90,8 +90,9 @@ pub struct UpdateConcurrencyConfig {
     pub idle_timeout_min: Option<u64>,
     /// 负载感知入场：系统 1 分钟负载 > factor×nproc 时暂缓启动新 agent（0 = 关闭）。
     pub max_load_factor: Option<f64>,
-    /// 合并门构建池：任意时刻最多并发的编译/测试数。
-    pub build_slots: Option<usize>,
+    /// 核预算令牌上限（Tier 2）：合并门测试逐 check 按权重借核令牌，总占用 ≤ 此数（以核计）。
+    #[serde(alias = "build_slots")]
+    pub cpu_permits: Option<usize>,
     /// cgroup CPU 预算（占总核数百分比，0 = 关闭；仅 Linux 生效）。
     pub cpu_budget_pct: Option<u64>,
     /// 出站 LLM 并发上限：同时打到 LLM 服务商的请求数（防 429 限流）。
@@ -112,12 +113,23 @@ pub struct ConcurrencyConfig {
     pub idle_timeout_min: u64,
     /// 负载感知入场阈值（factor×nproc，0 = 关闭）。
     pub max_load_factor: f64,
-    /// 合并门构建池大小。
-    pub build_slots: usize,
+    /// 核预算令牌上限（Tier 2，以核计）。
+    pub cpu_permits: usize,
     /// cgroup CPU 预算（% × nproc，0 = 关闭）。
     pub cpu_budget_pct: u64,
     /// 出站 LLM 并发上限（防 429 限流）。
     pub llm_max_concurrency: usize,
+    // ── 可观测收敛信号（文档 §6；只读，前端展示，非配置项）────────────────────────
+    /// 逻辑 CPU 数（核预算的分母）。
+    pub nproc: usize,
+    /// 核预算当前可用令牌数：`cpu_permits - available` 近似即时占用。
+    pub cpu_permits_available: usize,
+    /// 核预算队列深度：被阻塞等待令牌的验证相数（背压信号；`> cpu_permits` 即触发准入降速）。
+    pub cpu_permits_queue_depth: usize,
+    /// 1 分钟系统负载：稳态应 ≈ nproc。`None` = 非 Linux 不可读。
+    pub load_avg_1m: Option<f64>,
+    /// cgroup 累计被限速周期数（`nr_throttled`）：稳态应几乎不增长。`None` = 未启用 / 非 Linux。
+    pub cgroup_throttled_periods: Option<u64>,
 }
 
 /// 代码 agent 超时默认值（分钟）。墙钟是硬上限兜底，空闲超时是抓卡死的主闸。
@@ -131,25 +143,30 @@ pub const DEFAULT_IDLE_TIMEOUT_MIN: u64 = 8;
 pub const DEFAULT_IDLE_TIMEOUT_MIN: u64 = 0;
 /// 负载感知入场默认阈值：负载 > 1.5×nproc 才暂缓——只在真过载时踩刹车，正常不挡。
 pub const DEFAULT_MAX_LOAD_FACTOR: f64 = 1.5;
-/// 合并门构建池默认并发：2 个编译/测试同时跑（每个可吃多核，故不宜大）。
-pub const DEFAULT_BUILD_SLOTS: usize = 2;
-/// CPU 预算默认 0=关（cgroup 依环境，显式开启更安全；建议 Linux 上设 70~80）。
-pub const DEFAULT_CPU_BUDGET_PCT: u64 = 0;
+/// 核预算令牌上限（Tier 2）：合并门测试逐 check 按权重借核令牌，任意时刻总占用 ≤ 此数。
+/// 默认 = nproc（见 `load_cpu_permits`），以「核」为单位，取代旧「构建池 CR 计数」。
+pub const CPU_PERMITS_MAX: usize = 64;
+/// CPU 预算默认 90%×nproc：cgroup v2 硬兜底默认开启，把所有 code agent 进程组 + 合并门
+/// 测试的【总 CPU】封顶在 90%×nproc，留 ~10% 给控制平面/webview，封住 N 个并行 claude -p
+/// 内部 rustc/tsc 突发把机器打满。非 Linux / 无 cgroup v2 委派时 `cpubudget::init` 自动优雅
+/// 降级为空操作（回退到 nice + 负载闸 + max_slots），零副作用。UI 仍可改回 0 显式关闭。
+pub const DEFAULT_CPU_BUDGET_PCT: u64 = 90;
 /// 出站 LLM 并发上限默认值：限制同时打到 LLM 服务商的请求数，防批量任务（如一次分析 50 条
 /// 需求）瞬间数十并发触发 429 限流。保守取 4，可在「并发控制」按服务商配额调高。
 pub const DEFAULT_LLM_CONCURRENCY: usize = 4;
 
-/// 读取合并门构建池大小（clamp [1, 32]）。
-pub async fn load_build_slots(db: &crate::db::Db) -> usize {
+/// 读取核预算令牌上限（Tier 2，clamp [1, CPU_PERMITS_MAX]）。无值时默认 = nproc——以「核」
+/// 为单位，让合并门的验证并发自动贴合机器核数（取代旧 build_slots 的固定 2）。
+pub async fn load_cpu_permits(db: &crate::db::Db) -> usize {
     let v: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE key='execution.build_slots'")
+        sqlx::query_as("SELECT value FROM app_settings WHERE key='execution.cpu_permits'")
             .fetch_optional(db)
             .await
             .ok()
             .flatten();
     v.and_then(|(s,)| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_BUILD_SLOTS)
-        .clamp(1, 32)
+        .unwrap_or_else(crate::core::cpu_permits::nproc)
+        .clamp(1, CPU_PERMITS_MAX)
 }
 
 /// 读取 CPU 预算百分比（clamp [0, 100]，0=关）。
@@ -723,18 +740,19 @@ pub async fn update_concurrency_config(
         .await
         .map_err(|e| e.to_string())?;
     }
-    if let Some(b) = payload.build_slots {
+    if let Some(b) = payload.cpu_permits {
+        let n = b.clamp(1, CPU_PERMITS_MAX);
         sqlx::query(
             "INSERT INTO app_settings (key, value, updated_at)
-             VALUES ('execution.build_slots', ?, datetime('now'))
+             VALUES ('execution.cpu_permits', ?, datetime('now'))
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         )
-        .bind(b.clamp(1, 32).to_string())
+        .bind(n.to_string())
         .execute(&state.db)
         .await
         .map_err(|e| e.to_string())?;
-        // 即时调整构建池容量（与 max_slots/cpu_budget 一致，无需重启）。
-        crate::state::set_build_slots(b.clamp(1, 32));
+        // 即时调整核预算令牌上限（与 max_slots/cpu_budget 一致，无需重启）。
+        crate::core::cpu_permits::set_permits(n);
     }
     if let Some(p) = payload.cpu_budget_pct {
         sqlx::query(
@@ -766,9 +784,14 @@ pub async fn update_concurrency_config(
 
     let (wall_secs, idle_secs) = load_execution_limits(&state.db).await;
     let max_load_factor = load_max_load_factor(&state.db).await;
-    let build_slots = load_build_slots(&state.db).await;
+    let cpu_permits = load_cpu_permits(&state.db).await;
     let cpu_budget_pct = load_cpu_budget_pct(&state.db).await;
     let llm_max_concurrency = load_llm_concurrency(&state.db).await;
+    let nproc = crate::core::cpu_permits::nproc();
+    let cpu_permits_available = crate::core::cpu_permits::available();
+    let cpu_permits_queue_depth = crate::core::cpu_permits::queue_depth();
+    let load_avg_1m = crate::core::reaper::load_avg_1m();
+    let cgroup_throttled_periods = crate::core::cpubudget::throttle_stats().map(|(n, _)| n);
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,
         max_slots: status.max_slots,
@@ -779,9 +802,14 @@ pub async fn update_concurrency_config(
         timeout_min: wall_secs / 60,
         idle_timeout_min: idle_secs / 60,
         max_load_factor,
-        build_slots,
+        cpu_permits,
         cpu_budget_pct,
         llm_max_concurrency,
+        nproc,
+        cpu_permits_available,
+        cpu_permits_queue_depth,
+        load_avg_1m,
+        cgroup_throttled_periods,
     })
 }
 
@@ -792,9 +820,14 @@ pub async fn get_concurrency_config(
     let status = state.concurrency.status();
     let (wall_secs, idle_secs) = load_execution_limits(&state.db).await;
     let max_load_factor = load_max_load_factor(&state.db).await;
-    let build_slots = load_build_slots(&state.db).await;
+    let cpu_permits = load_cpu_permits(&state.db).await;
     let cpu_budget_pct = load_cpu_budget_pct(&state.db).await;
     let llm_max_concurrency = load_llm_concurrency(&state.db).await;
+    let nproc = crate::core::cpu_permits::nproc();
+    let cpu_permits_available = crate::core::cpu_permits::available();
+    let cpu_permits_queue_depth = crate::core::cpu_permits::queue_depth();
+    let load_avg_1m = crate::core::reaper::load_avg_1m();
+    let cgroup_throttled_periods = crate::core::cpubudget::throttle_stats().map(|(n, _)| n);
 
     Ok(ConcurrencyConfig {
         active_slots: status.active_slots,
@@ -806,9 +839,14 @@ pub async fn get_concurrency_config(
         timeout_min: wall_secs / 60,
         idle_timeout_min: idle_secs / 60,
         max_load_factor,
-        build_slots,
+        cpu_permits,
         cpu_budget_pct,
         llm_max_concurrency,
+        nproc,
+        cpu_permits_available,
+        cpu_permits_queue_depth,
+        load_avg_1m,
+        cgroup_throttled_periods,
     })
 }
 

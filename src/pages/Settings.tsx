@@ -45,7 +45,7 @@ import {
   type LlmConfig, type Agent, type SystemHealth, type PreviewEnvironment,
   type TestSession, type AdminDecision, type IntakeConfig, type WebhookStatus,
   type NotifyChannel, type AutoPassPolicy, type RoleSlot, type EmbeddingSettings,
-  type WebSearchSettings,
+  type WebSearchSettings, type ConcurrencyConfig,
   type Project, type SelfUpdateStatus, type SelfUpdateResult,
   type JobFailure,
   listCodeAgents, upsertCodeAgent, deleteCodeAgent, setDefaultCodeAgent,
@@ -1958,16 +1958,18 @@ function CodeAgentSkillSettings() {
 }
 
 function ConcurrencySettings() {
-  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, build_slots: 2, cpu_budget_pct: 0, llm_max_concurrency: 4 });
+  const [form, setForm] = useState({ max_slots: 5, pause_threshold: 20, queue_strategy: 'priority', timeout_min: 30, idle_timeout_min: 8, max_load_factor: 1.5, cpu_permits: 8, cpu_budget_pct: 90, llm_max_concurrency: 4 });
   const [result, setResult] = useState('');
+  // 可观测收敛信号（只读，文档 §6）：load≈核数 / 令牌队列非空但有界 / 几乎无 throttling。
+  const [signals, setSignals] = useState<Pick<ConcurrencyConfig, 'nproc' | 'cpu_permits' | 'cpu_permits_available' | 'cpu_permits_queue_depth' | 'load_avg_1m' | 'cgroup_throttled_periods'> | null>(null);
+
+  const applyCfg = (cfg: ConcurrencyConfig) => {
+    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy, timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor, cpu_permits: cfg.cpu_permits, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency });
+    setSignals({ nproc: cfg.nproc, cpu_permits: cfg.cpu_permits, cpu_permits_available: cfg.cpu_permits_available, cpu_permits_queue_depth: cfg.cpu_permits_queue_depth, load_avg_1m: cfg.load_avg_1m, cgroup_throttled_periods: cfg.cgroup_throttled_periods });
+  };
 
   useEffect(() => {
-    getConcurrencyConfig().then(cfg => setForm(f => ({
-      ...f,
-      max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy,
-      timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor,
-      build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency,
-    }))).catch(() => { });
+    getConcurrencyConfig().then(applyCfg).catch(() => { });
   }, []);
 
   const save = async () => {
@@ -1978,11 +1980,11 @@ function ConcurrencySettings() {
       timeout_min: form.timeout_min,
       idle_timeout_min: form.idle_timeout_min,
       max_load_factor: form.max_load_factor,
-      build_slots: form.build_slots,
+      cpu_permits: form.cpu_permits,
       cpu_budget_pct: form.cpu_budget_pct,
       llm_max_concurrency: form.llm_max_concurrency,
     });
-    setForm({ max_slots: cfg.max_slots, pause_threshold: cfg.pause_threshold, queue_strategy: cfg.queue_strategy, timeout_min: cfg.timeout_min, idle_timeout_min: cfg.idle_timeout_min, max_load_factor: cfg.max_load_factor, build_slots: cfg.build_slots, cpu_budget_pct: cfg.cpu_budget_pct, llm_max_concurrency: cfg.llm_max_concurrency });
+    applyCfg(cfg);
     setResult(`${cfg.stage} · ${cfg.active_slots}/${cfg.max_slots} · 待审核 ${cfg.pending_review}`);
   };
 
@@ -1992,8 +1994,9 @@ function ConcurrencySettings() {
       <div className="set-desc">控制代码 Agent 执行槽位、审核积压背压阈值、代码 agent 超时回收与 LLM 出站并发（防服务商限流）。</div>
       <div className="cfg-card">
         <div className="cfg-fields">
-          <div className="field"><label>最大并发槽位</label>
+          <div className="field"><label>会话槽位（Tier 1）</label>
             <input type="number" min="1" max="32" value={form.max_slots} onChange={e => setForm(f => ({ ...f, max_slots: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>每项目同时在产（执行+待审）的 CR 上限，约束内存/fd/API 并发——不再约束 CPU（CPU 由下方核预算+cgroup 真限）。</span>
           </div>
           <div className="field"><label>暂停阈值</label>
             <input type="number" min="1" max="200" value={form.pause_threshold} onChange={e => setForm(f => ({ ...f, pause_threshold: Number(e.target.value) }))} />
@@ -2014,13 +2017,13 @@ function ConcurrencySettings() {
             <input type="number" min="0" max="8" step="0.5" value={form.max_load_factor} onChange={e => setForm(f => ({ ...f, max_load_factor: Number(e.target.value) }))} />
             <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>系统负载超过 该值×CPU核数 时暂缓再起新 agent（在已有任务运行时）；0=关闭。压住批量过载。</span>
           </div>
-          <div className="field"><label>构建池并发</label>
-            <input type="number" min="1" max="16" value={form.build_slots} onChange={e => setForm(f => ({ ...f, build_slots: Number(e.target.value) }))} />
-            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>合并门测试任意时刻最多并发编译数，限住批量合并的编译波。全平台。</span>
+          <div className="field"><label>核预算令牌（Tier 2 · 核）</label>
+            <input type="number" min="1" max="64" value={form.cpu_permits} onChange={e => setForm(f => ({ ...f, cpu_permits: Number(e.target.value) }))} />
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>合并门测试逐 check 按权重借核令牌（tsc=1 / pytest·cargo·构建=4），总占用 ≤ 此数。以核为单位，默认=CPU核数；把同时撞上的验证尖峰排成流水线。全平台。</span>
           </div>
-          <div className="field"><label>CPU 预算（% × 核数）</label>
+          <div className="field"><label>CPU 硬兜底（% × 核数）</label>
             <input type="number" min="0" max="100" step="5" value={form.cpu_budget_pct} onChange={e => setForm(f => ({ ...f, cpu_budget_pct: Number(e.target.value) }))} />
-            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>cgroup 把 agent 自测+门的总 CPU 限到 该%×核数（不禁测试、只限速）；0=关闭。仅 Linux 生效，建议 70~80。</span>
+            <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 4 }}>cgroup 把 agent 自测+门的总 CPU 硬限到 该%×核数（不禁测试、只限速），兜住不透明 claude -p 内部扇出；0=关闭。仅 Linux 生效，默认 90。</span>
           </div>
           <div className="field"><label>LLM 并发上限</label>
             <input type="number" min="1" max="32" value={form.llm_max_concurrency} onChange={e => setForm(f => ({ ...f, llm_max_concurrency: Number(e.target.value) }))} />
@@ -2030,6 +2033,35 @@ function ConcurrencySettings() {
             <button className="btn btn-primary" onClick={save}><Icon name="check" size={14} />保存配置</button>
             {result && <span style={{ fontSize: 'var(--text-label)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{result}</span>}
           </div>
+          {signals && (
+            <div className="field full" style={{ gap: 8 }}>
+              <label>收敛信号（只读）</label>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {(() => {
+                  const load = signals.load_avg_1m;
+                  const loadOk = load != null && load <= signals.nproc * 1.2;
+                  const used = signals.cpu_permits - signals.cpu_permits_available;
+                  const qd = signals.cpu_permits_queue_depth;
+                  const backpressure = qd > signals.cpu_permits; // §10 准入降速触发线
+                  const thr = signals.cgroup_throttled_periods;
+                  const chip = (cls: string, label: string) => (
+                    <span className={`chip ${cls}`}>{label}</span>
+                  );
+                  return <>
+                    {load == null
+                      ? chip('', `负载 —（非 Linux）`)
+                      : chip(loadOk ? 'green' : 'amber', `负载 ${load.toFixed(2)} / ${signals.nproc} 核`)}
+                    {chip(used > 0 && signals.cpu_permits_available > 0 ? 'green' : (signals.cpu_permits_available === 0 ? 'amber' : ''), `核令牌 ${used}/${signals.cpu_permits} 在用`)}
+                    {chip(qd === 0 ? '' : (backpressure ? 'red' : 'amber'), `队列深度 ${qd}${backpressure ? ' · 背压中' : ''}`)}
+                    {thr == null
+                      ? chip('', `throttle —（未启用/非 Linux）`)
+                      : chip(thr === 0 ? 'green' : 'amber', `throttle ${thr} 次`)}
+                  </>;
+                })()}
+              </div>
+              <span style={{ fontSize: 'var(--text-caption)', color: 'var(--text-faint)', marginTop: 2 }}>调对的稳态：负载≈核数、核令牌在用但未满、throttle 几乎不增长（文档 §6）。保存后刷新。</span>
+            </div>
+          )}
         </div>
       </div>
     </div>

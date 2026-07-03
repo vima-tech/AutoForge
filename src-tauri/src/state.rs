@@ -95,49 +95,8 @@ pub fn agents_write_lock() -> &'static Mutex<()> {
     AGENTS_WRITE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// 全局「构建/测试池」信号量：所有合并门测试（`tasks/testing.rs::run_and_gate`）
-/// 占一个许可，跨项目/CR 共享，限制任意时刻并发编译/测试数（默认 2），避免批量合并
-/// 时多个 rustc/tsc 同时跑把 CPU 和内存打满。纯进程内、零 Tauri，全平台有效。
-/// 大小在启动时按 `execution.build_slots` 初始化；未初始化时惰性回退为 2。
-static BUILD_POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-/// 当前构建池容量（用于 `set_build_slots` 计算增减许可数）。
-static BUILD_SLOTS: std::sync::OnceLock<std::sync::Mutex<usize>> = std::sync::OnceLock::new();
-
-/// 启动时按配置初始化构建池大小（幂等：仅首次生效）。
-pub fn init_build_pool(slots: usize) {
-    let n = slots.max(1);
-    let _ = BUILD_POOL.set(Arc::new(tokio::sync::Semaphore::new(n)));
-    let _ = BUILD_SLOTS.set(std::sync::Mutex::new(n));
-}
-
-/// 取全局构建池（未初始化则惰性建一个大小 2 的）。
-pub fn build_pool() -> Arc<tokio::sync::Semaphore> {
-    BUILD_POOL
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
-        .clone()
-}
-
-/// 热改构建池容量（Settings 即时生效，与 max_slots/cpu_budget 一致）：
-/// 增 → `add_permits` 立即放大；减 → 后台收回多余许可（等正在跑的编译让出后 forget），
-/// 不阻塞调用方。
-pub fn set_build_slots(slots: usize) {
-    let n = slots.max(1);
-    let sem = build_pool();
-    let cur_lock = BUILD_SLOTS.get_or_init(|| std::sync::Mutex::new(2));
-    let mut cur = cur_lock.lock().unwrap();
-    if n > *cur {
-        sem.add_permits(n - *cur);
-        *cur = n;
-    } else if n < *cur {
-        let remove = (*cur - n) as u32;
-        *cur = n;
-        tokio::spawn(async move {
-            if let Ok(p) = sem.acquire_many_owned(remove).await {
-                p.forget();
-            }
-        });
-    }
-}
+// 旧「构建/测试池」（BUILD_POOL / build_slots）已退役，由 `core::cpu_permits` 的加权核预算
+// 令牌池取代——从「1 CR = 1 permit」升级为「按核加权 + 逐 check 相位租约」。见该模块文档。
 
 /// 运行中编码 Agent 的实时日志缓冲（按 cr_id）。前端中途进入「执行日志」时，realtime
 /// `CodeAgentLog` 事件只能拿到订阅之后的增量；此缓冲自任务开始累计全文，供
