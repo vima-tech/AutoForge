@@ -2302,6 +2302,7 @@ export default function ConversationsPage() {
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs' | 'deliverables'>('docs');
+  const [fileQuery,      setFileQuery]      = useState('');   // 上下文面板「工作区文件/只读文件」检索关键词
   const [wsRefs,         setWsRefs]         = useState<WorkspaceRef[]>([]);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
@@ -3253,9 +3254,31 @@ export default function ConversationsPage() {
                   )}
 
                   {/* Workspace (.autoforge) section */}
-                  {conv?.project_id && (
+                  {conv?.project_id && (() => {
+                    const q = fileQuery.trim().toLowerCase();
+                    const matchFile = (name: string, path: string) =>
+                      !q || name.toLowerCase().includes(q) || path.toLowerCase().includes(q);
+                    const wsInTab = workspaceFiles.filter(f => f.subfolder === workspaceTab);
+                    const wsShown = wsInTab.filter(f => matchFile(f.name, f.rel_path));
+                    const projShown = projectFiles.filter(f => matchFile(f.name, f.rel_path));
+                    return (
                     <>
                       <div style={{ height: 1, background: 'var(--border)', margin: '6px 0 2px' }} />
+                      <div className="chat-search-box" style={{ height: 30, margin: '4px 4px 6px' }}>
+                        <Icon name="search" size={13} />
+                        <input
+                          value={fileQuery}
+                          onChange={e => setFileQuery(e.target.value)}
+                          placeholder="检索工作区/只读文件名或路径"
+                          style={{ fontSize: 'var(--text-caption)' }}
+                        />
+                        {fileQuery && (
+                          <button className="icon-btn" title="清空检索" style={{ width: 20, height: 20, flex: 'none' }}
+                            onClick={() => setFileQuery('')}>
+                            <Icon name="x" size={12} />
+                          </button>
+                        )}
+                      </div>
                       <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                         <Icon name="folder" size={12} style={{ color: 'var(--ember)' }} />
                         工作区文件
@@ -3270,15 +3293,21 @@ export default function ConversationsPage() {
                         </div>
                       </div>
                       {/* File list：点击即把文件作为附件引用暂存到输入框上方，发送时随消息携带 */}
-                      {workspaceFiles.filter(f => f.subfolder === workspaceTab).length === 0 ? (
+                      {wsShown.length === 0 ? (
                         <div className="empty-compact" style={{ padding: '8px 8px' }}>
-                          .autoforge/{workspaceTab}/ 暂无文件
-                          <span style={{ display: 'block', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 3 }}>
-                            让 Agent 创建文档，或直接点击 Artifact 的"存入 {workspaceTab}"按钮
-                          </span>
+                          {q && wsInTab.length > 0 ? (
+                            <>无匹配「{fileQuery}」的文件</>
+                          ) : (
+                            <>
+                              .autoforge/{workspaceTab}/ 暂无文件
+                              <span style={{ display: 'block', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 3 }}>
+                                让 Agent 创建文档，或直接点击 Artifact 的"存入 {workspaceTab}"按钮
+                              </span>
+                            </>
+                          )}
                         </div>
                       ) : (
-                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => {
+                        wsShown.map(f => {
                           const referenced = wsRefs.some(r => r.path === f.rel_path);
                           return (
                           <div key={f.rel_path} className="mention-row" style={{ cursor: 'pointer' }}
@@ -3305,10 +3334,12 @@ export default function ConversationsPage() {
                         <Icon name="zap" size={12} style={{ color: 'var(--ember)' }} />
                         只读上下文文件
                       </div>
-                      {projectFiles.length === 0 && (
-                        <div className="empty-compact" style={{ padding: '6px 8px' }}>项目目录无可引用文件</div>
+                      {projShown.length === 0 && (
+                        <div className="empty-compact" style={{ padding: '6px 8px' }}>
+                          {q && projectFiles.length > 0 ? <>无匹配「{fileQuery}」的文件</> : '项目目录无可引用文件'}
+                        </div>
                       )}
-                      {projectFiles.slice(0, 12).map(f => (
+                      {projShown.slice(0, 12).map(f => (
                         <div key={f.rel_path} className="mention-row" style={{ paddingTop: 5, paddingBottom: 5 }}>
                           <div className="cfg-logo" style={{ width: 26, height: 26, flexShrink: 0,
                             background: f.is_priority ? 'var(--ember)' : f.pinned ? 'var(--amber)' : 'var(--bg-4)' }}>
@@ -3349,7 +3380,8 @@ export default function ConversationsPage() {
                         只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/、.autoforge/specs/ 和 .autoforge/deliverables/
                       </div>
                     </>
-                  )}
+                    );
+                  })()}
                 </div>
               )}
 
