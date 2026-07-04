@@ -1718,9 +1718,10 @@ export interface ContextItem {
   created_at: string;
   updated_at: string;
 }
-/** 枚举一个项目的上下文条目（薄索引元数据；access #1）。 */
-export const listContextItems = (projectId: string, kinds?: string[], limit?: number) =>
-  ipc<ContextItem[]>('list_context_items', { projectId, kinds, limit });
+/** 枚举一个项目的上下文条目（薄索引元数据；access #1）。
+ *  `query` 有值 = 标题关键词搜索（后端下推全部来源召回，产物类置前）。 */
+export const listContextItems = (projectId: string, kinds?: string[], limit?: number, query?: string) =>
+  ipc<ContextItem[]>('list_context_items', { projectId, kinds, limit, query });
 /** 按取景框装配上下文条目（refs 置顶 → kind 优先级 → 预算裁剪）。 */
 export const assembleContext = (
   projectId: string,

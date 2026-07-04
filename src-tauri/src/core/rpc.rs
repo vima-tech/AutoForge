@@ -232,13 +232,20 @@ pub fn register_substrate_commands(reg: &mut CommandRegistry) {
         project_id: String,
         kinds: Option<Vec<String>>,
         limit: Option<i64>,
+        query: Option<String>,
     }
     reg.register("ctx.list", None, |ctx: Ctx, a: ListArgs| async move {
         let kinds = a.kinds.unwrap_or_default();
         let kr: Vec<&str> = kinds.iter().map(|s| s.as_str()).collect();
-        context::list(ctx.db(), &a.project_id, &kr, a.limit.unwrap_or(200))
-            .await
-            .map_err(RpcError::from)
+        context::list(
+            ctx.db(),
+            &a.project_id,
+            &kr,
+            a.limit.unwrap_or(200),
+            a.query.as_deref(),
+        )
+        .await
+        .map_err(RpcError::from)
     });
 
     #[derive(serde::Deserialize)]
@@ -253,7 +260,8 @@ pub fn register_substrate_commands(reg: &mut CommandRegistry) {
             project_id: a.project_id,
             include: a.include.unwrap_or_default(),
             refs: a.refs.unwrap_or_default(),
-            budget_bytes: a.budget_bytes.unwrap_or(0),
+            // None = 默认预算兜底；Some(0) = 显式不限（与 Tauri 命令口径一致）。
+            budget_bytes: a.budget_bytes.unwrap_or(context::DEFAULT_BUDGET_BYTES),
         };
         context::assemble(ctx.db(), &req).await.map_err(RpcError::from)
     });

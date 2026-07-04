@@ -237,6 +237,7 @@ pub fn builtin_catalog() -> Vec<Box<dyn BuiltinTool>> {
         Box::new(specs::SpecToolFactory::List),
         Box::new(specs::SpecToolFactory::Read),
         Box::new(context_recall::RecallContextFactory),
+        Box::new(context_recall::ReadContextFactory),
         Box::new(memory::MemoryToolFactory::Recall),
         Box::new(memory::MemoryToolFactory::Remember),
     ]

@@ -31,19 +31,27 @@ pub async fn rpc_dispatch(
 }
 
 /// 枚举一个项目的上下文条目（薄索引元数据；access #1）。
-/// `kinds` 为空 = 不限来源；`limit` 默认 200。
+/// `kinds` 为空 = 不限来源；`limit` 默认 200；`query` 有值 = 标题关键词搜索
+/// （下推 provider 全量召回，结果按 kind 优先级 + 时间排序）。
 #[tauri::command]
 pub async fn list_context_items(
     project_id: String,
     kinds: Option<Vec<String>>,
     limit: Option<i64>,
+    query: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ContextItem>, String> {
     let kinds_v = kinds.unwrap_or_default();
     let kinds_ref: Vec<&str> = kinds_v.iter().map(|s| s.as_str()).collect();
-    context::list(&state.db, &project_id, &kinds_ref, limit.unwrap_or(200))
-        .await
-        .map_err(|e| e.to_string())
+    context::list(
+        &state.db,
+        &project_id,
+        &kinds_ref,
+        limit.unwrap_or(200),
+        query.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 按取景框装配上下文条目（refs 置顶 → kind 优先级 → 预算裁剪；access #1 + §4.2）。
@@ -59,7 +67,8 @@ pub async fn assemble_context(
         project_id,
         include: include.unwrap_or_default(),
         refs: refs.unwrap_or_default(),
-        budget_bytes: budget_bytes.unwrap_or(0),
+        // None = 默认预算兜底；Some(0) = 显式不限（逃生口）。
+        budget_bytes: budget_bytes.unwrap_or(context::DEFAULT_BUDGET_BYTES),
     };
     context::assemble(&state.db, &req)
         .await

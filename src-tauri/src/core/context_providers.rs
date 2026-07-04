@@ -386,12 +386,14 @@ pub trait SourceProvider: Send + Sync {
         trust::TRUSTED
     }
     /// 活查该项目下本来源的条目元数据（不搬正文）。
+    /// `query` 有值时按标题子串过滤（DB 来源下推 LIKE；文件来源按相对路径过滤）。
     async fn enumerate(
         &self,
         db: &Db,
         project_id: &str,
         repo_path: Option<&str>,
         limit: i64,
+        query: Option<&str>,
     ) -> Result<Vec<ContextItem>>;
     /// 懒取一条正文。外部来源实现须自行过注入闸（本层在 [`fetch_kind`] 统一兜一道）。
     async fn fetch(
@@ -401,6 +403,19 @@ pub trait SourceProvider: Send + Sync {
         repo_path: Option<&str>,
         max_chars: usize,
     ) -> Result<String>;
+}
+
+/// LIKE 模式转义：`%` `_` `\` 前加 `\` 再包 `%…%`（配合 `ESCAPE '\'`），
+/// 防用户输入被当通配符。中文子串是字节级匹配，天然可用。
+pub(crate) fn like_pattern(q: &str) -> String {
+    let mut esc = String::with_capacity(q.len() + 8);
+    for c in q.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            esc.push('\\');
+        }
+        esc.push(c);
+    }
+    format!("%{esc}%")
 }
 
 /// 标识符安全校验（防 typo 字面量逃逸成注入）：仅允许 `[a-z_][a-z0-9_.]*`。
@@ -433,15 +448,21 @@ impl SourceProvider for DbTableProvider {
         project_id: &str,
         _repo_path: Option<&str>,
         limit: i64,
+        query: Option<&str>,
     ) -> Result<Vec<ContextItem>> {
         let s = self.0;
-        // 组装 WHERE：项目作用域（可空=全局）+ 恒定额外谓词。
+        // 组装 WHERE：项目作用域（可空=全局）+ 恒定额外谓词 + 可选标题搜索（LIKE 下推）。
         let mut conds: Vec<String> = Vec::new();
         if !s.scope_project.is_empty() {
             conds.push(format!("{} = ?", s.scope_project));
         }
         if !s.extra_where.is_empty() {
             conds.push(s.extra_where.to_string());
+        }
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+        if query.is_some() {
+            // title_sql 是受信任的静态表达式；用户 query 走 bind + ESCAPE 转义。
+            conds.push(format!("({}) LIKE ? ESCAPE '\\'", s.title_sql));
         }
         let where_sql = if conds.is_empty() {
             String::new()
@@ -470,6 +491,9 @@ impl SourceProvider for DbTableProvider {
             sqlx::query_as::<_, (String, Option<String>, Option<String>, i64, Option<String>)>(&sql);
         if !s.scope_project.is_empty() {
             q = q.bind(project_id);
+        }
+        if let Some(qs) = query {
+            q = q.bind(like_pattern(qs));
         }
         q = q.bind(limit);
         let rows = q.fetch_all(db).await?;
@@ -538,6 +562,7 @@ impl SourceProvider for WorkspaceFileProvider {
         project_id: &str,
         repo_path: Option<&str>,
         limit: i64,
+        query: Option<&str>,
     ) -> Result<Vec<ContextItem>> {
         let Some(repo) = repo_path.filter(|r| !r.is_empty()) else {
             return Ok(vec![]); // 未配置本地仓库 → 无文件来源
@@ -552,6 +577,11 @@ impl SourceProvider for WorkspaceFileProvider {
                     rels.push((*f).to_string());
                 }
             }
+        }
+        // 搜索：按相对路径子串过滤（文件来源量小，内存过滤足够）。
+        if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
+            let ql = q.to_lowercase();
+            rels.retain(|r| r.to_lowercase().contains(&ql));
         }
         rels.truncate(limit.max(0) as usize);
 
@@ -702,13 +732,14 @@ pub async fn enumerate_all(
     kinds: &[&str],
     repo_path: Option<&str>,
     per_source_limit: i64,
+    query: Option<&str>,
 ) -> Result<Vec<ContextItem>> {
     let mut out: Vec<ContextItem> = Vec::new();
     for p in providers() {
         if !kinds.is_empty() && !kinds.contains(&p.kind()) {
             continue;
         }
-        match p.enumerate(db, project_id, repo_path, per_source_limit).await {
+        match p.enumerate(db, project_id, repo_path, per_source_limit, query).await {
             Ok(mut items) => out.append(&mut items),
             Err(e) => {
                 tracing::warn!("[context] provider {} enumerate 失败: {}", p.kind(), e);
@@ -718,6 +749,46 @@ pub async fn enumerate_all(
     // 全局按时间倒序（跨来源合并后统一定序）。
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(out)
+}
+
+/// 归属校验：`<kind>:<source_id>` 是否属于 `project_id`。
+/// 供消费侧（如 read_context 工具）在 [`crate::core::context::get`] 反构出**无归属**的
+/// 最小条目后补验——DB 来源的 `fetch` 本身不带项目过滤，缺这道就是跨项目读洞。
+/// - DB 表来源：用声明的 `scope_from`/`scope_project` 拼 `SELECT 1` 活查；
+///   `scope_project` 为空 = 全局来源（cfg_* 等），视为归属任意项目。
+/// - 文件来源：`fetch` 走**本项目** repo_path 解析，外项目路径天然取不到 → 放行。
+/// - 未知 kind：拒绝。
+pub async fn belongs_to_project(
+    db: &Db,
+    kind: &str,
+    source_id: &str,
+    project_id: &str,
+) -> Result<bool> {
+    for s in SOURCES {
+        if s.kind == kind {
+            if s.scope_project.is_empty() {
+                return Ok(true);
+            }
+            let sql = format!(
+                "SELECT 1 FROM {from} WHERE t.{id} = ? AND {scope} = ? LIMIT 1",
+                from = s.scope_from,
+                id = s.id_col,
+                scope = s.scope_project,
+            );
+            let hit = sqlx::query_as::<_, (i64,)>(&sql)
+                .bind(source_id)
+                .bind(project_id)
+                .fetch_optional(db)
+                .await?;
+            return Ok(hit.is_some());
+        }
+    }
+    for f in FILE_SOURCES {
+        if f.kind == kind {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 按 kind 懒取一条正文（替代原硬编码 scheme match）。外部来源过注入闸（I4）。
@@ -794,6 +865,16 @@ mod tests {
         }
     }
 
+    /// LIKE 转义：通配符与转义符本身都被转义，中文原样保留。
+    #[test]
+    fn like_pattern_escapes_wildcards() {
+        assert_eq!(like_pattern("abc"), "%abc%");
+        assert_eq!(like_pattern("100%"), "%100\\%%");
+        assert_eq!(like_pattern("a_b"), "%a\\_b%");
+        assert_eq!(like_pattern("a\\b"), "%a\\\\b%");
+        assert_eq!(like_pattern("登录页"), "%登录页%");
+    }
+
     #[test]
     fn is_safe_ident_rejects_injection() {
         assert!(is_safe_ident("issues"));
@@ -855,7 +936,7 @@ mod tests {
 
         let issue_src = SOURCES.iter().find(|s| s.kind == sk::ISSUE).unwrap();
         let prov = DbTableProvider(issue_src);
-        let items = prov.enumerate(&db, "p1", None, 100).await.unwrap();
+        let items = prov.enumerate(&db, "p1", None, 100, None).await.unwrap();
         assert_eq!(items.len(), 1, "只见本项目需求");
         assert_eq!(items[0].id, "issue:i1");
         assert_eq!(items[0].title, "登录页");
@@ -886,7 +967,7 @@ mod tests {
 
         let src = SOURCES.iter().find(|s| s.kind == sk::CHAT_MESSAGE).unwrap();
         let prov = DbTableProvider(src);
-        let items = prov.enumerate(&db, "p1", None, 100).await.unwrap();
+        let items = prov.enumerate(&db, "p1", None, 100, None).await.unwrap();
         assert_eq!(items.len(), 1, "软删会话的消息不出现");
         assert_eq!(items[0].source_id, "m1");
         // 标题从 content_json 首块提取可读文本，而非原始 JSON。
@@ -902,7 +983,7 @@ mod tests {
             .await
             .unwrap();
         let src = SOURCES.iter().find(|s| s.kind == sk::ISSUE).unwrap();
-        let items = DbTableProvider(src).enumerate(&db, "p1", None, 100).await.unwrap();
+        let items = DbTableProvider(src).enumerate(&db, "p1", None, 100, None).await.unwrap();
         assert_eq!(items[0].title, "登录页");
         assert_eq!(items[0].preview, "需要一个带记住我的登录页面", "预览取 description 正文");
     }

@@ -86,8 +86,9 @@ pub fn default_presets() -> Vec<LensPreset> {
             &[sk::CR_REVIEW, sk::WORKSPACE_DELIVERABLE],
             32_000,
         ),
-        // 会议室：跨角色协作场，include 为空 = 全部来源；预算放宽。
-        p("meeting", "会议室", "meeting", &[], 0),
+        // 会议室：跨角色协作场，include 为空 = 全部来源；预算走默认兜底
+        // （全量可及由 pull 工具兑现，注入不再无限）。
+        p("meeting", "会议室", "meeting", &[], context::DEFAULT_BUDGET_BYTES),
     ]
 }
 
@@ -101,7 +102,7 @@ pub fn preset_for_role(role: &str) -> LensPreset {
             name: "全部".into(),
             role: "meeting".into(),
             include: vec![],
-            budget_bytes: 0,
+            budget_bytes: context::DEFAULT_BUDGET_BYTES,
         })
 }
 

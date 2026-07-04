@@ -159,8 +159,10 @@ pub async fn list(
     project_id: &str,
     kinds: &[&str],
     limit: i64,
+    query: Option<&str>,
 ) -> Result<Vec<ContextItem>> {
     use crate::core::context_providers as cp;
+    let query = query.map(str::trim).filter(|q| !q.is_empty());
     let repo = project_repo_path(db, project_id).await;
     let n_sources = if kinds.is_empty() {
         (cp::SOURCES.len() + cp::FILE_SOURCES.len()) as i64
@@ -168,20 +170,31 @@ pub async fn list(
         kinds.len() as i64
     };
     // 每来源软上限：总预算摊平，但至少 10、至多 limit（单来源筛选时给满）。
+    // 搜索态它同时是防单一吵闹来源垄断结果的配额。
     let per_source = (limit / n_sources.max(1)).clamp(10, limit.max(10));
-    let mut items = cp::enumerate_all(db, project_id, kinds, repo.as_deref(), per_source).await?;
+    let mut items =
+        cp::enumerate_all(db, project_id, kinds, repo.as_deref(), per_source, query).await?;
 
     // 叠加 context_index 缓存（register 钩子预热 / 历史条目）：provider 未覆盖的按 id 补入，
     // provider 结果优先（活查是真源，缓存仅兜底/加速）。
     let seen: std::collections::HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
-    if let Ok(cached) = list_cached(db, project_id, kinds, limit).await {
+    if let Ok(cached) = list_cached(db, project_id, kinds, limit, query).await {
         for c in cached {
             if !seen.contains(&c.id) {
                 items.push(c);
             }
         }
     }
-    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    match query {
+        // 搜索态：kind 先验降权——产物类置前、过程类沉底（组内仍时间倒序）。
+        Some(_) => items.sort_by(|a, b| {
+            kind_rank(&a.source_kind)
+                .cmp(&kind_rank(&b.source_kind))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        }),
+        // 枚举态：维持全局时间倒序（现状行为，装配路径依赖它）。
+        None => items.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+    }
     items.truncate(limit.max(0) as usize);
     Ok(items)
 }
@@ -192,6 +205,7 @@ async fn list_cached(
     project_id: &str,
     kinds: &[&str],
     limit: i64,
+    query: Option<&str>,
 ) -> Result<Vec<ContextItem>> {
     let mut sql = String::from("SELECT * FROM context_index WHERE project_id=?");
     if !kinds.is_empty() {
@@ -199,10 +213,17 @@ async fn list_cached(
         sql.push_str(&vec!["?"; kinds.len()].join(","));
         sql.push(')');
     }
+    if query.is_some() {
+        sql.push_str(" AND (title LIKE ? ESCAPE '\\' OR labels LIKE ? ESCAPE '\\')");
+    }
     sql.push_str(" ORDER BY created_at DESC, rowid DESC LIMIT ?");
     let mut q = sqlx::query_as::<_, ContextItem>(&sql).bind(project_id);
     for k in kinds {
         q = q.bind(*k);
+    }
+    if let Some(qs) = query {
+        let pat = crate::core::context_providers::like_pattern(qs);
+        q = q.bind(pat.clone()).bind(pat);
     }
     q = q.bind(limit);
     Ok(q.fetch_all(db).await?)
@@ -259,6 +280,10 @@ pub async fn get(db: &Db, id: &str) -> Result<Option<ContextItem>> {
     }
     Ok(None)
 }
+
+/// 装配默认预算（调用方未显式给预算时的兜底；显式传 0 仍表示不限——逃生口保留）。
+/// 「万物可引」由 pull（搜索 + recall/read 工具）兑现，注入默认收敛到此预算内。
+pub const DEFAULT_BUDGET_BYTES: i64 = 49_152; // 48 KB
 
 /// 一次上下文装配请求（基质设计 §4.2 的动作侧输入）。
 #[derive(Debug, Clone, Default)]
@@ -337,7 +362,7 @@ pub fn select(candidates: Vec<ContextItem>, req: &ContextRequest) -> Vec<Context
 /// 返回**入选条目的元数据有序列表**；正文渲染（懒取 + 截断 + 拼 prompt）在 B2 叠加。
 pub async fn assemble(db: &Db, req: &ContextRequest) -> Result<Vec<ContextItem>> {
     let kinds: Vec<&str> = req.include.iter().map(|s| s.as_str()).collect();
-    let mut candidates = list(db, &req.project_id, &kinds, 500).await?;
+    let mut candidates = list(db, &req.project_id, &kinds, 500, None).await?;
 
     // 补齐不在 include 候选里的显式 refs（可能是别的来源类型）。
     let have: std::collections::HashSet<String> =
@@ -501,7 +526,7 @@ mod tests {
         v2.size_hint = 250;
         register(&db, v2).await.unwrap();
 
-        let rows = list(&db, "proj1", &[], 10).await.unwrap();
+        let rows = list(&db, "proj1", &[], 10, None).await.unwrap();
         assert_eq!(rows.len(), 1, "同一来源只登记一行");
         assert_eq!(rows[0].title, "执行日志 v2", "二次登记刷新标题");
         assert_eq!(rows[0].size_hint, 250, "二次登记刷新体积");
@@ -523,12 +548,69 @@ mod tests {
             .unwrap();
 
         // 项目隔离：p1 只见自己的两条。
-        assert_eq!(list(&db, "p1", &[], 10).await.unwrap().len(), 2);
-        assert_eq!(list(&db, "p2", &[], 10).await.unwrap().len(), 1);
+        assert_eq!(list(&db, "p1", &[], 10, None).await.unwrap().len(), 2);
+        assert_eq!(list(&db, "p2", &[], 10, None).await.unwrap().len(), 1);
         // 来源过滤：p1 仅物料 → 1 条。
-        let mats = list(&db, "p1", &[source_kind::MATERIAL], 10).await.unwrap();
+        let mats = list(&db, "p1", &[source_kind::MATERIAL], 10, None).await.unwrap();
         assert_eq!(mats.len(), 1);
         assert_eq!(mats[0].source_id, "m1");
+    }
+
+    /// 搜索：query 命中标题子串（缓存层 LIKE），未命中不出现；通配符被转义。
+    #[tokio::test]
+    async fn list_with_query_filters_and_escapes() {
+        let db = pool().await;
+        register(&db, NewContextItem::trusted("p1", source_kind::ISSUE, "i1", "登录页需求", ""))
+            .await
+            .unwrap();
+        register(&db, NewContextItem::trusted("p1", source_kind::ISSUE, "i2", "支付流程 100%完成", ""))
+            .await
+            .unwrap();
+
+        let hit = list(&db, "p1", &[], 10, Some("登录")).await.unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].source_id, "i1");
+
+        // `%` 被转义为字面量：`0%完` 只命中真含百分号的标题，不当通配符用。
+        let pct = list(&db, "p1", &[], 10, Some("0%完")).await.unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].source_id, "i2");
+
+        // 空白 query 等价于不搜索（枚举态）。
+        let all = list(&db, "p1", &[], 10, Some("  ")).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    /// 搜索态排序：kind 先验降权——同命中时产物类（spec rank 1）排在过程类（llm_trace rank 4）前，
+    /// 即使过程类条目更新。
+    #[tokio::test]
+    async fn search_ranks_artifact_kinds_above_process_kinds() {
+        let db = pool().await;
+        register(
+            &db,
+            NewContextItem::trusted("p1", source_kind::LLM_TRACE, "t1", "支付 trace · coder", ""),
+        )
+        .await
+        .unwrap();
+        // llm_trace 时间更新（后写 + 手动拉大时间差）。
+        sqlx::query("UPDATE context_index SET created_at='2999-01-01 00:00:00' WHERE source_id='t1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        register(
+            &db,
+            NewContextItem::trusted("p1", source_kind::PROJECT_SPEC, "s1", "支付接口规范", ""),
+        )
+        .await
+        .unwrap();
+
+        let out = list(&db, "p1", &[], 10, Some("支付")).await.unwrap();
+        let kinds: Vec<&str> = out.iter().map(|i| i.source_kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![source_kind::PROJECT_SPEC, source_kind::LLM_TRACE],
+            "搜索态产物类置前，不被更新的过程类挤掉"
+        );
     }
 
     /// 构造用于测 `select`（纯函数）的合成条目。
@@ -762,8 +844,8 @@ mod tests {
         register(&db, NewContextItem::trusted("p1", source_kind::ISSUE, "i1", "需求1", "table:issues.description#i1"))
             .await
             .unwrap();
-        assert_eq!(list(&db, "p1", &[], 10).await.unwrap().len(), 1);
+        assert_eq!(list(&db, "p1", &[], 10, None).await.unwrap().len(), 1);
         deregister(&db, source_kind::ISSUE, "i1").await.unwrap();
-        assert_eq!(list(&db, "p1", &[], 10).await.unwrap().len(), 0);
+        assert_eq!(list(&db, "p1", &[], 10, None).await.unwrap().len(), 0);
     }
 }
