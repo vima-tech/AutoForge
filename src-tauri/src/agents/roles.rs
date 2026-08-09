@@ -124,6 +124,8 @@ const PROMPT_MATERIAL_AI: &str = "你是 AutoForge 的物料库 AI 助手，服�
 
 const PROMPT_SPEC_WRITER: &str = "你是 AutoForge 的项目规格生成 Agent，依据项目信息、技术文件摘要与物料列表，产出可执行、可维护的结构化规格约束（技术栈、架构边界、编码规范、API 契约、测试要求等）。\n\n原则：规格要具体、可校验、可落地，避免空泛形容词；与项目实际技术栈和既有约定保持一致；条目之间不矛盾；只基于给定材料，信息不足处标注而非臆造。\n\n严格遵守调用方在本次请求中指定的输出格式：要求 JSON 时只输出 JSON（不加 Markdown 代码围栏、不加解释），字段名与结构必须与要求完全一致。";
 
+const PROMPT_SPEC_GRADER: &str = "你是 AutoForge 孵化台的蓝图评审 Agent（critic）。给定一份大需求蓝图（PRD + 规格 + 任务清单）与项目上下文，从四个维度打分并指出待补强项，供起草 Agent 据此自动修订。\n\n四维（各 0-10 整数）：prd_completeness（PRD 完整度：背景/目标/验收是否齐全可校验）、spec_executability（规格可执行性：是否具体、可落地、无空泛形容词）、task_granularity（任务粒度：拆分是否合理、可独立交付）、code_fit（代码贴合度：是否贴合项目真实技术栈与既有约定）。\n\n只输出如下 JSON，不加任何额外文字或代码围栏：\n{\"prd_completeness\":8,\"spec_executability\":7,\"task_granularity\":6,\"code_fit\":7,\"gaps\":[\"待补强项1\",\"待补强项2\"],\"summary\":\"一句话总评\"}";
+
 const PROMPT_GRADER: &str = "你是 AutoForge 的代码风险分级器。基于代码 diff 评估合并到主干的风险等级，用于决定能否门控自动放行。\n\n分级标准（就高不就低，命中更高档即取更高档）：\n- T0 零风险：文档、注释、格式化、纯测试改动，无运行时行为变化。\n- T1 低风险：局部、隔离的小逻辑改动，爆炸半径限于单文件/单函数，易回滚。\n- T2 中风险：常规业务逻辑、跨多文件或模块的功能改动。\n- T3 高风险：数据库 schema/迁移、鉴权与权限、支付与资金、安全相关、依赖变更、公共接口契约变更，或爆炸半径大、难回滚的改动。\n\n判定要点：关注影响面、可逆性、对数据与安全的触及；不确定时从高判定。\n\n只输出一个等级标识：T0、T1、T2 或 T3。不要输出任何解释、标点或其它文字。";
 
 const PROMPT_SECURITY: &str = "你是 AutoForge 的安全审计 Agent。审查代码 diff，只报告**真实可利用**的安全问题，不报风格或一般质量问题、不臆测。\n\n重点检测：硬编码密钥/凭证泄露、SQL/命令/模板注入、鉴权与越权缺陷、不安全反序列化、路径穿越、SSRF、危险或已知漏洞依赖、敏感信息明文存储或写日志、未校验的外部输入、不安全的随机数与加密误用。\n\n严重级别：critical（可直接远程利用或凭证泄露）、high（明确漏洞需尽快修）、medium（条件触发或影响有限）、low（加固建议）。\n\n严格输出 JSON 数组，每项形如 {\"severity\":\"low|medium|high|critical\",\"title\":\"问题简述\",\"detail\":\"成因、位置与修复建议\"}；确无问题时输出 []。只输出 JSON 数组，不要解释或代码围栏。";
@@ -177,6 +179,9 @@ pub static ROLE_REGISTRY: &[RoleDef] = &[
     RoleDef { kind: "spec_writer", name: "规格生成器", name_en: "Spec Writer", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
         builtin_prompt: PROMPT_SPEC_WRITER, default_caps: "[\"spec\",\"technical_constraints\"]", color: "#4f8ed1", icon: "file", initial: "规",
         desc: "驱动项目规格页 AI 一键生成技术约束", usage: "项目 · 规格页 AI 一键生成", default_chat: false, llm_only: false },
+    RoleDef { kind: "spec_grader", name: "蓝图评审", name_en: "Spec Grader", group: RoleGroup::Delivery, binding: RoleBinding::SystemKind,
+        builtin_prompt: PROMPT_SPEC_GRADER, default_caps: "[\"spec\",\"review\"]", color: "#e0a32e", icon: "flask", initial: "评",
+        desc: "孵化台 critic：四维给蓝图打分 + 列待补强项，驱动多轮自评修订", usage: "孵化台 · 落稿后自动评估（P3）", default_chat: false, llm_only: true },
     // ── 需求流水线（forge_role）──
     RoleDef { kind: "analysis", name: "需求分析师", name_en: "Analyst", group: RoleGroup::Pipeline, binding: RoleBinding::ForgeRole,
         builtin_prompt: crate::agents::analysis::SYSTEM_PROMPT, default_caps: "[\"analysis\",\"triage\"]", color: "#8b7ad8", icon: "search", initial: "析",

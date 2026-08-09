@@ -26,11 +26,13 @@ import {
   getConflictDetail, resolveConflictManually, openConflictWorkspace,
   issueSourceMeta, listCodeAgentRuns, getCodeAgentRun, getRunningCodeAgentLog,
   type CodeAgentRunMeta, type CodeAgentRunLog,
+  fetchContextContent,
   type Project, type ChangeRequest, type WorktreeSession, type CrGrade,
   type CrPreviewStatus, type Issue, type IssueAnalysis, type IssueAnalysisSpec,
   type BranchInfo, type BranchPreviewStatus, type MergeConflictView,
-  type ConflictDetail,
+  type ConflictDetail, type ContextItem,
 } from '../services';
+import ContextPicker, { kindLabel } from '../components/ContextPicker';
 
 type Sel = { kind: 'issue' | 'cr'; id: string };
 
@@ -2412,7 +2414,25 @@ function IssueReviewView({ issue, analysis, analysisLoading, submitting, decided
           「重新评估」时作为补充意见让需求带其重新分析并回到需求审核。 */}
       <div className="audit-dock">
         <div className="dock-advice">
-          <span className="dock-label">管理员意见（批准时给编码 Agent / 重新评估时给分析）</span>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <span className="dock-label">管理员意见（批准时给编码 Agent / 重新评估时给分析）</span>
+            {(canReview || analysisFailed) && (
+              <ContextPicker
+                projectId={issue.project_id}
+                placement="up"
+                triggerClassName="btn btn-sm"
+                trigger={<><Icon name="layers" size={12} />引用上下文</>}
+                title="引用系统上下文作为审核依据（内联进意见）"
+                onPick={async (it: ContextItem) => {
+                  try {
+                    const body = await fetchContextContent(it.id, 800);
+                    const cite = `\n\n【引用 · ${kindLabel(it.source_kind)}：${it.title || it.id}】\n${body}\n`;
+                    setAdvice(advice + cite);
+                  } catch { /* 取正文失败则忽略 */ }
+                }}
+              />
+            )}
+          </div>
           <div className="dock-advice-row">
             <textarea
               value={advice}

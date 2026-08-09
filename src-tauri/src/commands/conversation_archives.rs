@@ -2,7 +2,7 @@ use crate::models::conversation_archive::{
     ArchiveSearchHit, ArchivedMessage, ConversationArchiveDetail, ConversationArchiveSummary,
 };
 use crate::state::AppState;
-use tauri::State;
+use tauri::{AppHandle, State};
 use uuid::Uuid;
 
 const INNATE_SENDER: &str = "__innate__";
@@ -89,10 +89,73 @@ fn count_and_snippet(text: &str, query: &str) -> (i64, String) {
     (count, snippet)
 }
 
+/// 把归档消息拼成「发言人：正文」逐字记录，供 Innate 蒸馏学习。跳过 Innate 系统消息、
+/// 斜杠命令与空文本；上限 16K 字符（蒸馏侧还会再截，这里先粗筛）。
+fn build_transcript(messages: &[ArchivedMessage]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for m in messages {
+        if m.is_innate {
+            continue;
+        }
+        let text = extract_plain_text(&m.content_json);
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('/') {
+            continue;
+        }
+        lines.push(format!("{}：{}", m.author, text));
+    }
+    let joined = lines.join("\n");
+    joined.chars().take(16_000).collect()
+}
+
+/// 归档后台学习：把整段会议蒸馏成可复用经验存入 Innate，并在（已清空的）房间回一条
+/// 回执消息。best-effort——蒸馏不出东西或蒸馏器未配置时静默跳过，绝不影响归档结果。
+async fn learn_from_archive(
+    app: AppHandle,
+    db: crate::db::Db,
+    conversation_id: String,
+    title: String,
+    project_id: Option<String>,
+    project_name: Option<String>,
+    transcript: String,
+) {
+    let insights =
+        crate::knowledge::distill_meeting(&db, &title, project_name.as_deref(), &transcript).await;
+    if insights.is_empty() {
+        return;
+    }
+    let scope_label = if project_id.is_some() { "本项目知识库" } else { "通用知识库（跨项目）" };
+    for it in &insights {
+        // scope 感知写入（None → 共享库），复用 /remember 的路径：会做长度上限 + 净化 +
+        // 触发自动进化计数。
+        let _ = crate::knowledge::cmd_remember(project_id.as_deref(), &it.content, &it.trigger).await;
+    }
+    // 立即蒸馏 + 整理（与合并后学习一致，不等攒够阈值）。
+    match project_id.as_deref() {
+        Some(pid) => crate::knowledge::kb_evolve(pid).await,
+        None => crate::knowledge::kb_evolve_shared().await,
+    }
+    // 回执：让操作者看到这次归档到底学到了什么。
+    let bullets = insights
+        .iter()
+        .map(|it| format!("- {}", it.content.replace('\n', " ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "🧠 **已从归档会议《{}》学习**\n\n沉淀 {} 条经验到{}：\n\n{}",
+        title,
+        insights.len(),
+        scope_label,
+        bullets
+    );
+    let _ = crate::commands::knowledge::post_innate_message(&app, &db, &conversation_id, &body).await;
+}
+
 /// 归档会议室：把当前消息打包成不可变只读快照，随后清空会议室（房间保留可继续使用）。
 #[tauri::command]
 pub async fn archive_conversation(
     conversation_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ConversationArchiveSummary, String> {
     let conv: Option<(String, Option<String>, Option<String>)> =
@@ -215,6 +278,29 @@ pub async fn archive_conversation(
             .fetch_one(&state.db)
             .await
             .map_err(|e| e.to_string())?;
+
+    // 归档学习（可开关，默认开）：后台把整段会议蒸馏进 Innate。fire-and-forget，
+    // 不阻塞归档返回，失败也不影响归档结果。
+    if crate::commands::knowledge::load_knowledge_settings(&state.db)
+        .await
+        .archive_learning
+    {
+        let transcript = build_transcript(&messages);
+        if !transcript.trim().is_empty() {
+            let app = app.clone();
+            let db = state.db.clone();
+            let conv_id = conversation_id.clone();
+            let title2 = title.clone();
+            let project_id2 = project_id.clone();
+            let project_name2 = project_name.clone();
+            tokio::spawn(async move {
+                learn_from_archive(
+                    app, db, conv_id, title2, project_id2, project_name2, transcript,
+                )
+                .await;
+            });
+        }
+    }
 
     Ok(ConversationArchiveSummary {
         id: archive_id,

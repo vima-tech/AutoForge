@@ -113,22 +113,24 @@ pub fn system_overloaded(factor: f64) -> bool {
     if factor <= 0.0 {
         return false;
     }
+    match load_avg_1m() {
+        Some(load1) => load1 > factor * cpu_count() as f64,
+        // 信号不可用（非 Linux）→ 闸空转，回退到槽位/暂停阈值。
+        None => false,
+    }
+}
+
+/// 1 分钟系统负载均值（`/proc/loadavg` 第一列）。可观测收敛信号（文档 §6）：核预算调对后
+/// 稳态应 `load ≈ nproc`（既不空转也不过载）。`None` = 非 Linux / 不可读。
+pub fn load_avg_1m() -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
-        let Ok(s) = std::fs::read_to_string("/proc/loadavg") else {
-            return false;
-        };
-        let load1: f64 = s
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0);
-        load1 > factor * cpu_count() as f64
+        let s = std::fs::read_to_string("/proc/loadavg").ok()?;
+        s.split_whitespace().next()?.parse().ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = factor;
-        false
+        None
     }
 }
 

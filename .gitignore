@@ -11,6 +11,9 @@ src-tauri/target
 *.db-wal
 worktrees/
 
+# Local code intelligence runtime (database, PID, socket and logs)
+.codegraph/
+
 # Environment
 .env
 .env.local

@@ -954,6 +954,7 @@ button { font-family: inherit; cursor: pointer; }
   font-weight: 800;
   letter-spacing: -.01em;
   color: var(--text-2);
+  margin-left: 10px;
 }
 .rail-wordmark b { color: var(--ember); font-weight: 800; }
 
@@ -1539,6 +1540,8 @@ html[data-theme="light"][data-palette] { --bubble-me-text: #fff6ee; }
   display: flex; align-items: center; gap: 8px; padding: 8px 9px; font-size: var(--text-control);
 }
 .bubble-menu button:hover { background: var(--surface-hover); color: var(--ember); }
+.bubble-menu button.danger { color: var(--red); }
+.bubble-menu button.danger:hover { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
 
 .codeblock {
   background: var(--code-bg); border: 1px solid var(--border-strong);

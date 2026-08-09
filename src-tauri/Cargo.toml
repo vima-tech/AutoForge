@@ -2,8 +2,11 @@
 name = "autoforge"
 version = "0.1.0"
 description = "AutoForge — Human-Lite-in-the-Loop software factory"
-authors = []
+authors = ["Vima Tech"]
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/vima-tech/AutoForge"
+homepage = "https://github.com/vima-tech/AutoForge"
 
 [lib]
 name = "autoforge_lib"
@@ -67,7 +70,7 @@ rand = "0.8"
 # 物料库删除走系统回收站（freedesktop XDG Trash / macOS Trash / Windows 回收站），便于误删恢复。
 trash = "5"
 # 批量导入读取电子表格（xlsx/xls/ods，纯 Rust，只读）；模板导出写 xlsx（rust_xlsxwriter，纯 Rust）。
-calamine = "0.26"
+calamine = "0.36"
 rust_xlsxwriter = "0.79"
 
 # Linux/WebKitGTK：直接访问底层 webview 以放行 getUserMedia（麦克风/语音录入）。

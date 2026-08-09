@@ -267,7 +267,10 @@ export interface ConcurrencyConfig {
   active_slots: number; max_slots: number; pending_review: number;
   pause_threshold: number; stage: string; queue_strategy: string;
   timeout_min: number; idle_timeout_min: number; max_load_factor: number;
-  build_slots: number; cpu_budget_pct: number; llm_max_concurrency: number;
+  cpu_permits: number; cpu_budget_pct: number; llm_max_concurrency: number;
+  // 可观测收敛信号（只读）
+  nproc: number; cpu_permits_available: number; cpu_permits_queue_depth: number;
+  load_avg_1m: number | null; cgroup_throttled_periods: number | null;
 }
 export interface PreviewEnvironment {
   id: string; project_id: string; env_type: string;
@@ -317,7 +320,7 @@ export const getConcurrencyConfig = () => ipc<ConcurrencyConfig>('get_concurrenc
 export const updateConcurrencyConfig = (payload: Partial<{
   max_slots: number; pause_threshold: number; queue_strategy: string;
   timeout_min: number; idle_timeout_min: number; max_load_factor: number;
-  build_slots: number; cpu_budget_pct: number; llm_max_concurrency: number;
+  cpu_permits: number; cpu_budget_pct: number; llm_max_concurrency: number;
 }>) => ipc<ConcurrencyConfig>('update_concurrency_config', { payload });
 export const listPreviewEnvironments = (projectId?: string, status?: string) =>
   ipc<PreviewEnvironment[]>('list_preview_environments', {
@@ -597,6 +600,9 @@ export const startBlueprintDraft = (
 export const refineBlueprintDraft = (
   draftId: string, instruction: string, backend: BlueprintBackend = 'analysis',
 ) => ipc<BlueprintDraftView>('refine_blueprint_draft', { draftId, instruction, backend });
+/** 回答起草 Agent 的追问（断点续跑）：清挂起态、返回更新草稿；下轮 refine 从含 Q&A 的 transcript 续跑。 */
+export const answerBlueprintQuestion = (draftId: string, answer: string) =>
+  ipc<BlueprintDraftView>('answer_blueprint_question', { draftId, answer });
 /** 人工手改：前端发回编辑后的整份 PRD/规格/任务，落库。 */
 export const patchBlueprintDraft = (
   draftId: string, prdMarkdown: string, specs: BlueprintSpec[], tasklist: BlueprintTask[],
@@ -848,6 +854,8 @@ export const removeConversationMember = (conversationId: string, agentId: string
   ipc<Conversation>('remove_conversation_member', { conversationId, agentId });
 export const deleteGroupConversation = (conversationId: string) =>
   ipc<void>('delete_group_conversation', { conversationId });
+export const softDeleteMessage = (messageId: string) =>
+  ipc<void>('soft_delete_message', { messageId });
 export const clearConversationMessages = (conversationId: string) =>
   ipc<void>('clear_conversation_messages', { conversationId });
 
@@ -921,7 +929,7 @@ export type ConvCommandName = 'remember' | 'recall' | 'evolve' | 'innate';
 export const runConversationCommand = (payload: {
   conversation_id: string; command: ConvCommandName; arg: string;
 }) => ipc<Message>('run_conversation_command', { payload });
-export interface KnowledgeSettings { evolve_interval_hours: number; capture_threshold: number; }
+export interface KnowledgeSettings { evolve_interval_hours: number; capture_threshold: number; archive_learning: boolean; }
 export const getKnowledgeSettings = () =>
   ipc<KnowledgeSettings>('get_knowledge_settings');
 export const setKnowledgeSettings = (payload: KnowledgeSettings) =>
@@ -1495,7 +1503,8 @@ export const setSpecInjection = (id: string, injection: SpecInjection) =>
 
 export interface PrototypePrompt {
   id: string; project_id: string; issue_id: string | null;
-  tool_target: string; title: string; prompt: string; created_at: string;
+  tool_target: string; title: string; prompt: string;
+  draft_id: string; design_mode: string; created_at: string;
 }
 export interface SecurityAudit {
   id: string; project_id: string; change_request_id: string | null;
@@ -1518,12 +1527,24 @@ export interface AutoPassPolicy {
 }
 
 // Node 03 — prototype design prompts
-export const listPrototypePrompts = (projectId?: string) =>
-  ipc<PrototypePrompt[]>('list_prototype_prompts', { projectId: projectId ?? null });
-export const generatePrototypePrompt = (projectId: string, issueId?: string | null, toolTarget?: string) =>
+/** 列原型提示词：给 draftId 则只列该大需求的（按需求归档），否则列该项目全部。 */
+export const listPrototypePrompts = (projectId?: string, draftId?: string) =>
+  ipc<PrototypePrompt[]>('list_prototype_prompts', { projectId: projectId ?? null, draftId: draftId ?? null });
+export const generatePrototypePrompt = (
+  projectId: string, issueId?: string | null, toolTarget?: string,
+  opts?: { draftId?: string; docRefs?: string[]; designMode?: string; existingPageRefs?: string[] },
+) =>
   ipc<PrototypePrompt>('generate_prototype_prompt', {
     projectId, issueId: issueId ?? null, toolTarget: toolTarget ?? null,
+    draftId: opts?.draftId ?? null, docRefs: opts?.docRefs ?? null,
+    designMode: opts?.designMode ?? null, existingPageRefs: opts?.existingPageRefs ?? null,
   });
+/** P4：汇总项目可关联的核心文档源（设计契约/需求 PRD/技术规格），供「关联文档」面板勾选。 */
+export interface DocSource {
+  kind: string; ref: string; title: string; summary: string; est_tokens: number; default_on: boolean;
+}
+export const listPrototypeDocSources = (projectId: string, draftId?: string) =>
+  ipc<DocSource[]>('list_prototype_doc_sources', { projectId, draftId });
 
 // Node 07 — security audits
 export const listSecurityAudits = (projectId?: string) =>
@@ -1677,3 +1698,54 @@ export const deliveryArtifactDataUrl = (id: string) =>
   ipc<string>('delivery_artifact_data_url', { id });
 export const revealDeliveryArtifact = (id: string) =>
   ipc<void>('reveal_delivery_artifact', { id });
+
+// ── 上下文基质（方法论平台 / 基质设计 §4.1）────────────────────────────
+// 一切物料 + 过程信息的统一投影单元；供未来「取景框（Lens）」界面枚举/装配/懒取。
+export interface ContextItem {
+  id: string;
+  project_id: string;
+  source_kind: string;
+  source_id: string;
+  title: string;
+  /** 正文预览片段（列表区分用；可能为空，前端隐藏）。 */
+  preview: string;
+  origin_stage: string;
+  origin_actor: string;
+  content_ref: string;
+  size_hint: number;
+  trust: string;
+  labels: string;
+  created_at: string;
+  updated_at: string;
+}
+/** 枚举一个项目的上下文条目（薄索引元数据；access #1）。
+ *  `query` 有值 = 标题关键词搜索（后端下推全部来源召回，产物类置前）。 */
+export const listContextItems = (projectId: string, kinds?: string[], limit?: number, query?: string) =>
+  ipc<ContextItem[]>('list_context_items', { projectId, kinds, limit, query });
+/** 按取景框装配上下文条目（refs 置顶 → kind 优先级 → 预算裁剪）。 */
+export const assembleContext = (
+  projectId: string,
+  opts?: { include?: string[]; refs?: string[]; budgetBytes?: number },
+) =>
+  ipc<ContextItem[]>('assemble_context', {
+    projectId,
+    include: opts?.include,
+    refs: opts?.refs,
+    budgetBytes: opts?.budgetBytes,
+  });
+/** 懒取一条上下文条目正文（大体量走 G3 尾部摘要；access #2）。 */
+export const fetchContextContent = (id: string, maxChars?: number) =>
+  ipc<string>('fetch_context_content', { id, maxChars });
+/** 从取景框把一条基质条目引用到会议室（插入 context_ref 块消息；G4 产出方）。 */
+export const citeContextToConversation = (conversationId: string, contextItemId: string) =>
+  ipc<void>('cite_context_to_conversation', { conversationId, contextItemId });
+
+/**
+ * 统一 dispatch 出口（DUAL_HEAD M2 机制）：经单一 `rpc_dispatch` 命令调用后端命令注册表里
+ * 走统一契约的命令。`args` 内层键名须与后端 Args 结构一致（snake_case），因其作为不透明
+ * JSON Value 透传、不经 Tauri 的 camelCase→snake_case 转换。M2 逐域迁移时各命令改走此路，
+ * Tauri/Web 两个对接层共用同一注册表。当前注册表含基质命令 `ctx.list`/`ctx.assemble`/`ctx.fetch`。
+ */
+export function rpcDispatch<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  return ipc<T>('rpc_dispatch', { cmd, args: args ?? {} });
+}

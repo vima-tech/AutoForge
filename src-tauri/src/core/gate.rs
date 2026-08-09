@@ -91,7 +91,7 @@ pub async fn set_custom_merge_message_enabled(db: &Db, on: bool) -> Result<(), s
 
 /// Global switch: split merge into a parallel `premerge` (Phase1 dev-sync + tests +
 /// security, NO merge_lock) and a serial `land` (merge_lock). When ON, same-project
-/// CRs test in parallel (bounded by `build_pool`) and only the cheap land serializes.
+/// CRs test in parallel (bounded by `core::cpu_permits` 核预算) and only the cheap land serializes.
 /// OFF by default → the legacy single-lock `merge::run` path runs unchanged.
 /// Co-located with the other merge-pipeline flags.
 pub async fn parallel_premerge_enabled(db: &Db) -> bool {

@@ -4,11 +4,12 @@ import Markdown from './Markdown';
 import { RealtimeAsr } from '../lib/realtimeAsr';
 import { registerVoiceSurface } from '../lib/voiceInput';
 import {
-  startBlueprintDraft, refineBlueprintDraft, patchBlueprintDraft,
-  getBlueprintDraft, applyBlueprintDraft, codeBlueprintDraft, listProjectFiles,
+  startBlueprintDraft, refineBlueprintDraft, patchBlueprintDraft, answerBlueprintQuestion,
+  getBlueprintDraft, applyBlueprintDraft, codeBlueprintDraft, listProjectFiles, fetchContextContent,
   type Project, type BlueprintDraftView, type BlueprintSpec, type BlueprintTask, type ProjectContextFile,
-  type BlueprintBackend,
+  type BlueprintBackend, type ContextItem,
 } from '../services';
+import ContextPicker, { kindLabel } from './ContextPicker';
 
 /**
  * 项目蓝图工作台（全屏双栏）：左对话流 / 右产物预览（PRD · 规格 · 任务）。
@@ -60,10 +61,11 @@ export const DISPLAY_STATUS: Record<string, { label: string; chip: string }> = {
   conflict: { label: '需解冲突', chip: 'red' },
 };
 
-export default function BlueprintStudio({ project, draftId, isNew, onBack, onChanged, onOpenAudit }: {
+export default function BlueprintStudio({ project, draftId, isNew, onBack, onChanged, onOpenAudit, onOpenDelivery }: {
   project: Project; draftId: string | null; isNew: boolean;
   onBack: () => void; onChanged: (newDraftId?: string) => void;
   onOpenAudit?: (projectId: string, issueId: string) => void;
+  onOpenDelivery?: (projectId: string, opts?: { stage?: string; draftId?: string }) => void;
 }) {
   const [loading, setLoading] = useState(!isNew);
   const [busy, setBusy] = useState(false);
@@ -233,6 +235,20 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
     finally { setBusy(false); }
   };
 
+  // P2 断点续跑：起草 Agent 追问挂起时（status=awaiting_answer），回答后清挂起、续跑下一轮。
+  const awaiting = draft?.status === 'awaiting_answer';
+  const pendingQuestion = awaiting
+    ? [...messages].reverse().find(m => m.role === 'question')?.content ?? '起草 Agent 需要你补充一些信息。'
+    : '';
+  const doAnswer = async () => {
+    if (!draft || !chatInput.trim() || busy) return;
+    const ans = chatInput.trim();
+    setChatInput(''); setBusy(true); setErr('');
+    try { const v = await answerBlueprintQuestion(draft.id, ans); setView(v); onChanged(); }
+    catch (e) { setErr(String(e)); setChatInput(ans); }
+    finally { setBusy(false); }
+  };
+
   // 人工手改：本地乐观更新 + 落库（整份回写）。
   const persist = async (prd: string, specs: BlueprintSpec[], tasklist: BlueprintTask[]) => {
     if (!draft) return;
@@ -313,7 +329,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
             {isNew ? '新需求改动' : (draft?.title || project.name)}
           </div>
           <div style={{ fontSize: 'var(--text-caption)', color: 'var(--text-3)', fontFamily: 'var(--font-mono)', letterSpacing: '.04em' }}>
-            {project.name} · 孵化台
+            {project.name} · 需求孵化台
           </div>
         </div>
         {coding && (
@@ -335,6 +351,13 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
         {hasDraft && coding && draft?.issue_id && onOpenAudit && (
           <button className="btn btn-primary btn-sm" onClick={() => onOpenAudit(project.id, draft.issue_id)}>
             <Icon name="audit" size={14} />去代码审核
+          </button>
+        )}
+        {/* P4 深链：去交付页设计阶段做原型（携 draftId 预选本稿 PRD）。非 primary，尊重每屏≤1 主操作。 */}
+        {hasDraft && draft && onOpenDelivery && (
+          <button className="btn btn-sm" onClick={() => onOpenDelivery(project.id, { stage: 'design', draftId: draft.id })}
+            title="带本稿 PRD 去交付页生成原型设计提示词">
+            <Icon name="palette" size={14} />去原型设计 ↗
           </button>
         )}
       </div>
@@ -445,7 +468,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                 </div>
               )}
               <textarea
-                rows={5} value={briefInput} onChange={e => setBriefInput(e.target.value)} autoFocus
+                rows={10} value={briefInput} onChange={e => setBriefInput(e.target.value)} autoFocus
                 onFocus={() => setInputFocused(true)} onBlur={() => setInputFocused(false)}
                 onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && briefInput.trim()) { e.preventDefault(); void doStart(); } }}
                 placeholder="描述这次大需求改动 —— 背景、目标、要支持的能力、约束…越具体越好。"
@@ -479,6 +502,20 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                     </div>
                   )}
                 </div>
+                {/* 全量上下文基质：引系统任意信息（需求/日志/trace/规格/.autoforge…）作为起草依据，内联进大需求 */}
+                <ContextPicker
+                  projectId={project.id}
+                  placement="up"
+                  title="引用系统上下文作为起草依据（内联进大需求）"
+                  trigger={<Icon name="layers" size={17} />}
+                  onPick={async (it: ContextItem) => {
+                    try {
+                      const body = await fetchContextContent(it.id, 1200);
+                      const cite = `\n\n【引用 · ${kindLabel(it.source_kind)}：${it.title || it.id}】\n${body}\n`;
+                      setBriefInput(prev => prev + cite);
+                    } catch { /* 取正文失败则忽略 */ }
+                  }}
+                />
                 {/* 本地附件 */}
                 <input ref={attachInputRef} type="file" multiple style={{ display: 'none' }}
                   onChange={e => { const fs = Array.from(e.target.files ?? []); if (fs.length) setAttachFiles(p => [...p, ...fs]); if (attachInputRef.current) attachInputRef.current.value = ''; }} />
@@ -525,25 +562,34 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
           {/* 左：对话流 */}
           <div style={{ width: '40%', minWidth: 320, maxWidth: 520, display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--border)', background: 'var(--bg-1)' }}>
             <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {messages.map(m => (
-                <div key={m.id} style={{ display: 'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start' }}>
-                  <div style={{
-                    maxWidth: '88%', padding: '9px 12px', borderRadius: 12, fontSize: 'var(--text-label)',
-                    lineHeight: 'var(--leading-relaxed)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                    // 用语义气泡 token：跨深/浅主题与各 palette 自动配对前景/背景，避免浅色主题文字看不清。
-                    background: m.role === 'user' ? 'var(--bubble-me)' : 'var(--bubble-them)',
-                    color: m.role === 'user' ? 'var(--bubble-me-text)' : 'var(--bubble-them-text)',
-                    border: m.role === 'user' ? 'none' : '1px solid var(--border)',
-                  }}>
-                    {m.role === 'assistant' && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4, color: 'var(--ember)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', textTransform: 'uppercase', letterSpacing: '.1em' }}>
-                        <Icon name="zap" size={11} />蓝图 Agent
-                      </div>
-                    )}
-                    {m.content}
+              {messages.map(m => {
+                // 人侧（user/answer）靠右熔岩气泡；机侧（assistant/question/eval）靠左。
+                const mine = m.role === 'user' || m.role === 'answer';
+                // 各角色标签 + 语义色（question=amber 追问 / eval=green 评估 / assistant=ember 蓝图 Agent）。
+                const meta =
+                  m.role === 'assistant' ? { label: '蓝图 Agent', color: 'var(--ember)' }
+                  : m.role === 'question' ? { label: '追问', color: 'var(--amber)' }
+                  : m.role === 'eval' ? { label: '评估', color: 'var(--green)' }
+                  : null;
+                return (
+                  <div key={m.id} style={{ display: 'flex', justifyContent: mine ? 'flex-end' : 'flex-start' }}>
+                    <div style={{
+                      maxWidth: '88%', padding: '9px 12px', borderRadius: 12, fontSize: 'var(--text-label)',
+                      lineHeight: 'var(--leading-relaxed)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                      background: mine ? 'var(--bubble-me)' : 'var(--bubble-them)',
+                      color: mine ? 'var(--bubble-me-text)' : 'var(--bubble-them-text)',
+                      border: mine ? 'none' : '1px solid var(--border)',
+                    }}>
+                      {meta && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4, color: meta.color, fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', textTransform: 'uppercase', letterSpacing: '.1em' }}>
+                          <Icon name="zap" size={11} />{meta.label}
+                        </div>
+                      )}
+                      {m.content}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {busy && (
                 <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', borderRadius: 12, background: 'var(--bg-3)', border: '1px solid var(--border)', color: 'var(--text-2)', fontSize: 'var(--text-label)' }}>
@@ -556,6 +602,15 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
             </div>
             {/* 输入框：统一 composer（输入 + 发送同框，focus 走 ember 光环）*/}
             <div style={{ borderTop: '1px solid var(--border)', padding: '12px', flexShrink: 0, background: 'var(--bg-1)' }}>
+              {/* P2 追问卡：起草 Agent 挂起等答复（amber 语义色，非装饰）*/}
+              {awaiting && (
+                <div style={{ marginBottom: 10, padding: '10px 12px', borderRadius: 12, background: 'var(--amber-tint)', border: '1px solid var(--amber-soft)' }}>
+                  <div style={{ marginBottom: 6, color: 'var(--amber)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', textTransform: 'uppercase', letterSpacing: '.1em' }}>
+                    起草 Agent 追问 · 待答复
+                  </div>
+                  <div style={{ fontSize: 'var(--text-label)', color: 'var(--text)', lineHeight: 'var(--leading-relaxed)', whiteSpace: 'pre-wrap' }}>{pendingQuestion}</div>
+                </div>
+              )}
               <div style={{
                 display: 'flex', alignItems: 'flex-end', gap: 8,
                 background: 'var(--bg-3)', borderRadius: 12, padding: '6px 6px 6px 12px',
@@ -566,9 +621,9 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                 <textarea
                   rows={2} value={chatInput} onChange={e => setChatInput(e.target.value)}
                   onFocus={() => setInputFocused(true)} onBlur={() => setInputFocused(false)}
-                  onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); doRefine(); } }}
+                  onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); (awaiting ? doAnswer : doRefine)(); } }}
                   disabled={busy || coding}
-                  placeholder={coding ? '已进入编码开发，如需调整请到「变更审核」或新建一条需求改动' : '告诉我要改哪里：「验收标准写细点」「支付拆成 3 个任务」「补一条限流规格」…'}
+                  placeholder={coding ? '已进入编码开发，如需调整请到「变更审核」或新建一条需求改动' : awaiting ? '回答上面的追问，Agent 将据此继续起草…' : '告诉我要改哪里：「验收标准写细点」「支付拆成 3 个任务」「补一条限流规格」…'}
                   style={{
                     flex: 1, resize: 'none', minHeight: 40, maxHeight: 160,
                     border: 'none', background: 'transparent', outline: 'none', padding: '6px 0',
@@ -576,7 +631,7 @@ export default function BlueprintStudio({ project, draftId, isNew, onBack, onCha
                   }}
                 />
                 <button className="btn btn-primary" style={{ width: 36, height: 36, padding: 0, borderRadius: 9, flexShrink: 0, justifyContent: 'center' }}
-                  onClick={doRefine} disabled={busy || coding || !chatInput.trim()} title="发送修正指令（⌘/Ctrl+Enter）">
+                  onClick={awaiting ? doAnswer : doRefine} disabled={busy || coding || !chatInput.trim()} title={awaiting ? '提交答复（⌘/Ctrl+Enter）' : '发送修正指令（⌘/Ctrl+Enter）'}>
                   <Icon name="send" size={16} />
                 </button>
               </div>

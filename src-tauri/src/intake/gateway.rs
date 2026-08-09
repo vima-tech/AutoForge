@@ -4,7 +4,6 @@ use crate::db::Db;
 use crate::models::issue::Issue;
 use crate::models::job::JobPayload;
 use crate::tasks::runner::{enqueue, JobSender};
-use tauri::AppHandle;
 use uuid::Uuid;
 
 /// 统一需求接收网关：去重、安全检查、入库、入队分析。
@@ -12,11 +11,11 @@ use uuid::Uuid;
 pub async fn receive(
     db: &Db,
     job_tx: &JobSender,
-    app: &AppHandle,
+    sink: &dyn crate::core::event::EventSink,
     payload: IntakePayload,
     mode: IntakeMode,
 ) -> Result<Issue, String> {
-    receive_with_status(db, job_tx, app, payload, mode)
+    receive_with_status(db, job_tx, sink, payload, mode)
         .await
         .map(|(issue, _created)| issue)
 }
@@ -27,7 +26,7 @@ pub async fn receive(
 pub async fn receive_with_status(
     db: &Db,
     job_tx: &JobSender,
-    app: &AppHandle,
+    sink: &dyn crate::core::event::EventSink,
     payload: IntakePayload,
     mode: IntakeMode,
 ) -> Result<(Issue, bool), String> {
@@ -121,7 +120,7 @@ pub async fn receive_with_status(
             .map_err(|e| e.to_string())?;
 
         event::emit(
-            app,
+            sink,
             event::AppEvent::IssueCreated {
                 issue_id: issue.id.clone(),
                 project_id: issue.project_id.clone(),
@@ -203,8 +202,31 @@ pub async fn receive_with_status(
         .await
         .map_err(|e| e.to_string())?;
 
+    // 上下文基质登记（基质设计 §3.2）：新需求一入库即投影为 ContextItem，让后续任意
+    // 环节（编码/审核/会议室）可按需取用其正文。best-effort，登记失败不阻断入库。
+    {
+        use crate::core::context;
+        let cref = format!("issue:{}", issue.id);
+        let _ = context::register(
+            db,
+            context::NewContextItem {
+                project_id: &issue.project_id,
+                source_kind: context::source_kind::ISSUE,
+                source_id: &issue.id,
+                title: &issue.title,
+                origin_stage: "requirement",
+                origin_actor: &issue.source_type,
+                content_ref: &cref,
+                size_hint: issue.description.len() as i64,
+                trust: context::trust::TRUSTED,
+                labels: "[]",
+            },
+        )
+        .await;
+    }
+
     event::emit(
-        app,
+        sink,
         event::AppEvent::IssueCreated {
             issue_id: issue.id.clone(),
             project_id: issue.project_id.clone(),

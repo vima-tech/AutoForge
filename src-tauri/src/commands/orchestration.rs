@@ -1928,6 +1928,39 @@ async fn finalize_chat_reply(
     .await
     .map_err(|e| e.to_string())?;
 
+    // 上下文基质登记（基质 §2.2：Agent 历史输出此前仅同任务内累积、跨任务/跨会话不可取）。
+    // 仅**项目绑定**会议室的成功发言投影为 ContextItem（agent_output 源，atr: 读 output_text）。
+    if ok {
+        if let Some((Some(project_id),)) = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT project_id FROM conversations WHERE id=?",
+        )
+        .bind(ctx.conversation_id)
+        .fetch_optional(ctx.db)
+        .await
+        .ok()
+        .flatten()
+        {
+            let cref = format!("atr:{run_id}");
+            let title = format!("会议室发言 · {agent_id}");
+            let _ = crate::core::context::register(
+                ctx.db,
+                crate::core::context::NewContextItem {
+                    project_id: &project_id,
+                    source_kind: crate::core::context::source_kind::AGENT_OUTPUT,
+                    source_id: run_id,
+                    title: &title,
+                    origin_stage: "chat",
+                    origin_actor: agent_id,
+                    content_ref: &cref,
+                    size_hint: text.len() as i64,
+                    trust: crate::core::context::trust::TRUSTED,
+                    labels: "[]",
+                },
+            )
+            .await;
+        }
+    }
+
     event::emit(
         ctx.app,
         event::AppEvent::MessageReceived {
@@ -2468,6 +2501,44 @@ async fn message_to_prompt_text(db: &crate::db::Db, msg: &Message) -> Result<Str
                             "[工作区文件引用: .autoforge/{} 读取失败: {}]",
                             path, e
                         )),
+                    }
+                }
+            }
+            // 全量上下文基质 · 万物可引（D1/D2 消费侧）：把操作者/Agent 在消息里 @ 引用的基质
+            // 条目**展开成正文**注入 prompt。覆盖会议室 AI 任务与「立即编码」work_context（同一路径）。
+            // 单条上限 4000 字（大体量来源在 fetch_content 内已保尾）；外部来源正文已过注入闸。
+            Some("context_ref") => {
+                let ref_id = block.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                let title = block.get("title").and_then(|v| v.as_str()).unwrap_or("上下文");
+                if !ref_id.is_empty() {
+                    match crate::core::context::get(db, ref_id).await {
+                        Ok(Some(mut item)) => {
+                            // 从稳定 id 反构的条目 project_id 为空；文件类来源（.autoforge 文档/规格…）
+                            // 懒取正文需 repo_path，故从所在会话补齐项目（DB 类来源按 source_id 取，不受影响）。
+                            if item.project_id.is_empty() {
+                                if let Ok(Some((Some(pid),))) = sqlx::query_as::<_, (Option<String>,)>(
+                                    "SELECT project_id FROM conversations WHERE id=?",
+                                )
+                                .bind(&msg.conversation_id)
+                                .fetch_optional(db)
+                                .await
+                                {
+                                    item.project_id = pid;
+                                }
+                            }
+                            let body = crate::core::context::fetch_content(db, &item, 4000)
+                                .await
+                                .unwrap_or_default();
+                            if body.trim().is_empty() {
+                                parts.push(format!("[引用上下文: {}]", title));
+                            } else {
+                                parts.push(format!(
+                                    "[引用上下文 - {} ({})]\n```\n{}\n```",
+                                    title, item.source_kind, body
+                                ));
+                            }
+                        }
+                        _ => parts.push(format!("[引用上下文: {}]", title)),
                     }
                 }
             }
@@ -3041,4 +3112,139 @@ fn emit_task_update(app: &AppHandle, conversation_id: &str, task_id: &str, statu
         },
     );
     info!("[orchestration] task {} status={}", task_id, status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D1/D2 消费侧：消息里的 `context_ref` 块被展开成正文注入 prompt（万物可引闭环）。
+    #[tokio::test]
+    async fn context_ref_block_expands_into_prompt() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE context_index (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+                origin_stage TEXT NOT NULL DEFAULT '', origin_actor TEXT NOT NULL DEFAULT '',
+                content_ref TEXT NOT NULL DEFAULT '', size_hint INTEGER NOT NULL DEFAULT 0,
+                trust TEXT NOT NULL DEFAULT 'trusted', labels TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT, updated_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        // 一条基质缓存条目（正文经 fetch_content 的标题兜底返回）。
+        crate::core::context::register(
+            &db,
+            crate::core::context::NewContextItem::trusted(
+                "p1",
+                crate::core::context::source_kind::CODE_AGENT_LOG,
+                "l1",
+                "上次修了登录 bug 的关键改动",
+                "",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let msg = Message {
+            id: "m1".into(),
+            conversation_id: "c1".into(),
+            from_agent: None,
+            content_json: serde_json::json!([{
+                "t": "context_ref", "ref": "code_agent_log:l1",
+                "kind": "code_agent_log", "title": "编码日志"
+            }])
+            .to_string(),
+            created_at: String::new(),
+            excluded_from_context: false,
+            parent_message_id: None,
+        };
+        let text = message_to_prompt_text(&db, &msg).await.unwrap();
+        assert!(text.contains("引用上下文"), "context_ref 被展开为引用段");
+        assert!(
+            text.contains("上次修了登录 bug 的关键改动"),
+            "被引用条目的正文注入 prompt"
+        );
+
+        // 未知 ref → 优雅降级为标题占位，不报错。
+        let msg2 = Message {
+            content_json: serde_json::json!([{
+                "t": "context_ref", "ref": "issue:nope", "kind": "issue", "title": "某需求"
+            }])
+            .to_string(),
+            ..msg.clone()
+        };
+        let text2 = message_to_prompt_text(&db, &msg2).await.unwrap();
+        assert!(text2.contains("某需求"), "未命中 ref 降级为标题占位");
+    }
+
+    /// 头牌能力：会议室 @ 引用 `.autoforge` 文件 → 经会话补齐项目 → 文件 provider 读正文注入 prompt。
+    #[tokio::test]
+    async fn context_ref_expands_autoforge_file_via_conversation_project() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // get() 先查 context_index 缓存（此处 miss → 反构最小条目）。
+        sqlx::query(
+            "CREATE TABLE context_index (id TEXT PRIMARY KEY, project_id TEXT, source_kind TEXT,
+             source_id TEXT, title TEXT, origin_stage TEXT, origin_actor TEXT, content_ref TEXT,
+             size_hint INTEGER, trust TEXT, labels TEXT, created_at TEXT, updated_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE projects (id TEXT PRIMARY KEY, repo_path TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, project_id TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        // 造一个临时仓库 + .autoforge/docs/note.md。
+        let repo = std::env::temp_dir().join(format!("af_ctx_{}", uuid::Uuid::new_v4()));
+        let docs = repo.join(".autoforge").join("docs");
+        tokio::fs::create_dir_all(&docs).await.unwrap();
+        tokio::fs::write(docs.join("note.md"), "登录页 PRD 关键约束：必须支持空密码校验")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects VALUES ('p1', ?)")
+            .bind(repo.to_string_lossy().to_string())
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversations VALUES ('c1','p1')")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let msg = Message {
+            id: "m1".into(),
+            conversation_id: "c1".into(),
+            from_agent: None,
+            content_json: serde_json::json!([{
+                "t": "context_ref", "ref": "workspace_doc:docs/note.md",
+                "kind": "workspace_doc", "title": "note.md"
+            }])
+            .to_string(),
+            created_at: String::new(),
+            excluded_from_context: false,
+            parent_message_id: None,
+        };
+        let text = message_to_prompt_text(&db, &msg).await.unwrap();
+        assert!(
+            text.contains("必须支持空密码校验"),
+            ".autoforge 文件正文经会话补齐项目后注入 prompt，实得：{text}"
+        );
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
 }

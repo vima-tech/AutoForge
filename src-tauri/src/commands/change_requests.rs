@@ -430,7 +430,8 @@ pub async fn ai_resolve_merge_conflict(
     let db = state.db.clone();
     let tx = state.job_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::tasks::merge::ai_resolve_conflict(&db, &tx, &app, &cr_id).await {
+        let sink: std::sync::Arc<dyn crate::core::event::EventSink> = std::sync::Arc::new(app);
+        if let Err(e) = crate::tasks::merge::ai_resolve_conflict(&db, &tx, &sink, &cr_id).await {
             tracing::info!("ai_resolve_merge_conflict failed for {}: {}", cr_id, e);
         }
     });
@@ -1673,6 +1674,30 @@ async fn record_admin_decision(
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
+
+    // 上下文基质登记（基质 §2.2：CR/审核意见此前各自页面、编码时看不到「人在审核里说过什么」）。
+    // 幂等按 CR 归并：同一 CR 的多次审核决策刷新同一条 cr_review（crv: 读取器拼接其全部建议）。
+    // 仅当决策关联到具体 CR 时登记（review_1 早于 CR 存在时 change_request_id 为 None）。
+    if let Some(cr_id) = change_request_id {
+        let cref = format!("crv:{cr_id}");
+        let title = format!("审核意见 · {stage}");
+        let _ = crate::core::context::register(
+            db,
+            crate::core::context::NewContextItem {
+                project_id,
+                source_kind: crate::core::context::source_kind::CR_REVIEW,
+                source_id: cr_id,
+                title: &title,
+                origin_stage: "review",
+                origin_actor: admin_id,
+                content_ref: &cref,
+                size_hint: suggestions.map(|s| s.len() as i64).unwrap_or(0),
+                trust: crate::core::context::trust::TRUSTED,
+                labels: "[]",
+            },
+        )
+        .await;
+    }
 
     // Innate: capture the human gate decision as project knowledge (fire-and-forget).
     let pid = project_id.to_string();

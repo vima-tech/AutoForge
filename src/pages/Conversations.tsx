@@ -10,7 +10,7 @@ import RoundAvatarStack, { type RoundNav } from '../components/RoundAvatarStack'
 import { ReaderToc } from '../components/ReaderToc';
 import {
   listConversations, listMessages, sendMessage, createGroupConversation,
-  listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation,
+  listAgents, updateGroupConversation, addConversationMember, removeConversationMember, deleteGroupConversation, softDeleteMessage,
   markConversationRead, importAttachment, listConversationAttachments, openAttachment,
   toggleMessageContext, startConversationTask, listConversationTasks, compressConversationContext,
   draftCodingBrief, draftCodingBriefDetailed, draftCodingBriefStream, startConversationCoding,
@@ -22,8 +22,9 @@ import {
   type Conversation, type Message, type Agent, type ConversationAttachment,
   type Project, type ProjectContextFile, type WorkspaceFile, type ConvCommandName,
   type ConversationArchiveSummary, type ArchiveSearchHit, type ArchivedMessage,
-  type CodingBrief,
+  type CodingBrief, type ContextItem,
 } from '../services';
+import ContextPicker, { kindLabel } from '../components/ContextPicker';
 import type { BlockType } from '../data/mock';
 import { fmtMsgTime, fmtListTime, fmtFull } from '../utils/datetime';
 import { toggleMaximizeOnDoubleClick } from '../lib/window';
@@ -834,7 +835,7 @@ function CodeNowModal({ conversationId, onClose, onError }: {
 
 function Composer({ conv, agents, contextAttachments, onSend, onCompress, onError, quote, onClearQuote, wsRefs, onRemoveWsRef, busy }: {
   conv: Conversation; agents: Agent[]; contextAttachments: ConversationAttachment[];
-  onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[]) => Promise<boolean>;
+  onSend: (text: string, attachments: PendingAttachment[], contextRefs: ConversationAttachment[], mentionedAgentIds: string[], substrateRefs?: ContextItem[]) => Promise<boolean>;
   onCompress: (mode: 'summary' | 'conclusion') => Promise<boolean>;
   onError: (message: string) => void;
   quote: QuoteDraft | null;
@@ -845,6 +846,8 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
 }) {
   const [text, setText] = useState('');
   const [pending, setPending] = useState<PendingAttachment[]>([]);
+  // 全量上下文基质 · 内联引用：待随本条消息发出的基质条目（落 context_ref 块，后端展开注入 prompt）。
+  const [substrateRefs, setSubstrateRefs] = useState<ContextItem[]>([]);
   const [showMention, setShowMention] = useState(false);
   const [showAttachmentPicker, setShowAttachmentPicker] = useState(false);
   const [attachmentQuery, setAttachmentQuery] = useState('');
@@ -1382,15 +1385,17 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
     const pendingItems = [...pending];
     const refs = contextRefs();
     const mentions = mentionedAgentIds();
-    if (!outgoing && pendingItems.length === 0 && refs.length === 0 && wsRefs.length === 0) return;
+    const subRefs = [...substrateRefs];
+    if (!outgoing && pendingItems.length === 0 && refs.length === 0 && wsRefs.length === 0 && subRefs.length === 0) return;
     if (asrRef.current) void stopAsr();
     setText('');
     setPending([]);
+    setSubstrateRefs([]);
     if (editorRef.current) editorRef.current.innerHTML = '';
     setShowMention(false);
     setShowAttachmentPicker(false);
     clearComposerDraft(conv.id);
-    await onSend(outgoing, pendingItems, refs, mentions);
+    await onSend(outgoing, pendingItems, refs, mentions, subRefs);
   };
 
   // 快捷 tag：压缩类走 onCompress（生成摘要并压缩上下文），普通类直接发送预设指令。
@@ -1537,6 +1542,16 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             <Icon name="at" size={18} />
           </button>
         )}
+        {/* 全量上下文基质 · 内联引用：引系统任意信息（需求/会议/日志/trace/规格/.autoforge…）随消息发出 */}
+        {conv.project_id && (
+          <ContextPicker
+            projectId={conv.project_id}
+            placement="up"
+            title="引用上下文（系统全量信息可引，随消息注入 AI）"
+            trigger={<Icon name="layers" size={18} />}
+            onPick={it => setSubstrateRefs(prev => prev.some(p => p.id === it.id) ? prev : [...prev, it])}
+          />
+        )}
         <button
           ref={attachmentTriggerRef}
           className="context-attach-trigger"
@@ -1623,6 +1638,16 @@ function Composer({ conv, agents, contextAttachments, onSend, onCompress, onErro
             <span className="pending-name">{item.file.name}</span>
             <span className="pending-size">{formatBytes(item.file.size)}</span>
             <button className="icon-btn" title="移除附件" disabled={busy} onClick={() => removePending(item.id)}>
+              <Icon name="x" size={13} />
+            </button>
+          </div>
+        ))}
+        {substrateRefs.map(it => (
+          <div key={it.id} className="composer-pending-item" title={`引用上下文：${kindLabel(it.source_kind)} · ${it.title || it.id}`}>
+            <Icon name="layers" size={14} style={{ color: 'var(--ember)' }} />
+            <span className="pending-name">{it.title || it.id}</span>
+            <span className="pending-size">{kindLabel(it.source_kind)}</span>
+            <button className="icon-btn" title="移除引用" disabled={busy} onClick={() => setSubstrateRefs(prev => prev.filter(p => p.id !== it.id))}>
               <Icon name="x" size={13} />
             </button>
           </div>
@@ -2277,6 +2302,7 @@ export default function ConversationsPage() {
   const [projectFiles,   setProjectFiles]   = useState<ProjectContextFile[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
   const [workspaceTab,   setWorkspaceTab]   = useState<'docs' | 'specs' | 'deliverables'>('docs');
+  const [fileQuery,      setFileQuery]      = useState('');   // 上下文面板「工作区文件/只读文件」检索关键词
   const [wsRefs,         setWsRefs]         = useState<WorkspaceRef[]>([]);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
@@ -2723,7 +2749,7 @@ export default function ConversationsPage() {
     e.preventDefault();
     setBubbleMenu({
       x: Math.min(e.clientX, window.innerWidth - 148),
-      y: Math.min(e.clientY, window.innerHeight - 168),
+      y: Math.min(e.clientY, window.innerHeight - 232),
       message,
       author,
     });
@@ -2790,6 +2816,20 @@ export default function ConversationsPage() {
     }
   };
 
+  // 软删除单条消息：从当前气泡列表移除，后台仅打 deleted_at 标记（保留数据可审计）。
+  const deleteBubbleMessage = async () => {
+    if (!bubbleMenu) return;
+    const id = bubbleMenu.message.id;
+    setBubbleMenu(null);
+    try {
+      await softDeleteMessage(id);
+      setMsgs(ms => ms.filter(m => m.id !== id));
+      window.dispatchEvent(new Event('AutoForge:badges-refresh'));
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  };
+
   const openReader = () => {
     if (!bubbleMenu) return;
     setReader({ message: bubbleMenu.message, author: bubbleMenu.author });
@@ -2814,6 +2854,7 @@ export default function ConversationsPage() {
     attachments: PendingAttachment[],
     contextRefs: ConversationAttachment[],
     mentionedAgentIds: string[],
+    substrateRefs: ContextItem[] = [],
   ) => {
     if (!conv || sending) return false;
     const stagedWsRefs = wsRefs;
@@ -2839,6 +2880,12 @@ export default function ConversationsPage() {
 
       for (const attachment of contextRefs) {
         blocks.push(contextAttachmentBlock(attachment));
+      }
+
+      // 全量上下文基质 · 内联引用：把 @ 选中的基质条目落成 context_ref 块；
+      // 后端 message_to_prompt_text 会按 ref 懒取正文注入 AI（万物可引闭环）。
+      for (const it of substrateRefs) {
+        blocks.push({ t: 'context_ref', ref: it.id, kind: it.source_kind, title: it.title || it.id });
       }
 
       // 工作区文件引用：随消息携带 .autoforge/ 相对路径，后端构建提示时按需读取内容。
@@ -3207,9 +3254,31 @@ export default function ConversationsPage() {
                   )}
 
                   {/* Workspace (.autoforge) section */}
-                  {conv?.project_id && (
+                  {conv?.project_id && (() => {
+                    const q = fileQuery.trim().toLowerCase();
+                    const matchFile = (name: string, path: string) =>
+                      !q || name.toLowerCase().includes(q) || path.toLowerCase().includes(q);
+                    const wsInTab = workspaceFiles.filter(f => f.subfolder === workspaceTab);
+                    const wsShown = wsInTab.filter(f => matchFile(f.name, f.rel_path));
+                    const projShown = projectFiles.filter(f => matchFile(f.name, f.rel_path));
+                    return (
                     <>
                       <div style={{ height: 1, background: 'var(--border)', margin: '6px 0 2px' }} />
+                      <div className="chat-search-box" style={{ height: 30, margin: '4px 4px 6px' }}>
+                        <Icon name="search" size={13} />
+                        <input
+                          value={fileQuery}
+                          onChange={e => setFileQuery(e.target.value)}
+                          placeholder="检索工作区/只读文件名或路径"
+                          style={{ fontSize: 'var(--text-caption)' }}
+                        />
+                        {fileQuery && (
+                          <button className="icon-btn" title="清空检索" style={{ width: 20, height: 20, flex: 'none' }}
+                            onClick={() => setFileQuery('')}>
+                            <Icon name="x" size={12} />
+                          </button>
+                        )}
+                      </div>
                       <div className="mention-pop-label" style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                         <Icon name="folder" size={12} style={{ color: 'var(--ember)' }} />
                         工作区文件
@@ -3224,15 +3293,21 @@ export default function ConversationsPage() {
                         </div>
                       </div>
                       {/* File list：点击即把文件作为附件引用暂存到输入框上方，发送时随消息携带 */}
-                      {workspaceFiles.filter(f => f.subfolder === workspaceTab).length === 0 ? (
+                      {wsShown.length === 0 ? (
                         <div className="empty-compact" style={{ padding: '8px 8px' }}>
-                          .autoforge/{workspaceTab}/ 暂无文件
-                          <span style={{ display: 'block', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 3 }}>
-                            让 Agent 创建文档，或直接点击 Artifact 的"存入 {workspaceTab}"按钮
-                          </span>
+                          {q && wsInTab.length > 0 ? (
+                            <>无匹配「{fileQuery}」的文件</>
+                          ) : (
+                            <>
+                              .autoforge/{workspaceTab}/ 暂无文件
+                              <span style={{ display: 'block', fontSize: 'var(--text-micro)', color: 'var(--text-faint)', marginTop: 3 }}>
+                                让 Agent 创建文档，或直接点击 Artifact 的"存入 {workspaceTab}"按钮
+                              </span>
+                            </>
+                          )}
                         </div>
                       ) : (
-                        workspaceFiles.filter(f => f.subfolder === workspaceTab).map(f => {
+                        wsShown.map(f => {
                           const referenced = wsRefs.some(r => r.path === f.rel_path);
                           return (
                           <div key={f.rel_path} className="mention-row" style={{ cursor: 'pointer' }}
@@ -3259,10 +3334,12 @@ export default function ConversationsPage() {
                         <Icon name="zap" size={12} style={{ color: 'var(--ember)' }} />
                         只读上下文文件
                       </div>
-                      {projectFiles.length === 0 && (
-                        <div className="empty-compact" style={{ padding: '6px 8px' }}>项目目录无可引用文件</div>
+                      {projShown.length === 0 && (
+                        <div className="empty-compact" style={{ padding: '6px 8px' }}>
+                          {q && projectFiles.length > 0 ? <>无匹配「{fileQuery}」的文件</> : '项目目录无可引用文件'}
+                        </div>
                       )}
-                      {projectFiles.slice(0, 12).map(f => (
+                      {projShown.slice(0, 12).map(f => (
                         <div key={f.rel_path} className="mention-row" style={{ paddingTop: 5, paddingBottom: 5 }}>
                           <div className="cfg-logo" style={{ width: 26, height: 26, flexShrink: 0,
                             background: f.is_priority ? 'var(--ember)' : f.pinned ? 'var(--amber)' : 'var(--bg-4)' }}>
@@ -3303,7 +3380,8 @@ export default function ConversationsPage() {
                         只读文件仅注入上下文供参考，可写范围仅限 .autoforge/docs/、.autoforge/specs/ 和 .autoforge/deliverables/
                       </div>
                     </>
-                  )}
+                    );
+                  })()}
                 </div>
               )}
 
@@ -3516,6 +3594,7 @@ export default function ConversationsPage() {
           {conv?.project_id && (
             <button onClick={distillBubbleToIssue}><Icon name="inbox" size={14} />沉淀为需求</button>
           )}
+          <button className="danger" onClick={deleteBubbleMessage}><Icon name="trash" size={14} />删除</button>
         </div>
       )}
       {reader && (

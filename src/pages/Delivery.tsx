@@ -5,6 +5,7 @@ import Select from '../components/Select';
 import Toast, { type ToastData } from '../components/Toast';
 import {
   listActiveProjects, listPrototypePrompts, generatePrototypePrompt, deletePrototypePrompt, updatePrototypePrompt,
+  listBlueprintDrafts, type BlueprintDraftSummary,
   openUrl, launchOpenDesign,
   listSecurityAudits, listDeployments, generateDeployScript, confirmDeploy, updateDeployScript, deleteDeployment,
   runProactiveScan, listTestSessions, getWidgetSnippet, getWebhookStatus,
@@ -129,8 +130,16 @@ function ConfirmModal({ msg, onOk, onCancel }: { msg: string; onOk: () => void; 
   );
 }
 
-export default function Delivery() {
+export default function Delivery({ target, onTargetConsumed }: {
+  target?: { projectId: string; stage?: string; draftId?: string } | null;
+  onTargetConsumed?: () => void;
+} = {}) {
   const [projects, setProjects] = useState<Project[]>([]);
+  // P4 深链携带的草稿 id：设计阶段据此在文档源里带出该稿 PRD 并默认勾选。
+  // 现为「必选」：原型提示词必须对应一个孵化台需求，未选则不能生成。
+  const [designDraftId, setDesignDraftId] = useState<string | undefined>(undefined);
+  // 当前项目的孵化台需求列表，供设计阶段的「孵化台需求」选择器使用。
+  const [drafts, setDrafts] = useState<BlueprintDraftSummary[]>([]);
   const [projectId, setProjectId] = useState('');
   const [prototypes, setPrototypes] = useState<PrototypePrompt[]>([]);
   const [audits, setAudits] = useState<SecurityAudit[]>([]);
@@ -171,7 +180,8 @@ export default function Delivery() {
     if (!pid) return;
     try {
       const [pp, sa, dp, tsx, ar] = await Promise.all([
-        listPrototypePrompts(pid).catch(() => []),
+        // 从孵化台跳入(有 designDraftId)则只列该大需求的原型；否则列项目全部。
+        listPrototypePrompts(pid, designDraftId).catch(() => []),
         listSecurityAudits(pid).catch(() => []),
         listDeployments(pid).catch(() => []),
         listTestSessions(pid).catch(() => []),
@@ -183,7 +193,7 @@ export default function Delivery() {
       setScans(tsx.filter(s => s.session_type === 'proactive'));
       setArtifacts(ar);
     } catch (e) { showError(String(e)); }
-  }, [showError]);
+  }, [showError, designDraftId]);
 
   // The widget snippet is deterministic (derived from projectId + webhook config),
   // so auto-generate it on project change / mount instead of keeping it in ephemeral
@@ -200,6 +210,29 @@ export default function Delivery() {
     catch (e) { showError(String(e)); }
     finally { setBusy(''); }
   };
+
+  // P4 深链消费：孵化台「去原型设计」跳入时预选项目 + 切设计阶段 + 记 draftId（预选 PRD）。
+  useEffect(() => {
+    if (!target) return;
+    setProjectId(target.projectId);
+    if (target.stage) setStage(target.stage as StageId);
+    setDesignDraftId(target.draftId);
+    onTargetConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target]);
+
+  // 设计阶段：加载本项目的孵化台需求列表（选择器数据源）。
+  // 当前选择若已不在列表中（切项目/需求被删）则回落第一条；深链带入的 draftId 优先保留。
+  useEffect(() => {
+    if (stage !== 'design' || !projectId) { setDrafts([]); return; }
+    let alive = true;
+    listBlueprintDrafts(projectId).then(ds => {
+      if (!alive) return;
+      setDrafts(ds);
+      setDesignDraftId(cur => (cur && ds.some(d => d.id === cur)) ? cur : ds[0]?.id);
+    }).catch(() => { if (alive) setDrafts([]); });
+    return () => { alive = false; };
+  }, [stage, projectId]);
 
   const copy = async (text: string) => {
     try {
@@ -351,14 +384,28 @@ export default function Delivery() {
             <div className="panel-head">
               <div className="panel-title">
                 <Icon name="palette" size={17} style={{ color: 'var(--violet)' }} />原型设计提示词
+                {designDraftId && <span className="chip violet" style={{ marginLeft: 8 }}>本需求原型</span>}
                 <InfoHint text="提示词由项目根目录的 DESIGN.md 与技术规格喂给设计角色生成；仓库内有 DESIGN.md 时质量最佳，缺失时退回通用启发式模板。" />
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {/* 孵化台需求（必选）：每条原型提示词都归属一个孵化台需求。 */}
+                <div style={{ minWidth: 200 }}>
+                  <Select className="sm" value={designDraftId ?? ''} onChange={v => setDesignDraftId(v || undefined)}
+                    placeholder={drafts.length ? '选择需求…' : '暂无需求'}
+                    options={drafts.map(d => ({ value: d.id, label: d.title?.trim() || '未命名需求' }))} />
+                </div>
                 <div style={{ minWidth: 150 }}>
                   <Select className="sm" value={toolTarget} onChange={setToolTarget} options={TOOL_OPTS} />
                 </div>
                 <button className="btn btn-primary btn-sm" disabled={busy === 'proto'}
-                  onClick={() => run('proto', () => generatePrototypePrompt(projectId, null, toolTarget))}>
+                  onClick={() => {
+                    // 未选需求：不生成，提示去需求孵化台完善当前需求。
+                    if (!designDraftId) {
+                      setToast({ msg: '请先到「需求孵化台」完善当前需求，再来生成原型设计提示词', tone: 'info' });
+                      return;
+                    }
+                    run('proto', () => generatePrototypePrompt(projectId, null, toolTarget, { draftId: designDraftId }));
+                  }}>
                   <Icon name="zap" size={14} />{busy === 'proto' ? '生成中…' : '生成设计提示词'}
                 </button>
               </div>

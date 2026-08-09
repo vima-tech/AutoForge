@@ -124,25 +124,32 @@ pub fn start(db: Db, app: tauri::AppHandle, concurrency: Arc<ConcurrencyManager>
 }
 
 async fn dispatch_job(db: &Db, tx: &JobSender, app: &tauri::AppHandle, msg: &JobMsg) -> Result<()> {
+    // M0（EventSink 解耦）：已迁移的任务签名收 `&dyn EventSink` / `&Arc<dyn EventSink>`；
+    // `&AppHandle` 自动 unsize 成 `&dyn EventSink` 直接传入，spawn 型任务传共享 Arc sink。
+    // 未迁移任务仍收 `app`。待整棵 tasks 迁完，`app` 可整体退役为 sink。
+    let sink: std::sync::Arc<dyn crate::core::event::EventSink> =
+        std::sync::Arc::new(app.clone());
     match &msg.payload {
-        JobPayload::Analysis { issue_id } => crate::tasks::analysis::run(db, app, issue_id).await,
+        JobPayload::Analysis { issue_id } => {
+            crate::tasks::analysis::run(db, app, issue_id).await
+        }
         JobPayload::Execution {
             change_request_id,
             project_id,
-        } => crate::tasks::execution::run(db, tx, app, change_request_id, project_id).await,
+        } => crate::tasks::execution::run(db, tx, &sink, change_request_id, project_id).await,
         JobPayload::Testing { change_request_id } => {
             crate::tasks::testing::run(db, tx, app, change_request_id).await
         }
         JobPayload::Premerge { change_request_id } => {
-            crate::tasks::merge::premerge_run(db, tx, app, change_request_id).await
+            crate::tasks::merge::premerge_run(db, tx, &sink, change_request_id).await
         }
         JobPayload::Merge { change_request_id } => {
             // 已走完 premerge（落了 tested_dev_sha）→ 仅落地（land_run，再校验 dev 漂移）；
             // 否则（开关关 / 旧数据 / 直接 Merge）→ legacy 单锁全流程 run()。
             if crate::tasks::merge::should_land_only(db, change_request_id).await {
-                crate::tasks::merge::land_run(db, tx, app, change_request_id).await
+                crate::tasks::merge::land_run(db, tx, &sink, change_request_id).await
             } else {
-                crate::tasks::merge::run(db, tx, app, change_request_id).await
+                crate::tasks::merge::run(db, tx, &sink, change_request_id).await
             }
         }
         JobPayload::Revert { change_request_id } => {
@@ -171,6 +178,24 @@ async fn wait_for_execution_slot(
         if load_factor > 0.0
             && status.active_slots >= 1
             && crate::core::reaper::system_overloaded(load_factor)
+        {
+            let _ = sqlx::query(
+                "UPDATE job_executions SET status='waiting', updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(job_id)
+            .execute(db)
+            .await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
+        }
+
+        // 核预算背压（文档 §10）：合并门/巡检的验证队列积压——被阻塞等待核令牌的 check 数
+        // 超过池容量（即 >1× 过载）——时，暂缓再起新 agent：它们最终的 verify 也会排到这条
+        // 队列后面，先放行只会加深积压。与 loadavg 闸同形：仅批内已有 agent 时生效（冷启动
+        // 不挡），且是 throttle+重试而非拒绝，队列消化后自动放行，绝不死锁。loadavg（Linux-
+        // only）测的是即时系统负载，本闸测的是 AutoForge 自身验证门的排队压力，两者互补。
+        if status.active_slots >= 1
+            && crate::core::cpu_permits::queue_depth() > crate::core::cpu_permits::total()
         {
             let _ = sqlx::query(
                 "UPDATE job_executions SET status='waiting', updated_at=datetime('now') WHERE id=?",

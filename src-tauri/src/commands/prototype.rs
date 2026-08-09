@@ -1,4 +1,3 @@
-use crate::models::issue::Issue;
 use crate::models::project::Project;
 use crate::models::prototype::PrototypePrompt;
 use crate::state::AppState;
@@ -6,11 +5,213 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
+/// 一个可作为原型设计依据的核心文档源（孵化台深化 §3.5B）。
+/// 前端「关联文档」面板据此让用户勾选，`generate_prototype_prompt(doc_refs)` 按选中项拼上下文。
+#[derive(Debug, Clone, Serialize)]
+pub struct DocSource {
+    /// design_md / blueprint_prd / spec / workspace
+    pub kind: String,
+    /// draft_id / category / rel_path（design_md 为空）
+    pub r#ref: String,
+    pub title: String,
+    pub summary: String,
+    pub est_tokens: i64,
+    pub default_on: bool,
+}
+
+fn est_tokens(text: &str) -> i64 {
+    // 粗估：中英文混排约 3-4 字符/token，取 /3 保守偏高。
+    (text.chars().count() as i64 / 3).max(1)
+}
+
+/// 汇总一个项目当前所有可作为原型设计依据的核心文档源（P4：设计契约 / 需求 PRD / 技术规格）。
+/// 供前端「关联文档」面板勾选；`generate_prototype_prompt` 再按选中的 `doc_refs` 拼上下文。
+#[tauri::command]
+pub async fn list_prototype_doc_sources(
+    project_id: String,
+    draft_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<DocSource>, String> {
+    let project = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
+        .bind(&project_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("项目不存在")?;
+    Ok(collect_doc_sources(&state.db, &project_id, &project.repo_path, draft_id.as_deref()).await)
+}
+
+/// 汇总核心文档源的纯逻辑（DB + 文件驱动，命令外可测）。
+pub(crate) async fn collect_doc_sources(
+    db: &crate::db::Db,
+    project_id: &str,
+    repo_path: &str,
+    draft_id: Option<&str>,
+) -> Vec<DocSource> {
+    let mut out: Vec<DocSource> = Vec::new();
+
+    // ① 设计契约：DESIGN.md（必选）。
+    if let Some(design) = read_repo_design(repo_path) {
+        out.push(DocSource {
+            kind: "design_md".into(),
+            r#ref: String::new(),
+            title: "DESIGN.md（设计契约）".into(),
+            summary: "项目 UI 设计系统与 token 契约".into(),
+            est_tokens: est_tokens(&design),
+            default_on: true,
+        });
+    }
+
+    // ② 需求文档：孵化台草稿 PRD（从孵化台跳入时默认选中）。
+    if let Some(did) = draft_id.filter(|s| !s.is_empty()) {
+        if let Some((title, prd)) =
+            sqlx::query_as::<_, (String, String)>("SELECT title, prd_markdown FROM blueprint_drafts WHERE id=?")
+                .bind(did)
+                .fetch_optional(db)
+                .await
+                .ok()
+                .flatten()
+        {
+            let disp = if title.trim().is_empty() { "孵化台草稿" } else { title.trim() };
+            out.push(DocSource {
+                kind: "blueprint_prd".into(),
+                r#ref: did.to_string(),
+                title: format!("需求 PRD · {disp}"),
+                summary: "孵化台梳理的大需求 PRD".into(),
+                est_tokens: est_tokens(&prd),
+                default_on: true,
+            });
+        }
+    }
+
+    // ③ 技术规格：project_specs 按分类聚合（architecture/api 默认选中）。
+    let specs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT category, title FROM project_specs WHERE project_id=? ORDER BY category",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (cat, _title) in &specs {
+        if !seen.insert(cat.clone()) {
+            continue; // 同分类只出一条聚合项
+        }
+        out.push(DocSource {
+            kind: "spec".into(),
+            r#ref: cat.clone(),
+            title: format!("技术规格 · {cat}"),
+            summary: "项目规格约束".into(),
+            est_tokens: 0,
+            default_on: matches!(cat.as_str(), "architecture" | "api"),
+        });
+    }
+
+    out
+}
+
+/// 按选中的文档源引用读取正文，拼成 design_ctx（P4 §3.5C）。
+/// ref 形如 `design_md` / `blueprint_prd:<id>` / `spec:<category>`；单条 ~5K、总量 ~18K 封顶；
+/// 防御性过注入闸（疑似注入的文档跳过，不喂进原型 prompt）。
+pub(crate) async fn read_doc_refs(
+    db: &crate::db::Db,
+    repo_path: &str,
+    project_id: &str,
+    doc_refs: &[String],
+) -> String {
+    const PER: usize = 5000;
+    const TOTAL: usize = 18000;
+    let mut ctx = String::new();
+    let mut used = 0usize;
+    for r in doc_refs {
+        if used >= TOTAL {
+            break;
+        }
+        let (header, body): (String, String) = if r == "design_md" {
+            ("# 设计契约(DESIGN.md)".into(), read_repo_design(repo_path).unwrap_or_default())
+        } else if let Some(id) = r.strip_prefix("blueprint_prd:") {
+            let prd = sqlx::query_as::<_, (String,)>("SELECT prd_markdown FROM blueprint_drafts WHERE id=?")
+                .bind(id)
+                .fetch_optional(db)
+                .await
+                .ok()
+                .flatten()
+                .map(|(v,)| v)
+                .unwrap_or_default();
+            ("# 需求文档(PRD)".into(), prd)
+        } else if let Some(cat) = r.strip_prefix("spec:") {
+            let content = sqlx::query_as::<_, (String,)>(
+                "SELECT group_concat(content, char(10)) FROM project_specs WHERE project_id=? AND category=?",
+            )
+            .bind(project_id)
+            .bind(cat)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(v,)| Some(v))
+            .unwrap_or_default();
+            (format!("# 技术规格·{cat}"), content)
+        } else {
+            continue; // 未知 ref（如 workspace:）暂跳过
+        };
+        let body = body.trim();
+        if body.is_empty() || crate::core::security::has_obvious_injection(body) {
+            continue;
+        }
+        let budget = (TOTAL - used).min(PER);
+        let slice: String = body.chars().take(budget).collect();
+        used += slice.len();
+        if !ctx.is_empty() {
+            ctx.push_str("\n\n");
+        }
+        ctx.push_str(&header);
+        ctx.push('\n');
+        ctx.push_str(&slice);
+    }
+    ctx
+}
+
+/// 读取「改现有页面」选中的仓库页面组件源码，拼成「现有页面基础」块。
+/// 守卫读（read_repo_file，防越界）+ 注入过滤 + 单条/总量封顶。
+async fn read_existing_pages(repo_path: &str, refs: &[String]) -> String {
+    const PER: usize = 6000;
+    const TOTAL: usize = 20000;
+    let mut buf = String::new();
+    let mut used = 0usize;
+    for rel in refs.iter().filter(|r| !r.trim().is_empty()).take(6) {
+        if used >= TOTAL {
+            break;
+        }
+        match crate::commands::project_context::read_repo_file(repo_path, rel.trim()) {
+            Ok(content) if !crate::core::security::has_obvious_injection(&content) => {
+                let budget = (TOTAL - used).min(PER);
+                let slice: String = content.chars().take(budget).collect();
+                used += slice.len();
+                buf.push_str(&format!("\n### 文件：{}\n```\n{}\n```\n", rel.trim(), slice));
+            }
+            _ => { /* 读失败/疑似注入：跳过该文件，不阻断生成 */ }
+        }
+    }
+    buf
+}
+
 #[tauri::command]
 pub async fn list_prototype_prompts(
     project_id: Option<String>,
+    // 给了 draft_id 则只列该大需求的原型（按需求归档；从孵化台跳入时传）。
+    draft_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<PrototypePrompt>, String> {
+    if let Some(did) = draft_id.as_deref().filter(|s| !s.is_empty()) {
+        return sqlx::query_as::<_, PrototypePrompt>(
+            "SELECT * FROM prototype_prompts WHERE draft_id=? ORDER BY created_at DESC LIMIT 200",
+        )
+        .bind(did)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string());
+    }
     match project_id {
         Some(pid) => sqlx::query_as::<_, PrototypePrompt>(
             "SELECT * FROM prototype_prompts WHERE project_id=? ORDER BY created_at DESC LIMIT 200",
@@ -73,6 +274,12 @@ pub async fn generate_prototype_prompt(
     project_id: String,
     issue_id: Option<String>,
     tool_target: Option<String>,
+    draft_id: Option<String>,
+    doc_refs: Option<Vec<String>>,
+    // 'new'（新页面，默认）/ 'existing'（在现有页面基础上改动）。
+    design_mode: Option<String>,
+    // design_mode='existing' 时选中的现有页面组件仓库相对路径。
+    existing_page_refs: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<PrototypePrompt, String> {
     let project = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id=?")
@@ -82,15 +289,20 @@ pub async fn generate_prototype_prompt(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    let issue: Option<Issue> = if let Some(iid) = &issue_id {
-        sqlx::query_as::<_, Issue>("SELECT * FROM issues WHERE id=?")
-            .bind(iid)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| e.to_string())?
-    } else {
-        None
-    };
+    // 硬约束：原型提示词必须对应一个孵化台需求（draft）。空 draft_id 直接拒绝，
+    // 且不落库——杜绝生成脱离孵化台需求的「野」提示词（前端也会禁用生成按钮兜住）。
+    let draft_id = draft_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or("原型提示词必须对应一个需求，请先在「需求孵化台」选择或新建一条需求")?;
+    let (draft_title, draft_brief) = sqlx::query_as::<_, (String, String)>(
+        "SELECT title, brief FROM blueprint_drafts WHERE id=?",
+    )
+    .bind(&draft_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("对应的需求不存在（可能已删除），请重新选择")?;
 
     // Pull the project's spec docs as design context (best-effort).
     let specs: String = sqlx::query_as::<_, (String, String)>(
@@ -125,14 +337,40 @@ pub async fn generate_prototype_prompt(
         design_ctx.push_str(&specs);
     }
 
+    // P4 §3.5C：若前端「关联文档」面板给了显式 doc_refs，按选中文档拼 design_ctx（更准），
+    // 覆盖上面的默认 DESIGN.md+specs 粗放种子；空则回落旧行为（向后兼容）。
+    let doc_refs = doc_refs.unwrap_or_default();
+    if !doc_refs.is_empty() {
+        let picked = read_doc_refs(&state.db, &project.repo_path, &project_id, &doc_refs).await;
+        if !picked.trim().is_empty() {
+            design_ctx = picked;
+        }
+    }
+
+    // 「改现有页面」模式：读选中的现有页面组件源码，作为改动基础前置进 design_ctx，
+    // 并指令模型在其上做增量改动而非从零重设计（新页面模式则不注入，行为不变）。
+    let mode = design_mode.unwrap_or_default();
+    if mode == "existing" {
+        let refs = existing_page_refs.clone().unwrap_or_default();
+        let pages = read_existing_pages(&project.repo_path, &refs).await;
+        if !pages.trim().is_empty() {
+            design_ctx = format!(
+                "# ⚠️ 本次是对【现有页面】的改动，不是新建页面\n\
+                 必须在下面现有页面的基础上做**增量改动**：保持其整体布局、组件层级、交互流与\
+                 视觉风格一致，只针对下方需求描述涉及的部分做修改/新增，不要从零重新设计整个页面。\n\n\
+                 ## 现有页面代码（改动基础，务必延续其结构与风格）\n{pages}\n\n---\n\n{design_ctx}"
+            );
+        }
+    }
+
     let target = tool_target.unwrap_or_else(|| "generic".to_string());
-    let (feature_title, feature_desc) = match &issue {
-        Some(i) => (i.title.clone(), i.description.clone()),
-        None => (
-            format!("{} 产品界面", project.name),
-            project.description.clone(),
-        ),
+    // 从（必选的）孵化台草稿派生 feature 标题/描述（真实需求，而非「项目名+产品界面」）。
+    let feature_title = if draft_title.trim().is_empty() {
+        format!("{} 界面", project.name)
+    } else {
+        draft_title
     };
+    let feature_desc = draft_brief;
 
     let heuristic = heuristic_prompt(&project.name, &target, &feature_title, &feature_desc, &design_ctx);
     let prompt = llm_prompt(&state.db, &project.id, &project.name, &target, &feature_title, &feature_desc, &design_ctx)
@@ -141,8 +379,8 @@ pub async fn generate_prototype_prompt(
 
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO prototype_prompts (id, project_id, issue_id, tool_target, title, prompt)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO prototype_prompts (id, project_id, issue_id, tool_target, title, prompt, draft_id, design_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project_id)
@@ -150,6 +388,8 @@ pub async fn generate_prototype_prompt(
     .bind(&target)
     .bind(&feature_title)
     .bind(&prompt)
+    .bind(&draft_id)
+    .bind(&mode)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
@@ -699,4 +939,108 @@ pub async fn launch_opendesign(state: State<'_, AppState>) -> Result<String, Str
 #[tauri::command]
 pub async fn get_opendesign_log() -> Result<String, String> {
     Ok(tail(&read_log(), 16000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P4 文档源汇总：需求 PRD（有 draft 时默认选）+ 技术规格按分类聚合（architecture/api 默认选）。
+    /// design_md 走文件（测试 repo_path 不存在 → 跳过，不影响 DB 源验证）。
+    #[tokio::test]
+    async fn collect_doc_sources_aggregates_prd_and_specs() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE project_specs (id TEXT PRIMARY KEY, project_id TEXT, category TEXT, title TEXT)")
+            .execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE blueprint_drafts (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', prd_markdown TEXT NOT NULL DEFAULT '')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO project_specs VALUES ('s1','p1','architecture','架构'),('s2','p1','architecture','架构2'),('s3','p1','testing','测试')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO blueprint_drafts (id, title, prd_markdown) VALUES ('d1','登录改造','# PRD 内容')")
+            .execute(&db).await.unwrap();
+
+        let out = collect_doc_sources(&db, "p1", "/nonexistent-repo", Some("d1")).await;
+        // 需求 PRD 在（默认选）。
+        let prd = out.iter().find(|d| d.kind == "blueprint_prd").expect("有 PRD 源");
+        assert!(prd.default_on && prd.title.contains("登录改造"));
+        // 规格按分类聚合：architecture 一条（去重）+ testing 一条。
+        let specs: Vec<&DocSource> = out.iter().filter(|d| d.kind == "spec").collect();
+        assert_eq!(specs.len(), 2, "两个分类各一条聚合项");
+        let arch = specs.iter().find(|d| d.r#ref == "architecture").unwrap();
+        assert!(arch.default_on, "architecture 默认选中");
+        let testing = specs.iter().find(|d| d.r#ref == "testing").unwrap();
+        assert!(!testing.default_on, "testing 默认不选");
+    }
+
+    /// P4 §3.5C：read_doc_refs 按选中 ref 读正文拼上下文（PRD + spec 分类聚合），跳未知 ref。
+    #[tokio::test]
+    async fn read_doc_refs_assembles_selected_docs() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE blueprint_drafts (id TEXT PRIMARY KEY, prd_markdown TEXT NOT NULL DEFAULT '')")
+            .execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE project_specs (id TEXT PRIMARY KEY, project_id TEXT, category TEXT, content TEXT)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO blueprint_drafts VALUES ('d1','# 登录页 PRD 正文')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO project_specs VALUES ('s1','p1','api','接口约束A'),('s2','p1','api','接口约束B')")
+            .execute(&db).await.unwrap();
+
+        let refs = vec![
+            "blueprint_prd:d1".to_string(),
+            "spec:api".to_string(),
+            "workspace:未知".to_string(), // 未知 ref → 跳过
+        ];
+        let ctx = read_doc_refs(&db, "/nonexistent", "p1", &refs).await;
+        assert!(ctx.contains("# 需求文档(PRD)") && ctx.contains("登录页 PRD 正文"));
+        assert!(ctx.contains("# 技术规格·api") && ctx.contains("接口约束A") && ctx.contains("接口约束B"));
+    }
+
+    /// 原型按需求归档：draft_id 列 + 按 draft_id 过滤（同项目不同需求各自独立列出）。
+    #[tokio::test]
+    async fn prototypes_filter_by_draft() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // 与迁移 0021+0083 同构的最小建表（含 draft_id/design_mode）。
+        sqlx::query(
+            "CREATE TABLE prototype_prompts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+             issue_id TEXT, tool_target TEXT NOT NULL DEFAULT 'generic', title TEXT NOT NULL DEFAULT '',
+             prompt TEXT NOT NULL DEFAULT '', draft_id TEXT NOT NULL DEFAULT '',
+             design_mode TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO prototype_prompts (id, project_id, draft_id, design_mode, title) VALUES
+               ('a','p1','d1','new','登录页'),
+               ('b','p1','d1','existing','登录页改版'),
+               ('c','p1','d2','new','结算页')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // 按需求 d1 过滤 → 2 条；d2 → 1 条。
+        let d1 = sqlx::query_as::<_, PrototypePrompt>("SELECT * FROM prototype_prompts WHERE draft_id=? ORDER BY id")
+            .bind("d1").fetch_all(&db).await.unwrap();
+        assert_eq!(d1.len(), 2, "需求 d1 有两个原型");
+        assert_eq!(d1[1].design_mode, "existing", "design_mode 落库可读");
+        let d2 = sqlx::query_as::<_, PrototypePrompt>("SELECT * FROM prototype_prompts WHERE draft_id=?")
+            .bind("d2").fetch_all(&db).await.unwrap();
+        assert_eq!(d2.len(), 1);
+        // 项目级(不带 draft)仍列全部 3 条。
+        let all = sqlx::query_as::<_, PrototypePrompt>("SELECT * FROM prototype_prompts WHERE project_id=?")
+            .bind("p1").fetch_all(&db).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
 }

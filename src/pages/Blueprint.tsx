@@ -8,10 +8,11 @@ import { listProjects, listBlueprintDrafts, deleteBlueprintDraft, type Project, 
  * 列表视图（多需求 + 状态）↔ 详情视图（BlueprintStudio 工作台）。每条大需求 = 一个草稿；
  * 编码开发后落为 issue + CR，状态（编码中/待审核/已实现）回链到卡片。
  */
-export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit }: {
+export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit, onOpenDelivery }: {
   target?: { projectId: string } | null;
   onTargetConsumed?: () => void;
   onOpenAudit?: (projectId: string, issueId: string) => void;
+  onOpenDelivery?: (projectId: string, opts?: { stage?: string; draftId?: string }) => void;
 }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -90,6 +91,7 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit }:
         onBack={backToList}
         onChanged={(newId) => { if (newId) { setSelectedDraftId(newId); setIsNew(false); } if (activeId) void loadDrafts(activeId); }}
         onOpenAudit={onOpenAudit}
+        onOpenDelivery={onOpenDelivery}
       />
     );
   }
@@ -98,23 +100,19 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit }:
   return (
     <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       {/* 头栏：孵化台标识 + 项目选择器 + 新建需求 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 20px 12px', flexShrink: 0, borderBottom: '1px solid var(--border)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-          <Icon name="layers" size={18} style={{ color: 'var(--ember)' }} />
-          <span style={{ fontFamily: 'var(--font-display)', fontWeight: 800, fontSize: 'var(--text-heading)' }}>孵化台</span>
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-micro)', letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>
-            从念头到可交付
-          </span>
+      <div className="audit-top" style={{ height: 56 }}>
+        <div className="eyebrow" style={{ fontSize: 'var(--text-heading)' }}>
+          <span className="en">INCUBATOR</span><span className="cn">· 需求孵化台</span>
         </div>
-        <div style={{ position: 'relative', minWidth: 240, maxWidth: 340 }} ref={projRef}>
+        <div style={{ position: 'relative', minWidth: 200, maxWidth: 300 }} ref={projRef}>
           {active ? (
-            <div className="proj-select" onClick={() => setProjOpen(o => !o)} style={{ cursor: 'pointer' }}>
-              <div className="proj-logo" style={{ background: '#e8772e' }}>{active.name[0]}</div>
+            <div className="proj-select" onClick={() => setProjOpen(o => !o)} style={{ cursor: 'pointer', padding: '5px 10px', gap: 8 }}>
+              <div className="proj-logo" style={{ background: '#e8772e', width: 28, height: 28, fontSize: 'var(--text-label)', borderRadius: 8 }}>{active.name[0]}</div>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="proj-name">{active.name}</div>
-                <div className="proj-meta">{active.description || active.slug}</div>
+                <div className="proj-name" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{active.name}</div>
+                <div className="proj-meta" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{active.description || active.slug}</div>
               </div>
-              <Icon name="chevDown" size={16} style={{ color: 'var(--text-3)', transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none' }} />
+              <Icon name="chevDown" size={15} style={{ color: 'var(--text-3)', flexShrink: 0, transition: 'transform .15s', transform: projOpen ? 'rotate(180deg)' : 'none' }} />
             </div>
           ) : (
             <div className="empty-compact" style={{ padding: '8px 10px' }}>{loadingProjects ? '载入项目…' : '暂无项目'}</div>
@@ -133,8 +131,7 @@ export default function BlueprintPage({ target, onTargetConsumed, onOpenAudit }:
             </div>
           )}
         </div>
-        <div style={{ flex: 1 }} />
-        <button className="btn btn-primary" disabled={!active} onClick={() => { setIsNew(true); setSelectedDraftId(null); }}>
+        <button className="btn btn-primary btn-sm" style={{ marginLeft: 'auto' }} disabled={!active} onClick={() => { setIsNew(true); setSelectedDraftId(null); }}>
           <Icon name="plus" size={14} />新建需求改动
         </button>
       </div>

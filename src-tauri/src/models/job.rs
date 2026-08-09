@@ -30,7 +30,7 @@ pub enum JobPayload {
         change_request_id: String,
     },
     /// 合并前阶段（Phase1 dev-sync + 测试门 + 安全门），不持 merge_lock，多 CR 可并行
-    /// （受 build_pool 节流）。通过后置 merge_ready 并入队 Merge(land)。
+    /// （受 core::cpu_permits 核预算节流）。通过后置 merge_ready 并入队 Merge(land)。
     Premerge {
         change_request_id: String,
     },

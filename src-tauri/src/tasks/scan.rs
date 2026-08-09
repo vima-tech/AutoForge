@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub async fn run_proactive(
     db: &Db,
     tx: &JobSender,
-    app: &tauri::AppHandle,
+    sink: &dyn crate::core::event::EventSink,
     project_id: &str,
     trigger: &str,
 ) -> Result<()> {
@@ -48,9 +48,14 @@ pub async fn run_proactive(
     .execute(db)
     .await?;
 
+    // 相位作用域租约（同合并门）：巡检的 check 也按权重借核令牌、扇出封顶，与合并门共用
+    // 同一核预算池，避免巡检与合并门的编译尖峰叠加把 CPU 打满。
     let mut results = Vec::new();
     for (name, command, timeout) in checks {
-        results.push(run_check(&project.repo_path, name, command, timeout).await);
+        let weight = crate::core::cpu_permits::weight_of(&name, &command);
+        let lease = crate::core::cpu_permits::acquire(weight).await;
+        results.push(run_check(&project.repo_path, name, command, timeout, lease.granted).await);
+        drop(lease);
     }
 
     let failed: Vec<_> = results.iter().filter(|r| !r.ok).collect();
@@ -122,7 +127,7 @@ pub async fn run_proactive(
     .await?;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TestCompleted {
             cr_id: String::new(),
             test_session_id: session_id,

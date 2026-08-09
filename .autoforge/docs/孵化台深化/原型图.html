@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>孵化台深化 · 页面布局原型</title>
+<style>
+:root{
+  --font-display:"Archivo","Noto Sans SC",system-ui,sans-serif;
+  --font-sans:"Noto Sans SC","Archivo",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",monospace;
+  --font-reading:"Noto Serif SC","Noto Sans SC",Georgia,serif;
+  --text-micro:10px;--text-caption:11px;--text-label:12px;--text-control:13px;
+  --text-body:14px;--text-title:15px;--text-section:16px;--text-heading:18px;
+  --text-page-title:24px;--text-metric:28px;
+  --leading-normal:1.5;--leading-relaxed:1.6;--leading-prose:1.7;
+  --ember:#e8772e;--ember-soft:#f29a55;--ember-deep:#c2571a;
+  --molten:linear-gradient(135deg,#f4a93c 0%,#e8772e 55%,#d65f1c 100%);
+  --green:#4f9d6b;--green-soft:#6fc090;--blue:#4f8ed1;--violet:#8b7ad8;--red:#db5a40;--amber:#e0a32e;
+  --radius-sm:8px;--radius:12px;--radius-lg:16px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.18),0 1px 1px rgba(0,0,0,.10);
+  --shadow:0 6px 20px rgba(0,0,0,.18);--shadow-lg:0 24px 60px rgba(0,0,0,.34);
+  --bg:#16110d;--bg-1:#1b150f;--bg-2:#211a13;--bg-3:#2a2017;
+  --surface-hover:#322619;--surface-active:#3a2c1c;--code-bg:#120d08;
+  --border:rgba(255,206,150,.10);--border-strong:rgba(255,206,150,.18);
+  --text:#f1e8d9;--text-2:#b8a78f;--text-3:#8a7964;--text-faint:#5f5343;
+  --ember-tint:rgba(232,119,46,.14);--ember-tint-strong:rgba(232,119,46,.22);
+  --green-tint:rgba(79,157,107,.14);--blue-tint:rgba(79,142,209,.14);
+  --violet-tint:rgba(139,122,216,.14);--amber-tint:rgba(224,163,46,.14);--red-tint:rgba(219,90,64,.14);
+  --bubble-me:linear-gradient(135deg,#f4a93c,#e8772e);--bubble-me-text:#2a1607;
+  --bubble-them:#261d14;--bubble-them-text:#ece2d2;
+  --paper-dot:color-mix(in srgb,var(--text) 3%,transparent);
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 700px at 70% -10%,#211a13,transparent),var(--bg);
+  color:var(--text);font-family:var(--font-sans);font-size:var(--text-body);line-height:var(--leading-normal);
+  -webkit-font-smoothing:antialiased;padding:36px 28px 80px}
+h1.top{font-family:var(--font-display);font-weight:800;font-size:var(--text-page-title);margin:0 0 4px;letter-spacing:-.01em}
+.kicker{font-family:var(--font-mono);font-size:var(--text-caption);letter-spacing:.16em;text-transform:uppercase;color:var(--ember-soft)}
+.lead{color:var(--text-2);max-width:900px;margin:6px 0 30px}
+.frame{max-width:1240px;margin:0 auto 46px}
+.frame-cap{display:flex;align-items:center;gap:10px;margin:0 0 12px}
+.frame-cap .no{font-family:var(--font-mono);font-size:var(--text-caption);color:var(--bubble-me-text);background:var(--molten);
+  padding:2px 9px;border-radius:99px;font-weight:700;letter-spacing:.04em}
+.frame-cap .t{font-family:var(--font-display);font-weight:700;font-size:var(--text-section)}
+.frame-cap .d{color:var(--text-3);font-size:var(--text-label)}
+.win{background:var(--bg);border:1px solid var(--border-strong);border-radius:14px;box-shadow:var(--shadow-lg);overflow:hidden}
+
+/* header bar */
+.hdr{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--bg-1)}
+.ico-btn{width:32px;height:32px;border-radius:9px;background:var(--bg-3);border:1px solid var(--border-strong);
+  display:grid;place-items:center;color:var(--text-2);font-size:15px}
+.hdr .title{font-weight:600;font-size:var(--text-title)}
+.hdr .sub{font-family:var(--font-mono);font-size:var(--text-micro);letter-spacing:.14em;text-transform:uppercase;color:var(--text-faint)}
+.spacer{flex:1}
+.chip{font-family:var(--font-mono);font-size:var(--text-caption);padding:3px 10px;border-radius:99px;display:inline-flex;align-items:center;gap:5px;letter-spacing:.03em}
+.chip.ember{background:var(--ember-tint-strong);color:var(--ember-soft)}
+.chip.green{background:var(--green-tint);color:var(--green-soft)}
+.chip.amber{background:var(--amber-tint);color:var(--amber)}
+.chip.blue{background:var(--blue-tint);color:var(--blue)}
+.chip.violet{background:var(--violet-tint);color:var(--violet)}
+.chip.gray{background:var(--bg-3);color:var(--text-3)}
+.dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+.btn{font-family:var(--font-sans);font-weight:600;font-size:var(--text-control);padding:7px 13px;border-radius:10px;
+  background:var(--bg-3);border:1px solid var(--border-strong);color:var(--text);display:inline-flex;align-items:center;gap:6px;cursor:default}
+.btn.ghost{background:transparent;border-color:var(--border)}
+.btn.primary{background:var(--molten);color:var(--bubble-me-text);border:none;box-shadow:0 3px 12px rgba(232,119,46,.3)}
+.btn.sm{padding:5px 10px;font-size:var(--text-label)}
+.btn.violet{background:var(--violet-tint);border:1px solid var(--violet);color:var(--violet)}
+
+/* two-column body */
+.body{display:grid;grid-template-columns:minmax(0,46fr) minmax(0,54fr);min-height:560px}
+.col-chat{border-right:1px solid var(--border);display:flex;flex-direction:column;background:var(--bg-1)}
+.col-draft{display:flex;flex-direction:column;background:var(--bg)}
+.pane-head{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.pane-head .lbl{font-family:var(--font-mono);font-size:var(--text-caption);letter-spacing:.14em;text-transform:uppercase;color:var(--text-3)}
+.scroll{flex:1;overflow:auto;padding:16px}
+
+/* chat */
+.msg{margin-bottom:14px;max-width:92%}
+.msg.me{margin-left:auto}
+.bubble{padding:10px 13px;border-radius:14px;font-size:var(--text-body);line-height:var(--leading-relaxed);
+  background:var(--bubble-them);color:var(--bubble-them-text);border:1px solid var(--border)}
+.msg.me .bubble{background:var(--bubble-me);color:var(--bubble-me-text);border:none}
+.who{font-family:var(--font-mono);font-size:var(--text-micro);letter-spacing:.1em;text-transform:uppercase;color:var(--text-faint);margin:0 4px 4px}
+
+/* tool activity chips */
+.tools{display:flex;flex-wrap:wrap;gap:6px;margin:6px 2px 0}
+.tool{font-family:var(--font-mono);font-size:var(--text-micro);padding:3px 8px;border-radius:8px;background:var(--bg-3);
+  border:1px solid var(--border);color:var(--text-2);display:inline-flex;align-items:center;gap:5px}
+.tool .g{color:var(--violet)}
+.tool .ok{color:var(--green-soft)}
+
+/* thinking stream */
+.think{margin:2px 2px 0;padding:8px 11px;border-left:2px solid var(--ember);background:var(--ember-tint);border-radius:0 10px 10px 0;
+  font-size:var(--text-label);color:var(--text-2);font-style:italic}
+.think .cur{display:inline-block;width:7px;height:14px;background:var(--ember);vertical-align:-2px;margin-left:2px;animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+
+/* question card (追问) */
+.qcard{border:1px solid var(--amber);background:linear-gradient(180deg,var(--amber-tint),transparent);border-radius:14px;padding:13px 14px;margin:6px 0}
+.qcard .qh{display:flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:var(--text-caption);
+  letter-spacing:.12em;text-transform:uppercase;color:var(--amber);margin-bottom:8px}
+.qcard .qtext{font-size:var(--text-body);color:var(--text);line-height:var(--leading-relaxed);margin-bottom:11px}
+.qopts{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.qopt{padding:6px 11px;border-radius:99px;border:1px solid var(--border-strong);background:var(--bg-3);font-size:var(--text-label);color:var(--text-2)}
+.qopt.sel{border-color:var(--amber);background:var(--amber-tint);color:var(--amber)}
+.qans{display:flex;gap:8px}
+.qans input{flex:1;background:var(--bg-3);border:1px solid var(--border-strong);border-radius:9px;padding:8px 11px;color:var(--text);font-family:var(--font-sans);font-size:var(--text-control)}
+
+/* eval report card */
+.eval{border:1px solid var(--border-strong);background:var(--bg-2);border-radius:14px;padding:13px 14px;margin:6px 0}
+.eval .eh{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.eval .eh .lbl{font-family:var(--font-mono);font-size:var(--text-caption);letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
+.eval .score{font-family:var(--font-display);font-weight:800;font-size:var(--text-heading);color:var(--green-soft)}
+.dims{display:grid;grid-template-columns:1fr 1fr;gap:7px 14px;margin-bottom:9px}
+.dim{display:flex;align-items:center;gap:8px;font-size:var(--text-label);color:var(--text-2)}
+.bar{flex:1;height:5px;border-radius:99px;background:var(--bg-3);overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--molten)}
+.eval .issues{font-size:var(--text-label);color:var(--text-2);line-height:var(--leading-relaxed);border-top:1px dashed var(--border);padding-top:8px}
+.eval .issues b{color:var(--amber)}
+
+/* composer */
+.composer{border-top:1px solid var(--border);padding:12px 14px;background:var(--bg-1)}
+.seg{display:inline-flex;background:var(--bg-3);border:1px solid var(--border);border-radius:99px;padding:2px;margin-bottom:9px}
+.seg span{font-family:var(--font-mono);font-size:var(--text-micro);letter-spacing:.06em;padding:4px 11px;border-radius:99px;color:var(--text-3)}
+.seg span.on{background:var(--ember-tint-strong);color:var(--ember-soft);box-shadow:var(--shadow-sm)}
+.inrow{display:flex;gap:9px;align-items:flex-end}
+.inrow textarea{flex:1;background:var(--bg-3);border:1px solid var(--border-strong);border-radius:11px;padding:9px 12px;color:var(--text);
+  font-family:var(--font-sans);font-size:var(--text-control);resize:none;height:46px}
+.composer.locked{opacity:.55}
+.lockbar{display:flex;align-items:center;gap:7px;font-size:var(--text-label);color:var(--amber);
+  background:var(--amber-tint);border:1px solid var(--amber);border-radius:10px;padding:8px 11px;margin-bottom:10px}
+
+/* draft pane */
+.dtabs{display:flex;gap:2px;padding:8px 14px 0}
+.dtab{font-family:var(--font-mono);font-size:var(--text-label);padding:7px 13px;border-radius:10px 10px 0 0;color:var(--text-3);border:1px solid transparent;border-bottom:none}
+.dtab.on{color:var(--ember-soft);background:var(--bg-2);border-color:var(--border)}
+.doc{padding:16px 20px;font-family:var(--font-reading);line-height:var(--leading-prose);color:var(--text)}
+.doc h2{font-family:var(--font-display);font-size:var(--text-section);margin:2px 0 8px;padding-left:9px;border-left:3px solid var(--ember)}
+.doc h3{font-size:var(--text-title);color:var(--text);margin:16px 0 6px}
+.doc p{color:var(--text-2);margin:6px 0}
+.doc ul{margin:6px 0;padding-left:20px;color:var(--text-2)}
+.doc li{margin:3px 0}
+.tag-src{font-family:var(--font-mono);font-size:var(--text-micro);color:var(--violet);background:var(--violet-tint);padding:1px 6px;border-radius:6px;margin-left:6px}
+
+/* spec / task rows */
+.srow{display:flex;gap:10px;padding:11px 13px;border:1px solid var(--border);border-radius:12px;margin:8px 16px;background:var(--bg-2)}
+.srow .ic{width:26px;height:26px;border-radius:8px;background:var(--bg-3);display:grid;place-items:center;color:var(--ember-soft);flex-shrink:0;font-family:var(--font-mono);font-size:var(--text-caption)}
+.srow .m{flex:1;min-width:0}
+.srow .nm{font-weight:600;font-size:var(--text-control)}
+.srow .ds{font-size:var(--text-label);color:var(--text-3);margin-top:2px}
+
+/* prototype / delivery */
+.stage-bar{display:flex;gap:8px;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--bg-1)}
+.stage{display:flex;align-items:center;gap:7px;padding:7px 13px;border-radius:11px;border:1px solid var(--border);background:var(--bg-2);color:var(--text-3);font-size:var(--text-label)}
+.stage.on{border-color:var(--violet);background:var(--violet-tint);color:var(--violet)}
+.stage .n{font-family:var(--font-mono);font-size:var(--text-micro)}
+.proto-wrap{padding:16px}
+.proto-gen{border:1px dashed var(--border-strong);border-radius:14px;padding:16px;background:var(--bg-2);display:flex;align-items:center;gap:14px;margin-bottom:14px}
+.proto-gen .txt{flex:1}
+.proto-gen .txt .h{font-weight:600;font-size:var(--text-title);margin-bottom:3px}
+.proto-gen .txt .s{font-size:var(--text-label);color:var(--text-3)}
+.proto-card{border:1px solid var(--border-strong);border-radius:14px;background:var(--bg-2);overflow:hidden}
+.proto-card .ph{display:flex;align-items:center;gap:9px;padding:11px 14px;border-bottom:1px solid var(--border)}
+.proto-card .ph .nm{font-weight:600;font-size:var(--text-control)}
+.proto-body{padding:13px 15px;font-family:var(--font-mono);font-size:var(--text-caption);color:var(--text-2);line-height:var(--leading-relaxed);
+  background:var(--code-bg);max-height:210px;overflow:auto;white-space:pre-wrap}
+.proto-body .k{color:var(--ember-soft)}
+.dd{font-family:var(--font-sans);font-size:var(--text-label);padding:6px 11px;border-radius:9px;background:var(--bg-3);border:1px solid var(--border-strong);color:var(--text-2);display:inline-flex;gap:6px;align-items:center}
+
+/* jump / flow */
+.jump{display:flex;flex-direction:column;align-items:center;gap:2px;padding:14px 0 6px}
+.jump .arrow{font-size:22px;color:var(--ember)}
+.jump .cap{font-family:var(--font-mono);font-size:var(--text-caption);letter-spacing:.1em;color:var(--ember-soft);text-transform:uppercase}
+.mini-win{max-width:1160px;margin:0 auto}
+.proj-pin{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:99px;background:var(--bg-3);border:1px solid var(--border-strong)}
+.proj-pin .lg{width:20px;height:20px;border-radius:6px;background:var(--ember);color:var(--bubble-me-text);display:grid;place-items:center;font-family:var(--font-mono);font-size:var(--text-micro);font-weight:700}
+.hl-btn{background:var(--violet-tint);border:1px solid var(--violet);color:var(--violet);box-shadow:0 0 0 3px rgba(139,122,216,.16)}
+
+/* document association panel */
+.assoc{padding:16px}
+.assoc-hd{display:flex;align-items:center;gap:9px;margin-bottom:12px}
+.assoc-hd .h{font-weight:600;font-size:var(--text-title)}
+.assoc-hd .s{font-size:var(--text-label);color:var(--text-3)}
+.budget{margin-left:auto;display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:var(--text-micro);color:var(--text-3)}
+.budget .bar{width:120px;height:6px;border-radius:99px;background:var(--bg-3);overflow:hidden}
+.budget .bar>i{display:block;height:100%;background:var(--molten)}
+.grp{margin-bottom:12px}
+.grp .gl{font-family:var(--font-mono);font-size:var(--text-micro);letter-spacing:.14em;text-transform:uppercase;color:var(--text-faint);margin:0 2px 6px;display:flex;align-items:center;gap:6px}
+.docrow{display:flex;align-items:center;gap:11px;padding:10px 13px;border:1px solid var(--border);border-radius:12px;margin-bottom:7px;background:var(--bg-2)}
+.docrow.on{border-color:var(--ember-deep);background:linear-gradient(180deg,var(--ember-tint),transparent)}
+.docrow.from-forge{border-color:var(--green);background:linear-gradient(180deg,var(--green-tint),transparent)}
+.ck{width:18px;height:18px;border-radius:6px;border:1.5px solid var(--border-strong);flex-shrink:0;display:grid;place-items:center;font-size:12px;color:var(--bubble-me-text)}
+.ck.on{background:var(--ember);border-color:var(--ember)}
+.ck.gk{background:var(--green);border-color:var(--green)}
+.docrow .m{flex:1;min-width:0}
+.docrow .nm{font-weight:600;font-size:var(--text-control);display:flex;align-items:center;gap:7px}
+.docrow .sm2{font-size:var(--text-label);color:var(--text-3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.docrow .tk{font-family:var(--font-mono);font-size:var(--text-micro);color:var(--text-faint);flex-shrink:0}
+.badge{font-family:var(--font-mono);font-size:var(--text-micro);padding:1px 6px;border-radius:6px}
+.badge.forge{color:var(--green-soft);background:var(--green-tint)}
+.badge.req{color:var(--ember-soft);background:var(--ember-tint)}
+
+/* annotation callouts */
+.notes{max-width:1240px;margin:14px auto 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.note{border:1px solid var(--border);border-radius:12px;padding:11px 13px;background:var(--bg-1)}
+.note .n{font-family:var(--font-mono);font-size:var(--text-micro);color:var(--ember-soft);letter-spacing:.06em}
+.note .x{font-size:var(--text-label);color:var(--text-2);margin-top:4px;line-height:var(--leading-relaxed)}
+.legend{max-width:1240px;margin:0 auto 34px;color:var(--text-3);font-size:var(--text-label)}
+.mini{color:var(--text-faint);font-size:var(--text-caption);font-family:var(--font-mono)}
+</style>
+</head>
+<body>
+
+<div class="kicker">AutoForge · Incubator 2.0</div>
+<h1 class="top">孵化台深化 · 页面布局原型</h1>
+<p class="lead">在既有 BlueprintStudio「对话面 ｜ 草稿产物」双栏骨架上叠加三类新元素：<b>工具活动链</b>（codegraph 检索可见）、<b>追问卡</b>（真交互·断点续跑）、<b>评估报告卡</b>（默认多轮自评）；原型设计仍归<b>交付流水线页</b>，孵化台<b>跳转+选中</b>并<b>关联核心文档</b>（DESIGN.md / PRD / 技术规格）据此生成更准提示词。全部使用项目 <span class="mini">src/index.css</span> 的 Ember token，未引入任何新色。</p>
+
+<!-- ============ FRAME 1 ============ -->
+<div class="frame">
+  <div class="frame-cap"><span class="no">01</span><span class="t">主工作台 · 起草进行中</span><span class="d">对话面在跑工具循环，草稿产物实时成型；PRD 标签页激活</span></div>
+  <div class="win">
+    <div class="hdr">
+      <div class="ico-btn">←</div>
+      <div>
+        <div class="title">支付渠道接入与对账</div>
+        <div class="sub">FORGE · 大需求改动</div>
+      </div>
+      <span class="chip ember"><span class="dot" style="background:var(--ember-soft)"></span>起草中</span>
+      <div class="spacer"></div>
+      <button class="btn ghost sm">去原型设计 ↗</button>
+      <button class="btn primary sm">编码开发 →</button>
+    </div>
+    <div class="body">
+      <!-- chat -->
+      <div class="col-chat">
+        <div class="pane-head"><span class="lbl">◎ 起草对话</span><span class="mini" style="margin-left:auto">spec_writer · claude</span></div>
+        <div class="scroll">
+          <div class="msg me"><div class="bubble">接入微信支付 + 支付宝，要有对账文件下载和差异告警。参考现有 order 模块。</div></div>
+
+          <div class="msg">
+            <div class="who">起草 Agent</div>
+            <div class="bubble">已检索仓库现状：订单与支付分离在 <code>order/</code> 与 <code>billing/</code>。我把渠道抽象、对账任务、差异告警拆进了 PRD 与任务清单，规格里锁定了幂等键约束。</div>
+            <div class="tools">
+              <span class="tool"><span class="g">◱ codegraph</span> search "payment channel" · <span class="ok">7 命中</span></span>
+              <span class="tool"><span class="g">◱ codegraph</span> impact <code>billing::reconcile</code> · <span class="ok">影响 4 文件</span></span>
+              <span class="tool">▤ read_project_file <code>billing/mod.rs</code></span>
+              <span class="tool">◇ read_spec <code>api</code></span>
+            </div>
+          </div>
+
+          <div class="eval">
+            <div class="eh"><span class="lbl">◈ 自动评估 · 第 1 轮</span><div class="spacer"></div><span class="score">82</span><span class="mini">/100 · 达标</span></div>
+            <div class="dims">
+              <div class="dim">PRD 完整度<div class="bar"><i style="width:88%"></i></div><span class="mini">88</span></div>
+              <div class="dim">规格可执行<div class="bar"><i style="width:80%"></i></div><span class="mini">80</span></div>
+              <div class="dim">任务粒度<div class="bar"><i style="width:85%"></i></div><span class="mini">85</span></div>
+              <div class="dim">代码贴合度<div class="bar"><i style="width:76%"></i></div><span class="mini">76</span></div>
+            </div>
+            <div class="issues">仍需补强：<b>对账差异的重试/告警阈值未量化</b>；建议把「渠道密钥存储」显式绑定到 secrets.rs 信封加密规格。</div>
+          </div>
+
+          <div class="think">正在依据评估意见补充对账阈值规格<span class="cur"></span></div>
+        </div>
+        <div class="composer">
+          <div class="seg"><span class="on">分析后端</span><span>编码 Agent 读仓库</span></div>
+          <div class="inrow">
+            <textarea placeholder="继续对它说要改哪里，或让它检索某处代码…"></textarea>
+            <button class="btn primary">发送</button>
+          </div>
+        </div>
+      </div>
+      <!-- draft -->
+      <div class="col-draft">
+        <div class="dtabs">
+          <span class="dtab on">PRD</span>
+          <span class="dtab">规格 · 4</span>
+          <span class="dtab">任务 · 6</span>
+        </div>
+        <div class="scroll" style="padding:0">
+          <div class="doc">
+            <h2>支付渠道接入与对账</h2>
+            <h3>背景与目标</h3>
+            <p>现有 <code>billing/</code> 仅记账，缺渠道抽象与对账。目标：接入微信/支付宝，日终对账并对差异告警。<span class="tag-src">codegraph 佐证</span></p>
+            <h3>功能范围</h3>
+            <ul>
+              <li>统一渠道抽象 <code>PaymentChannel</code>（下单 / 查询 / 退款）</li>
+              <li>对账文件拉取 + 与本地流水 diff</li>
+              <li>差异分级告警（金额 / 状态 / 缺单）</li>
+            </ul>
+            <h3>非目标</h3>
+            <ul><li>不做多币种；不接海外渠道</li></ul>
+            <h3>验收标准</h3>
+            <ul>
+              <li>下单幂等：同一 <code>out_trade_no</code> 重复请求不重复扣款</li>
+              <li>对账 T+1 生成差异报告，缺单/金额差 100% 命中告警</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div class="note"><div class="n">工具活动链</div><div class="x">每条 assistant 气泡下挂一排 chip，显示 codegraph 检索 / read_file / read_spec 的命中数，让"它凭什么这么写"可见。</div></div>
+    <div class="note"><div class="n">评估报告卡</div><div class="x">落稿即自动评估，四维打分 + 待补强项。低于阈值会自动再修一版（上限 2 轮）。</div></div>
+    <div class="note"><div class="n">来源标注</div><div class="x">PRD 里由代码检索佐证的结论带 <span class="tag-src">codegraph 佐证</span> 标签，可追溯。</div></div>
+    <div class="note"><div class="n">去原型设计</div><div class="x">头栏次级按钮「去原型设计 ↗」跳到交付页设计阶段（见第 03 帧），原型不在孵化台生成。</div></div>
+  </div>
+</div>
+
+<!-- ============ FRAME 2 ============ -->
+<div class="frame">
+  <div class="frame-cap"><span class="no">02</span><span class="t">追问 · 断点续跑</span><span class="d">Agent 遇歧义调 ask_user 挂起，草稿转「待答」，输入框锁定直到答复</span></div>
+  <div class="win">
+    <div class="hdr">
+      <div class="ico-btn">←</div>
+      <div><div class="title">支付渠道接入与对账</div><div class="sub">FORGE · 大需求改动</div></div>
+      <span class="chip amber"><span class="dot" style="background:var(--amber)"></span>待答复</span>
+      <div class="spacer"></div>
+      <button class="btn ghost sm" style="opacity:.5">去原型设计 ↗</button>
+      <button class="btn primary sm" style="opacity:.5">编码开发 →</button>
+    </div>
+    <div class="body">
+      <div class="col-chat">
+        <div class="pane-head"><span class="lbl">◎ 起草对话</span><span class="mini" style="margin-left:auto">已挂起 · 等待你的答复</span></div>
+        <div class="scroll">
+          <div class="msg me"><div class="bubble">接入微信支付 + 支付宝，要有对账和差异告警。</div></div>
+          <div class="msg">
+            <div class="who">起草 Agent</div>
+            <div class="bubble">开始拆解前有一处会显著影响架构，需要你先定一下。</div>
+            <div class="tools"><span class="tool"><span class="g">◱ codegraph</span> callers <code>billing::ledger</code> · <span class="ok">3 处</span></span></div>
+          </div>
+
+          <div class="qcard">
+            <div class="qh">✦ 需要你的裁定 · 追问 1/1</div>
+            <div class="qtext">对账差异发现后，系统应<b>自动发起补偿/冲正</b>，还是仅<b>告警等人工处理</b>？这决定要不要引入补偿事务与审批节点。</div>
+            <div class="qopts">
+              <span class="qopt sel">仅告警 + 人工处理</span>
+              <span class="qopt">自动补偿（需审批）</span>
+              <span class="qopt">按金额阈值分流</span>
+            </div>
+            <div class="qans">
+              <input value="先仅告警；金额 > 500 的走人工审批队列" />
+              <button class="btn primary sm">答复并继续 →</button>
+            </div>
+          </div>
+        </div>
+        <div class="composer locked">
+          <div class="lockbar">⚠ Agent 正等待上方追问的答复，答复后将从断点继续起草。</div>
+          <div class="inrow"><textarea disabled placeholder="待答复期间输入已锁定…"></textarea><button class="btn" style="opacity:.5">发送</button></div>
+        </div>
+      </div>
+      <div class="col-draft">
+        <div class="dtabs"><span class="dtab on">PRD</span><span class="dtab">规格 · 2</span><span class="dtab">任务 · 3</span></div>
+        <div class="scroll" style="padding:0">
+          <div class="doc">
+            <h2 style="color:var(--text-3);border-color:var(--text-faint)">草稿部分成型</h2>
+            <p>Agent 在补齐结构前暂停以确认对账策略。答复后将据此决定是否新增「补偿事务」规格与「差异审批」任务。</p>
+            <div class="srow" style="margin-left:0;margin-right:0;opacity:.7"><div class="ic">?</div><div class="m"><div class="nm">补偿事务约束 <span class="mini">（待裁定后决定是否加入）</span></div><div class="ds">依赖上方追问答复</div></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div class="note"><div class="n">终止型工具 ask_user</div><div class="x">Agent 调 ask_user 即收口本轮、落 pending_question、状态转 awaiting_answer——不冻结 Rust future。</div></div>
+    <div class="note"><div class="n">快选 + 自由输入</div><div class="x">追问可带 options 做一键快选，也可自由补充；答复走 answer_blueprint_question。</div></div>
+    <div class="note"><div class="n">断点续跑</div><div class="x">答复写入 transcript 后重进同一工具循环，天然幂等，无需保存运行时状态。</div></div>
+    <div class="note"><div class="n">输入锁定</div><div class="x">待答期间主输入框禁用，避免与追问答复通道混淆。</div></div>
+  </div>
+</div>
+
+<!-- ============ FRAME 3 ============ -->
+<div class="frame">
+  <div class="frame-cap"><span class="no">03</span><span class="t">跨页跳转联动</span><span class="d">孵化台定稿 → 一键跳到交付流水线「设计」阶段并预选该项目；原型生成仍在交付页</span></div>
+
+  <!-- 孵化台头栏（定稿态，去原型设计按钮高亮） -->
+  <div class="win mini-win" style="margin-bottom:0">
+    <div class="hdr">
+      <div class="ico-btn">←</div>
+      <div><div class="title">支付渠道接入与对账</div><div class="sub">FORGE · 大需求改动</div></div>
+      <span class="chip green"><span class="dot" style="background:var(--green-soft)"></span>已定稿 · 评估 88</span>
+      <div class="spacer"></div>
+      <button class="btn sm hl-btn">去原型设计 ↗</button>
+      <button class="btn primary sm">编码开发 →</button>
+    </div>
+    <div style="padding:11px 18px;font-size:var(--text-label);color:var(--text-3)">
+      PRD / 4 规格 / 6 任务已定稿。点头栏「<span style="color:var(--violet)">去原型设计 ↗</span>」→ 携 <span class="mini">projectId</span>（+已编码则带 <span class="mini">issueId</span>）跳转交付页。
+    </div>
+  </div>
+
+  <!-- 跳转箭头 -->
+  <div class="jump">
+    <div class="cap">goToDelivery(projectId, stage:'design')</div>
+    <div class="arrow">↓</div>
+  </div>
+
+  <!-- 交付流水线页（设计阶段，项目已选中） -->
+  <div class="win mini-win">
+    <div class="hdr">
+      <span style="font-family:var(--font-display);font-weight:800;font-size:var(--text-heading)">交付流水线</span>
+      <span class="proj-pin"><span class="lg">支</span>支付网关 · 已选中</span>
+      <div class="spacer"></div>
+      <span class="chip violet">从孵化台跳入</span>
+    </div>
+    <div class="stage-bar">
+      <span class="stage on"><span class="n">03</span>设计提示词</span>
+      <span class="stage"><span class="n">07</span>安全审计</span>
+      <span class="stage"><span class="n">08</span>部署</span>
+      <span class="stage"><span class="n">09</span>归档</span>
+    </div>
+    <div class="proto-wrap">
+      <div class="proto-gen">
+        <div class="txt"><div class="h">原型设计提示词</div><div class="s">由 DESIGN.md + 项目技术规格生成 design.md 级 10 段结构，可直接投喂设计工具。</div></div>
+        <span class="dd">目标：OpenDesign ▾</span>
+        <button class="btn primary">⚡ 生成设计提示词</button>
+      </div>
+      <div class="proto-card">
+        <div class="ph"><span class="nm">支付网关 产品界面 · 设计提示词</span><span class="chip violet">OpenDesign</span><div class="spacer"></div>
+          <span class="btn sm ghost">复制</span><span class="btn sm ghost">编辑</span>
+          <span class="dd">在设计工具打开 ↗</span>
+        </div>
+        <div class="proto-body"><span class="k"># 设计提示词 · 为「支付网关」设计对账工作台</span>
+
+<span class="k">1. Overview</span> — 温暖深色工业风，唯一强调色 ember 橙；三栏：渠道侧栏 ｜ 差异列表 ｜ 详情。
+<span class="k">2. Colors</span> — --ember #e8772e 主操作；--green 已对平 / --amber 差异待处理 / --red 缺单；表面 --bg→--bg-3 分层。
+<span class="k">3. Typography</span> — Archivo 标题 / Noto Sans SC 正文 / JetBrains Mono 金额与单号（等宽对齐）。
+<span class="k">8. Screens & States</span> — 空态「今日已对平」；加载骨架；差异行展开对比；告警 toast。
+      …（省略 4–7 / 9 / 10 段）</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <div class="note"><div class="n">解耦</div><div class="x">需求分析（孵化台）与原型设计（交付页）分属两件事，各自独立；不互相塞面板。</div></div>
+    <div class="note"><div class="n">跳转 + 选中</div><div class="x">复刻现有 goToAuditStage / blueprintTarget 深链：切页 + setProjectId + setStage('design')。</div></div>
+    <div class="note"><div class="n">零后端改动</div><div class="x">原型仍用交付页 generate_prototype_prompt，联动是纯前端 target prop，不新增 IPC / 迁移列。</div></div>
+    <div class="note"><div class="n">交付页不动</div><div class="x">design 节点、prototype_prompts 表、OpenDesign 启动器全部保留原样，仅加一个 target 预选入参。</div></div>
+  </div>
+</div>
+
+<!-- ============ FRAME 4 ============ -->
+<div class="frame">
+  <div class="frame-cap"><span class="no">04</span><span class="t">关联核心文档 · 按文档生成</span><span class="d">设计阶段进入后，勾选项目当前核心文档作为生成依据；从孵化台跳入时 PRD 自动关联</span></div>
+  <div class="win mini-win">
+    <div class="hdr">
+      <span style="font-family:var(--font-display);font-weight:800;font-size:var(--text-heading)">交付流水线 · 设计</span>
+      <span class="proj-pin"><span class="lg">支</span>支付网关</span>
+      <div class="spacer"></div>
+      <span class="chip green">PRD 来自孵化台草稿</span>
+    </div>
+    <div class="assoc">
+      <div class="assoc-hd">
+        <div><div class="h">关联文档</div><div class="s">勾选的文档会作为「必须严格遵循」的上下文喂给生成，越贴合真实需求/规格越准。</div></div>
+        <div class="budget">预算 12.4K / 18K<div class="bar"><i style="width:69%"></i></div></div>
+      </div>
+
+      <div class="grp">
+        <div class="gl">◈ 设计契约</div>
+        <div class="docrow on">
+          <div class="ck on">✓</div>
+          <div class="m"><div class="nm">DESIGN.md</div><div class="sm2">熔炉/余烬 Ember 深色设计系统 · 颜色/字体/组件 token 全量</div></div>
+          <div class="tk">~8.0K</div>
+        </div>
+      </div>
+
+      <div class="grp">
+        <div class="gl">✦ 需求文档（PRD）</div>
+        <div class="docrow from-forge">
+          <div class="ck gk">✓</div>
+          <div class="m"><div class="nm">支付渠道接入与对账 · PRD<span class="badge forge">来自孵化台</span></div><div class="sm2">PRD + 4 规格 + 6 任务 · 背景/功能范围/验收标准</div></div>
+          <div class="tk">~2.6K</div>
+        </div>
+      </div>
+
+      <div class="grp">
+        <div class="gl">▤ 技术规格</div>
+        <div class="docrow on">
+          <div class="ck on">✓</div>
+          <div class="m"><div class="nm">architecture <span class="badge req">影响界面结构</span></div><div class="sm2">双审核节点 / IPC 单一入口 / 工作区写入限制 …</div></div>
+          <div class="tk">~1.1K</div>
+        </div>
+        <div class="docrow on">
+          <div class="ck on">✓</div>
+          <div class="m"><div class="nm">api</div><div class="sm2">IPC 调用规范 / 事件推送 autoforge://event / 输入安全过滤</div></div>
+          <div class="tk">~0.7K</div>
+        </div>
+        <div class="docrow">
+          <div class="ck"></div>
+          <div class="m"><div class="nm">testing</div><div class="sm2">IPC 功能测试环境 / 合并前自动测试 …</div></div>
+          <div class="tk">~0.6K</div>
+        </div>
+      </div>
+
+      <div class="grp">
+        <div class="gl">◇ 工作区文档 · .autoforge/</div>
+        <div class="docrow">
+          <div class="ck"></div>
+          <div class="m"><div class="nm">docs/对账界面调研.md</div><div class="sm2">竞品对账台交互调研（默认不选，按需勾）</div></div>
+          <div class="tk">~1.8K</div>
+        </div>
+        <div class="docrow">
+          <div class="ck"></div>
+          <div class="m"><div class="nm">specs/接口定义.md</div><div class="sm2">对账拉单 / 差异回调接口草案</div></div>
+          <div class="tk">~1.2K</div>
+        </div>
+      </div>
+
+      <div class="proto-gen" style="margin-top:4px">
+        <div class="txt"><div class="h">生成设计提示词</div><div class="s">将以上 4 份勾选文档（≈12.4K）拼为设计上下文，界面/状态据 PRD 展开。</div></div>
+        <span class="dd">目标：OpenDesign ▾</span>
+        <button class="btn primary">⚡ 按关联文档生成</button>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div class="note"><div class="n">目录来源</div><div class="x">list_prototype_doc_sources 汇总：DESIGN.md + 孵化台 PRD + project_specs 分类 + .autoforge 工作区文件。</div></div>
+    <div class="note"><div class="n">智能默认</div><div class="x">DESIGN.md 必选；跳入草稿的 PRD 自动勾（绿色「来自孵化台」）；architecture/api 默认勾，其余按需。</div></div>
+    <div class="note"><div class="n">token 预算</div><div class="x">每条估 token、总量封顶 ~18K；单条 ~5K 截断，避免灌爆 prompt。守卫读 + 注入过滤。</div></div>
+    <div class="note"><div class="n">更准生成</div><div class="x">feature 标题/描述从草稿派生，界面据真实 PRD 而非「XX 产品界面」；doc_refs 空则回落旧行为。</div></div>
+  </div>
+</div>
+
+<div class="legend">
+  <b style="color:var(--text-2)">说明</b> — 本原型仅演示布局与信息架构，非最终像素稿；所有颜色/字号/圆角/阴影均引用项目 <span class="mini">src/index.css</span> 变量，落地时复用 <span class="mini">.panel / .chip / .seg / .btn / proj-select</span> 等既有类，不另起样式体系。图标以字符占位，实现走 <span class="mini">&lt;Icon /&gt;</span>。
+</div>
+
+</body>
+</html>

@@ -7,17 +7,17 @@
 //! 协议（paraformer-realtime-v2，PCM 16k 单声道）：connect → run-task → 流式发二进制音频
 //! → result-generated(增量/整句) → finish-task → task-finished。
 //!
-//! Tauri 耦合仅限 `AppHandle` 用于事件发射（CLAUDE.md 允许的唯一例外）。
+//! 事件发射经 `EventSink` 抽象（不再直接持 `AppHandle`），对齐 core 层「纯 Rust、
+//! 不依赖 Tauri 类型」的后端独立化愿景。
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tauri::AppHandle;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::core::event::{self, AppEvent};
+use crate::core::event::{self, AppEvent, EventSink};
 use crate::db::Db;
 
 const DASHSCOPE_WS: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/";
@@ -92,14 +92,13 @@ async fn open_ws(db: &Db) -> Result<(WsStream, Value, String), String> {
 /// 后台任务负责：run-task 握手 → 转发音频 → 解析结果发事件 → finish。
 pub async fn start_session(
     db: &Db,
-    app: &AppHandle,
+    sink: std::sync::Arc<dyn EventSink>,
     session_id: String,
 ) -> Result<mpsc::UnboundedSender<AsrCtl>, String> {
     let (ws, run_task, task_id) = open_ws(db).await?;
     let (tx, rx) = mpsc::unbounded_channel::<AsrCtl>();
-    let app = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = drive(ws, rx, run_task, task_id, &app, &session_id).await {
+        if let Err(e) = drive(ws, rx, run_task, task_id, sink.as_ref(), &session_id).await {
             tracing::warn!("[asr] 会话 {} 结束：{}", session_id, e);
         }
     });
@@ -177,7 +176,7 @@ async fn drive(
     mut rx: mpsc::UnboundedReceiver<AsrCtl>,
     run_task: Value,
     task_id: String,
-    app: &AppHandle,
+    sink: &dyn EventSink,
     session_id: &str,
 ) -> Result<()> {
     let (mut write, mut read) = ws.split();
@@ -203,7 +202,7 @@ async fn drive(
                 }
             },
             msg = read.next() => match msg {
-                Some(Ok(Message::Text(t))) if handle_event(&t, app, session_id) => {
+                Some(Ok(Message::Text(t))) if handle_event(&t, sink, session_id) => {
                     break;
                 }
                 Some(Ok(Message::Close(_))) | None => break,
@@ -216,7 +215,7 @@ async fn drive(
 }
 
 /// 解析一条服务端 JSON 事件；返回 true 表示会话应终止。
-fn handle_event(text: &str, app: &AppHandle, session_id: &str) -> bool {
+fn handle_event(text: &str, sink: &dyn EventSink, session_id: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else { return false };
     match v["header"]["event"].as_str() {
         Some("result-generated") => {
@@ -225,7 +224,7 @@ fn handle_event(text: &str, app: &AppHandle, session_id: &str) -> bool {
             if !out.is_empty() {
                 let is_final = sentence["sentence_end"].as_bool().unwrap_or(false);
                 event::emit(
-                    app,
+                    sink,
                     AppEvent::AsrResult {
                         session_id: session_id.to_string(),
                         text: out,

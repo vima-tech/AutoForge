@@ -55,6 +55,7 @@ pub async fn list_conversations(
              SELECT conversation_id, content_json, created_at,
                     ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at DESC) AS rn
              FROM messages
+             WHERE deleted_at IS NULL
          )
          WHERE rn = 1",
     )
@@ -73,6 +74,7 @@ pub async fn list_conversations(
          FROM messages m
          LEFT JOIN conversation_reads r ON r.conversation_id = m.conversation_id
          WHERE m.from_agent IS NOT NULL
+           AND m.deleted_at IS NULL
            AND m.created_at > COALESCE(r.read_at, '1970-01-01')
          GROUP BY m.conversation_id",
     )
@@ -184,7 +186,7 @@ pub async fn list_messages(
          FROM (
              SELECT *
              FROM messages
-             WHERE conversation_id=?
+             WHERE conversation_id=? AND deleted_at IS NULL
              ORDER BY created_at DESC
              LIMIT 300
          )
@@ -577,6 +579,38 @@ pub async fn remove_conversation_member(
     conversation_detail(&state.db, conv).await
 }
 
+/// 软删除单条消息：只把 messages.deleted_at 打上时间戳，从会议室气泡列表隐藏，
+/// 消息本体仍保留在库中（可后续恢复/审计）。幂等（已删除的再删无副作用）。
+#[tauri::command]
+pub async fn soft_delete_message(
+    message_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let affected = sqlx::query(
+        "UPDATE messages SET deleted_at = datetime('now')
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(&message_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+
+    if affected == 0 {
+        // 已删除视为成功（幂等）；仅当消息根本不存在时报错。
+        let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM messages WHERE id=?")
+            .bind(&message_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Err(format!("message {} not found", message_id));
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn delete_group_conversation(
     conversation_id: String,
@@ -879,6 +913,7 @@ async fn unread_count(db: &crate::db::Db, conversation_id: &str) -> Result<i64, 
          FROM messages
          WHERE conversation_id=?
            AND from_agent IS NOT NULL
+           AND deleted_at IS NULL
            AND created_at > COALESCE(
              (SELECT read_at FROM conversation_reads WHERE conversation_id=?),
              '1970-01-01'

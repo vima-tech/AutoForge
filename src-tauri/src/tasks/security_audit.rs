@@ -1,4 +1,5 @@
-use crate::core::{event, git::GitProxy, security};
+use crate::core::event::{self, EventSink};
+use crate::core::{git::GitProxy, security};
 use crate::db::Db;
 use crate::models::job::JobPayload;
 use crate::tasks::runner::{enqueue, JobSender};
@@ -13,7 +14,7 @@ use uuid::Uuid;
 /// patterns. Runs a cheap heuristic pass (always) plus an optional LLM audit
 /// (best-effort; degrades to heuristic-only when no security agent is configured).
 /// High/critical findings are filed back as issues, re-entering the pipeline loop.
-pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -> Result<()> {
+pub async fn run(db: &Db, tx: &JobSender, sink: &dyn EventSink, cr_id: &str) -> Result<()> {
     let cr = sqlx::query_as::<_, crate::models::change_request::ChangeRequest>(
         "SELECT * FROM change_requests WHERE id=?",
     )
@@ -149,15 +150,12 @@ pub async fn run(db: &Db, tx: &JobSender, app: &tauri::AppHandle, cr_id: &str) -
         crate::core::notify::dispatch(db, "security_high", "安全审查发现高危问题", &summary).await;
     }
 
-    event::emit(
-        app,
-        event::AppEvent::SecurityAuditCompleted {
-            cr_id: cr_id.to_string(),
-            audit_id,
-            severity,
-            summary,
-        },
-    );
+    sink.emit(event::AppEvent::SecurityAuditCompleted {
+        cr_id: cr_id.to_string(),
+        audit_id,
+        severity,
+        summary,
+    });
 
     Ok(())
 }

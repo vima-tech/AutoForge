@@ -180,6 +180,207 @@ async fn insert_message(
     Ok(())
 }
 
+/// P3 蓝图评审结果（孵化台深化 §3.3 默认多轮评估）：四维打分 + 待补强项 + 总评。
+/// critic（`spec_grader` 角色）落稿后打分；低于阈值且有轮次预算则回喂起草 Agent 自动修订。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct BlueprintEval {
+    #[serde(default)]
+    pub prd_completeness: i64,
+    #[serde(default)]
+    pub spec_executability: i64,
+    #[serde(default)]
+    pub task_granularity: i64,
+    #[serde(default)]
+    pub code_fit: i64,
+    #[serde(default)]
+    pub gaps: Vec<String>,
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl BlueprintEval {
+    /// 四维最低分（短板决定是否需再修订）。
+    pub fn min_score(&self) -> i64 {
+        self.prd_completeness
+            .min(self.spec_executability)
+            .min(self.task_granularity)
+            .min(self.code_fit)
+    }
+    /// 是否达标（所有维度 ≥ 阈值）。
+    pub fn passes(&self, threshold: i64) -> bool {
+        self.min_score() >= threshold
+    }
+}
+
+/// 从 critic 原始输出解析评估 JSON（容忍前后解释/围栏，取首 `{` 到末 `}`）。
+pub(crate) fn parse_eval(raw: &str) -> Option<BlueprintEval> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    serde_json::from_str(raw.get(start..=end)?).ok()
+}
+
+/// 落库一次评估：写 `eval_json` + 记一条 `role='eval'` 消息（总评）。可测。
+pub(crate) async fn store_eval(
+    db: &crate::db::Db,
+    draft_id: &str,
+    eval: &BlueprintEval,
+) -> Result<(), String> {
+    let json = serde_json::to_string(eval).map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE blueprint_drafts SET eval_json=?, updated_at=? WHERE id=?")
+        .bind(&json)
+        .bind(now_str())
+        .bind(draft_id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let note = if eval.summary.trim().is_empty() {
+        format!("评估：最低分 {}/10", eval.min_score())
+    } else {
+        eval.summary.trim().to_string()
+    };
+    insert_message(db, draft_id, "eval", &note, "").await?;
+    Ok(())
+}
+
+/// P3 评估开关（app_settings 键 `blueprint.eval_enabled`，默认关=旧行为零回归）。
+async fn blueprint_eval_enabled(db: &crate::db::Db) -> bool {
+    sqlx::query_as::<_, (String,)>("SELECT value FROM app_settings WHERE key='blueprint.eval_enabled'")
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|(v,)| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// 落稿后自动评审（P3 默认多轮评估的评审步）：spec_grader 四维打分 → 落 eval_json + eval 消息。
+/// best-effort：LLM 不可用 / 解析失败则跳过，不阻断起草主流程。LLM 行为需运行时验证；
+/// 本函数的解析/落库逻辑由 `parse_eval`/`store_eval` 单测覆盖。
+pub(crate) async fn run_blueprint_critic(
+    db: &crate::db::Db,
+    project_id: &str,
+    draft_id: &str,
+) -> Result<(), String> {
+    let draft = fetch_draft(db, draft_id).await?;
+    let specs_json = serde_json::to_string(&draft.specs).unwrap_or_default();
+    let tasks_json = serde_json::to_string(&draft.tasklist).unwrap_or_default();
+    let prompt = format!(
+        "请评审下面这份大需求蓝图并按四维打分（只输出评估 JSON）。\n\n【PRD】\n{}\n\n【规格】\n{}\n\n【任务清单】\n{}",
+        draft.prd_markdown, specs_json, tasks_json
+    );
+    let raw = crate::agents::llm::run_system_role_text(
+        db,
+        "spec_grader",
+        &prompt,
+        crate::agents::roles::builtin_prompt("spec_grader"),
+        Some(project_id),
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(eval) = parse_eval(&raw) {
+        store_eval(db, draft_id, &eval).await?;
+    }
+    Ok(())
+}
+
+/// P1 grounding（孵化台深化 §3.1/§3.4）：起草/修正前，从统一上下文基质 assemble 一小段
+/// 与本项目相关的已有上下文（需求 / 编码执行日志 / 审核意见 / 既有草稿），注入 prompt 作为
+/// grounding，让起草 Agent 看到「项目此前发生过什么」而非凭空生成。
+///
+/// 复用编码台取景框（issue/spec/code_agent_log/llm_trace）+ 小预算（~6KB）；正文经保尾摘要。
+/// 防御性再过一遍注入闸（源头 intake 已过滤，此处兜底）；无基质条目时返回空串（prompt 不变，
+/// 即旧行为，零回归）。基质空/查询失败均静默降级。
+async fn build_substrate_grounding(db: &crate::db::Db, project_id: &str) -> String {
+    use crate::core::{context, lens};
+    let preset = lens::preset_for_role("coding");
+    let req = context::ContextRequest {
+        project_id: project_id.to_string(),
+        include: preset.include,
+        refs: vec![],
+        budget_bytes: 6000,
+    };
+    let items = match context::assemble(db, &req).await {
+        Ok(v) if !v.is_empty() => v,
+        _ => return String::new(),
+    };
+    let mut out = String::new();
+    for it in items.iter().take(6) {
+        let snip = context::fetch_content(db, it, 300).await.unwrap_or_default();
+        let snip = snip.trim();
+        // 源头已过注入闸，此处兜底：疑似注入的条目跳过，不喂进起草 prompt。
+        if snip.is_empty() || crate::core::security::has_obvious_injection(snip) {
+            continue;
+        }
+        out.push_str(&format!("- [{}] {}：{}\n", it.source_kind, it.title, snip));
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n【项目已有上下文（来自统一基质，供参考理解现状，勿照抄）】\n{out}"
+    )
+}
+
+/// 追问挂起（孵化台深化 §3.2 断点续跑）：起草 Agent 调 `ask_user` 终止型工具时，把问题
+/// 落 `blueprint_messages(role='question')`，草稿置 `awaiting_answer` + `pending_question`。
+/// 纯状态转换，供 P2 工具循环收口调用；本身可独立单测。
+pub(crate) async fn set_awaiting_answer(
+    db: &crate::db::Db,
+    draft_id: &str,
+    question: &str,
+) -> Result<(), String> {
+    insert_message(db, draft_id, "question", question, "").await?;
+    sqlx::query(
+        "UPDATE blueprint_drafts SET status='awaiting_answer', pending_question=?, updated_at=? WHERE id=?",
+    )
+    .bind(question)
+    .bind(now_str())
+    .bind(draft_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 回答追问的状态转换（可测 helper）：记录答复 → 清 `pending_question` → 状态回 `drafting`。
+/// **续跑机制**（§3.2）：不在此保存运行时状态；下一轮 `refine_blueprint_draft` 从
+/// `blueprint_messages` 重建 transcript（此刻已含 Q&A）再起工具循环，天然幂等。
+pub(crate) async fn apply_answer(
+    db: &crate::db::Db,
+    draft_id: &str,
+    answer: &str,
+) -> Result<(), String> {
+    insert_message(db, draft_id, "answer", answer, "").await?;
+    sqlx::query(
+        "UPDATE blueprint_drafts SET status='drafting', pending_question='', updated_at=? WHERE id=?",
+    )
+    .bind(now_str())
+    .bind(draft_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 命令：回答孵化台起草 Agent 的追问，清挂起态、返回更新后的草稿视图（断点续跑，见 §3.2）。
+#[tauri::command]
+pub async fn answer_blueprint_question(
+    draft_id: String,
+    answer: String,
+    state: State<'_, AppState>,
+) -> Result<BlueprintDraftView, String> {
+    let answer = answer.trim().to_string();
+    if answer.is_empty() {
+        return Err("答复不能为空".into());
+    }
+    if crate::core::security::has_obvious_injection(&answer) {
+        return Err("答复文本疑似含注入内容，已拒绝".into());
+    }
+    apply_answer(&state.db, &draft_id, &answer).await?;
+    load_view(&state.db, &draft_id).await
+}
+
 /// 把草稿的 specs/tasklist 写回 DB（序列化进 JSON 列）+ 刷新 updated_at。
 async fn persist_draft_body(
     db: &crate::db::Db,
@@ -203,6 +404,37 @@ async fn persist_draft_body(
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
+
+    // 上下文基质登记（基质 §3.2：孵化台草稿此前与会议室/CR 上下文不互通，是关键缺口）。
+    // 落稿即把该大需求草稿投影为 ContextItem，让编码/审核/会议室等环节可取用其 PRD。
+    // best-effort：查 draft 归属项目/标题后登记；content_ref=bp:<id> 对应 fetch_content 的 bp 读取器。
+    if let Some((project_id, title)) =
+        sqlx::query_as::<_, (String, String)>("SELECT project_id, title FROM blueprint_drafts WHERE id=?")
+            .bind(draft_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+    {
+        let cref = format!("bp:{draft_id}");
+        let disp = if title.trim().is_empty() { "孵化台草稿" } else { title.trim() };
+        let _ = crate::core::context::register(
+            db,
+            crate::core::context::NewContextItem {
+                project_id: &project_id,
+                source_kind: crate::core::context::source_kind::INCUBATOR_DRAFT,
+                source_id: draft_id,
+                title: disp,
+                origin_stage: "requirement",
+                origin_actor: "spec_writer",
+                content_ref: &cref,
+                size_hint: prd_markdown.len() as i64,
+                trust: crate::core::context::trust::TRUSTED,
+                labels: "[]",
+            },
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -465,6 +697,9 @@ pub async fn refine_blueprint_draft(
         hist_block.push_str("（无）\n");
     }
 
+    // P1 grounding：注入项目已有基质上下文（无则空串，prompt 不变=旧行为）。
+    let grounding = build_substrate_grounding(&state.db, &draft.project_id).await;
+
     let prompt = format!(
         r#"你正在与用户多轮打磨一份项目蓝图。下面是【当前蓝图】（JSON，规格与任务都带稳定 id）、【对话历史】与用户【本轮指令】。
 请在当前蓝图基础上做**最小必要改动**满足指令，然后回传**整份更新后的蓝图**。
@@ -480,7 +715,7 @@ pub async fn refine_blueprint_draft(
 
 【对话历史】
 {history}
-
+{grounding}
 【本轮指令】
 {instruction}
 
@@ -493,6 +728,7 @@ pub async fn refine_blueprint_draft(
 }}"#,
         current = current_json,
         history = hist_block.trim(),
+        grounding = grounding,
         instruction = instruction,
     );
 
@@ -531,6 +767,11 @@ pub async fn refine_blueprint_draft(
     };
     insert_message(&state.db, &draft_id, "user", &instruction, "").await?;
     insert_message(&state.db, &draft_id, "assistant", &change_summary, &change_summary).await?;
+
+    // P3：若开启评估，落稿后自动跑 critic 打分（best-effort，不阻断；开关默认关=零回归）。
+    if blueprint_eval_enabled(&state.db).await {
+        let _ = run_blueprint_critic(&state.db, &draft.project_id, &draft_id).await;
+    }
 
     load_view(&state.db, &draft_id).await
 }
@@ -849,6 +1090,141 @@ mod tests {
     #[test]
     fn parse_raw_errors_when_no_json() {
         assert!(parse_raw("没有任何大括号").is_err());
+    }
+
+    /// P3 评估解析 + 阈值：容忍围栏；min_score 取四维最低；passes 全维达标才 true。
+    #[test]
+    fn eval_parse_and_threshold() {
+        let raw = "评估如下：\n```json\n{\"prd_completeness\":8,\"spec_executability\":5,\"task_granularity\":9,\"code_fit\":7,\"gaps\":[\"验收标准缺量化\"],\"summary\":\"整体可用，规格偏空\"}\n```";
+        let e = parse_eval(raw).expect("parse eval");
+        assert_eq!(e.min_score(), 5, "四维最低=规格可执行性 5");
+        assert!(!e.passes(7), "阈值 7 → 短板 5 不达标");
+        assert!(e.passes(5), "阈值 5 → 达标");
+        assert_eq!(e.gaps.len(), 1);
+    }
+
+    /// P3 落库：store_eval 写 eval_json + 记 role='eval' 消息。
+    #[tokio::test]
+    async fn store_eval_persists_json_and_message() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE blueprint_drafts (id TEXT PRIMARY KEY, eval_json TEXT NOT NULL DEFAULT '', updated_at TEXT)")
+            .execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE blueprint_messages (id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', change_summary TEXT NOT NULL DEFAULT '', created_at TEXT)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO blueprint_drafts (id) VALUES ('d1')").execute(&db).await.unwrap();
+
+        let eval = BlueprintEval { prd_completeness: 8, spec_executability: 6, task_granularity: 7, code_fit: 7, gaps: vec![], summary: "还行".into() };
+        store_eval(&db, "d1", &eval).await.unwrap();
+        let (json,): (String,) = sqlx::query_as("SELECT eval_json FROM blueprint_drafts WHERE id='d1'").fetch_one(&db).await.unwrap();
+        assert!(json.contains("\"spec_executability\":6"));
+        let (role,): (String,) = sqlx::query_as("SELECT role FROM blueprint_messages WHERE draft_id='d1'").fetch_one(&db).await.unwrap();
+        assert_eq!(role, "eval");
+    }
+
+    /// P1 grounding：从基质 assemble 出的项目上下文被注入起草 prompt；空项目返回空串（旧行为）。
+    #[tokio::test]
+    async fn substrate_grounding_injects_project_context() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE context_index (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+                origin_stage TEXT NOT NULL DEFAULT '', origin_actor TEXT NOT NULL DEFAULT '',
+                content_ref TEXT NOT NULL DEFAULT '', size_hint INTEGER NOT NULL DEFAULT 0,
+                trust TEXT NOT NULL DEFAULT 'trusted', labels TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        crate::core::context::register(
+            &db,
+            crate::core::context::NewContextItem::trusted(
+                "p1",
+                crate::core::context::source_kind::CODE_AGENT_LOG,
+                "l1",
+                "上次编码修了登录 bug",
+                "",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let g = build_substrate_grounding(&db, "p1").await;
+        assert!(g.contains("上次编码修了登录 bug"), "基质上下文注入 grounding");
+        assert!(g.contains("项目已有上下文"));
+
+        let empty = build_substrate_grounding(&db, "none").await;
+        assert!(empty.is_empty(), "空项目 → 空 grounding（prompt 不变=旧行为）");
+    }
+
+    /// 追问状态机（P2 断点续跑）：ask_user 挂起 → awaiting_answer + pending_question；
+    /// 回答 → 清挂起、回 drafting；Q&A 均进 transcript 供下轮 refine 重建续跑。
+    #[tokio::test]
+    async fn awaiting_answer_state_machine_roundtrip() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE blueprint_drafts (id TEXT PRIMARY KEY, project_id TEXT,
+             status TEXT NOT NULL DEFAULT 'drafting', pending_question TEXT NOT NULL DEFAULT '',
+             updated_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE blueprint_messages (id TEXT PRIMARY KEY, draft_id TEXT NOT NULL,
+             role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+             change_summary TEXT NOT NULL DEFAULT '', created_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO blueprint_drafts (id, project_id, status) VALUES ('d1','p1','drafting')")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        set_awaiting_answer(&db, "d1", "需要支持第三方登录吗？").await.unwrap();
+        let (status, pending): (String, String) =
+            sqlx::query_as("SELECT status, pending_question FROM blueprint_drafts WHERE id='d1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(status, "awaiting_answer");
+        assert_eq!(pending, "需要支持第三方登录吗？");
+
+        apply_answer(&db, "d1", "是，支持微信登录").await.unwrap();
+        let (status2, pending2): (String, String) =
+            sqlx::query_as("SELECT status, pending_question FROM blueprint_drafts WHERE id='d1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(status2, "drafting", "回答后回到起草态");
+        assert_eq!(pending2, "", "pending_question 已清");
+
+        let roles: Vec<String> =
+            sqlx::query_as::<_, (String,)>("SELECT role FROM blueprint_messages WHERE draft_id='d1'")
+                .fetch_all(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(r,)| r)
+                .collect();
+        assert!(roles.contains(&"question".to_string()));
+        assert!(roles.contains(&"answer".to_string()));
     }
 
     #[test]

@@ -101,6 +101,39 @@ pub fn set_budget(budget_pct: u64) {
     }
 }
 
+/// cgroup CPU 节流统计：读 `autoforge.agents/cpu.stat` 的 `nr_throttled`（被限速周期数）与
+/// `throttled_usec`（累计被限速微秒）。可观测收敛信号（文档 §6）——核预算调对后稳态应「几乎无
+/// throttling 事件」。`None` = 未启用 cgroup 预算 / 非 Linux。
+pub fn throttle_stats() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let cg = AGENTS_CG.get()?.as_ref()?;
+        let content = std::fs::read_to_string(format!("{}/cpu.stat", cg)).ok()?;
+        Some(parse_cpu_stat(&content))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// 解析 cgroup v2 `cpu.stat` 内容，取 `(nr_throttled, throttled_usec)`；缺字段记 0。纯函数，
+/// 便于单测（非 Linux 下不被调用但仍编译）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cpu_stat(content: &str) -> (u64, u64) {
+    let mut nr_throttled = 0u64;
+    let mut throttled_usec = 0u64;
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("nr_throttled"), Some(v)) => nr_throttled = v.parse().unwrap_or(0),
+            (Some("throttled_usec"), Some(v)) => throttled_usec = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    (nr_throttled, throttled_usec)
+}
+
 #[cfg(target_os = "linux")]
 fn try_init_linux(budget_pct: u64) -> Option<String> {
     if budget_pct == 0 {
@@ -164,5 +197,15 @@ mod tests {
     fn attach_zero_is_noop() {
         // 不得 panic；pid 0 必须被忽略（不会误写）。
         attach(0);
+    }
+
+    #[test]
+    fn parse_cpu_stat_extracts_throttle_fields() {
+        let sample = "usage_usec 123456\nuser_usec 100000\nsystem_usec 23456\nnr_periods 50\nnr_throttled 7\nthrottled_usec 890123\n";
+        assert_eq!(parse_cpu_stat(sample), (7, 890123));
+        // 缺字段记 0（旧内核 / 未启用限速）。
+        assert_eq!(parse_cpu_stat("usage_usec 1\n"), (0, 0));
+        // 空内容不 panic。
+        assert_eq!(parse_cpu_stat(""), (0, 0));
     }
 }

@@ -43,7 +43,7 @@ fn build_failure_reason(exit_code: i32, stdout: &str, stderr: &str) -> String {
 pub async fn run(
     db: &Db,
     tx: &crate::tasks::runner::JobSender,
-    app: &tauri::AppHandle,
+    sink: &std::sync::Arc<dyn crate::core::event::EventSink>,
     cr_id: &str,
     _project_id: &str,
 ) -> Result<()> {
@@ -100,7 +100,7 @@ pub async fn run(
     const ITERATION_SOFT_LIMIT: i64 = 3;
     if iteration >= ITERATION_SOFT_LIMIT {
         event::emit(
-            app,
+            sink,
             event::AppEvent::IterationWarning {
                 cr_id: cr_id.to_string(),
                 iteration,
@@ -211,7 +211,7 @@ pub async fn run(
         crate::commands::change_requests::set_cr_issues_status(db, cr_id, "execution_failed")
             .await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "execution_failed".to_string(),
@@ -243,7 +243,7 @@ pub async fn run(
     );
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "worktree_ready".to_string(),
@@ -392,7 +392,7 @@ pub async fn run(
     .await?;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::PreviewUpdate {
             cr_id: cr_id.to_string(),
             preview_id: preview_id.clone(),
@@ -422,7 +422,7 @@ pub async fn run(
     crate::commands::change_requests::set_cr_issues_status(db, cr_id, "executing").await?;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::WorktreeUpdate {
             cr_id: cr_id.to_string(),
             status: "running".to_string(),
@@ -453,7 +453,7 @@ pub async fn run(
 
     // 进度提示用实际解析出的 agent 名，避免切到 codex/opencode 后仍写死「Claude Code」。
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "coding".to_string(),
@@ -485,14 +485,14 @@ pub async fn run(
     let (log_tx, mut log_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::agents::code_agent::LogChunk>();
     let forward = {
-        let app = app.clone();
+        let sink = sink.clone();
         let cr = cr_id.to_string();
         tokio::spawn(async move {
             while let Some(c) = log_rx.recv().await {
                 // 先入累计缓冲（供中途进入回灌），再带序号推事件（供实时滚动 + 去重续接）。
                 let seq = crate::state::running_log_append(&cr, &c.text);
                 event::emit(
-                    &app,
+                    &sink,
                     event::AppEvent::CodeAgentLog {
                         cr_id: cr.clone(),
                         phase: "execution".to_string(),
@@ -563,7 +563,7 @@ pub async fn run(
         crate::commands::change_requests::set_cr_issues_status(db, cr_id, "execution_failed")
             .await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "execution_failed".to_string(),
@@ -626,7 +626,7 @@ pub async fn run(
         crate::commands::change_requests::set_cr_issues_status(db, cr_id, "no_change_needed")
             .await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "no_change_needed".to_string(),
@@ -683,7 +683,7 @@ pub async fn run(
         crate::commands::change_requests::set_cr_issues_status(db, cr_id, "execution_failed")
             .await?;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "execution_failed".to_string(),
@@ -699,7 +699,7 @@ pub async fn run(
     }
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::TaskProgress {
             cr_id: cr_id.to_string(),
             phase: "grading".to_string(),
@@ -725,7 +725,7 @@ pub async fn run(
     crate::agents::grader::record_to_outputs(db, cr_id, &project.id, &grade).await;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::WorktreeUpdate {
             cr_id: cr_id.to_string(),
             status: "completed".to_string(),
@@ -760,7 +760,7 @@ pub async fn run(
         crate::tasks::merge::enqueue_merge_pipeline(db, tx, cr_id, "autogate").await;
         crate::core::notify::dispatch(db, "auto_merged", &issue.title, "低风险改动已自动放行合并").await;
         event::emit(
-            app,
+            sink,
             event::AppEvent::WorktreeUpdate {
                 cr_id: cr_id.to_string(),
                 status: "auto_merged".to_string(),
@@ -798,7 +798,7 @@ pub async fn run(
     crate::core::notify::dispatch(db, "review_needed", &issue.title, "代码实现完成，待代码审核").await;
 
     event::emit(
-        app,
+        sink,
         event::AppEvent::ReviewNeeded {
             cr_id: cr_id.to_string(),
             issue_title: issue.title,

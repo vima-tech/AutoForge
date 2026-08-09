@@ -10,6 +10,7 @@ pub mod review_assist;
 pub mod code_agents;
 pub mod code_agent_skills;
 pub mod conflicts;
+pub mod context;
 pub mod intake;
 pub mod conversations;
 pub mod conversation_archives;
