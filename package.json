@@ -1,12 +1,19 @@
 {
   "name": "autoforge",
   "version": "0.1.0",
+  "description": "Human-gated autonomous software factory",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vima-tech/AutoForge.git"
+  },
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "version:check": "node scripts/check-version.mjs",
     "tauri": "tauri",
     "tauri:dev": "node scripts/tauri-dev.mjs",
     "tauri:build": "tauri build"

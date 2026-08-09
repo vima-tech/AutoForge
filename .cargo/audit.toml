@@ -15,4 +15,9 @@ ignore = [
     # proc-macro-error / unic-* ：构建期宏与 Unicode 表，均 unmaintained 警告，无运行时风险。
     "RUSTSEC-2024-0370", "RUSTSEC-2025-0075", "RUSTSEC-2025-0080", "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098", "RUSTSEC-2025-0100",
+    # quick-xml 0.37.x：仅由 Windows 通知适配器 tauri-winrt-notification 0.7.x 引入；
+    # 该适配器只调用 quick_xml::escape 生成 Toast XML，不解析外部 XML，因此不触达
+    # RUSTSEC-2026-0194/0195 所述的重复属性与命名空间解析路径。notify-rust 4.18
+    # 仍固定使用 0.7.x，待其升级 tauri-winrt-notification 后移除此例外。
+    "RUSTSEC-2026-0194", "RUSTSEC-2026-0195",
 ]

@@ -10,11 +10,19 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/vima-tech/AutoForge/actions/workflows/ci.yml"><img src="https://github.com/vima-tech/AutoForge/actions/workflows/ci.yml/badge.svg?branch=dev" alt="CI" /></a>
+  <a href="https://github.com/vima-tech/AutoForge/releases/latest"><img src="https://img.shields.io/github/v/release/vima-tech/AutoForge" alt="GitHub Release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/vima-tech/AutoForge" alt="Apache-2.0 License" /></a>
+</p>
+
+<p align="center">
   <a href="#产品理念">产品理念</a> ·
   <a href="#工作方式">工作方式</a> ·
   <a href="#核心能力">核心能力</a> ·
+  <a href="#下载">下载</a> ·
   <a href="#快速开始">快速开始</a> ·
-  <a href="#技术架构">技术架构</a>
+  <a href="#技术架构">技术架构</a> ·
+  <a href="#参与贡献">参与贡献</a>
 </p>
 
 > [!NOTE]
@@ -77,11 +85,19 @@ flowchart LR
 - **输入防护**：外部需求、网页与工具返回值按不可信数据处理，检测明显 Prompt Injection。
 - **完整追踪**：Agent、模型与工具调用关联到同一条 trace，便于定位结果从何而来。
 
+## 下载
+
+前往 [GitHub Releases](https://github.com/vima-tech/AutoForge/releases/latest)
+下载 Windows、macOS 或 Linux 安装包。每个版本都附带 `SHA256SUMS.txt`，可用于校验下载文件完整性。
+
+> [!IMPORTANT]
+> AutoForge 目前是 Alpha 软件，能够调用本地编码 Agent、访问已配置仓库并连接外部模型或 MCP 服务。首次试用请使用可丢弃或已备份的仓库，并只授予必要凭据。
+
 ## 快速开始
 
 ### 前提条件
 
-- [Rust](https://rustup.rs/) 1.75+
+- [Rust](https://rustup.rs/) 1.88+
 - Node.js 18+
 - 已登录的本地 `claude` CLI，或在应用中配置可用的模型服务
 - [Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/)
@@ -120,9 +136,9 @@ xcode-select --install
 ### 本地运行
 
 ```bash
-git clone https://github.com/renmengkai/AutoForge.git
+git clone https://github.com/vima-tech/AutoForge.git
 cd AutoForge
-npm install
+npm ci
 npm run tauri:dev
 ```
 
@@ -159,6 +175,18 @@ src-tauri/migrations SQLite 数据模型演进
 specs/               Agent 与项目规格
 docs/                文档与品牌资产
 ```
+
+## 参与贡献
+
+欢迎提交 Bug、文档改进和聚焦的功能变更。请先阅读
+[贡献指南](CONTRIBUTING.md)；安全问题请按 [安全策略](SECURITY.md)
+私下报告，不要创建公开 Issue。项目的集成分支是 `dev`，外部 Pull Request
+也应以 `dev` 为目标分支。
+
+## 开源协议
+
+AutoForge 基于 [Apache License 2.0](LICENSE) 开源。该协议允许使用、修改与分发，
+并包含明确的专利授权；项目名称和视觉标识不因代码许可而获得商标授权，详见 [NOTICE](NOTICE)。
 
 ---
 
