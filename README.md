@@ -67,13 +67,26 @@ flowchart LR
 
 | 能力域 | AutoForge 提供什么 |
 |:---|:---|
-| 需求入口 | 快速录入、会议材料、GitHub / Webhook 接入、重复与优先级分析 |
-| 蓝图工作室 | 将大型想法迭代为 PRD、规格与可执行任务，再统一送入需求池 |
+| 需求入口 | 快速录入、会议材料、GitHub / Webhook 接入、重复与优先级分析、AI 自动供料（系统自扫代码提需求） |
+| 孵化台 | 将大型想法迭代为 PRD、规格与可执行任务，再统一送入需求池 |
 | 多 Agent 协作 | IM 风格会议室、角色化 Agent、`@mention`、附件与项目上下文 |
-| 自主实现 | 在隔离 Git worktree 中执行代码变更，生成变更摘要与交付产物 |
+| 自主实现 | 可插拔编码 Agent（claude / codex / opencode）在隔离 Git worktree 中执行，按风险分级选快/强模型 |
+| 并发治理 | 会话槽位 + 按核 CPU 预算 + 依赖共享缓存，批量执行不拖垮本机 |
 | 质量闸口 | 测试、代码 Diff、功能审计、安全审计与人工批准 |
 | 可观测性 | 任务状态、Agent 输出、模型与工具调用链路、失败原因下钻 |
-| 知识与扩展 | 项目规格、经验记忆、Skills 与 MCP Server 接入 |
+| 知识与扩展 | 项目规格、经验记忆、Skills 与 MCP Server 接入（会议归档自动蒸馏为长期知识） |
+
+### 它和其他 AI 编码工具的差别
+
+| 维度 | IDE Copilot | 云端自主 Agent | **AutoForge** |
+|:---|:---|:---|:---|
+| 人的角色 | 逐次驾驶 | 几乎不管 | 只守两个审核闸口 |
+| 处理单位 | 一次编辑会话 | 一个任务 | 一条持续流水线（队列化、并发、自供料） |
+| 运行位置 | 编辑器内 | 厂商云端 | 本地桌面应用，代码不出本机 |
+
+AutoForge 不做"更聪明的单次执行"，而是做执行之上的**编排、治理与闭环**——
+把你已有的编码 CLI 组织成有审批流、有安全边界、有记忆的生产系统。底层模型越强，
+瓶颈越在治理与吞吐，这一层的价值随之增值。
 
 ## 为什么可以放手
 
@@ -169,12 +182,15 @@ npm run dev
 | 工程隔离 | Git worktree · 受控合并入口 |
 
 ```text
-src/                 React 页面、组件与设计系统
-src-tauri/src/       Rust 运行时、Agent、任务与命令
-src-tauri/migrations SQLite 数据模型演进
-specs/               Agent 与项目规格
+src/                 React 页面、组件与设计系统（8 个页面，IPC 收口于 services/index.ts）
+src-tauri/src/       Rust 运行时：agents/（AI 调用）· core/（基础设施）· tasks/（后台流水线）· commands/（IPC 薄壳）
+src-tauri/migrations SQLite 数据模型演进（只增不改）
+.autoforge/          项目工作区：docs / specs / deliverables 与 AI 指引
 docs/                文档与品牌资产
 ```
+
+后端业务核心（`agents/`、`core/`、`tasks/`、`models/`）是**纯 Rust、零 Tauri 类型依赖**——
+Tauri 只是可替换的传输与壳层，为未来后端独立化（headless / 服务化）保留缝隙。
 
 ## 参与贡献
 
@@ -193,3 +209,5 @@ AutoForge 基于 [Apache License 2.0](LICENSE) 开源。该协议允许使用、
 <p align="center">
   <strong>AutoForge</strong> · Autonomous where it should be. Human-gated where it matters.
 </p>
+
+<p align="center"><sub>文档更新日期: 2026-08-12</sub></p>

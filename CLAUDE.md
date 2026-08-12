@@ -1,11 +1,17 @@
 # CLAUDE.md — AutoForge
 
+更新日期: 2026-08-12
+
 ## 项目简介
 
 AutoForge 是一个"Human-Lite-in-the-Loop"自主软件工厂，**Tauri 桌面端应用**。
 AI 全自动处理需求分析→代码实现→测试；人类只在两个审核节点做决策。
 
 核心流程：需求提交 → AI 分析 → 人工需求审核 → AI 实现（Claude Code worktree）→ 人工代码审核 → 自动合并
+
+定位一句话：**个人/小团队的本地自主软件工厂中控台**——把编码 CLI（claude/codex/opencode）
+组织成有审批流、有并发治理、有安全边界、有记忆的生产系统；价值在执行之上的编排、治理与闭环。
+完整定位与架构分析见 [`.autoforge/docs/设计文档/AutoForge-项目全景分析.md`](./.autoforge/docs/设计文档/AutoForge-项目全景分析.md)。
 
 ---
 
@@ -140,7 +146,10 @@ src/                          # React 前端
     Dashboard.tsx             # 工厂总览（流水线统计、需求队列、并发槽位）
     Conversations.tsx         # 会议室（群聊/直聊、消息、项目绑定、工作区文件浏览）
     Projects.tsx              # 项目管理（物料库、代码扫描、备份配置）
-    Audit.tsx                 # 变更审核（Diff 查看、预览环境、测试结果）
+    Blueprint.tsx             # 孵化台（大需求从草稿迭代到编码，内部名 blueprint）
+    Delivery.tsx              # 交付流水线（需求传送带、批量执行进度）
+    Audit.tsx                 # 变更审核（Diff 查看、预览环境、测试结果、执行日志）
+    Trace.tsx                 # LLM 链路追踪（LangSmith 式，按需求/会议室/角色筛选）
     Settings.tsx              # 设置（LLM 配置、Agent 管理、系统健康、并发控制）
   services/index.ts           # 所有 IPC 调用封装（唯一 Tauri 交互层）
   data/mock.ts                # BlockType 类型定义 + 开发用 mock 数据
@@ -158,10 +167,13 @@ src-tauri/                    # Rust 后端
         mod.rs                #   trait CodeAgent + resolve/resolve_for_risk + 分级选模型 + build_prompt
         cli.rs                #   CliCodeAgent：一个 struct 覆盖三家 kind（含 MCP pull 注入、超时回收）
         mcp_inject.rs         #   pull：把 for_code_agent 的 MCP 注入各 CLI（claude/codex/opencode 机制各异）
-      tools/
+      tools/                  # Agent 工具循环（ToolRegistry）
         code_intel.rs         #   push：执行前用 MCP code-intel 预查符号定位/调用者/影响面，注入 prompt
         mcp.rs                #   MCP client（rmcp）：把外部 MCP 工具适配为本地 Tool
-    commands/                 # Tauri IPC commands（每个文件对应一个功能域）
+        web_search.rs / deep_research.rs / code_scan.rs / memory.rs / specs.rs / context_recall.rs / web_fetch.rs
+      roles.rs                # 内置角色提示词注册表（两层 Agent 模型：LLM × 角色卡）
+      grader.rs / test_agent.rs / schema.rs  # CR 评分、测试 Agent、Schema 驱动产物
+    commands/                 # Tauri IPC commands（45 个功能域、~320 个命令；完整清单见 mod.rs）
       projects.rs             # 项目 CRUD
       issues.rs               # 需求管理
       change_requests.rs      # 变更请求、审核、代码 Diff
@@ -175,18 +187,35 @@ src-tauri/                    # Rust 后端
       intake.rs               # 需求接收（webhook、GitHub sync、批量导入）
       dev_server.rs           # 开发预览服务器管理
       system.rs               # 系统健康、流水线统计、并发控制
-      demo.rs                 # URL 打开等演示功能
-    core/
+      blueprint.rs            # 孵化台（大需求草稿→编码）
+      code_agents.rs          # 可插拔编码 Agent 配置（claude/codex/opencode）
+      mcp.rs                  # MCP server 配置
+      trace.rs                # LLM 链路追踪查询
+      knowledge.rs            # Innate 记忆/知识
+      run_config.rs           # 运行配置（真源 .autoforge/run-config.json，读走 effective_config）
+      backup.rs               # 配置口令加密导出/导入
+      …                       # 其余：asr/meetings/notify/widget/scan/conflicts/self_update 等
+    core/                     # 纯 Rust 基础设施（24 模块，零 Tauri 依赖）
       security.rs             # 输入消毒（has_obvious_injection）
       git.rs                  # GitProxy（拦截危险 git 操作）
-      concurrency.rs          # 并发槽位管理（Semaphore + 背压）
-      event.rs                # Tauri 事件广播（AppEvent 枚举）
-    models/                   # SQLite 数据模型（sqlx::FromRow + Serialize）
-    tasks/
+      concurrency.rs          # 并发会话槽位（Semaphore + 背压）
+      cpu_permits.rs          # 按核 CPU 预算（加权令牌池 + 分相位租约）
+      event.rs                # Tauri 事件广播（AppEvent 枚举，emit 唯一出口）
+      secrets.rs              # 密钥信封加密（keyring 主密钥 + AES-256-GCM）
+      trace.rs                # LLM 链路追踪（task_local）
+      stack.rs                # 多技术栈画像检测（node/vue/react/java/go/python/tauri…）
+      reaper.rs               # 进程组回收（孤儿 agent 进程整组 SIGKILL）
+      platform.rs             # 跨平台进程抽象（Linux/macOS/Windows）
+      dep_cache.rs            # worktree 依赖共享缓存（lockfile 内容寻址）
+      …                       # 其余：context/context_providers/rpc/lens/gate/notify 等
+    models/                   # SQLite 数据模型（sqlx::FromRow + Serialize，35 模块）
+    tasks/                    # 后台任务（runner 调度，全部幂等）
       runner.rs               # Tokio 任务池主循环
       analysis.rs             # 需求分析任务
       execution.rs            # 代码实现任务（worktree）
-      merge.rs                # 合并任务
+      merge.rs                # 合并任务（premerge 并行测试 / land 串行落地）
+      autosupply.rs           # 自动供料（proposer/scanner 自扫代码提需求）
+      testing.rs / scan.rs / security_audit.rs / preview.rs / revert.rs
     db.rs                     # SQLite 连接池 + 自动迁移
     state.rs                  # AppState（db + job_tx + concurrency + dev_servers）
     lib.rs                    # Tauri setup + 所有 command 注册
@@ -232,10 +261,13 @@ listen('autoforge://event', (e) => { /* message_received | conversation_task_upd
 5. 解析 agent 输出中的 `<write-file>` 标签并自动写入工作区文件
 6. 可选：summarizer agent 综合发言、doc_writer agent 生成文档产物
 
-### 并发槽位
+### 并发治理（会话槽位 + CPU 预算）
 
-`core/concurrency.rs` 用 `tokio::sync::Semaphore` 控制同时执行的 CR 数量（默认 5），
-`Mutex<usize>` 计数 pending_review，到达阈值（默认 20）时暂停新任务。
+两层并发控制：
+- **会话槽位**：`core/concurrency.rs` 用 `tokio::sync::Semaphore` 控制同时执行的 CR 数量（默认 5），
+  `Mutex<usize>` 计数 pending_review，到达阈值（默认 20）时暂停新任务。
+- **按核 CPU 预算**：`core/cpu_permits.rs` 加权令牌池（默认预算为核数的 90%），
+  编码执行整体计权，testing/scan 等相位按需申请租约，防止批量执行把 CPU 占满。
 
 ### Git 安全代理
 
