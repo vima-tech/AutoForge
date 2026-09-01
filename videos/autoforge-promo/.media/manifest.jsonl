@@ -1,0 +1,20 @@
+{"id":"bgm_001","type":"bgm","path":"assets/bgm/track.mp3","source":"existing","description":"track","duration":32,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_001","type":"sfx","path":"assets/sfx/chip-slap-3.mp3","source":"existing","description":"chip slap 3","duration":0.8,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_002","type":"sfx","path":"assets/sfx/impact-soft-token.mp3","source":"existing","description":"impact soft token","duration":2.8,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_003","type":"sfx","path":"assets/sfx/none.mp3","source":"existing","description":"none","duration":0.7,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_004","type":"sfx","path":"assets/sfx/percussive-hit-4.mp3","source":"existing","description":"percussive hit 4","duration":1.6,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_005","type":"sfx","path":"assets/sfx/pop-3-whoosh-glow.mp3","source":"existing","description":"pop 3 whoosh glow","duration":2.6,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_006","type":"sfx","path":"assets/sfx/resolve-shimmer.mp3","source":"existing","description":"resolve shimmer","duration":3.3,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_007","type":"sfx","path":"assets/sfx/riser.mp3","source":"existing","description":"riser","duration":5,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_008","type":"sfx","path":"assets/sfx/soft-ignite-glow.mp3","source":"existing","description":"soft ignite glow","duration":2.4,"provenance":{"provider":"local","adopted":true}}
+{"id":"sfx_009","type":"sfx","path":"assets/sfx/tick-5-resolve-chime-merged.mp3","source":"existing","description":"tick 5 resolve chime merged","duration":1.3,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_001","type":"voice","path":"assets/voice/01.wav","source":"existing","description":"01","duration":4.5,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_002","type":"voice","path":"assets/voice/02.wav","source":"existing","description":"02","duration":7.3,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_003","type":"voice","path":"assets/voice/03.wav","source":"existing","description":"03","duration":5.1,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_004","type":"voice","path":"assets/voice/04.wav","source":"existing","description":"04","duration":8.2,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_005","type":"voice","path":"assets/voice/05.wav","source":"existing","description":"05","duration":8.3,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_006","type":"voice","path":"assets/voice/06.wav","source":"existing","description":"06","duration":9.7,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_007","type":"voice","path":"assets/voice/07.wav","source":"existing","description":"07","duration":12.4,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_008","type":"voice","path":"assets/voice/08.wav","source":"existing","description":"08","duration":5.3,"provenance":{"provider":"local","adopted":true}}
+{"id":"voice_009","type":"voice","path":"assets/voice/09.wav","source":"existing","description":"09","duration":2.6,"provenance":{"provider":"local","adopted":true}}
+{"id":"logo_001","type":"logo","path":".media/images/logo_001.png","source":"ingested","description":"logo.png","provenance":{"provider":"local","from":"../../src/assets/logo.png"}}

@@ -1,0 +1,107 @@
+<template>
+<div id="root" data-composition-id="02-three-gaps" data-duration="9.482" data-width="1920" data-height="1080">
+  <div class="clip" id="hf02-ground" data-start="0" data-duration="7.262" data-track-index="0" style="position:absolute;inset:0;background:#16110d;overflow:hidden;"></div>
+  <div class="clip" id="hf02-content" data-start="0" data-duration="7.262" data-track-index="1" style="position:absolute;inset:0;overflow:hidden;">
+    <div id="hf02-world" style="position:absolute;width:5760px;height:1080px;left:0;top:0;">
+      <!-- Station 1: 定位 · 靠 grep -->
+      <div class="hf02-station" id="hf02-s1" style="position:absolute;left:600px;top:340px;display:flex;flex-direction:column;align-items:center;gap:24px;">
+        <svg width="80" height="80" viewBox="0 0 80 80" fill="none">
+          <circle cx="34" cy="34" r="22" stroke="#e8772e" stroke-width="2.5"/>
+          <line x1="50" y1="50" x2="70" y2="70" stroke="#e8772e" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:48px;font-weight:800;letter-spacing:-0.03em;color:#f1e8d9;">定位</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:500;letter-spacing:0.14em;text-transform:uppercase;color:#e8772e;">靠 grep</div>
+      </div>
+      <!-- Station 2: 纪律 · 靠自觉 -->
+      <div class="hf02-station" id="hf02-s2" style="position:absolute;left:2560px;top:340px;display:flex;flex-direction:column;align-items:center;gap:24px;">
+        <svg width="80" height="80" viewBox="0 0 80 80" fill="none">
+          <path d="M40 10 L40 10 C55 10 68 23 68 38 L68 52 C68 58 63 63 57 63 L23 63 C17 63 12 58 12 52 L12 38 C12 23 25 10 40 10Z" stroke="#e8772e" stroke-width="2.5" fill="none"/>
+          <line x1="40" y1="30" x2="40" y2="48" stroke="#e8772e" stroke-width="2.5" stroke-linecap="round"/>
+          <circle cx="40" cy="56" r="3" fill="#e8772e"/>
+        </svg>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:48px;font-weight:800;letter-spacing:-0.03em;color:#f1e8d9;">纪律</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:500;letter-spacing:0.14em;text-transform:uppercase;color:#e8772e;">靠自觉</div>
+      </div>
+      <!-- Station 3: 安全 · 靠运气 -->
+      <div class="hf02-station" id="hf02-s3" style="position:absolute;left:4520px;top:340px;display:flex;flex-direction:column;align-items:center;gap:24px;">
+        <svg width="80" height="80" viewBox="0 0 80 80" fill="none">
+          <rect x="14" y="14" width="52" height="52" rx="10" stroke="#e8772e" stroke-width="2.5" fill="none"/>
+          <circle cx="30" cy="36" r="4" fill="#e8772e"/>
+          <circle cx="50" cy="36" r="4" fill="#e8772e"/>
+          <circle cx="40" cy="54" r="4" fill="#e8772e"/>
+        </svg>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:48px;font-weight:800;letter-spacing:-0.03em;color:#f1e8d9;">安全</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:500;letter-spacing:0.14em;text-transform:uppercase;color:#e8772e;">靠运气</div>
+      </div>
+      <!-- Guide lines SVG -->
+      <svg id="hf02-guides" style="position:absolute;inset:0;width:5760px;height:1080px;pointer-events:none;" viewBox="0 0 5760 1080" fill="none">
+        <path id="hf02-line1" d="M700,440 C900,440 1100,540 1400,540 C1700,540 2100,440 2560,440" stroke="#e8772e" stroke-width="1.5" opacity="0.6"/>
+        <path id="hf02-line2" d="M2660,440 C2900,440 3200,540 3600,540 C4000,540 4300,440 4520,440" stroke="#e8772e" stroke-width="1.5" opacity="0.6"/>
+        <path id="hf02-knot" d="M3500,540 C3600,400 3800,650 3900,500 C4000,350 4100,600 4200,480 C4300,360 4200,580 4000,540 C3800,500 3700,600 3600,540 C3500,480 3550,520 3500,540" stroke="#e8772e" stroke-width="2" opacity="0"/>
+      </svg>
+      <!-- Callout -->
+      <div id="hf02-callout" style="position:absolute;left:3400px;top:680px;font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:52px;font-weight:800;letter-spacing:-0.03em;color:#e8772e;opacity:0;transform:scale(0);">三块短板，块块致命</div>
+    </div>
+  </div>
+</div>
+<style>
+  #root {
+    position: relative;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    container-type: size;
+  }
+  @font-face {
+    font-family: 'Noto Sans SC';
+    src: url('assets/fonts/NotoSansSC.ttf') format('truetype');
+    font-weight: 100 900;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<script>
+(function() {
+  var tl = gsap.timeline({ paused: true });
+  window.__timelines = window.__timelines || {};
+  window.__timelines["02-three-gaps"] = tl;
+
+  var world = document.getElementById("hf02-world");
+  var cam = { x: 0 };
+  function applyCam() {
+    world.style.transform = "translateX(" + cam.x + "px)";
+  }
+  applyCam();
+
+  // Setup guide line draw
+  var line1 = document.getElementById("hf02-line1");
+  var line2 = document.getElementById("hf02-line2");
+  var knot = document.getElementById("hf02-knot");
+  var len1 = line1.getTotalLength();
+  var len2 = line2.getTotalLength();
+  var lenK = knot.getTotalLength();
+  gsap.set(line1, { strokeDasharray: len1, strokeDashoffset: len1 });
+  gsap.set(line2, { strokeDasharray: len2, strokeDashoffset: len2 });
+  gsap.set(knot, { strokeDasharray: lenK, strokeDashoffset: lenK });
+
+  // Scene 1 (0.0–1.5s): camera at station 1, guide line draws
+  tl.fromTo("#hf02-s1", { opacity: 0 }, { opacity: 1, duration: 0.4, ease: "power2.out" }, 0.0);
+  tl.to(line1, { strokeDashoffset: len1 * 0.35, duration: 1.2, ease: "power2.inOut" }, 0.2);
+
+  // Scene 2 (1.5–3.1s): pan to station 2
+  tl.to(cam, { x: -1960, duration: 1.2, ease: "power3.inOut", onUpdate: applyCam }, 1.5);
+  tl.fromTo("#hf02-s2", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power2.out" }, 2.0);
+  tl.to(line1, { strokeDashoffset: 0, duration: 1.0, ease: "power2.inOut" }, 1.8);
+
+  // Scene 3 (3.1–4.7s): pan to station 3
+  tl.to(cam, { x: -3920, duration: 1.2, ease: "power3.inOut", onUpdate: applyCam }, 3.1);
+  tl.fromTo("#hf02-s3", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power2.out" }, 3.6);
+  tl.to(line2, { strokeDashoffset: 0, duration: 1.0, ease: "power2.inOut" }, 3.4);
+
+  // Scene 4 (4.7–7.262s): knot draws + callout spring-pop
+  tl.to(knot, { opacity: 1, duration: 0.01 }, 4.7);
+  tl.to(knot, { strokeDashoffset: 0, duration: 1.5, ease: "power2.inOut" }, 4.7);
+  tl.fromTo("#hf02-callout", { scale: 0, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.6, ease: "power3.out" }, 5.8);
+  // camera hold
+})();
+</script>
+</template>

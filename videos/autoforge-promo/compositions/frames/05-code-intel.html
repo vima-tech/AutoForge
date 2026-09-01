@@ -1,0 +1,103 @@
+<template>
+<div id="root" data-composition-id="05-code-intel" data-duration="12.281" data-width="1920" data-height="1080">
+  <div class="clip" id="hf05-ground" data-start="0" data-duration="8.255" data-track-index="0" style="position:absolute;inset:0;background:#16110d;"></div>
+  <div class="clip" id="hf05-content" data-start="0" data-duration="8.255" data-track-index="1" style="position:absolute;inset:0;">
+    <!-- Kicker -->
+    <div id="hf05-kicker" style="position:absolute;top:80px;left:106px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.14em;text-transform:uppercase;color:#e8772e;opacity:0;">MCP · CODE-INTEL 预查</div>
+    <!-- Title -->
+    <div id="hf05-title" style="position:absolute;top:120px;left:106px;display:flex;flex-direction:column;gap:4px;">
+      <div class="hf05-title-line" style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:52px;font-weight:800;letter-spacing:-0.03em;color:#f1e8d9;opacity:0;">开工之前，</div>
+      <div class="hf05-title-line" style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:52px;font-weight:800;letter-spacing:-0.03em;color:#f1e8d9;opacity:0;">已经查完了。</div>
+    </div>
+    <!-- Intel cards grid (2x2) -->
+    <div id="hf05-grid" style="position:absolute;top:300px;left:106px;display:grid;grid-template-columns:1fr 1fr;gap:20px;width:1060px;">
+      <!-- Card 1: 符号定位 -->
+      <div class="hf05-card" style="background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:16px;padding:24px;opacity:0;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:#e8772e;"></div>
+          <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:20px;font-weight:700;color:#f1e8d9;">符号定位</div>
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:14px;color:#e8772e;background:rgba(232,119,46,0.1);padding:4px 10px;border-radius:6px;display:inline-block;">tasks/merge.rs:696</div>
+      </div>
+      <!-- Card 2: 调用者列表 -->
+      <div class="hf05-card" style="background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:16px;padding:24px;opacity:0;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:#e8772e;"></div>
+          <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:20px;font-weight:700;color:#f1e8d9;">调用者列表</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <div class="hf05-mini" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:rgba(241,232,217,0.7);opacity:0;">→ execute_merge_task()</div>
+          <div class="hf05-mini" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:rgba(241,232,217,0.5);opacity:0;">→ run_merge_job()</div>
+          <div class="hf05-mini" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:rgba(241,232,217,0.35);opacity:0;">→ handle_review_approved()</div>
+        </div>
+      </div>
+      <!-- Card 3: 影响面分析 -->
+      <div class="hf05-card" style="background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:16px;padding:24px;grid-column:span 2;opacity:0;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:#e8772e;"></div>
+          <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:20px;font-weight:700;color:#f1e8d9;">影响面分析</div>
+        </div>
+        <div style="display:flex;gap:32px;">
+          <div class="hf05-tree" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:rgba(241,232,217,0.7);line-height:1.8;opacity:0;">
+            <div>├ change_requests.rs</div>
+            <div>├ worktree_sessions</div>
+            <div>└ job_executions</div>
+          </div>
+          <div class="hf05-tree" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:rgba(241,232,217,0.5);line-height:1.8;opacity:0;">
+            <div>├ git merge --squash</div>
+            <div>├ branch protection</div>
+            <div>└ event broadcast</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Risk pill -->
+    <div id="hf05-risk" style="position:absolute;bottom:140px;left:106px;display:flex;align-items:center;gap:16px;opacity:0;">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:rgba(34,197,94,0.15);border:1px solid rgba(34,197,94,0.3);padding:6px 16px;border-radius:8px;">低风险 → 快模型 · 省</div>
+      <div style="width:24px;height:1px;background:rgba(241,232,217,0.2);"></div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:rgba(232,119,46,0.15);border:1px solid rgba(232,119,46,0.3);padding:6px 16px;border-radius:8px;">高风险 → 强模型 · 稳</div>
+    </div>
+    <!-- Ember sweep line -->
+    <div id="hf05-sweep" style="position:absolute;bottom:120px;left:106px;width:1060px;height:2px;background:linear-gradient(90deg,transparent,#e8772e,transparent);opacity:0;transform:scaleX(0);transform-origin:left center;"></div>
+  </div>
+</div>
+<style>
+  #root {
+    position: relative;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    container-type: size;
+  }
+  @font-face {
+    font-family: 'Noto Sans SC';
+    src: url('assets/fonts/NotoSansSC.ttf') format('truetype');
+    font-weight: 100 900;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<script>
+(function() {
+  var tl = gsap.timeline({ paused: true });
+  window.__timelines = window.__timelines || {};
+  window.__timelines["05-code-intel"] = tl;
+
+  // Scene 1 (0.0–1.2s): kicker + title lines fill in
+  tl.fromTo("#hf05-kicker", { opacity: 0 }, { opacity: 1, duration: 0.4, ease: "power2.out" }, 0.0);
+  tl.fromTo(".hf05-title-line", { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.4, ease: "power3.out", stagger: 0.15 }, 0.3);
+
+  // Scene 2 (1.2–5.5s): intel cards stagger in
+  tl.fromTo(".hf05-card", { opacity: 0, scale: 0.92, y: 20 }, { opacity: 1, scale: 1, y: 0, duration: 0.5, ease: "power3.out", stagger: 0.2 }, 1.2);
+  // Mini lines inside card 2
+  tl.fromTo("#hf05-grid .hf05-card:nth-child(2) .hf05-mini", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.3, ease: "power2.out", stagger: 0.12 }, 2.2);
+  // Tree lines inside card 3
+  tl.fromTo("#hf05-grid .hf05-card:nth-child(3) .hf05-tree", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.3, ease: "power2.out", stagger: 0.15 }, 3.2);
+
+  // Scene 3 (5.5–8.255s): risk pill + ember sweep
+  tl.fromTo("#hf05-risk", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.5, ease: "power3.out" }, 5.5);
+  tl.fromTo("#hf05-sweep", { opacity: 0, scaleX: 0 }, { opacity: 1, scaleX: 1, duration: 0.8, ease: "power2.inOut" }, 6.2);
+  tl.to("#hf05-sweep", { opacity: 0, duration: 0.4, ease: "power2.in" }, 7.0);
+  // hold
+})();
+</script>
+</template>

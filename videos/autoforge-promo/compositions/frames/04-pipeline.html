@@ -1,0 +1,162 @@
+<template>
+<div id="root" data-composition-id="04-pipeline" data-duration="9.617" data-width="1920" data-height="1080">
+  <div class="clip" id="hf04-ground" data-start="0" data-duration="8.229" data-track-index="0" style="position:absolute;inset:0;background:#16110d;"></div>
+  <div class="clip" id="hf04-content" data-start="0" data-duration="8.229" data-track-index="1" style="position:absolute;inset:0;">
+    <!-- Issue card -->
+    <div id="hf04-issue" style="position:absolute;top:80px;left:106px;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:16px;padding:20px 28px;display:flex;align-items:center;gap:16px;opacity:0;">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.14em;text-transform:uppercase;color:#e8772e;background:rgba(232,119,46,0.15);padding:4px 10px;border-radius:6px;">ISSUE</div>
+      <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:20px;font-weight:700;color:#f1e8d9;">需求 · 批量导入 CSV</div>
+    </div>
+    <!-- Status pill -->
+    <div id="hf04-status" style="position:absolute;top:88px;left:420px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.1em;text-transform:uppercase;opacity:0;">
+      <span id="hf04-status-text" style="color:#e8772e;background:rgba(232,119,46,0.15);padding:4px 12px;border-radius:6px;">QUEUED</span>
+    </div>
+    <!-- Spinner -->
+    <svg id="hf04-spinner" style="position:absolute;top:90px;left:540px;width:24px;height:24px;opacity:0;" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10" stroke="rgba(232,119,46,0.3)" stroke-width="2" fill="none"/>
+      <path id="hf04-spin-arc" d="M12 2 A10 10 0 0 1 22 12" stroke="#e8772e" stroke-width="2" fill="none" stroke-linecap="round"/>
+    </svg>
+    <!-- Loader text -->
+    <div id="hf04-loader" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-family:'JetBrains Mono',monospace;font-size:28px;font-weight:500;color:#f1e8d9;opacity:0;">
+      <span id="hf04-loader-text"></span><span id="hf04-loader-caret" style="display:inline-block;width:2px;height:28px;background:#e8772e;margin-left:2px;"></span>
+    </div>
+    <!-- CR chips -->
+    <div id="hf04-chips" style="position:absolute;top:200px;right:106px;display:flex;flex-direction:column;gap:12px;opacity:0;">
+      <div class="hf04-chip" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:8px;padding:8px 16px;opacity:0;">CR-1</div>
+      <div class="hf04-chip" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:8px;padding:8px 16px;opacity:0;">CR-2</div>
+      <div class="hf04-chip" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:8px;padding:8px 16px;opacity:0;">CR-3</div>
+      <div class="hf04-chip" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:8px;padding:8px 16px;opacity:0;">CR-4</div>
+      <div class="hf04-chip" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;letter-spacing:0.1em;color:#f1e8d9;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:8px;padding:8px 16px;opacity:0;">CR-5</div>
+    </div>
+    <!-- Receipt card -->
+    <div id="hf04-receipt" style="position:absolute;top:180px;left:50%;transform:translateX(-50%);width:720px;background:#211a13;border:1px solid rgba(255,206,150,0.18);border-radius:16px;padding:28px 32px;opacity:0;">
+      <div class="hf04-row" style="display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid rgba(255,206,150,0.08);opacity:0;">
+        <div class="hf04-check" style="width:24px;height:24px;border-radius:50%;border:2px solid rgba(241,232,217,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path class="hf04-tick" d="M2 7 L5.5 10.5 L12 3.5" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0"/></svg></div>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:22px;font-weight:700;color:#f1e8d9;">需求分析</div>
+      </div>
+      <div class="hf04-row" style="display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid rgba(255,206,150,0.08);opacity:0;">
+        <div class="hf04-check" style="width:24px;height:24px;border-radius:50%;border:2px solid rgba(241,232,217,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path class="hf04-tick" d="M2 7 L5.5 10.5 L12 3.5" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0"/></svg></div>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:22px;font-weight:700;color:#f1e8d9;">代码实现 · worktree 隔离</div>
+      </div>
+      <div class="hf04-row" style="display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid rgba(255,206,150,0.08);opacity:0;">
+        <div class="hf04-check" style="width:24px;height:24px;border-radius:50%;border:2px solid rgba(241,232,217,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path class="hf04-tick" d="M2 7 L5.5 10.5 L12 3.5" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0"/></svg></div>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:22px;font-weight:700;color:#f1e8d9;">测试门</div>
+      </div>
+      <div class="hf04-row" style="display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid rgba(255,206,150,0.08);opacity:0;">
+        <div class="hf04-check" style="width:24px;height:24px;border-radius:50%;border:2px solid rgba(241,232,217,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path class="hf04-tick" d="M2 7 L5.5 10.5 L12 3.5" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0"/></svg></div>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:22px;font-weight:700;color:#f1e8d9;">安全门</div>
+      </div>
+      <div class="hf04-row" style="display:flex;align-items:center;gap:14px;padding:12px 0;opacity:0;">
+        <div class="hf04-check" style="width:24px;height:24px;border-radius:50%;border:2px solid rgba(241,232,217,0.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path class="hf04-tick" d="M2 7 L5.5 10.5 L12 3.5" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0"/></svg></div>
+        <div style="font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:22px;font-weight:700;color:#f1e8d9;">squash 合并</div>
+      </div>
+    </div>
+    <!-- MERGED badge -->
+    <div id="hf04-merged" style="position:absolute;bottom:220px;left:50%;transform:translateX(-50%);font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:48px;font-weight:800;letter-spacing:-0.03em;color:#22c55e;opacity:0;">MERGED ✓</div>
+    <!-- Final tagline -->
+    <div id="hf04-tagline" style="position:absolute;bottom:140px;left:50%;transform:translateX(-50%);font-family:'Archivo Black','Noto Sans SC',sans-serif;font-size:36px;font-weight:800;letter-spacing:-0.02em;color:#f1e8d9;opacity:0;">
+      <span>你，只管</span><span style="color:#e8772e;">审核</span>
+    </div>
+  </div>
+</div>
+<style>
+  #root {
+    position: relative;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    container-type: size;
+  }
+  @font-face {
+    font-family: 'Noto Sans SC';
+    src: url('assets/fonts/NotoSansSC.ttf') format('truetype');
+    font-weight: 100 900;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<script>
+(function() {
+  var tl = gsap.timeline({ paused: true });
+  window.__timelines = window.__timelines || {};
+  window.__timelines["04-pipeline"] = tl;
+
+  // Scene 1 (0.0–1.2s): issue card + spinner + status pill
+  tl.fromTo("#hf04-issue", { x: -60, opacity: 0 }, { x: 0, opacity: 1, duration: 0.5, ease: "power3.out" }, 0.0);
+  tl.fromTo("#hf04-spinner", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power2.out" }, 0.2);
+  tl.fromTo("#hf04-status", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power2.out" }, 0.3);
+  // Spinner rotation
+  var spinArc = document.getElementById("hf04-spin-arc");
+  var spinRot = { r: 0 };
+  tl.to(spinRot, {
+    r: 360 * 4,
+    duration: 6.0,
+    ease: "none",
+    onUpdate: function() {
+      spinArc.setAttribute("transform", "rotate(" + spinRot.r + " 12 12)");
+    }
+  }, 0.2);
+  // Status QUEUED → ANALYZING
+  tl.set("#hf04-status-text", { innerText: "ANALYZING" }, 0.8);
+
+  // Scene 2 (1.2–3.3s): loader typing + CR chips pulse
+  tl.to("#hf04-issue", { opacity: 0.4, duration: 0.3 }, 1.2);
+  tl.to("#hf04-status", { opacity: 0.4, duration: 0.3 }, 1.2);
+  tl.fromTo("#hf04-loader", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power2.out" }, 1.3);
+  // Loader typing
+  var loaderText = document.getElementById("hf04-loader-text");
+  var fullText = "分析中…";
+  var typeLen = { v: 0 };
+  tl.to(typeLen, {
+    v: fullText.length,
+    duration: 1.0,
+    ease: "none",
+    onUpdate: function() {
+      loaderText.textContent = fullText.substring(0, Math.floor(typeLen.v));
+    }
+  }, 1.4);
+  // Caret blink
+  var loaderBlink = { p: 0 };
+  tl.to(loaderBlink, {
+    p: Math.PI * 2 * 8,
+    duration: 4.0,
+    ease: "none",
+    onUpdate: function() {
+      document.getElementById("hf04-loader-caret").style.opacity = Math.sin(loaderBlink.p) > 0 ? "1" : "0";
+    }
+  }, 1.4);
+  // CR chips pulse
+  tl.fromTo("#hf04-chips", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 1.5);
+  gsap.utils.toArray(".hf04-chip").forEach(function(el, i) {
+    tl.fromTo(el, { opacity: 0, scale: 0.9 }, { opacity: 1, scale: 1, duration: 0.3, ease: "power3.out" }, 1.8 + i * 0.15);
+    tl.to(el, { scale: 1.04, duration: 0.15, ease: "power2.out", yoyo: true, repeat: 1 }, 2.1 + i * 0.15);
+  });
+
+  // Scene 3 (3.3–7.0s): receipt card + checkable rows
+  tl.to("#hf04-loader", { opacity: 0, duration: 0.3 }, 3.0);
+  tl.to("#hf04-chips", { opacity: 0, duration: 0.3 }, 3.0);
+  tl.fromTo("#hf04-receipt", { opacity: 0, y: 40 }, { opacity: 1, y: 0, duration: 0.5, ease: "power3.out" }, 3.3);
+  // Row stagger in + check off
+  var rows = gsap.utils.toArray(".hf04-row");
+  rows.forEach(function(row, i) {
+    var t = 3.5 + i * 0.4;
+    tl.fromTo(row, { opacity: 0, x: -20 }, { opacity: 1, x: 0, duration: 0.3, ease: "power2.out" }, t);
+    // Check: green circle + tick draw
+    var check = row.querySelector(".hf04-check");
+    var tick = row.querySelector(".hf04-tick");
+    var tickLen = tick.getTotalLength();
+    gsap.set(tick, { strokeDasharray: tickLen, strokeDashoffset: tickLen });
+    tl.to(check, { backgroundColor: "#22c55e", borderColor: "#22c55e", duration: 0.2, ease: "power2.out" }, t + 0.3);
+    tl.to(tick, { strokeDashoffset: 0, opacity: 1, duration: 0.2, ease: "power2.out" }, t + 0.3);
+    // Strikethrough + dim
+    tl.to(row, { opacity: 0.5, duration: 0.3, ease: "power2.out" }, t + 0.6);
+  });
+
+  // Scene 4 (7.0–8.229s): MERGED + tagline
+  tl.fromTo("#hf04-merged", { opacity: 0, scale: 0.8 }, { opacity: 1, scale: 1, duration: 0.5, ease: "power3.out" }, 7.0);
+  tl.fromTo("#hf04-tagline", { opacity: 0 }, { opacity: 1, duration: 0.4, ease: "power2.out" }, 7.4);
+  // Stop spinner
+  tl.to(spinRot, { r: spinRot.r, duration: 0.01 }, 7.0);
+  tl.set("#hf04-spinner", { opacity: 0 }, 7.0);
+})();
+</script>
+</template>

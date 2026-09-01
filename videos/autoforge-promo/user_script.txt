@@ -1,0 +1,5 @@
+用户需求（verbatim）：
+「分析当前系统在普通程序员岗位的优势在哪里」→「生成一个突出这个特点的介绍宣传视频」
+
+源素材：AutoForge 对普通程序员岗位的优势分析（见 capture/extracted/visible-text.txt）
+VO_MODE=restructure —— 分析素材不是口播稿，60s 中文配音由 Step 3 重写。

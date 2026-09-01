@@ -1,0 +1,61 @@
+{
+  "lines": [
+    {
+      "id": "01",
+      "sfx": [
+        "impact-soft（token 撞换瞬间）"
+      ]
+    },
+    {
+      "id": "02",
+      "sfx": [
+        "riser（收尾死结）"
+      ]
+    },
+    {
+      "id": "03",
+      "sfx": [
+        "soft-ignite（ glow 点燃）"
+      ]
+    },
+    {
+      "id": "04",
+      "sfx": [
+        "tick × 5（每行打勾）、resolve-chime（merged）"
+      ]
+    },
+    {
+      "id": "05",
+      "sfx": [
+        "pop × 3（卡片入位）、whoosh（glow 扫过）"
+      ]
+    },
+    {
+      "id": "06",
+      "sfx": [
+        "chip-slap × 3（徽章硬切）"
+      ]
+    },
+    {
+      "id": "07",
+      "sfx": [
+        "percussive-hit × 4（每拍一记）"
+      ]
+    },
+    {
+      "id": "08",
+      "sfx": [
+        "none（静默是本帧的设计）"
+      ]
+    },
+    {
+      "id": "09",
+      "sfx": [
+        "resolve-shimmer（锁定瞬间）"
+      ]
+    }
+  ],
+  "bgm": {
+    "mode": "none"
+  }
+}

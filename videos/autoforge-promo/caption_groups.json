@@ -1,0 +1,3334 @@
+{
+  "total_duration_s": 74.815,
+  "width": 1920,
+  "height": 1080,
+  "groups": [
+    {
+      "id": "caption-group-0",
+      "frame": 1,
+      "start": 0.299,
+      "end": 0.579,
+      "text": "你 不",
+      "words": [
+        {
+          "id": "caption-word-0-0",
+          "text": "你",
+          "start": 0.299,
+          "end": 0.319
+        },
+        {
+          "id": "caption-word-0-1",
+          "text": "不",
+          "start": 0.319,
+          "end": 0.579
+        }
+      ]
+    },
+    {
+      "id": "caption-group-1",
+      "frame": 1,
+      "start": 0.579,
+      "end": 0.799,
+      "text": "是 写",
+      "words": [
+        {
+          "id": "caption-word-1-0",
+          "text": "是",
+          "start": 0.579,
+          "end": 0.699
+        },
+        {
+          "id": "caption-word-1-1",
+          "text": "写",
+          "start": 0.699,
+          "end": 0.799
+        }
+      ]
+    },
+    {
+      "id": "caption-group-2",
+      "frame": 1,
+      "start": 0.799,
+      "end": 1.079,
+      "text": "不 动",
+      "words": [
+        {
+          "id": "caption-word-2-0",
+          "text": "不",
+          "start": 0.799,
+          "end": 0.959
+        },
+        {
+          "id": "caption-word-2-1",
+          "text": "动",
+          "start": 0.959,
+          "end": 1.079
+        }
+      ]
+    },
+    {
+      "id": "caption-group-3",
+      "frame": 1,
+      "start": 1.079,
+      "end": 1.439,
+      "text": "代 码",
+      "words": [
+        {
+          "id": "caption-word-3-0",
+          "text": "代",
+          "start": 1.079,
+          "end": 1.419
+        },
+        {
+          "id": "caption-word-3-1",
+          "text": "码",
+          "start": 1.419,
+          "end": 1.439
+        }
+      ]
+    },
+    {
+      "id": "caption-group-4",
+      "frame": 1,
+      "start": 1.439,
+      "end": 1.559,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-4-0",
+          "text": "。",
+          "start": 1.439,
+          "end": 1.439
+        }
+      ]
+    },
+    {
+      "id": "caption-group-5",
+      "frame": 1,
+      "start": 2.019,
+      "end": 2.18,
+      "text": "你 只",
+      "words": [
+        {
+          "id": "caption-word-5-0",
+          "text": "你",
+          "start": 2.019,
+          "end": 2.059
+        },
+        {
+          "id": "caption-word-5-1",
+          "text": "只",
+          "start": 2.059,
+          "end": 2.18
+        }
+      ]
+    },
+    {
+      "id": "caption-group-6",
+      "frame": 1,
+      "start": 2.18,
+      "end": 2.5,
+      "text": "是 把",
+      "words": [
+        {
+          "id": "caption-word-6-0",
+          "text": "是",
+          "start": 2.18,
+          "end": 2.359
+        },
+        {
+          "id": "caption-word-6-1",
+          "text": "把",
+          "start": 2.359,
+          "end": 2.5
+        }
+      ]
+    },
+    {
+      "id": "caption-group-7",
+      "frame": 1,
+      "start": 2.5,
+      "end": 2.72,
+      "text": "一 半",
+      "words": [
+        {
+          "id": "caption-word-7-0",
+          "text": "一",
+          "start": 2.5,
+          "end": 2.7
+        },
+        {
+          "id": "caption-word-7-1",
+          "text": "半",
+          "start": 2.7,
+          "end": 2.72
+        }
+      ]
+    },
+    {
+      "id": "caption-group-8",
+      "frame": 1,
+      "start": 2.72,
+      "end": 3.099,
+      "text": "的 时",
+      "words": [
+        {
+          "id": "caption-word-8-0",
+          "text": "的",
+          "start": 2.72,
+          "end": 2.899
+        },
+        {
+          "id": "caption-word-8-1",
+          "text": "时",
+          "start": 2.899,
+          "end": 3.099
+        }
+      ]
+    },
+    {
+      "id": "caption-group-9",
+      "frame": 1,
+      "start": 3.099,
+      "end": 3.659,
+      "text": "间 ，",
+      "words": [
+        {
+          "id": "caption-word-9-0",
+          "text": "间",
+          "start": 3.099,
+          "end": 3.539
+        },
+        {
+          "id": "caption-word-9-1",
+          "text": "，",
+          "start": 3.539,
+          "end": 3.539
+        }
+      ]
+    },
+    {
+      "id": "caption-group-10",
+      "frame": 1,
+      "start": 3.659,
+      "end": 3.899,
+      "text": "耗 在",
+      "words": [
+        {
+          "id": "caption-word-10-0",
+          "text": "耗",
+          "start": 3.659,
+          "end": 3.819
+        },
+        {
+          "id": "caption-word-10-1",
+          "text": "在",
+          "start": 3.819,
+          "end": 3.899
+        }
+      ]
+    },
+    {
+      "id": "caption-group-11",
+      "frame": 1,
+      "start": 3.899,
+      "end": 4.259,
+      "text": "了 找",
+      "words": [
+        {
+          "id": "caption-word-11-0",
+          "text": "了",
+          "start": 3.899,
+          "end": 4.079
+        },
+        {
+          "id": "caption-word-11-1",
+          "text": "找",
+          "start": 4.079,
+          "end": 4.259
+        }
+      ]
+    },
+    {
+      "id": "caption-group-12",
+      "frame": 1,
+      "start": 4.259,
+      "end": 4.659,
+      "text": "代 码",
+      "words": [
+        {
+          "id": "caption-word-12-0",
+          "text": "代",
+          "start": 4.259,
+          "end": 4.459
+        },
+        {
+          "id": "caption-word-12-1",
+          "text": "码",
+          "start": 4.46,
+          "end": 4.659
+        }
+      ]
+    },
+    {
+      "id": "caption-group-13",
+      "frame": 1,
+      "start": 4.659,
+      "end": 4.839,
+      "text": "上 。",
+      "words": [
+        {
+          "id": "caption-word-13-0",
+          "text": "上",
+          "start": 4.659,
+          "end": 4.719
+        },
+        {
+          "id": "caption-word-13-1",
+          "text": "。",
+          "start": 4.719,
+          "end": 4.719
+        }
+      ]
+    },
+    {
+      "id": "caption-group-14",
+      "frame": 2,
+      "start": 5.342,
+      "end": 5.602,
+      "text": "定 位",
+      "words": [
+        {
+          "id": "caption-word-14-0",
+          "text": "定",
+          "start": 5.342,
+          "end": 5.502
+        },
+        {
+          "id": "caption-word-14-1",
+          "text": "位",
+          "start": 5.502,
+          "end": 5.602
+        }
+      ]
+    },
+    {
+      "id": "caption-group-15",
+      "frame": 2,
+      "start": 5.602,
+      "end": 5.722,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-15-0",
+          "text": "，",
+          "start": 5.602,
+          "end": 5.602
+        }
+      ]
+    },
+    {
+      "id": "caption-group-16",
+      "frame": 2,
+      "start": 6.102,
+      "end": 6.302,
+      "text": "靠 g",
+      "words": [
+        {
+          "id": "caption-word-16-0",
+          "text": "靠",
+          "start": 6.102,
+          "end": 6.242
+        },
+        {
+          "id": "caption-word-16-1",
+          "text": "g",
+          "start": 6.242,
+          "end": 6.302
+        }
+      ]
+    },
+    {
+      "id": "caption-group-17",
+      "frame": 2,
+      "start": 6.302,
+      "end": 6.463,
+      "text": "r e",
+      "words": [
+        {
+          "id": "caption-word-17-0",
+          "text": "r",
+          "start": 6.302,
+          "end": 6.362
+        },
+        {
+          "id": "caption-word-17-1",
+          "text": "e",
+          "start": 6.362,
+          "end": 6.463
+        }
+      ]
+    },
+    {
+      "id": "caption-group-18",
+      "frame": 2,
+      "start": 6.463,
+      "end": 6.782,
+      "text": "p 。",
+      "words": [
+        {
+          "id": "caption-word-18-0",
+          "text": "p",
+          "start": 6.463,
+          "end": 6.662
+        },
+        {
+          "id": "caption-word-18-1",
+          "text": "。",
+          "start": 6.662,
+          "end": 6.662
+        }
+      ]
+    },
+    {
+      "id": "caption-group-19",
+      "frame": 2,
+      "start": 7.102,
+      "end": 7.663,
+      "text": "纪 律",
+      "words": [
+        {
+          "id": "caption-word-19-0",
+          "text": "纪",
+          "start": 7.102,
+          "end": 7.322
+        },
+        {
+          "id": "caption-word-19-1",
+          "text": "律",
+          "start": 7.322,
+          "end": 7.663
+        }
+      ]
+    },
+    {
+      "id": "caption-group-20",
+      "frame": 2,
+      "start": 7.663,
+      "end": 8.162,
+      "text": "， 靠",
+      "words": [
+        {
+          "id": "caption-word-20-0",
+          "text": "，",
+          "start": 7.663,
+          "end": 7.663
+        },
+        {
+          "id": "caption-word-20-1",
+          "text": "靠",
+          "start": 7.822,
+          "end": 8.162
+        }
+      ]
+    },
+    {
+      "id": "caption-group-21",
+      "frame": 2,
+      "start": 8.162,
+      "end": 8.543,
+      "text": "自 觉 。",
+      "words": [
+        {
+          "id": "caption-word-21-0",
+          "text": "自",
+          "start": 8.162,
+          "end": 8.362
+        },
+        {
+          "id": "caption-word-21-1",
+          "text": "觉",
+          "start": 8.362,
+          "end": 8.423
+        },
+        {
+          "id": "caption-word-21-2",
+          "text": "。",
+          "start": 8.423,
+          "end": 8.423
+        }
+      ]
+    },
+    {
+      "id": "caption-group-22",
+      "frame": 2,
+      "start": 9.463,
+      "end": 9.843,
+      "text": "安 全",
+      "words": [
+        {
+          "id": "caption-word-22-0",
+          "text": "安",
+          "start": 9.463,
+          "end": 9.762
+        },
+        {
+          "id": "caption-word-22-1",
+          "text": "全",
+          "start": 9.762,
+          "end": 9.843
+        }
+      ]
+    },
+    {
+      "id": "caption-group-23",
+      "frame": 2,
+      "start": 9.843,
+      "end": 9.963,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-23-0",
+          "text": "，",
+          "start": 9.843,
+          "end": 9.843
+        }
+      ]
+    },
+    {
+      "id": "caption-group-24",
+      "frame": 2,
+      "start": 10.383,
+      "end": 10.802,
+      "text": "靠 运",
+      "words": [
+        {
+          "id": "caption-word-24-0",
+          "text": "靠",
+          "start": 10.383,
+          "end": 10.522
+        },
+        {
+          "id": "caption-word-24-1",
+          "text": "运",
+          "start": 10.522,
+          "end": 10.802
+        }
+      ]
+    },
+    {
+      "id": "caption-group-25",
+      "frame": 2,
+      "start": 10.802,
+      "end": 11.022,
+      "text": "气 。",
+      "words": [
+        {
+          "id": "caption-word-25-0",
+          "text": "气",
+          "start": 10.802,
+          "end": 10.902
+        },
+        {
+          "id": "caption-word-25-1",
+          "text": "。",
+          "start": 10.902,
+          "end": 10.902
+        }
+      ]
+    },
+    {
+      "id": "caption-group-26",
+      "frame": 2,
+      "start": 11.582,
+      "end": 12.082,
+      "text": "三 块",
+      "words": [
+        {
+          "id": "caption-word-26-0",
+          "text": "三",
+          "start": 11.582,
+          "end": 11.802
+        },
+        {
+          "id": "caption-word-26-1",
+          "text": "块",
+          "start": 11.802,
+          "end": 12.082
+        }
+      ]
+    },
+    {
+      "id": "caption-group-27",
+      "frame": 2,
+      "start": 12.082,
+      "end": 12.402,
+      "text": "短 板",
+      "words": [
+        {
+          "id": "caption-word-27-0",
+          "text": "短",
+          "start": 12.082,
+          "end": 12.262
+        },
+        {
+          "id": "caption-word-27-1",
+          "text": "板",
+          "start": 12.262,
+          "end": 12.402
+        }
+      ]
+    },
+    {
+      "id": "caption-group-28",
+      "frame": 2,
+      "start": 12.402,
+      "end": 12.522,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-28-0",
+          "text": "，",
+          "start": 12.402,
+          "end": 12.402
+        }
+      ]
+    },
+    {
+      "id": "caption-group-29",
+      "frame": 2,
+      "start": 12.862,
+      "end": 13.322,
+      "text": "块 块",
+      "words": [
+        {
+          "id": "caption-word-29-0",
+          "text": "块",
+          "start": 12.862,
+          "end": 13.142
+        },
+        {
+          "id": "caption-word-29-1",
+          "text": "块",
+          "start": 13.142,
+          "end": 13.322
+        }
+      ]
+    },
+    {
+      "id": "caption-group-30",
+      "frame": 2,
+      "start": 13.322,
+      "end": 13.502,
+      "text": "致 命",
+      "words": [
+        {
+          "id": "caption-word-30-0",
+          "text": "致",
+          "start": 13.322,
+          "end": 13.442
+        },
+        {
+          "id": "caption-word-30-1",
+          "text": "命",
+          "start": 13.442,
+          "end": 13.502
+        }
+      ]
+    },
+    {
+      "id": "caption-group-31",
+      "frame": 2,
+      "start": 13.502,
+      "end": 13.622,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-31-0",
+          "text": "。",
+          "start": 13.502,
+          "end": 13.502
+        }
+      ]
+    },
+    {
+      "id": "caption-group-32",
+      "frame": 3,
+      "start": 14.044,
+      "end": 14.164,
+      "text": "A u",
+      "words": [
+        {
+          "id": "caption-word-32-0",
+          "text": "A",
+          "start": 14.044,
+          "end": 14.084
+        },
+        {
+          "id": "caption-word-32-1",
+          "text": "u",
+          "start": 14.084,
+          "end": 14.164
+        }
+      ]
+    },
+    {
+      "id": "caption-group-33",
+      "frame": 3,
+      "start": 14.164,
+      "end": 14.384,
+      "text": "t o",
+      "words": [
+        {
+          "id": "caption-word-33-0",
+          "text": "t",
+          "start": 14.164,
+          "end": 14.224
+        },
+        {
+          "id": "caption-word-33-1",
+          "text": "o",
+          "start": 14.224,
+          "end": 14.384
+        }
+      ]
+    },
+    {
+      "id": "caption-group-34",
+      "frame": 3,
+      "start": 14.384,
+      "end": 14.504,
+      "text": "F o",
+      "words": [
+        {
+          "id": "caption-word-34-0",
+          "text": "F",
+          "start": 14.384,
+          "end": 14.444
+        },
+        {
+          "id": "caption-word-34-1",
+          "text": "o",
+          "start": 14.444,
+          "end": 14.504
+        }
+      ]
+    },
+    {
+      "id": "caption-group-35",
+      "frame": 3,
+      "start": 14.504,
+      "end": 14.664,
+      "text": "r g",
+      "words": [
+        {
+          "id": "caption-word-35-0",
+          "text": "r",
+          "start": 14.504,
+          "end": 14.564
+        },
+        {
+          "id": "caption-word-35-1",
+          "text": "g",
+          "start": 14.564,
+          "end": 14.664
+        }
+      ]
+    },
+    {
+      "id": "caption-group-36",
+      "frame": 3,
+      "start": 14.664,
+      "end": 15.104,
+      "text": "e 自",
+      "words": [
+        {
+          "id": "caption-word-36-0",
+          "text": "e",
+          "start": 14.664,
+          "end": 14.884
+        },
+        {
+          "id": "caption-word-36-1",
+          "text": "自",
+          "start": 14.965,
+          "end": 15.104
+        }
+      ]
+    },
+    {
+      "id": "caption-group-37",
+      "frame": 3,
+      "start": 15.104,
+      "end": 15.444,
+      "text": "主 软",
+      "words": [
+        {
+          "id": "caption-word-37-0",
+          "text": "主",
+          "start": 15.104,
+          "end": 15.264
+        },
+        {
+          "id": "caption-word-37-1",
+          "text": "软",
+          "start": 15.264,
+          "end": 15.444
+        }
+      ]
+    },
+    {
+      "id": "caption-group-38",
+      "frame": 3,
+      "start": 15.444,
+      "end": 15.824,
+      "text": "件 工",
+      "words": [
+        {
+          "id": "caption-word-38-0",
+          "text": "件",
+          "start": 15.444,
+          "end": 15.604
+        },
+        {
+          "id": "caption-word-38-1",
+          "text": "工",
+          "start": 15.604,
+          "end": 15.824
+        }
+      ]
+    },
+    {
+      "id": "caption-group-39",
+      "frame": 3,
+      "start": 15.824,
+      "end": 16.044,
+      "text": "厂 。",
+      "words": [
+        {
+          "id": "caption-word-39-0",
+          "text": "厂",
+          "start": 15.824,
+          "end": 15.924
+        },
+        {
+          "id": "caption-word-39-1",
+          "text": "。",
+          "start": 15.924,
+          "end": 15.924
+        }
+      ]
+    },
+    {
+      "id": "caption-group-40",
+      "frame": 3,
+      "start": 16.624,
+      "end": 17.144,
+      "text": "这 三",
+      "words": [
+        {
+          "id": "caption-word-40-0",
+          "text": "这",
+          "start": 16.624,
+          "end": 16.805
+        },
+        {
+          "id": "caption-word-40-1",
+          "text": "三",
+          "start": 16.805,
+          "end": 17.144
+        }
+      ]
+    },
+    {
+      "id": "caption-group-41",
+      "frame": 3,
+      "start": 17.144,
+      "end": 17.684,
+      "text": "件 事",
+      "words": [
+        {
+          "id": "caption-word-41-0",
+          "text": "件",
+          "start": 17.144,
+          "end": 17.305
+        },
+        {
+          "id": "caption-word-41-1",
+          "text": "事",
+          "start": 17.305,
+          "end": 17.684
+        }
+      ]
+    },
+    {
+      "id": "caption-group-42",
+      "frame": 3,
+      "start": 17.684,
+      "end": 18.104,
+      "text": "， 全",
+      "words": [
+        {
+          "id": "caption-word-42-0",
+          "text": "，",
+          "start": 17.684,
+          "end": 17.684
+        },
+        {
+          "id": "caption-word-42-1",
+          "text": "全",
+          "start": 17.825,
+          "end": 18.104
+        }
+      ]
+    },
+    {
+      "id": "caption-group-43",
+      "frame": 3,
+      "start": 18.104,
+      "end": 18.325,
+      "text": "部 焊",
+      "words": [
+        {
+          "id": "caption-word-43-0",
+          "text": "部",
+          "start": 18.104,
+          "end": 18.224
+        },
+        {
+          "id": "caption-word-43-1",
+          "text": "焊",
+          "start": 18.225,
+          "end": 18.325
+        }
+      ]
+    },
+    {
+      "id": "caption-group-44",
+      "frame": 3,
+      "start": 18.325,
+      "end": 18.584,
+      "text": "死 在",
+      "words": [
+        {
+          "id": "caption-word-44-0",
+          "text": "死",
+          "start": 18.325,
+          "end": 18.544
+        },
+        {
+          "id": "caption-word-44-1",
+          "text": "在",
+          "start": 18.544,
+          "end": 18.584
+        }
+      ]
+    },
+    {
+      "id": "caption-group-45",
+      "frame": 3,
+      "start": 18.584,
+      "end": 19.024,
+      "text": "架 构",
+      "words": [
+        {
+          "id": "caption-word-45-0",
+          "text": "架",
+          "start": 18.584,
+          "end": 18.864
+        },
+        {
+          "id": "caption-word-45-1",
+          "text": "构",
+          "start": 18.864,
+          "end": 19.024
+        }
+      ]
+    },
+    {
+      "id": "caption-group-46",
+      "frame": 3,
+      "start": 19.024,
+      "end": 19.184,
+      "text": "里 。",
+      "words": [
+        {
+          "id": "caption-word-46-0",
+          "text": "里",
+          "start": 19.024,
+          "end": 19.064
+        },
+        {
+          "id": "caption-word-46-1",
+          "text": "。",
+          "start": 19.064,
+          "end": 19.064
+        }
+      ]
+    },
+    {
+      "id": "caption-group-47",
+      "frame": 4,
+      "start": 19.637,
+      "end": 19.977,
+      "text": "需 求",
+      "words": [
+        {
+          "id": "caption-word-47-0",
+          "text": "需",
+          "start": 19.637,
+          "end": 19.936
+        },
+        {
+          "id": "caption-word-47-1",
+          "text": "求",
+          "start": 19.936,
+          "end": 19.977
+        }
+      ]
+    },
+    {
+      "id": "caption-group-48",
+      "frame": 4,
+      "start": 19.977,
+      "end": 20.336,
+      "text": "进 来",
+      "words": [
+        {
+          "id": "caption-word-48-0",
+          "text": "进",
+          "start": 19.977,
+          "end": 20.176
+        },
+        {
+          "id": "caption-word-48-1",
+          "text": "来",
+          "start": 20.176,
+          "end": 20.276
+        }
+      ]
+    },
+    {
+      "id": "caption-group-49",
+      "frame": 4,
+      "start": 20.336,
+      "end": 20.756,
+      "text": "分 析",
+      "words": [
+        {
+          "id": "caption-word-49-0",
+          "text": "分",
+          "start": 20.336,
+          "end": 20.636
+        },
+        {
+          "id": "caption-word-49-1",
+          "text": "析",
+          "start": 20.636,
+          "end": 20.756
+        }
+      ]
+    },
+    {
+      "id": "caption-group-50",
+      "frame": 4,
+      "start": 20.756,
+      "end": 20.876,
+      "text": "、",
+      "words": [
+        {
+          "id": "caption-word-50-0",
+          "text": "、",
+          "start": 20.756,
+          "end": 20.756
+        }
+      ]
+    },
+    {
+      "id": "caption-group-51",
+      "frame": 4,
+      "start": 21.196,
+      "end": 21.656,
+      "text": "实 现",
+      "words": [
+        {
+          "id": "caption-word-51-0",
+          "text": "实",
+          "start": 21.196,
+          "end": 21.456
+        },
+        {
+          "id": "caption-word-51-1",
+          "text": "现",
+          "start": 21.456,
+          "end": 21.656
+        }
+      ]
+    },
+    {
+      "id": "caption-group-52",
+      "frame": 4,
+      "start": 21.656,
+      "end": 22.057,
+      "text": "、 测",
+      "words": [
+        {
+          "id": "caption-word-52-0",
+          "text": "、",
+          "start": 21.656,
+          "end": 21.656
+        },
+        {
+          "id": "caption-word-52-1",
+          "text": "测",
+          "start": 21.797,
+          "end": 22.057
+        }
+      ]
+    },
+    {
+      "id": "caption-group-53",
+      "frame": 4,
+      "start": 22.057,
+      "end": 22.576,
+      "text": "试 、",
+      "words": [
+        {
+          "id": "caption-word-53-0",
+          "text": "试",
+          "start": 22.057,
+          "end": 22.456
+        },
+        {
+          "id": "caption-word-53-1",
+          "text": "、",
+          "start": 22.456,
+          "end": 22.456
+        }
+      ]
+    },
+    {
+      "id": "caption-group-54",
+      "frame": 4,
+      "start": 22.597,
+      "end": 22.936,
+      "text": "合 并",
+      "words": [
+        {
+          "id": "caption-word-54-0",
+          "text": "合",
+          "start": 22.597,
+          "end": 22.857
+        },
+        {
+          "id": "caption-word-54-1",
+          "text": "并",
+          "start": 22.857,
+          "end": 22.936
+        }
+      ]
+    },
+    {
+      "id": "caption-group-55",
+      "frame": 4,
+      "start": 22.936,
+      "end": 23.056,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-55-0",
+          "text": "，",
+          "start": 22.936,
+          "end": 22.936
+        }
+      ]
+    },
+    {
+      "id": "caption-group-56",
+      "frame": 4,
+      "start": 23.357,
+      "end": 23.696,
+      "text": "全 自",
+      "words": [
+        {
+          "id": "caption-word-56-0",
+          "text": "全",
+          "start": 23.357,
+          "end": 23.576
+        },
+        {
+          "id": "caption-word-56-1",
+          "text": "自",
+          "start": 23.576,
+          "end": 23.696
+        }
+      ]
+    },
+    {
+      "id": "caption-group-57",
+      "frame": 4,
+      "start": 23.696,
+      "end": 24.196,
+      "text": "动 跑",
+      "words": [
+        {
+          "id": "caption-word-57-0",
+          "text": "动",
+          "start": 23.696,
+          "end": 23.936
+        },
+        {
+          "id": "caption-word-57-1",
+          "text": "跑",
+          "start": 23.936,
+          "end": 24.196
+        }
+      ]
+    },
+    {
+      "id": "caption-group-58",
+      "frame": 4,
+      "start": 24.196,
+      "end": 24.417,
+      "text": "完 。",
+      "words": [
+        {
+          "id": "caption-word-58-0",
+          "text": "完",
+          "start": 24.196,
+          "end": 24.297
+        },
+        {
+          "id": "caption-word-58-1",
+          "text": "。",
+          "start": 24.297,
+          "end": 24.297
+        }
+      ]
+    },
+    {
+      "id": "caption-group-59",
+      "frame": 4,
+      "start": 24.656,
+      "end": 24.956,
+      "text": "五 个",
+      "words": [
+        {
+          "id": "caption-word-59-0",
+          "text": "五",
+          "start": 24.656,
+          "end": 24.776
+        },
+        {
+          "id": "caption-word-59-1",
+          "text": "个",
+          "start": 24.777,
+          "end": 24.956
+        }
+      ]
+    },
+    {
+      "id": "caption-group-60",
+      "frame": 4,
+      "start": 24.956,
+      "end": 25.297,
+      "text": "变 更",
+      "words": [
+        {
+          "id": "caption-word-60-0",
+          "text": "变",
+          "start": 24.956,
+          "end": 25.216
+        },
+        {
+          "id": "caption-word-60-1",
+          "text": "更",
+          "start": 25.216,
+          "end": 25.297
+        }
+      ]
+    },
+    {
+      "id": "caption-group-61",
+      "frame": 4,
+      "start": 25.297,
+      "end": 25.417,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-61-0",
+          "text": "，",
+          "start": 25.297,
+          "end": 25.297
+        }
+      ]
+    },
+    {
+      "id": "caption-group-62",
+      "frame": 4,
+      "start": 25.716,
+      "end": 26.096,
+      "text": "并 行",
+      "words": [
+        {
+          "id": "caption-word-62-0",
+          "text": "并",
+          "start": 25.716,
+          "end": 25.876
+        },
+        {
+          "id": "caption-word-62-1",
+          "text": "行",
+          "start": 25.876,
+          "end": 26.096
+        }
+      ]
+    },
+    {
+      "id": "caption-group-63",
+      "frame": 4,
+      "start": 26.096,
+      "end": 26.436,
+      "text": "推 进",
+      "words": [
+        {
+          "id": "caption-word-63-0",
+          "text": "推",
+          "start": 26.096,
+          "end": 26.316
+        },
+        {
+          "id": "caption-word-63-1",
+          "text": "进",
+          "start": 26.317,
+          "end": 26.436
+        }
+      ]
+    },
+    {
+      "id": "caption-group-64",
+      "frame": 4,
+      "start": 26.436,
+      "end": 26.556,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-64-0",
+          "text": "。",
+          "start": 26.436,
+          "end": 26.436
+        }
+      ]
+    },
+    {
+      "id": "caption-group-65",
+      "frame": 4,
+      "start": 26.936,
+      "end": 27.376,
+      "text": "你 ，",
+      "words": [
+        {
+          "id": "caption-word-65-0",
+          "text": "你",
+          "start": 26.936,
+          "end": 27.276
+        },
+        {
+          "id": "caption-word-65-1",
+          "text": "，",
+          "start": 27.276,
+          "end": 27.276
+        }
+      ]
+    },
+    {
+      "id": "caption-group-66",
+      "frame": 4,
+      "start": 27.376,
+      "end": 27.777,
+      "text": "只 管",
+      "words": [
+        {
+          "id": "caption-word-66-0",
+          "text": "只",
+          "start": 27.376,
+          "end": 27.676
+        },
+        {
+          "id": "caption-word-66-1",
+          "text": "管",
+          "start": 27.676,
+          "end": 27.777
+        }
+      ]
+    },
+    {
+      "id": "caption-group-67",
+      "frame": 4,
+      "start": 27.777,
+      "end": 28.176,
+      "text": "审 核",
+      "words": [
+        {
+          "id": "caption-word-67-0",
+          "text": "审",
+          "start": 27.777,
+          "end": 28.077
+        },
+        {
+          "id": "caption-word-67-1",
+          "text": "核",
+          "start": 28.077,
+          "end": 28.176
+        }
+      ]
+    },
+    {
+      "id": "caption-group-68",
+      "frame": 4,
+      "start": 28.176,
+      "end": 28.296,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-68-0",
+          "text": "。",
+          "start": 28.176,
+          "end": 28.176
+        }
+      ]
+    },
+    {
+      "id": "caption-group-69",
+      "frame": 5,
+      "start": 28.773,
+      "end": 29.193,
+      "text": "找 代",
+      "words": [
+        {
+          "id": "caption-word-69-0",
+          "text": "找",
+          "start": 28.773,
+          "end": 28.933
+        },
+        {
+          "id": "caption-word-69-1",
+          "text": "代",
+          "start": 28.933,
+          "end": 29.193
+        }
+      ]
+    },
+    {
+      "id": "caption-group-70",
+      "frame": 5,
+      "start": 29.193,
+      "end": 29.393,
+      "text": "码 ？",
+      "words": [
+        {
+          "id": "caption-word-70-0",
+          "text": "码",
+          "start": 29.193,
+          "end": 29.273
+        },
+        {
+          "id": "caption-word-70-1",
+          "text": "？",
+          "start": 29.273,
+          "end": 29.273
+        }
+      ]
+    },
+    {
+      "id": "caption-group-71",
+      "frame": 5,
+      "start": 30.133,
+      "end": 30.533,
+      "text": "开 工",
+      "words": [
+        {
+          "id": "caption-word-71-0",
+          "text": "开",
+          "start": 30.133,
+          "end": 30.293
+        },
+        {
+          "id": "caption-word-71-1",
+          "text": "工",
+          "start": 30.293,
+          "end": 30.533
+        }
+      ]
+    },
+    {
+      "id": "caption-group-72",
+      "frame": 5,
+      "start": 30.533,
+      "end": 31.013,
+      "text": "之 前 ，",
+      "words": [
+        {
+          "id": "caption-word-72-0",
+          "text": "之",
+          "start": 30.533,
+          "end": 30.793
+        },
+        {
+          "id": "caption-word-72-1",
+          "text": "前",
+          "start": 30.793,
+          "end": 30.893
+        },
+        {
+          "id": "caption-word-72-2",
+          "text": "，",
+          "start": 30.893,
+          "end": 30.893
+        }
+      ]
+    },
+    {
+      "id": "caption-group-73",
+      "frame": 5,
+      "start": 31.593,
+      "end": 31.853,
+      "text": "符 号",
+      "words": [
+        {
+          "id": "caption-word-73-0",
+          "text": "符",
+          "start": 31.593,
+          "end": 31.733
+        },
+        {
+          "id": "caption-word-73-1",
+          "text": "号",
+          "start": 31.733,
+          "end": 31.853
+        }
+      ]
+    },
+    {
+      "id": "caption-group-74",
+      "frame": 5,
+      "start": 31.853,
+      "end": 32.173,
+      "text": "已 经",
+      "words": [
+        {
+          "id": "caption-word-74-0",
+          "text": "已",
+          "start": 31.853,
+          "end": 32.013
+        },
+        {
+          "id": "caption-word-74-1",
+          "text": "经",
+          "start": 32.013,
+          "end": 32.173
+        }
+      ]
+    },
+    {
+      "id": "caption-group-75",
+      "frame": 5,
+      "start": 32.173,
+      "end": 32.493,
+      "text": "定 位",
+      "words": [
+        {
+          "id": "caption-word-75-0",
+          "text": "定",
+          "start": 32.173,
+          "end": 32.333
+        },
+        {
+          "id": "caption-word-75-1",
+          "text": "位",
+          "start": 32.333,
+          "end": 32.493
+        }
+      ]
+    },
+    {
+      "id": "caption-group-76",
+      "frame": 5,
+      "start": 32.493,
+      "end": 32.934,
+      "text": "到 行",
+      "words": [
+        {
+          "id": "caption-word-76-0",
+          "text": "到",
+          "start": 32.493,
+          "end": 32.733
+        },
+        {
+          "id": "caption-word-76-1",
+          "text": "行",
+          "start": 32.733,
+          "end": 32.854
+        }
+      ]
+    },
+    {
+      "id": "caption-group-77",
+      "frame": 5,
+      "start": 32.934,
+      "end": 33.394,
+      "text": "调 用",
+      "words": [
+        {
+          "id": "caption-word-77-0",
+          "text": "调",
+          "start": 32.934,
+          "end": 33.053
+        },
+        {
+          "id": "caption-word-77-1",
+          "text": "用",
+          "start": 33.053,
+          "end": 33.394
+        }
+      ]
+    },
+    {
+      "id": "caption-group-78",
+      "frame": 5,
+      "start": 33.394,
+      "end": 33.574,
+      "text": "者 、",
+      "words": [
+        {
+          "id": "caption-word-78-0",
+          "text": "者",
+          "start": 33.394,
+          "end": 33.454
+        },
+        {
+          "id": "caption-word-78-1",
+          "text": "、",
+          "start": 33.454,
+          "end": 33.454
+        }
+      ]
+    },
+    {
+      "id": "caption-group-79",
+      "frame": 5,
+      "start": 34.173,
+      "end": 34.613,
+      "text": "影 响",
+      "words": [
+        {
+          "id": "caption-word-79-0",
+          "text": "影",
+          "start": 34.173,
+          "end": 34.434
+        },
+        {
+          "id": "caption-word-79-1",
+          "text": "响",
+          "start": 34.434,
+          "end": 34.613
+        }
+      ]
+    },
+    {
+      "id": "caption-group-80",
+      "frame": 5,
+      "start": 34.613,
+      "end": 34.813,
+      "text": "面 ，",
+      "words": [
+        {
+          "id": "caption-word-80-0",
+          "text": "面",
+          "start": 34.613,
+          "end": 34.693
+        },
+        {
+          "id": "caption-word-80-1",
+          "text": "，",
+          "start": 34.693,
+          "end": 34.693
+        }
+      ]
+    },
+    {
+      "id": "caption-group-81",
+      "frame": 5,
+      "start": 35.353,
+      "end": 35.713,
+      "text": "直 接",
+      "words": [
+        {
+          "id": "caption-word-81-0",
+          "text": "直",
+          "start": 35.353,
+          "end": 35.613
+        },
+        {
+          "id": "caption-word-81-1",
+          "text": "接",
+          "start": 35.613,
+          "end": 35.713
+        }
+      ]
+    },
+    {
+      "id": "caption-group-82",
+      "frame": 5,
+      "start": 35.713,
+      "end": 35.993,
+      "text": "写 进",
+      "words": [
+        {
+          "id": "caption-word-82-0",
+          "text": "写",
+          "start": 35.713,
+          "end": 35.893
+        },
+        {
+          "id": "caption-word-82-1",
+          "text": "进",
+          "start": 35.893,
+          "end": 35.993
+        }
+      ]
+    },
+    {
+      "id": "caption-group-83",
+      "frame": 5,
+      "start": 35.993,
+      "end": 36.093,
+      "text": "p r",
+      "words": [
+        {
+          "id": "caption-word-83-0",
+          "text": "p",
+          "start": 35.993,
+          "end": 36.033
+        },
+        {
+          "id": "caption-word-83-1",
+          "text": "r",
+          "start": 36.033,
+          "end": 36.093
+        }
+      ]
+    },
+    {
+      "id": "caption-group-84",
+      "frame": 5,
+      "start": 36.093,
+      "end": 36.313,
+      "text": "o m",
+      "words": [
+        {
+          "id": "caption-word-84-0",
+          "text": "o",
+          "start": 36.093,
+          "end": 36.193
+        },
+        {
+          "id": "caption-word-84-1",
+          "text": "m",
+          "start": 36.193,
+          "end": 36.313
+        }
+      ]
+    },
+    {
+      "id": "caption-group-85",
+      "frame": 5,
+      "start": 36.313,
+      "end": 36.474,
+      "text": "p t",
+      "words": [
+        {
+          "id": "caption-word-85-0",
+          "text": "p",
+          "start": 36.313,
+          "end": 36.353
+        },
+        {
+          "id": "caption-word-85-1",
+          "text": "t",
+          "start": 36.353,
+          "end": 36.474
+        }
+      ]
+    },
+    {
+      "id": "caption-group-86",
+      "frame": 5,
+      "start": 36.474,
+      "end": 36.594,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-86-0",
+          "text": "。",
+          "start": 36.474,
+          "end": 36.474
+        }
+      ]
+    },
+    {
+      "id": "caption-group-87",
+      "frame": 5,
+      "start": 37.234,
+      "end": 37.573,
+      "text": "小 活",
+      "words": [
+        {
+          "id": "caption-word-87-0",
+          "text": "小",
+          "start": 37.234,
+          "end": 37.394
+        },
+        {
+          "id": "caption-word-87-1",
+          "text": "活",
+          "start": 37.394,
+          "end": 37.573
+        }
+      ]
+    },
+    {
+      "id": "caption-group-88",
+      "frame": 5,
+      "start": 37.573,
+      "end": 38.033,
+      "text": "快 模",
+      "words": [
+        {
+          "id": "caption-word-88-0",
+          "text": "快",
+          "start": 37.573,
+          "end": 37.833
+        },
+        {
+          "id": "caption-word-88-1",
+          "text": "模",
+          "start": 37.833,
+          "end": 38.033
+        }
+      ]
+    },
+    {
+      "id": "caption-group-89",
+      "frame": 5,
+      "start": 38.033,
+      "end": 38.233,
+      "text": "型 ，",
+      "words": [
+        {
+          "id": "caption-word-89-0",
+          "text": "型",
+          "start": 38.033,
+          "end": 38.113
+        },
+        {
+          "id": "caption-word-89-1",
+          "text": "，",
+          "start": 38.113,
+          "end": 38.113
+        }
+      ]
+    },
+    {
+      "id": "caption-group-90",
+      "frame": 5,
+      "start": 39.033,
+      "end": 39.493,
+      "text": "大 活",
+      "words": [
+        {
+          "id": "caption-word-90-0",
+          "text": "大",
+          "start": 39.033,
+          "end": 39.353
+        },
+        {
+          "id": "caption-word-90-1",
+          "text": "活",
+          "start": 39.354,
+          "end": 39.493
+        }
+      ]
+    },
+    {
+      "id": "caption-group-91",
+      "frame": 5,
+      "start": 39.493,
+      "end": 39.974,
+      "text": "强 模",
+      "words": [
+        {
+          "id": "caption-word-91-0",
+          "text": "强",
+          "start": 39.493,
+          "end": 39.673
+        },
+        {
+          "id": "caption-word-91-1",
+          "text": "模",
+          "start": 39.673,
+          "end": 39.974
+        }
+      ]
+    },
+    {
+      "id": "caption-group-92",
+      "frame": 5,
+      "start": 39.974,
+      "end": 40.193,
+      "text": "型 。",
+      "words": [
+        {
+          "id": "caption-word-92-0",
+          "text": "型",
+          "start": 39.974,
+          "end": 40.073
+        },
+        {
+          "id": "caption-word-92-1",
+          "text": "。",
+          "start": 40.073,
+          "end": 40.073
+        }
+      ]
+    },
+    {
+      "id": "caption-group-93",
+      "frame": 6,
+      "start": 40.494,
+      "end": 40.854,
+      "text": "纪 律",
+      "words": [
+        {
+          "id": "caption-word-93-0",
+          "text": "纪",
+          "start": 40.494,
+          "end": 40.734
+        },
+        {
+          "id": "caption-word-93-1",
+          "text": "律",
+          "start": 40.734,
+          "end": 40.854
+        }
+      ]
+    },
+    {
+      "id": "caption-group-94",
+      "frame": 6,
+      "start": 40.854,
+      "end": 40.974,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-94-0",
+          "text": "，",
+          "start": 40.854,
+          "end": 40.854
+        }
+      ]
+    },
+    {
+      "id": "caption-group-95",
+      "frame": 6,
+      "start": 41.454,
+      "end": 41.914,
+      "text": "不 靠",
+      "words": [
+        {
+          "id": "caption-word-95-0",
+          "text": "不",
+          "start": 41.454,
+          "end": 41.694
+        },
+        {
+          "id": "caption-word-95-1",
+          "text": "靠",
+          "start": 41.694,
+          "end": 41.914
+        }
+      ]
+    },
+    {
+      "id": "caption-group-96",
+      "frame": 6,
+      "start": 41.914,
+      "end": 42.334,
+      "text": "自 觉 。",
+      "words": [
+        {
+          "id": "caption-word-96-0",
+          "text": "自",
+          "start": 41.914,
+          "end": 42.114
+        },
+        {
+          "id": "caption-word-96-1",
+          "text": "觉",
+          "start": 42.115,
+          "end": 42.214
+        },
+        {
+          "id": "caption-word-96-2",
+          "text": "。",
+          "start": 42.214,
+          "end": 42.214
+        }
+      ]
+    },
+    {
+      "id": "caption-group-97",
+      "frame": 6,
+      "start": 42.955,
+      "end": 43.014,
+      "text": "w o",
+      "words": [
+        {
+          "id": "caption-word-97-0",
+          "text": "w",
+          "start": 42.955,
+          "end": 42.975
+        },
+        {
+          "id": "caption-word-97-1",
+          "text": "o",
+          "start": 42.975,
+          "end": 43.014
+        }
+      ]
+    },
+    {
+      "id": "caption-group-98",
+      "frame": 6,
+      "start": 43.014,
+      "end": 43.255,
+      "text": "r k",
+      "words": [
+        {
+          "id": "caption-word-98-0",
+          "text": "r",
+          "start": 43.014,
+          "end": 43.134
+        },
+        {
+          "id": "caption-word-98-1",
+          "text": "k",
+          "start": 43.134,
+          "end": 43.255
+        }
+      ]
+    },
+    {
+      "id": "caption-group-99",
+      "frame": 6,
+      "start": 43.255,
+      "end": 43.374,
+      "text": "t r",
+      "words": [
+        {
+          "id": "caption-word-99-0",
+          "text": "t",
+          "start": 43.255,
+          "end": 43.314
+        },
+        {
+          "id": "caption-word-99-1",
+          "text": "r",
+          "start": 43.314,
+          "end": 43.374
+        }
+      ]
+    },
+    {
+      "id": "caption-group-100",
+      "frame": 6,
+      "start": 43.374,
+      "end": 43.735,
+      "text": "e e",
+      "words": [
+        {
+          "id": "caption-word-100-0",
+          "text": "e",
+          "start": 43.374,
+          "end": 43.434
+        },
+        {
+          "id": "caption-word-100-1",
+          "text": "e",
+          "start": 43.434,
+          "end": 43.734
+        }
+      ]
+    },
+    {
+      "id": "caption-group-101",
+      "frame": 6,
+      "start": 43.735,
+      "end": 44.014,
+      "text": "隔 离",
+      "words": [
+        {
+          "id": "caption-word-101-0",
+          "text": "隔",
+          "start": 43.735,
+          "end": 43.794
+        },
+        {
+          "id": "caption-word-101-1",
+          "text": "离",
+          "start": 43.794,
+          "end": 44.014
+        }
+      ]
+    },
+    {
+      "id": "caption-group-102",
+      "frame": 6,
+      "start": 44.014,
+      "end": 44.134,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-102-0",
+          "text": "。",
+          "start": 44.014,
+          "end": 44.014
+        }
+      ]
+    },
+    {
+      "id": "caption-group-103",
+      "frame": 6,
+      "start": 44.675,
+      "end": 45.175,
+      "text": "危 险",
+      "words": [
+        {
+          "id": "caption-word-103-0",
+          "text": "危",
+          "start": 44.675,
+          "end": 44.894
+        },
+        {
+          "id": "caption-word-103-1",
+          "text": "险",
+          "start": 44.894,
+          "end": 45.175
+        }
+      ]
+    },
+    {
+      "id": "caption-group-104",
+      "frame": 6,
+      "start": 45.175,
+      "end": 45.454,
+      "text": "命 令",
+      "words": [
+        {
+          "id": "caption-word-104-0",
+          "text": "命",
+          "start": 45.175,
+          "end": 45.334
+        },
+        {
+          "id": "caption-word-104-1",
+          "text": "令",
+          "start": 45.334,
+          "end": 45.454
+        }
+      ]
+    },
+    {
+      "id": "caption-group-105",
+      "frame": 6,
+      "start": 45.454,
+      "end": 45.574,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-105-0",
+          "text": "，",
+          "start": 45.454,
+          "end": 45.454
+        }
+      ]
+    },
+    {
+      "id": "caption-group-106",
+      "frame": 6,
+      "start": 46.074,
+      "end": 46.534,
+      "text": "硬 拦",
+      "words": [
+        {
+          "id": "caption-word-106-0",
+          "text": "硬",
+          "start": 46.074,
+          "end": 46.094
+        },
+        {
+          "id": "caption-word-106-1",
+          "text": "拦",
+          "start": 46.094,
+          "end": 46.534
+        }
+      ]
+    },
+    {
+      "id": "caption-group-107",
+      "frame": 6,
+      "start": 46.534,
+      "end": 46.734,
+      "text": "截 。",
+      "words": [
+        {
+          "id": "caption-word-107-0",
+          "text": "截",
+          "start": 46.534,
+          "end": 46.614
+        },
+        {
+          "id": "caption-word-107-1",
+          "text": "。",
+          "start": 46.614,
+          "end": 46.614
+        }
+      ]
+    },
+    {
+      "id": "caption-group-108",
+      "frame": 6,
+      "start": 47.574,
+      "end": 47.994,
+      "text": "合 并 ，",
+      "words": [
+        {
+          "id": "caption-word-108-0",
+          "text": "合",
+          "start": 47.574,
+          "end": 47.834
+        },
+        {
+          "id": "caption-word-108-1",
+          "text": "并",
+          "start": 47.834,
+          "end": 47.874
+        },
+        {
+          "id": "caption-word-108-2",
+          "text": "，",
+          "start": 47.874,
+          "end": 47.874
+        }
+      ]
+    },
+    {
+      "id": "caption-group-109",
+      "frame": 6,
+      "start": 48.614,
+      "end": 49.114,
+      "text": "三 重",
+      "words": [
+        {
+          "id": "caption-word-109-0",
+          "text": "三",
+          "start": 48.614,
+          "end": 48.934
+        },
+        {
+          "id": "caption-word-109-1",
+          "text": "重",
+          "start": 48.934,
+          "end": 49.114
+        }
+      ]
+    },
+    {
+      "id": "caption-group-110",
+      "frame": 6,
+      "start": 49.114,
+      "end": 49.354,
+      "text": "门 。",
+      "words": [
+        {
+          "id": "caption-word-110-0",
+          "text": "门",
+          "start": 49.114,
+          "end": 49.234
+        },
+        {
+          "id": "caption-word-110-1",
+          "text": "。",
+          "start": 49.234,
+          "end": 49.234
+        }
+      ]
+    },
+    {
+      "id": "caption-group-111",
+      "frame": 6,
+      "start": 50.055,
+      "end": 50.474,
+      "text": "不 遵",
+      "words": [
+        {
+          "id": "caption-word-111-0",
+          "text": "不",
+          "start": 50.055,
+          "end": 50.294
+        },
+        {
+          "id": "caption-word-111-1",
+          "text": "遵",
+          "start": 50.294,
+          "end": 50.474
+        }
+      ]
+    },
+    {
+      "id": "caption-group-112",
+      "frame": 6,
+      "start": 50.474,
+      "end": 50.954,
+      "text": "守 ，",
+      "words": [
+        {
+          "id": "caption-word-112-0",
+          "text": "守",
+          "start": 50.474,
+          "end": 50.834
+        },
+        {
+          "id": "caption-word-112-1",
+          "text": "，",
+          "start": 50.834,
+          "end": 50.834
+        }
+      ]
+    },
+    {
+      "id": "caption-group-113",
+      "frame": 6,
+      "start": 51.034,
+      "end": 51.294,
+      "text": "就 走",
+      "words": [
+        {
+          "id": "caption-word-113-0",
+          "text": "就",
+          "start": 51.034,
+          "end": 51.175
+        },
+        {
+          "id": "caption-word-113-1",
+          "text": "走",
+          "start": 51.175,
+          "end": 51.294
+        }
+      ]
+    },
+    {
+      "id": "caption-group-114",
+      "frame": 6,
+      "start": 51.294,
+      "end": 51.574,
+      "text": "不 通",
+      "words": [
+        {
+          "id": "caption-word-114-0",
+          "text": "不",
+          "start": 51.294,
+          "end": 51.534
+        },
+        {
+          "id": "caption-word-114-1",
+          "text": "通",
+          "start": 51.534,
+          "end": 51.574
+        }
+      ]
+    },
+    {
+      "id": "caption-group-115",
+      "frame": 6,
+      "start": 51.574,
+      "end": 51.694,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-115-0",
+          "text": "。",
+          "start": 51.574,
+          "end": 51.574
+        }
+      ]
+    },
+    {
+      "id": "caption-group-116",
+      "frame": 7,
+      "start": 52.266,
+      "end": 52.806,
+      "text": "安 全 ，",
+      "words": [
+        {
+          "id": "caption-word-116-0",
+          "text": "安",
+          "start": 52.266,
+          "end": 52.586
+        },
+        {
+          "id": "caption-word-116-1",
+          "text": "全",
+          "start": 52.586,
+          "end": 52.686
+        },
+        {
+          "id": "caption-word-116-2",
+          "text": "，",
+          "start": 52.686,
+          "end": 52.686
+        }
+      ]
+    },
+    {
+      "id": "caption-group-117",
+      "frame": 7,
+      "start": 53.286,
+      "end": 53.567,
+      "text": "不 靠",
+      "words": [
+        {
+          "id": "caption-word-117-0",
+          "text": "不",
+          "start": 53.286,
+          "end": 53.546
+        },
+        {
+          "id": "caption-word-117-1",
+          "text": "靠",
+          "start": 53.546,
+          "end": 53.567
+        }
+      ]
+    },
+    {
+      "id": "caption-group-118",
+      "frame": 7,
+      "start": 53.567,
+      "end": 54.206,
+      "text": "运 气 。",
+      "words": [
+        {
+          "id": "caption-word-118-0",
+          "text": "运",
+          "start": 53.567,
+          "end": 54.007
+        },
+        {
+          "id": "caption-word-118-1",
+          "text": "气",
+          "start": 54.007,
+          "end": 54.086
+        },
+        {
+          "id": "caption-word-118-2",
+          "text": "。",
+          "start": 54.086,
+          "end": 54.086
+        }
+      ]
+    },
+    {
+      "id": "caption-group-119",
+      "frame": 7,
+      "start": 55.067,
+      "end": 55.446,
+      "text": "注 入",
+      "words": [
+        {
+          "id": "caption-word-119-0",
+          "text": "注",
+          "start": 55.067,
+          "end": 55.206
+        },
+        {
+          "id": "caption-word-119-1",
+          "text": "入",
+          "start": 55.206,
+          "end": 55.446
+        }
+      ]
+    },
+    {
+      "id": "caption-group-120",
+      "frame": 7,
+      "start": 55.446,
+      "end": 55.566,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-120-0",
+          "text": "，",
+          "start": 55.446,
+          "end": 55.446
+        }
+      ]
+    },
+    {
+      "id": "caption-group-121",
+      "frame": 7,
+      "start": 55.946,
+      "end": 56.486,
+      "text": "整 条",
+      "words": [
+        {
+          "id": "caption-word-121-0",
+          "text": "整",
+          "start": 55.946,
+          "end": 56.186
+        },
+        {
+          "id": "caption-word-121-1",
+          "text": "条",
+          "start": 56.187,
+          "end": 56.486
+        }
+      ]
+    },
+    {
+      "id": "caption-group-122",
+      "frame": 7,
+      "start": 56.486,
+      "end": 56.887,
+      "text": "丢 弃 。",
+      "words": [
+        {
+          "id": "caption-word-122-0",
+          "text": "丢",
+          "start": 56.486,
+          "end": 56.646
+        },
+        {
+          "id": "caption-word-122-1",
+          "text": "弃",
+          "start": 56.646,
+          "end": 56.767
+        },
+        {
+          "id": "caption-word-122-2",
+          "text": "。",
+          "start": 56.767,
+          "end": 56.767
+        }
+      ]
+    },
+    {
+      "id": "caption-group-123",
+      "frame": 7,
+      "start": 57.727,
+      "end": 58.206,
+      "text": "密 钥 ，",
+      "words": [
+        {
+          "id": "caption-word-123-0",
+          "text": "密",
+          "start": 57.727,
+          "end": 58.006
+        },
+        {
+          "id": "caption-word-123-1",
+          "text": "钥",
+          "start": 58.006,
+          "end": 58.086
+        },
+        {
+          "id": "caption-word-123-2",
+          "text": "，",
+          "start": 58.086,
+          "end": 58.086
+        }
+      ]
+    },
+    {
+      "id": "caption-group-124",
+      "frame": 7,
+      "start": 58.747,
+      "end": 59.307,
+      "text": "信 封",
+      "words": [
+        {
+          "id": "caption-word-124-0",
+          "text": "信",
+          "start": 58.747,
+          "end": 59.026
+        },
+        {
+          "id": "caption-word-124-1",
+          "text": "封",
+          "start": 59.026,
+          "end": 59.307
+        }
+      ]
+    },
+    {
+      "id": "caption-group-125",
+      "frame": 7,
+      "start": 59.307,
+      "end": 59.646,
+      "text": "加 密 。",
+      "words": [
+        {
+          "id": "caption-word-125-0",
+          "text": "加",
+          "start": 59.307,
+          "end": 59.426
+        },
+        {
+          "id": "caption-word-125-1",
+          "text": "密",
+          "start": 59.426,
+          "end": 59.526
+        },
+        {
+          "id": "caption-word-125-2",
+          "text": "。",
+          "start": 59.526,
+          "end": 59.526
+        }
+      ]
+    },
+    {
+      "id": "caption-group-126",
+      "frame": 7,
+      "start": 60.486,
+      "end": 61.026,
+      "text": "越 界",
+      "words": [
+        {
+          "id": "caption-word-126-0",
+          "text": "越",
+          "start": 60.486,
+          "end": 60.787
+        },
+        {
+          "id": "caption-word-126-1",
+          "text": "界",
+          "start": 60.787,
+          "end": 61.026
+        }
+      ]
+    },
+    {
+      "id": "caption-group-127",
+      "frame": 7,
+      "start": 61.026,
+      "end": 61.266,
+      "text": "写 入",
+      "words": [
+        {
+          "id": "caption-word-127-0",
+          "text": "写",
+          "start": 61.026,
+          "end": 61.207
+        },
+        {
+          "id": "caption-word-127-1",
+          "text": "入",
+          "start": 61.207,
+          "end": 61.266
+        }
+      ]
+    },
+    {
+      "id": "caption-group-128",
+      "frame": 7,
+      "start": 61.266,
+      "end": 61.386,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-128-0",
+          "text": "，",
+          "start": 61.266,
+          "end": 61.266
+        }
+      ]
+    },
+    {
+      "id": "caption-group-129",
+      "frame": 7,
+      "start": 61.886,
+      "end": 62.386,
+      "text": "直 接",
+      "words": [
+        {
+          "id": "caption-word-129-0",
+          "text": "直",
+          "start": 61.886,
+          "end": 62.166
+        },
+        {
+          "id": "caption-word-129-1",
+          "text": "接",
+          "start": 62.167,
+          "end": 62.386
+        }
+      ]
+    },
+    {
+      "id": "caption-group-130",
+      "frame": 7,
+      "start": 62.386,
+      "end": 62.827,
+      "text": "拒 绝 。",
+      "words": [
+        {
+          "id": "caption-word-130-0",
+          "text": "拒",
+          "start": 62.386,
+          "end": 62.626
+        },
+        {
+          "id": "caption-word-130-1",
+          "text": "绝",
+          "start": 62.627,
+          "end": 62.707
+        },
+        {
+          "id": "caption-word-130-2",
+          "text": "。",
+          "start": 62.707,
+          "end": 62.707
+        }
+      ]
+    },
+    {
+      "id": "caption-group-131",
+      "frame": 7,
+      "start": 63.406,
+      "end": 63.866,
+      "text": "失 控",
+      "words": [
+        {
+          "id": "caption-word-131-0",
+          "text": "失",
+          "start": 63.406,
+          "end": 63.646
+        },
+        {
+          "id": "caption-word-131-1",
+          "text": "控",
+          "start": 63.646,
+          "end": 63.866
+        }
+      ]
+    },
+    {
+      "id": "caption-group-132",
+      "frame": 7,
+      "start": 63.866,
+      "end": 64.346,
+      "text": "进 程 ，",
+      "words": [
+        {
+          "id": "caption-word-132-0",
+          "text": "进",
+          "start": 63.866,
+          "end": 64.146
+        },
+        {
+          "id": "caption-word-132-1",
+          "text": "程",
+          "start": 64.146,
+          "end": 64.226
+        },
+        {
+          "id": "caption-word-132-2",
+          "text": "，",
+          "start": 64.226,
+          "end": 64.226
+        }
+      ]
+    },
+    {
+      "id": "caption-group-133",
+      "frame": 7,
+      "start": 64.926,
+      "end": 65.426,
+      "text": "当 场",
+      "words": [
+        {
+          "id": "caption-word-133-0",
+          "text": "当",
+          "start": 64.926,
+          "end": 65.186
+        },
+        {
+          "id": "caption-word-133-1",
+          "text": "场",
+          "start": 65.186,
+          "end": 65.426
+        }
+      ]
+    },
+    {
+      "id": "caption-group-134",
+      "frame": 7,
+      "start": 65.426,
+      "end": 65.646,
+      "text": "真 杀",
+      "words": [
+        {
+          "id": "caption-word-134-0",
+          "text": "真",
+          "start": 65.426,
+          "end": 65.586
+        },
+        {
+          "id": "caption-word-134-1",
+          "text": "杀",
+          "start": 65.586,
+          "end": 65.646
+        }
+      ]
+    },
+    {
+      "id": "caption-group-135",
+      "frame": 7,
+      "start": 65.646,
+      "end": 65.766,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-135-0",
+          "text": "。",
+          "start": 65.646,
+          "end": 65.646
+        }
+      ]
+    },
+    {
+      "id": "caption-group-136",
+      "frame": 8,
+      "start": 66.18,
+      "end": 66.6,
+      "text": "你 只",
+      "words": [
+        {
+          "id": "caption-word-136-0",
+          "text": "你",
+          "start": 66.18,
+          "end": 66.3
+        },
+        {
+          "id": "caption-word-136-1",
+          "text": "只",
+          "start": 66.3,
+          "end": 66.6
+        }
+      ]
+    },
+    {
+      "id": "caption-group-137",
+      "frame": 8,
+      "start": 66.6,
+      "end": 66.8,
+      "text": "做 两",
+      "words": [
+        {
+          "id": "caption-word-137-0",
+          "text": "做",
+          "start": 66.6,
+          "end": 66.72
+        },
+        {
+          "id": "caption-word-137-1",
+          "text": "两",
+          "start": 66.72,
+          "end": 66.8
+        }
+      ]
+    },
+    {
+      "id": "caption-group-138",
+      "frame": 8,
+      "start": 66.8,
+      "end": 67.361,
+      "text": "个 决",
+      "words": [
+        {
+          "id": "caption-word-138-0",
+          "text": "个",
+          "start": 66.8,
+          "end": 67.06
+        },
+        {
+          "id": "caption-word-138-1",
+          "text": "决",
+          "start": 67.06,
+          "end": 67.36
+        }
+      ]
+    },
+    {
+      "id": "caption-group-139",
+      "frame": 8,
+      "start": 67.361,
+      "end": 67.52,
+      "text": "策 ：",
+      "words": [
+        {
+          "id": "caption-word-139-0",
+          "text": "策",
+          "start": 67.361,
+          "end": 67.4
+        },
+        {
+          "id": "caption-word-139-1",
+          "text": "：",
+          "start": 67.4,
+          "end": 67.4
+        }
+      ]
+    },
+    {
+      "id": "caption-group-140",
+      "frame": 8,
+      "start": 67.92,
+      "end": 68.2,
+      "text": "这 个",
+      "words": [
+        {
+          "id": "caption-word-140-0",
+          "text": "这",
+          "start": 67.92,
+          "end": 67.96
+        },
+        {
+          "id": "caption-word-140-1",
+          "text": "个",
+          "start": 67.96,
+          "end": 68.2
+        }
+      ]
+    },
+    {
+      "id": "caption-group-141",
+      "frame": 8,
+      "start": 68.2,
+      "end": 68.7,
+      "text": "需 求",
+      "words": [
+        {
+          "id": "caption-word-141-0",
+          "text": "需",
+          "start": 68.2,
+          "end": 68.341
+        },
+        {
+          "id": "caption-word-141-1",
+          "text": "求",
+          "start": 68.341,
+          "end": 68.7
+        }
+      ]
+    },
+    {
+      "id": "caption-group-142",
+      "frame": 8,
+      "start": 68.7,
+      "end": 68.9,
+      "text": "， 要",
+      "words": [
+        {
+          "id": "caption-word-142-0",
+          "text": "，",
+          "start": 68.7,
+          "end": 68.7
+        },
+        {
+          "id": "caption-word-142-1",
+          "text": "要",
+          "start": 68.72,
+          "end": 68.9
+        }
+      ]
+    },
+    {
+      "id": "caption-group-143",
+      "frame": 8,
+      "start": 68.9,
+      "end": 69.361,
+      "text": "不 要",
+      "words": [
+        {
+          "id": "caption-word-143-0",
+          "text": "不",
+          "start": 68.9,
+          "end": 69.06
+        },
+        {
+          "id": "caption-word-143-1",
+          "text": "要",
+          "start": 69.06,
+          "end": 69.36
+        }
+      ]
+    },
+    {
+      "id": "caption-group-144",
+      "frame": 8,
+      "start": 69.361,
+      "end": 69.6,
+      "text": "做 ；",
+      "words": [
+        {
+          "id": "caption-word-144-0",
+          "text": "做",
+          "start": 69.361,
+          "end": 69.48
+        },
+        {
+          "id": "caption-word-144-1",
+          "text": "；",
+          "start": 69.48,
+          "end": 69.48
+        }
+      ]
+    },
+    {
+      "id": "caption-group-145",
+      "frame": 8,
+      "start": 69.861,
+      "end": 70.241,
+      "text": "这 段",
+      "words": [
+        {
+          "id": "caption-word-145-0",
+          "text": "这",
+          "start": 69.861,
+          "end": 70.02
+        },
+        {
+          "id": "caption-word-145-1",
+          "text": "段",
+          "start": 70.02,
+          "end": 70.24
+        }
+      ]
+    },
+    {
+      "id": "caption-group-146",
+      "frame": 8,
+      "start": 70.241,
+      "end": 70.68,
+      "text": "代 码",
+      "words": [
+        {
+          "id": "caption-word-146-0",
+          "text": "代",
+          "start": 70.241,
+          "end": 70.5
+        },
+        {
+          "id": "caption-word-146-1",
+          "text": "码",
+          "start": 70.5,
+          "end": 70.68
+        }
+      ]
+    },
+    {
+      "id": "caption-group-147",
+      "frame": 8,
+      "start": 70.68,
+      "end": 70.9,
+      "text": "， 收",
+      "words": [
+        {
+          "id": "caption-word-147-0",
+          "text": "，",
+          "start": 70.68,
+          "end": 70.68
+        },
+        {
+          "id": "caption-word-147-1",
+          "text": "收",
+          "start": 70.761,
+          "end": 70.9
+        }
+      ]
+    },
+    {
+      "id": "caption-group-148",
+      "frame": 8,
+      "start": 70.9,
+      "end": 71.24,
+      "text": "不 收",
+      "words": [
+        {
+          "id": "caption-word-148-0",
+          "text": "不",
+          "start": 70.9,
+          "end": 71.12
+        },
+        {
+          "id": "caption-word-148-1",
+          "text": "收",
+          "start": 71.12,
+          "end": 71.24
+        }
+      ]
+    },
+    {
+      "id": "caption-group-149",
+      "frame": 8,
+      "start": 71.24,
+      "end": 71.36,
+      "text": "。",
+      "words": [
+        {
+          "id": "caption-word-149-0",
+          "text": "。",
+          "start": 71.24,
+          "end": 71.24
+        }
+      ]
+    },
+    {
+      "id": "caption-group-150",
+      "frame": 9,
+      "start": 71.57,
+      "end": 71.751,
+      "text": "A u",
+      "words": [
+        {
+          "id": "caption-word-150-0",
+          "text": "A",
+          "start": 71.57,
+          "end": 71.67
+        },
+        {
+          "id": "caption-word-150-1",
+          "text": "u",
+          "start": 71.67,
+          "end": 71.751
+        }
+      ]
+    },
+    {
+      "id": "caption-group-151",
+      "frame": 9,
+      "start": 71.751,
+      "end": 72.01,
+      "text": "t o",
+      "words": [
+        {
+          "id": "caption-word-151-0",
+          "text": "t",
+          "start": 71.751,
+          "end": 71.83
+        },
+        {
+          "id": "caption-word-151-1",
+          "text": "o",
+          "start": 71.83,
+          "end": 72.01
+        }
+      ]
+    },
+    {
+      "id": "caption-group-152",
+      "frame": 9,
+      "start": 72.01,
+      "end": 72.151,
+      "text": "F o",
+      "words": [
+        {
+          "id": "caption-word-152-0",
+          "text": "F",
+          "start": 72.01,
+          "end": 72.091
+        },
+        {
+          "id": "caption-word-152-1",
+          "text": "o",
+          "start": 72.091,
+          "end": 72.151
+        }
+      ]
+    },
+    {
+      "id": "caption-group-153",
+      "frame": 9,
+      "start": 72.151,
+      "end": 72.33,
+      "text": "r g",
+      "words": [
+        {
+          "id": "caption-word-153-0",
+          "text": "r",
+          "start": 72.151,
+          "end": 72.211
+        },
+        {
+          "id": "caption-word-153-1",
+          "text": "g",
+          "start": 72.211,
+          "end": 72.33
+        }
+      ]
+    },
+    {
+      "id": "caption-group-154",
+      "frame": 9,
+      "start": 72.33,
+      "end": 72.61,
+      "text": "e 一",
+      "words": [
+        {
+          "id": "caption-word-154-0",
+          "text": "e",
+          "start": 72.33,
+          "end": 72.43
+        },
+        {
+          "id": "caption-word-154-1",
+          "text": "一",
+          "start": 72.55,
+          "end": 72.61
+        }
+      ]
+    },
+    {
+      "id": "caption-group-155",
+      "frame": 9,
+      "start": 72.61,
+      "end": 72.87,
+      "text": "个 人",
+      "words": [
+        {
+          "id": "caption-word-155-0",
+          "text": "个",
+          "start": 72.61,
+          "end": 72.711
+        },
+        {
+          "id": "caption-word-155-1",
+          "text": "人",
+          "start": 72.711,
+          "end": 72.87
+        }
+      ]
+    },
+    {
+      "id": "caption-group-156",
+      "frame": 9,
+      "start": 72.87,
+      "end": 72.99,
+      "text": "，",
+      "words": [
+        {
+          "id": "caption-word-156-0",
+          "text": "，",
+          "start": 72.87,
+          "end": 72.87
+        }
+      ]
+    },
+    {
+      "id": "caption-group-157",
+      "frame": 9,
+      "start": 73.31,
+      "end": 73.59,
+      "text": "就 是",
+      "words": [
+        {
+          "id": "caption-word-157-0",
+          "text": "就",
+          "start": 73.31,
+          "end": 73.43
+        },
+        {
+          "id": "caption-word-157-1",
+          "text": "是",
+          "start": 73.43,
+          "end": 73.59
+        }
+      ]
+    },
+    {
+      "id": "caption-group-158",
+      "frame": 9,
+      "start": 73.59,
+      "end": 74.05,
+      "text": "一 条",
+      "words": [
+        {
+          "id": "caption-word-158-0",
+          "text": "一",
+          "start": 73.59,
+          "end": 73.77
+        },
+        {
+          "id": "caption-word-158-1",
+          "text": "条",
+          "start": 73.77,
+          "end": 74.05
+        }
+      ]
+    },
+    {
+      "id": "caption-group-159",
+      "frame": 9,
+      "start": 74.05,
+      "end": 74.51,
+      "text": "流 水",
+      "words": [
+        {
+          "id": "caption-word-159-0",
+          "text": "流",
+          "start": 74.05,
+          "end": 74.27
+        },
+        {
+          "id": "caption-word-159-1",
+          "text": "水",
+          "start": 74.27,
+          "end": 74.51
+        }
+      ]
+    },
+    {
+      "id": "caption-group-160",
+      "frame": 9,
+      "start": 74.51,
+      "end": 74.71,
+      "text": "线 。",
+      "words": [
+        {
+          "id": "caption-word-160-0",
+          "text": "线",
+          "start": 74.51,
+          "end": 74.59
+        },
+        {
+          "id": "caption-word-160-1",
+          "text": "。",
+          "start": 74.59,
+          "end": 74.59
+        }
+      ]
+    }
+  ]
+}
